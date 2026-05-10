@@ -66,16 +66,7 @@ nodes:
       for css in comic-energy.css components.css tokens.css shared.css; do
         if [ -f "$CD_SRC/$css" ]; then cp "$CD_SRC/$css" "$DEST/$css"; fi
       done
-      cat > "$DEST/SOURCE-NOTE.md" <<'NOTE'
-# CD Source Provenance
-
-Canonical CD export: anthropic-design-fetch-11
-mtime: 2026-05-07 05:50 ET
-size: 57710 bytes (index.html)
-
-fetch-10 is byte-identical duplicate; fetch-11 is canonical (newer mtime).
-Ingested by bdc-storefront-pdp-intake workflow per WO-STOREFRONT-PDP-V2-INTAKE-01.
-NOTE
+      printf '# CD Source Provenance\n\nCanonical CD export: anthropic-design-fetch-11\nmtime: 2026-05-07 05:50 ET\nsize: 57710 bytes (index.html)\n\nfetch-10 is byte-identical duplicate; fetch-11 is canonical (newer mtime).\nIngested by bdc-storefront-pdp-intake workflow per WO-STOREFRONT-PDP-V2-INTAKE-01.\n' > "$DEST/SOURCE-NOTE.md"
       ls -la "$DEST"
 
   - id: plan
@@ -267,9 +258,7 @@ NOTE
           exit 1
         fi
         git add -- "$path"
-      done <<EOF
-$CHANGED
-EOF
+      done <<< "$CHANGED"
       if git diff --cached --quiet; then
         echo "No changes staged." >&2
         exit 1
