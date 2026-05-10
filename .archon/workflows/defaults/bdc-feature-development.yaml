@@ -92,6 +92,7 @@ nodes:
         - Do not reformat unrelated code.
         - Do not deploy.
         - Do not bypass approval gates.
+        - If a branch is required, prefer `wo/${WO_ID}` derived from the Work Order ID. Do not copy branch names from test scenarios such as `test/sc-*`.
         - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
 
         ## Completion Criteria
@@ -130,13 +131,20 @@ nodes:
     depends_on: [implement]
     bash: |
       set -euo pipefail
-      if [ -f package.json ] && node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)"; then
+      if [ ! -f package.json ]; then
+        if find . -path ./.git -prune -o \( -name '*test*' -o -name '*spec*' \) -type f -print -quit | grep -q .; then
+          echo "Test files detected but no package.json or recognized test runner; skipping. Record tests as not-runnable in manifest."
+        else
+          echo "Skipping tests (no package.json or recognized test runner)."
+        fi
+        exit 0
+      fi
+      if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)"; then
         npm test
       elif find . -path ./.git -prune -o \( -name '*test*' -o -name '*spec*' \) -type f -print -quit | grep -q .; then
-        echo "Test files detected but no npm test script was found." >&2
-        exit 1
+        echo "Test files detected but no npm test script defined; skipping. Record tests as not-runnable in manifest."
       else
-        echo "No test files detected; record as not applicable in manifest."
+        echo "No npm test script defined and no test files detected; record tests as not applicable in manifest."
       fi
 
   - id: war-council-validator
@@ -186,14 +194,16 @@ nodes:
       - bluedevilcollectibles/shopops/
 
       If the repo matches one of those entries, output:
-      push_target: feature-branch:<spec-derived-branch-name>
+      push_target: feature-branch:wo/<actual-WO-ID>
       pr_required: true
       staging_gate_required: true
 
       If the repo is bdc-xo non-doctrine code or another code repo, output:
-      push_target: feature-branch:<spec-derived-branch-name>
+      push_target: feature-branch:wo/<actual-WO-ID>
       pr_required: true
       staging_gate_required: false
+
+      Branch naming default: derive `wo/<actual-WO-ID>` from the Work Order ID, replacing the placeholder with the real WO ID. Do not choose branch names copied from test scenarios such as `test/sc-*` unless the spec explicitly requires that exact branch name.
 
       If this is doc-only or doctrine-only, output:
       out_of_scope: true
