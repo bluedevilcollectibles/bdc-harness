@@ -145,6 +145,7 @@ nodes:
         - Report each command's exit code.
         - Stop and report blocker if any command fails; do not proceed to verification.
         - Do not skip error handling.
+        - If a source-change branch is required, prefer `wo/${WO_ID}` derived from the Work Order ID. Do not copy branch names from test scenarios such as `test/sc-*`.
 
         ## Completion Criteria
         Output <promise>COMPLETE</promise> only when all planned infra changes have been applied successfully.
@@ -247,8 +248,28 @@ nodes:
       eval "$SMOKE_CMD" > "$ARTIFACT_DIR/post-state/smoke-test.txt" 2>&1 || true
       echo "✓ Smoke test complete (evidence saved)"
 
-  - id: decide-push-target
+  - id: verify-tests
     depends_on: [runtime-smoke-test]
+    bash: |
+      set -euo pipefail
+      if [ ! -f package.json ]; then
+        if find . -path ./.git -prune -o \( -name '*test*' -o -name '*spec*' \) -type f -print -quit | grep -q .; then
+          echo "Test files detected but no package.json or recognized test runner; skipping. Record tests as not-runnable in manifest."
+        else
+          echo "Skipping tests (no package.json or recognized test runner)."
+        fi
+        exit 0
+      fi
+      if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)"; then
+        npm test
+      elif find . -path ./.git -prune -o \( -name '*test*' -o -name '*spec*' \) -type f -print -quit | grep -q .; then
+        echo "Test files detected but no npm test script defined; skipping. Record tests as not-runnable in manifest."
+      else
+        echo "No npm test script defined and no test files detected; record tests as not applicable in manifest."
+      fi
+
+  - id: decide-push-target
+    depends_on: [runtime-smoke-test, verify-tests]
     task_class: clerical
     prompt: |
       Decide whether source files were modified during the infra deploy and if so, which branch to push to.
@@ -258,8 +279,8 @@ nodes:
       - output: no_push_needed: true
 
       If source files were modified (rare for pure infra):
-      - Derive a feature branch name from the WO ID
-      - output: push_target: feature-branch:<branch-name>
+      - Derive a feature branch name from the WO ID as `wo/<actual-WO-ID>`, replacing the placeholder with the real WO ID
+      - output: push_target: feature-branch:wo/<actual-WO-ID>
       - output: pr_required: true
 
       ## Analysis
@@ -341,6 +362,7 @@ nodes:
       - Post-state verification: source live per Rule 19 (Y/N if applicable)
       - Post-state verification: env vars present (Y/N if applicable)
       - Post-state verification: smoke test result
+      - Test verification: $verify-tests.output
       - docker inspect output (excerpt from post-state)
       - docker logs excerpt
       - curl evidence (if applicable)

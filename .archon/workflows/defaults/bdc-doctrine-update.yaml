@@ -84,6 +84,7 @@ nodes:
         - Preserve all unrelated content; never reformat files outside the target edits.
         - Do not deploy.
         - Do not bypass approval gates.
+        - If a branch is required by an explicit spec override, prefer `wo/${WO_ID}` derived from the Work Order ID. This workflow otherwise pushes doctrine-only work directly.
         - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
 
         ## Completion Criteria
@@ -125,8 +126,28 @@ nodes:
       fi
       echo "All grep checks passed."
 
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      if [ ! -f package.json ]; then
+        if find . -path ./.git -prune -o \( -name '*test*' -o -name '*spec*' \) -type f -print -quit | grep -q .; then
+          echo "Test files detected but no package.json or recognized test runner; skipping. Record tests as not-runnable in manifest."
+        else
+          echo "Skipping tests (no package.json or recognized test runner)."
+        fi
+        exit 0
+      fi
+      if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)"; then
+        npm test
+      elif find . -path ./.git -prune -o \( -name '*test*' -o -name '*spec*' \) -type f -print -quit | grep -q .; then
+        echo "Test files detected but no npm test script defined; skipping. Record tests as not-runnable in manifest."
+      else
+        echo "No npm test script defined and no test files detected; record tests as not applicable in manifest."
+      fi
+
   - id: decide-push-target
-    depends_on: [verify-greps]
+    depends_on: [verify-greps, verify-tests]
     task_class: clerical
     prompt: |
       Confirm the push target for this BDC doctrine Work Order.
@@ -211,6 +232,9 @@ nodes:
 
       Verification:
       $verify-greps.output
+
+      Tests:
+      $verify-tests.output
 
       ## Required Manifest Fields
       - WO ID

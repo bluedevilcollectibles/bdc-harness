@@ -99,6 +99,7 @@ nodes:
          filename: 3 → 0 (cleaned)
          ```
       5. Stop and report if any file has a violation count that doesn't match the expected result.
+      6. If a branch is required, prefer `wo/${WO_ID}` derived from the Work Order ID. Do not copy branch names from test scenarios such as `test/sc-*`.
 
       ## Completion
       Output <promise>COMPLETE</promise> only when all files have been swept and verified.
@@ -139,8 +140,28 @@ nodes:
         echo "No tsconfig.json; skipping TypeScript check."
       fi
 
+  - id: verify-tests
+    depends_on: [verify-post-state]
+    bash: |
+      set -euo pipefail
+      if [ ! -f package.json ]; then
+        if find . -path ./.git -prune -o \( -name '*test*' -o -name '*spec*' \) -type f -print -quit | grep -q .; then
+          echo "Test files detected but no package.json or recognized test runner; skipping. Record tests as not-runnable in manifest."
+        else
+          echo "Skipping tests (no package.json or recognized test runner)."
+        fi
+        exit 0
+      fi
+      if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.test ? 0 : 1)"; then
+        npm test
+      elif find . -path ./.git -prune -o \( -name '*test*' -o -name '*spec*' \) -type f -print -quit | grep -q .; then
+        echo "Test files detected but no npm test script defined; skipping. Record tests as not-runnable in manifest."
+      else
+        echo "No npm test script defined and no test files detected; record tests as not applicable in manifest."
+      fi
+
   - id: decide-push-target
-    depends_on: [verify-build, verify-types]
+    depends_on: [verify-build, verify-types, verify-tests]
     task_class: clerical
     prompt: |
       Decide the push target for this BDC cleanup-sweep Work Order.
@@ -159,16 +180,16 @@ nodes:
       - bluedevilcollectibles/shopops/
 
       If the repo matches one of those entries, output:
-      push_target: feature-branch:<spec-derived-branch-name>
+      push_target: feature-branch:wo/<actual-WO-ID>
       pr_required: true
       staging_gate_required: true
 
       If the repo is bdc-harness or another code repo, output:
-      push_target: feature-branch:<spec-derived-branch-name>
+      push_target: feature-branch:wo/<actual-WO-ID>
       pr_required: true
       staging_gate_required: false
 
-      Branch naming convention: cleanup-<WO-ID-lowercase>
+      Branch naming default: derive `wo/<actual-WO-ID>` from the Work Order ID, replacing the placeholder with the real WO ID. Do not choose branch names copied from test scenarios such as `test/sc-*` unless the spec explicitly requires that exact branch name.
 
   - id: commit-and-push
     depends_on: [decide-push-target]
@@ -228,6 +249,8 @@ nodes:
         echo "Build: $verify-build.output"
         echo ""
         echo "Types: $verify-types.output"
+        echo ""
+        echo "Tests: $verify-tests.output"
       } > "$BODY_FILE"
       gh pr create --title "$TITLE" --body-file "$BODY_FILE"
 
@@ -251,6 +274,9 @@ nodes:
       Types:
       $verify-types.output
 
+      Tests:
+      $verify-tests.output
+
       ## Required Manifest Fields
       - WO ID
       - Files modified (list with before/after violation counts)
@@ -258,6 +284,7 @@ nodes:
       - Validation evidence:
         * Build PASS/N/A
         * Types PASS/N/A
+        * Tests PASS/N/A/not-runnable
         * Per-file grep counts (before → after)
       - PR URL, if opened
       - Staging gate status, if required
