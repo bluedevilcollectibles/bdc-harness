@@ -37,11 +37,7 @@ nodes:
     depends_on: [read-spec]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
       curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
         -H "Content-Type: application/json" \
         -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Builder-4\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
@@ -68,14 +64,10 @@ nodes:
     depends_on: [reproduce]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      REPRODUCE_OUTPUT=$reproduce.output
       # Extract test file path and command from reproduce output
       # The test MUST fail before the fix. If test passes, reproduction is wrong.
       echo "Extracting test file path and run command from reproduce output..."
-      TEST_PATH=$(printf '%s\n' "$REPRODUCE_OUTPUT" | grep -Eo '\`[^`]+\.(test\.(ts|js|py)|spec\.(ts|js|py))[^`]*\`' | head -n 1 | sed 's/`//g' || echo "")
+      TEST_PATH=$(printf '%s\n' "$reproduce.output" | grep -Eo '\`[^`]+\.(test\.(ts|js|py)|spec\.(ts|js|py))[^`]*\`' | head -n 1 | sed 's/`//g' || echo "")
       if [ -z "$TEST_PATH" ]; then
         echo "Could not extract test file path from reproduce output. Look for test file references." >&2
         exit 1
@@ -175,12 +167,8 @@ nodes:
     depends_on: [implement-fix]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      REPRODUCE_OUTPUT=$reproduce.output
       echo "Verifying the reproduction test now passes after the fix..."
-      TEST_PATH=$(printf '%s\n' "$REPRODUCE_OUTPUT" | grep -Eo '\`[^`]+\.(test\.(ts|js|py)|spec\.(ts|js|py))[^`]*\`' | head -n 1 | sed 's/`//g' || echo "")
+      TEST_PATH=$(printf '%s\n' "$reproduce.output" | grep -Eo '\`[^`]+\.(test\.(ts|js|py)|spec\.(ts|js|py))[^`]*\`' | head -n 1 | sed 's/`//g' || echo "")
       if [ -z "$TEST_PATH" ]; then
         echo "Could not extract test file path from reproduce output." >&2
         exit 1
@@ -315,18 +303,12 @@ nodes:
     depends_on: [decide-push-target]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_PUSH_TARGET_OUTPUT=$decide-push-target.output
-      PLAN_FIX_OUTPUT=$plan-fix.output
-      READ_SPEC_OUTPUT=$read-spec.output
-      echo "$DECIDE_PUSH_TARGET_OUTPUT"
-      if printf '%s\n' "$DECIDE_PUSH_TARGET_OUTPUT" | grep -q '^out_of_scope: true'; then
+      echo "$decide-push-target.output"
+      if printf '%s\n' "$decide-push-target.output" | grep -q '^out_of_scope: true'; then
         echo "Out of scope for bdc-bug-fix; failing closed." >&2
         exit 1
       fi
-      BRANCH=$(printf '%s\n' "$DECIDE_PUSH_TARGET_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      BRANCH=$(printf '%s\n' "$decide-push-target.output" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
       if [ -z "$BRANCH" ]; then
         echo "No feature branch target found in decide-push-target output." >&2
         exit 1
@@ -342,7 +324,7 @@ nodes:
         if [ -z "$path" ]; then
           continue
         fi
-        if ! printf '%s\n' "$PLAN_FIX_OUTPUT" | grep -F -- "$path" >/dev/null; then
+        if ! printf '%s\n' "$plan-fix.output" | grep -F -- "$path" >/dev/null; then
           echo "Changed file was not listed in plan output: $path" >&2
           exit 1
         fi
@@ -354,9 +336,9 @@ nodes:
         echo "No changes staged; cannot commit." >&2
         exit 1
       fi
-      COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_FIX_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+      COMMIT_MESSAGE=$(printf '%s\n' "$plan-fix.output" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$COMMIT_MESSAGE" ]; then
-        WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+        WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
         COMMIT_MESSAGE="fix: ${WO_ID} bug fix"
       fi
       git commit -m "$COMMIT_MESSAGE"
@@ -367,44 +349,33 @@ nodes:
     task_class: clerical
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_PUSH_TARGET_OUTPUT=$decide-push-target.output
-      PLAN_FIX_OUTPUT=$plan-fix.output
-      VERIFY_TEST_FAILS_OUTPUT=$verify-test-fails.output
-      VERIFY_TEST_PASSES_OUTPUT=$verify-test-passes.output
-      VERIFY_BUILD_OUTPUT=$verify-build.output
-      VERIFY_TYPES_OUTPUT=$verify-types.output
-      VERIFY_OTHER_TESTS_OUTPUT=$verify-other-tests.output
-      WAR_COUNCIL_VALIDATOR_OUTPUT=$war-council-validator.output
-      if ! printf '%s\n' "$DECIDE_PUSH_TARGET_OUTPUT" | grep -q '^pr_required: true'; then
+      if ! printf '%s\n' "$decide-push-target.output" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
       fi
-      TITLE=$(printf '%s\n' "$PLAN_FIX_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+      TITLE=$(printf '%s\n' "$plan-fix.output" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$TITLE" ]; then
         TITLE="BDC bug fix Work Order"
       fi
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "$PLAN_FIX_OUTPUT"
+        echo "$plan-fix.output"
         echo
         echo "## Test Verification"
         echo "Failing test before fix:"
-        echo "$VERIFY_TEST_FAILS_OUTPUT"
+        echo "$verify-test-fails.output"
         echo
         echo "Passing test after fix:"
-        echo "$VERIFY_TEST_PASSES_OUTPUT"
+        echo "$verify-test-passes.output"
         echo
         echo "## Validation"
-        echo "$VERIFY_BUILD_OUTPUT"
-        echo "$VERIFY_TYPES_OUTPUT"
-        echo "$VERIFY_OTHER_TESTS_OUTPUT"
+        echo "$verify-build.output"
+        echo "$verify-types.output"
+        echo "$verify-other-tests.output"
         echo
         echo "## Root Cause Review"
-        echo "$WAR_COUNCIL_VALIDATOR_OUTPUT"
+        echo "$war-council-validator.output"
       } > "$BODY_FILE"
       gh pr create --title "$TITLE" --body-file "$BODY_FILE"
 
@@ -472,13 +443,8 @@ nodes:
     depends_on: [build-manifest]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      BUILD_MANIFEST_OUTPUT=$build-manifest.output
-      WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
-      DETAIL=$(printf '%s\n' "$BUILD_MANIFEST_OUTPUT" | python -c "import json,sys; print(json.dumps(sys.stdin.read()))")
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
+      DETAIL=$(printf '%s\n' "$build-manifest.output" | python -c "import json,sys; print(json.dumps(sys.stdin.read()))")
       curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
         -H "Content-Type: application/json" \
         -d "{\"action\":\"completed\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Builder-4\",\"detail\":${DETAIL}}"

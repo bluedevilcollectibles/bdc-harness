@@ -37,11 +37,7 @@ nodes:
     depends_on: [read-spec]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
       curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
         -H "Content-Type: application/json" \
         -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
@@ -113,14 +109,10 @@ nodes:
     depends_on: [implement]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      PLAN_OUTPUT=$plan.output
       echo "Running grep verification checks on doctrine edits..."
       # Extract grep checks from plan output's "## Grep verification checks" section.
       # Strip markdown code fences (```bash, ```) so they don't get eval'd as commands.
-      CHECKS=$(printf '%s\n' "$PLAN_OUTPUT" \
+      CHECKS=$(printf '%s\n' "$plan.output" \
         | sed -n '/## Grep verification checks/,/^## /p' \
         | sed '1d;$d' \
         | grep -v '^[[:space:]]*$' \
@@ -187,15 +179,9 @@ nodes:
     depends_on: [decide-push-target]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_PUSH_TARGET_OUTPUT=$decide-push-target.output
-      PLAN_OUTPUT=$plan.output
-      READ_SPEC_OUTPUT=$read-spec.output
-      echo "$DECIDE_PUSH_TARGET_OUTPUT"
+      echo "$decide-push-target.output"
       # Verify master direct decision
-      if ! printf '%s\n' "$DECIDE_PUSH_TARGET_OUTPUT" | grep -q '^push_target: master'; then
+      if ! printf '%s\n' "$decide-push-target.output" | grep -q '^push_target: master'; then
         echo "Push target was not 'master direct'; this workflow applies only to doctrine WOs." >&2
         exit 1
       fi
@@ -215,7 +201,7 @@ nodes:
         if [ -z "$path" ]; then
           continue
         fi
-        if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
+        if ! printf '%s\n' "$plan.output" | grep -F -- "$path" >/dev/null; then
           echo "Changed file was not listed in plan output: $path" >&2
           exit 1
         fi
@@ -229,9 +215,9 @@ nodes:
         exit 1
       fi
 
-      COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+      COMMIT_MESSAGE=$(printf '%s\n' "$plan.output" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$COMMIT_MESSAGE" ]; then
-        WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+        WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
         COMMIT_MESSAGE="docs(doctrine): ${WO_ID}"
       fi
 
@@ -272,13 +258,8 @@ nodes:
     depends_on: [build-manifest]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      BUILD_MANIFEST_OUTPUT=$build-manifest.output
-      WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
-      DETAIL=$(printf '%s\n' "$BUILD_MANIFEST_OUTPUT" | python -c "import json,sys; print(json.dumps(sys.stdin.read()))")
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
+      DETAIL=$(printf '%s\n' "$build-manifest.output" | python -c "import json,sys; print(json.dumps(sys.stdin.read()))")
       curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
         -H "Content-Type: application/json" \
         -d "{\"action\":\"completed\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":${DETAIL}}"

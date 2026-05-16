@@ -37,11 +37,7 @@ nodes:
     depends_on: [read-spec]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
       curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
         -H "Content-Type: application/json" \
         -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
@@ -50,11 +46,7 @@ nodes:
     depends_on: [read-spec]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      SPEC="$READ_SPEC_OUTPUT"
+      SPEC="$read-spec.output"
 
       # Extract locked mapping table — fail fast if missing
       if ! printf '%s\n' "$SPEC" | grep -q '##.*[Ll]ocked.*[Mm]apping'; then
@@ -74,11 +66,7 @@ nodes:
     depends_on: [enumerate]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      SPEC="$READ_SPEC_OUTPUT"
+      SPEC="$read-spec.output"
 
       # Extract file glob from spec (simplified: look for common patterns)
       # In practice, the spec should list the exact glob or file list.
@@ -119,11 +107,7 @@ nodes:
     depends_on: [apply-mappings]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      SPEC="$READ_SPEC_OUTPUT"
+      SPEC="$read-spec.output"
 
       echo "Post-sweep verification: grep for violations across all swept files..."
       # This will be populated by the apply-mappings node with file list and patterns.
@@ -190,13 +174,8 @@ nodes:
     depends_on: [decide-push-target]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_PUSH_TARGET_OUTPUT=$decide-push-target.output
-      READ_SPEC_OUTPUT=$read-spec.output
-      echo "$DECIDE_PUSH_TARGET_OUTPUT"
-      BRANCH=$(printf '%s\n' "$DECIDE_PUSH_TARGET_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      echo "$decide-push-target.output"
+      BRANCH=$(printf '%s\n' "$decide-push-target.output" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
       if [ -z "$BRANCH" ]; then
         echo "No feature branch target found in decide-push-target output." >&2
         exit 1
@@ -221,7 +200,7 @@ nodes:
         echo "No changes staged; cannot commit." >&2
         exit 1
       fi
-      WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
       COMMIT_MESSAGE="cleanup: ${WO_ID} — sweep per locked mapping table"
       git commit -m "$COMMIT_MESSAGE"
       git push -u origin "$BRANCH"
@@ -231,19 +210,11 @@ nodes:
     task_class: clerical
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_PUSH_TARGET_OUTPUT=$decide-push-target.output
-      READ_SPEC_OUTPUT=$read-spec.output
-      APPLY_MAPPINGS_OUTPUT=$apply-mappings.output
-      VERIFY_BUILD_OUTPUT=$verify-build.output
-      VERIFY_TYPES_OUTPUT=$verify-types.output
-      if ! printf '%s\n' "$DECIDE_PUSH_TARGET_OUTPUT" | grep -q '^pr_required: true'; then
+      if ! printf '%s\n' "$decide-push-target.output" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
       fi
-      WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
       TITLE="cleanup: ${WO_ID} — sweep per locked mapping"
       BODY_FILE=$(mktemp)
       {
@@ -251,12 +222,12 @@ nodes:
         echo "Cleanup sweep per locked mapping table in spec."
         echo ""
         echo "## Mappings Applied"
-        echo "$APPLY_MAPPINGS_OUTPUT"
+        echo "$apply-mappings.output"
         echo ""
         echo "## Verification"
-        echo "Build: $VERIFY_BUILD_OUTPUT"
+        echo "Build: $verify-build.output"
         echo ""
-        echo "Types: $VERIFY_TYPES_OUTPUT"
+        echo "Types: $verify-types.output"
       } > "$BODY_FILE"
       gh pr create --title "$TITLE" --body-file "$BODY_FILE"
 
@@ -295,13 +266,8 @@ nodes:
     depends_on: [build-manifest]
     bash: |
       set -euo pipefail
-      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
-      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
-      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      READ_SPEC_OUTPUT=$read-spec.output
-      BUILD_MANIFEST_OUTPUT=$build-manifest.output
-      WO_ID=$(printf '%s\n' "$READ_SPEC_OUTPUT" | sed -n 's/^WO_ID=//p' | head -n 1)
-      DETAIL=$(printf '%s\n' "$BUILD_MANIFEST_OUTPUT" | python -c "import json,sys; print(json.dumps(sys.stdin.read()))")
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
+      DETAIL=$(printf '%s\n' "$build-manifest.output" | python -c "import json,sys; print(json.dumps(sys.stdin.read()))")
       curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
         -H "Content-Type: application/json" \
         -d "{\"action\":\"completed\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":${DETAIL}}"
