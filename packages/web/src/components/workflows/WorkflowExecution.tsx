@@ -4,6 +4,7 @@ import { MessageSquare } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { DagNodeProgress } from './DagNodeProgress';
+import { RunCostMeter } from './RunCostMeter';
 import { StepLogs } from './StepLogs';
 import { WorkflowLogs } from './WorkflowLogs';
 import { WorkflowDagViewer } from './WorkflowDagViewer';
@@ -131,6 +132,10 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   duration: e.data.duration_ms as number | undefined,
                   error: e.data.error as string | undefined,
                   reason: e.data.reason as 'when_condition' | 'trigger_rule' | undefined,
+                  costUsd:
+                    e.event_type === 'node_completed'
+                      ? (e.data.cost_usd as number | undefined)
+                      : existing?.costUsd,
                 });
               }
             }
@@ -469,6 +474,11 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     ? (nodeStartTimes.get(selectedDagNode) ?? null)
     : null;
 
+  const runningTotalCostUsd = useMemo(
+    (): number => (workflow?.dagNodes ?? []).reduce((sum, n) => sum + (n.costUsd ?? 0), 0),
+    [workflow]
+  );
+
   // Handler for user-initiated node clicks (graph or sidebar).
   // Increments scroll trigger so WorkflowLogs scrolls to the node's section.
   const handleNodeClick = useCallback((nodeId: string): void => {
@@ -622,6 +632,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
               <span>Run Details</span>
             </button>
           )}
+          <RunCostMeter costUsd={runningTotalCostUsd} isRunning={isRunning} />
           <span className="text-xs text-text-secondary">{formatDurationMs(elapsed)}</span>
         </div>
       </div>

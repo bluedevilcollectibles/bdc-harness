@@ -1,5 +1,11 @@
 import { describe, test, expect } from 'bun:test';
-import { ensureUtc, formatDuration, formatDurationMs, formatStarted } from './format';
+import {
+  ensureUtc,
+  formatCostUsd,
+  formatDuration,
+  formatDurationMs,
+  formatStarted,
+} from './format';
 
 describe('ensureUtc', () => {
   test('returns timestamp unchanged when it already ends with Z', () => {
@@ -164,5 +170,36 @@ describe('formatDurationMs', () => {
 
   test('one decimal place for minutes', () => {
     expect(formatDurationMs(75000)).toBe('1.3m');
+  });
+});
+
+describe('formatCostUsd', () => {
+  test('returns $0.00 for zero', () => {
+    expect(formatCostUsd(0)).toBe('$0.00');
+  });
+
+  test('returns <$0.01 for sub-cent values', () => {
+    expect(formatCostUsd(0.001)).toBe('<$0.01');
+    expect(formatCostUsd(0.0099)).toBe('<$0.01');
+  });
+
+  test('returns 4 decimal places for values under $1 (at least $0.01)', () => {
+    expect(formatCostUsd(0.042)).toBe('$0.0420');
+    expect(formatCostUsd(0.01)).toBe('$0.0100');
+    expect(formatCostUsd(0.9999)).toBe('$0.9999');
+  });
+
+  test('returns 2 decimal places for values $1 and above', () => {
+    expect(formatCostUsd(1.5)).toBe('$1.50');
+    expect(formatCostUsd(1)).toBe('$1.00');
+    expect(formatCostUsd(12.345)).toBe('$12.35');
+  });
+
+  test('boundary: $0.01 uses 4 decimal places', () => {
+    expect(formatCostUsd(0.01)).toBe('$0.0100');
+  });
+
+  test('boundary: $1.00 uses 2 decimal places', () => {
+    expect(formatCostUsd(1.0)).toBe('$1.00');
   });
 });

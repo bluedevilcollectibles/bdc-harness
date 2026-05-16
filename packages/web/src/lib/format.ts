@@ -30,3 +30,11 @@ export function formatDurationMs(ms: number): string {
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${(ms / 60000).toFixed(1)}m`;
 }
+
+/** Format a USD cost value for display. */
+export function formatCostUsd(usd: number): string {
+  if (usd === 0) return '$0.00';
+  if (usd < 0.01) return '<$0.01';
+  if (usd < 1) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}

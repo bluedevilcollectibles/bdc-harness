@@ -255,6 +255,7 @@ export const useWorkflowStore = create<WorkflowStoreState>()(
                 duration: event.duration,
                 error: event.error,
                 reason: event.reason,
+                ...(event.costUsd !== undefined ? { costUsd: event.costUsd } : {}),
               };
 
               if (existingIdx >= 0) {

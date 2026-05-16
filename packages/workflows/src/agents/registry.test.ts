@@ -17,7 +17,10 @@ import {
 let testDir: string;
 
 beforeEach(async () => {
-  testDir = join(tmpdir(), `agent-registry-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  testDir = join(
+    tmpdir(),
+    `agent-registry-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  );
   await mkdir(testDir, { recursive: true });
 });
 
@@ -59,7 +62,9 @@ describe('parseFrontmatter', () => {
   });
 
   test('parses inline array tools', () => {
-    const result = parseFrontmatter('---\nname: a\nmodel: opus\ntools: [Read, Grep, Glob]\n---\n\nPrompt.');
+    const result = parseFrontmatter(
+      '---\nname: a\nmodel: opus\ntools: [Read, Grep, Glob]\n---\n\nPrompt.'
+    );
     expect(result?.frontmatter.tools).toEqual(['Read', 'Grep', 'Glob']);
   });
 
@@ -313,7 +318,10 @@ describe('resolveAgent', () => {
   });
 
   test('throws agent_not_found when registry has entries but name is missing', async () => {
-    const filePath = await writeAgent('known-agent.md', VALID_AGENT.replace('test-agent', 'known-agent'));
+    const filePath = await writeAgent(
+      'known-agent.md',
+      VALID_AGENT.replace('test-agent', 'known-agent')
+    );
     const registry = await loadAgentRegistry(testDir);
 
     let err: AgentRegistryError | null = null;
