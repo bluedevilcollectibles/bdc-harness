@@ -36,16 +36,35 @@ description: |
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
 
+# 2026-05-16 fix: declare inputs at workflow root so API payload `inputs.X`
+# resolves. Cauldron engine injects each declared input as $INPUT_<NAME> env
+# var in bash nodes. Without this block, the API `inputs` field is silently
+# dropped — bash node sees empty env vars and fires "X is required" errors.
+inputs:
+  WO_CONCEPTS_FILE:
+    default: ""
+  PLAN_DOC_PATH:
+    default: "docs/plans/2026-06-15-mutant-market-hq-readiness.md"
+  CALIBRATION_DOC:
+    default: ""
+  NOTION_DB_ID:
+    default: "a6df831c-0b52-449f-8ca4-d77be6b70d0a"
+  DRY_RUN:
+    default: "false"
+
 nodes:
 
   - id: read-inputs
     bash: |
       set -euo pipefail
-      PLAN_DOC_PATH="${PLAN_DOC_PATH:-docs/plans/2026-06-15-mutant-market-hq-readiness.md}"
-      WO_CONCEPTS_FILE="${WO_CONCEPTS_FILE:-}"
-      CALIBRATION_DOC="${CALIBRATION_DOC:-}"
-      NOTION_DB_ID="${NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}"
-      DRY_RUN="${DRY_RUN:-false}"
+      # 2026-05-16: read from $INPUT_<NAME> (Cauldron engine injects these from
+      # workflow.inputs); fall back to bare $NAME for legacy /workflow run cmd-line
+      # arg style. Both work; API payload uses INPUT_ prefix path.
+      PLAN_DOC_PATH="${INPUT_PLAN_DOC_PATH:-${PLAN_DOC_PATH:-docs/plans/2026-06-15-mutant-market-hq-readiness.md}}"
+      WO_CONCEPTS_FILE="${INPUT_WO_CONCEPTS_FILE:-${WO_CONCEPTS_FILE:-}}"
+      CALIBRATION_DOC="${INPUT_CALIBRATION_DOC:-${CALIBRATION_DOC:-}}"
+      NOTION_DB_ID="${INPUT_NOTION_DB_ID:-${NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}}"
+      DRY_RUN="${INPUT_DRY_RUN:-${DRY_RUN:-false}}"
 
       if [ -z "$WO_CONCEPTS_FILE" ]; then
         echo "ERROR: WO_CONCEPTS_FILE is required. Example: WO_CONCEPTS_FILE=memory/wo-batch-concepts.json" >&2
