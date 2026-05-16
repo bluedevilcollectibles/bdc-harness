@@ -131,7 +131,13 @@ nodes:
       printf '=== WO CONCEPTS JSON ===\n%s\n\n' "$WO_CONCEPTS"
       printf '=== PLAN DOC (%s) ===\n%s\n\n' "$PLAN_DOC_PATH" "$PLAN_CONTENT"
       printf '=== CALIBRATION ===\n%s\n\n' "$CALIBRATION"
-      [ -n "$ARCHON_DOCTRINE" ] && printf '=== ARCHON YAML DOCTRINE (excerpt) ===\n%s\n\n' "$ARCHON_DOCTRINE"
+      # 2026-05-16: don't use `[ ] && cmd` as terminal line under `set -e` —
+      # if the test is false (ARCHON_DOCTRINE empty), [ exits 1, becomes the
+      # script's exit code, and the whole node dies silently with no stderr.
+      # Anchor: Codex diagnosis of post-#77 fast-die-no-stderr symptom.
+      if [ -n "$ARCHON_DOCTRINE" ]; then
+        printf '=== ARCHON YAML DOCTRINE (excerpt) ===\n%s\n\n' "$ARCHON_DOCTRINE"
+      fi
 
   - id: author-wo
     depends_on: [read-inputs]
@@ -284,7 +290,9 @@ nodes:
     depends_on: [author-wo]
     bash: |
       set -euo pipefail
-      WO_CONCEPTS_FILE="${WO_CONCEPTS_FILE:-}"
+      # 2026-05-16: mirror read-inputs dual-path pattern — engine injects
+      # INPUT_<NAME> from YAML defaults; fall back to bare env for legacy.
+      WO_CONCEPTS_FILE="${INPUT_WO_CONCEPTS_FILE:-${WO_CONCEPTS_FILE:-}}"
       [ -z "$WO_CONCEPTS_FILE" ] && { echo "ERROR: WO_CONCEPTS_FILE not set" >&2; exit 1; }
 
       # Get WO IDs from concepts file
