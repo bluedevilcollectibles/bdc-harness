@@ -42,6 +42,17 @@ services:
     env_file: .env
     environment:
       ARCHON_DOCKER: "true"
+      # WO-HARNESS-CONTAINER-GITHUB-AUTH-BOUNDARY-01 (#171):
+      # Workflows (sync-workflows, author-wo-batch, persona-schema, engine
+      # sortie) push branches/PRs to GitHub from inside the container. The
+      # token must be visible to bash subprocesses AND to both the legacy
+      # GH_TOKEN credential-helper check in docker-entrypoint.sh and the
+      # current `gh` CLI which reads GITHUB_TOKEN. Map both names to the
+      # same host value so neither path silently no-ops.
+      # NEVER store the literal token here. Value comes from .env (which is
+      # gitignored) or the host shell env. See docs/operations/container-github-auth.md.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GH_TOKEN: ${GH_TOKEN:-${GITHUB_TOKEN:-}}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:

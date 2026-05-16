@@ -54,12 +54,40 @@ find /.archon -name ".git" -prune -print 2>/dev/null | while IFS= read -r git_di
   fi
 done
 
-# Configure git to use GH_TOKEN for HTTPS clones via credential helper
-# Uses a helper function so the token stays in the environment, not in ~/.gitconfig
-if [ -n "$GH_TOKEN" ]; then
+# Configure git to use a GitHub token for HTTPS clones AND pushes via credential
+# helper. Accept either GH_TOKEN (gh CLI legacy) or GITHUB_TOKEN (compose default
+# in this fork — see WO-HARNESS-CONTAINER-GITHUB-AUTH-BOUNDARY-01 / #171).
+# Uses a helper function so the token stays in the environment, not in ~/.gitconfig.
+_GH_AUTH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+if [ -n "$_GH_AUTH_TOKEN" ]; then
+  # Export both names so child processes (gh CLI, bun workflow nodes spawning git)
+  # find whichever they look for. The credential helper reads GH_AUTH_TOKEN_INTERNAL
+  # to avoid coupling to either upstream name.
+  export GH_AUTH_TOKEN_INTERNAL="$_GH_AUTH_TOKEN"
+  export GH_TOKEN="${GH_TOKEN:-$_GH_AUTH_TOKEN}"
+  export GITHUB_TOKEN="${GITHUB_TOKEN:-$_GH_AUTH_TOKEN}"
   $RUNNER git config --global credential."https://github.com".helper \
-    '!f() { echo "username=x-access-token"; echo "password=${GH_TOKEN}"; }; f'
+    '!f() { echo "username=x-access-token"; echo "password=${GH_AUTH_TOKEN_INTERNAL}"; }; f'
+
+  # Pre-flight: verify the token actually authenticates. We use `gh auth status`
+  # because an UNauthenticated ls-remote against a public repo always succeeds
+  # and proves nothing about the token. gh auth status is the cheapest call that
+  # actually exercises token + scopes. Failure is LOUD but non-fatal — a stale
+  # token must not block container startup; workflows that try to push will
+  # surface the error in their own run logs. Result written to /tmp so future
+  # healthcheck wiring can pick it up.
+  if command -v gh >/dev/null 2>&1 && gh auth status 2>&1 | grep -q "Logged in to github.com"; then
+    echo "[archon] GitHub auth pre-flight: OK (token authenticates to github.com)" >&2
+    echo "ok" > /tmp/github-auth-preflight.status
+  else
+    echo "[archon] ERROR: GitHub auth pre-flight FAILED — token is missing, expired, or lacks scope. Workflows that push branches/PRs will fail. Refresh GITHUB_TOKEN in .env and restart. See docs/operations/container-github-auth.md." >&2
+    echo "fail" > /tmp/github-auth-preflight.status
+  fi
+else
+  echo "[archon] WARN: No GITHUB_TOKEN or GH_TOKEN set — git push and gh CLI will fail. Workflows that author PRs (bdc-author-wo-batch, sync-workflows, engine sortie) will silently fail. See docs/operations/container-github-auth.md." >&2
+  echo "missing" > /tmp/github-auth-preflight.status
 fi
+unset _GH_AUTH_TOKEN
 
 # Pin the glibc Claude Code binary to bypass the SDK's musl-first resolver.
 # Bun's hoisted linker installs both glibc and musl optional-dep variants for
