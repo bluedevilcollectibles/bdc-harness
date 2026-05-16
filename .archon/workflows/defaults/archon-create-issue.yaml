@@ -362,9 +362,6 @@ nodes:
       [any additional observations, suspected root cause refinements]
       ```
 
-      CRITICAL: The Status line MUST be exactly one of: REPRODUCED, NOT_REPRODUCED, PARTIAL.
-      This value is read by a downstream bash node to decide whether to create the issue.
-
       Even if you cannot fully reproduce the issue, document what you tried
       and what you observed. Partial reproduction is still valuable evidence.
     depends_on: [classify, git-context, investigate, start-server]
@@ -373,6 +370,17 @@ nodes:
       - agent-browser
     trigger_rule: one_success
     idle_timeout: 300000
+    output_format:
+      type: object
+      properties:
+        reproduced:
+          type: boolean
+        status:
+          type: string
+          enum: ["REPRODUCED", "NOT_REPRODUCED", "PARTIAL"]
+        summary:
+          type: string
+      required: [reproduced, status, summary]
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 5: CLEANUP + GATE
@@ -412,14 +420,7 @@ nodes:
 
   - id: check-reproduction
     bash: |
-      # Read the reproduction status from the results file
-      if [ ! -f "$ARTIFACTS_DIR/reproduction-results.md" ]; then
-        echo "NOT_REPRODUCED"
-        exit 0
-      fi
-
-      STATUS=$(grep -oE '(NOT_REPRODUCED|REPRODUCED|PARTIAL)' "$ARTIFACTS_DIR/reproduction-results.md" | head -1)
-
+      STATUS=$reproduce.output.status
       if [ -z "$STATUS" ]; then
         echo "NOT_REPRODUCED"
       else
@@ -443,7 +444,10 @@ nodes:
       - **Reproduction hint**: $classify.output.repro_hint
 
       ## What Was Tried
-      $reproduce.output
+      $reproduce.output.summary
+
+      (Full evidence is in $ARTIFACTS_DIR/reproduction-results.md —
+      read it for step-by-step detail, command output, and environment.)
 
       ## Investigation Findings
       $investigate.output
@@ -497,8 +501,15 @@ nodes:
       ## Codebase Investigation
       $investigate.output
 
-      ## Reproduction Results
-      $reproduce.output
+      ## Reproduction Status
+      Status: $reproduce.output.status (reproduced: $reproduce.output.reproduced)
+
+      ## Reproduction Summary
+      $reproduce.output.summary
+
+      ## Full Reproduction Evidence
+      Read the complete artifact file at $ARTIFACTS_DIR/reproduction-results.md
+      for screenshots, command output, and environment details.
 
       ## Instructions
 
