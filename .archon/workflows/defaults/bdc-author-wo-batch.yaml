@@ -36,15 +36,20 @@ description: |
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
 
-# 2026-05-16 fix: declare inputs at workflow root so API payload `inputs.X`
-# resolves. Cauldron engine injects each declared input as $INPUT_<NAME> env
-# var in bash nodes. Without this block, the API `inputs` field is silently
-# dropped — bash node sees empty env vars and fires "X is required" errors.
+# 2026-05-16 fix v2: Cauldron API ONLY accepts conversationId + message — the
+# `inputs` field in API payloads is silently dropped. Engine injects only the
+# DEFAULTS from this block as $INPUT_<NAME> env vars. To run a different batch,
+# either (a) edit the WO_CONCEPTS_FILE default and re-fire, or (b) pass the path
+# in the API `message` and have bash parse it (mirrors bdc-feature-development's
+# WO_ID-from-USER_MESSAGE pattern).
+#
+# Per-batch default below = engine sortie 2026-05-16. Change to next batch path
+# when re-firing.
 inputs:
   WO_CONCEPTS_FILE:
-    default: ""
+    default: "docs/plans/2026-05-16-engine-sortie-concepts.json"
   PLAN_DOC_PATH:
-    default: "docs/plans/2026-06-15-mutant-market-hq-readiness.md"
+    default: "docs/architecture/2026-05-15-shop-ops-hq-pull-list-engine-spec.md"
   CALIBRATION_DOC:
     default: ""
   NOTION_DB_ID:
