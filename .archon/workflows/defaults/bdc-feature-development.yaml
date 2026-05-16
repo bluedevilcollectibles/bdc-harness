@@ -253,8 +253,22 @@ nodes:
         echo "No changed files AND remote branch missing/behind — implement loop did not commit." >&2
         exit 1
       fi
+      # Auto-tolerated files: dependency lockfiles + standard auto-regenerated
+      # artifacts. These are managed by package managers (bun install, etc.)
+      # during the implement loop and won't be listed in any plan output.
+      # Patch 7 (2026-05-16, anchor smoketest4): without this allowlist, a plan
+      # that adds even one dependency to package.json causes the implement loop
+      # to regenerate bun.lock, which trips this strict-allowlist check and
+      # kills the workflow with "Changed file was not listed in plan output".
+      AUTO_TOLERATED='^(bun\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.bun-tag|node_modules/)$'
       printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
         if [ -z "$path" ]; then
+          continue
+        fi
+        # Skip allowlist check for auto-managed files; just stage them.
+        if printf '%s\n' "$path" | grep -Eq "$AUTO_TOLERATED"; then
+          echo "Auto-tolerated change (lockfile/managed): $path"
+          git add -- "$path"
           continue
         fi
         if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
