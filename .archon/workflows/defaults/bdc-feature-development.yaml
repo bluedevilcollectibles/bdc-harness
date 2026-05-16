@@ -234,9 +234,23 @@ nodes:
       fi
       git checkout -B "$BRANCH"
       git status --short
+      # Backstop no-op detection (Patch 6, 2026-05-16):
+      # The implement loop now commits + pushes its own work (Patch 2, Rule 23).
+      # If it succeeded, the working tree + index are clean here — this backstop
+      # should exit 0 as a no-op, NOT exit 1 with "no changed files." Anchor:
+      # 2026-05-16 smoketest3 reached commit-and-push cleanly through the quote-fix
+      # (#65) but died exit 1 here because implement loop had already pushed.
       CHANGED_FILES=$(git status --porcelain | awk '{print substr($0,4)}')
       if [ -z "$CHANGED_FILES" ]; then
-        echo "No changed files found; cannot commit." >&2
+        # Verify HEAD is on the expected branch + remote has it.
+        # If yes: implement loop did its job — backstop is no-op, exit clean.
+        # If no: something is genuinely wrong (implement skipped commit AND working tree clean).
+        if git rev-parse --quiet --verify "origin/$BRANCH" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed to origin/$BRANCH (HEAD matches)."
+          exit 0
+        fi
+        echo "No changed files AND remote branch missing/behind — implement loop did not commit." >&2
         exit 1
       fi
       printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
@@ -250,8 +264,8 @@ nodes:
         git add -- "$path"
       done
       if git diff --cached --quiet; then
-        echo "No changes staged; cannot commit." >&2
-        exit 1
+        echo "No changes staged; nothing for backstop to commit." >&2
+        exit 0
       fi
       COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$COMMIT_MESSAGE" ]; then
