@@ -14,6 +14,7 @@ import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/componen
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { getWorkflowRun, getWorkflowRunByWorker, getCodebase, getWorkflow } from '@/lib/api';
 import { ensureUtc, formatDurationMs } from '@/lib/format';
+import { formatCostUsd, costColorClass } from '@/lib/cost-utils';
 import { selectInitialNode } from '@/lib/select-initial-node';
 import type {
   WorkflowState,
@@ -54,6 +55,14 @@ interface WorkflowRunQueryData {
 
 interface WorkflowExecutionProps {
   runId: string;
+}
+
+function RunCostBadge({ usd }: { usd: number }): React.ReactElement {
+  return (
+    <span className={`text-xs font-medium tabular-nums ${costColorClass(usd)}`}>
+      {formatCostUsd(usd)}
+    </span>
+  );
 }
 
 function StatusBadge({ status }: { status: string }): React.ReactElement {
@@ -131,6 +140,10 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   duration: e.data.duration_ms as number | undefined,
                   error: e.data.error as string | undefined,
                   reason: e.data.reason as 'when_condition' | 'trigger_rule' | undefined,
+                  costUsd:
+                    e.event_type === 'node_completed'
+                      ? (e.data.cost_usd as number | undefined)
+                      : undefined,
                 });
               }
             }
@@ -352,6 +365,12 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       maxIterations: liveWorkflow.maxIterations ?? initialData.maxIterations,
     };
   })();
+
+  // Running total cost across all completed nodes in this run
+  const runTotalCostUsd = useMemo(
+    () => (workflow?.dagNodes ?? []).reduce((sum, n) => sum + (n.costUsd ?? 0), 0),
+    [workflow?.dagNodes]
+  );
 
   // Auto-select the first DAG node when workflow data loads and no node is selected.
   // Prefer the currently executing node (for running workflows), otherwise pick the first node.
@@ -623,6 +642,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
             </button>
           )}
           <span className="text-xs text-text-secondary">{formatDurationMs(elapsed)}</span>
+          <RunCostBadge usd={runTotalCostUsd} />
         </div>
       </div>
 

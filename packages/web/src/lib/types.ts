@@ -119,6 +119,7 @@ export interface DagNodeEvent extends BaseSSEEvent {
   duration?: number;
   error?: string;
   reason?: 'when_condition' | 'trigger_rule';
+  costUsd?: number;
 }
 
 // Workflow tool activity (tool_started / tool_completed from executor)
@@ -250,6 +251,7 @@ export interface DagNodeState {
   currentIteration?: number;
   maxIterations?: number;
   iterations?: LoopIterationInfo[];
+  costUsd?: number;
 }
 
 export interface WorkflowArtifact {

@@ -4,6 +4,7 @@ import type { NodeProps, Node } from '@xyflow/react';
 import type { DagNodeData } from './DagNodeComponent';
 import type { WorkflowStepStatus } from '@/lib/types';
 import { formatDurationMs } from '@/lib/format';
+import { formatCostUsd, costColorClass } from '@/lib/cost-utils';
 import { StatusIcon } from './StatusIcon';
 
 export interface ExecutionNodeData extends DagNodeData {
@@ -13,6 +14,7 @@ export interface ExecutionNodeData extends DagNodeData {
   selected?: boolean;
   currentIteration?: number;
   maxIterations?: number;
+  costUsd?: number;
 }
 
 export type ExecutionFlowNode = Node<ExecutionNodeData>;
@@ -70,6 +72,11 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
         {data.duration !== undefined && (
           <span className="text-[10px] text-text-tertiary ml-auto shrink-0">
             {formatDurationMs(data.duration)}
+          </span>
+        )}
+        {data.costUsd !== undefined && (
+          <span className={`text-[10px] shrink-0 ${costColorClass(data.costUsd)}`}>
+            {formatCostUsd(data.costUsd)}
           </span>
         )}
       </div>
