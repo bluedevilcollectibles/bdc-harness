@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router';
 import { MessageSquare } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
+import { CostMeter } from './CostMeter';
 import { DagNodeProgress } from './DagNodeProgress';
 import { StepLogs } from './StepLogs';
 import { WorkflowLogs } from './WorkflowLogs';
@@ -50,6 +51,7 @@ interface WorkflowRunQueryData {
   conversationPlatformId: string | null;
   codebaseId: string | null;
   events: WorkflowEventResponse[];
+  runningTotalUsd: number;
 }
 
 interface WorkflowExecutionProps {
@@ -177,6 +179,18 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
               });
             }
 
+            // Third pass: attach cost data from node_completed events
+            for (const e of data.events.filter(ev => ev.event_type === 'node_completed')) {
+              const nodeId = e.step_name ?? '';
+              if (!nodeId) continue;
+              const existing = nodeMap.get(nodeId);
+              if (!existing) continue;
+              const costUsd = e.data.cost_usd as number | undefined;
+              if (costUsd !== undefined) {
+                nodeMap.set(nodeId, { ...existing, costUsd });
+              }
+            }
+
             return Array.from(nodeMap.values());
           })(),
           artifacts: data.events
@@ -201,6 +215,11 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         conversationPlatformId: data.run.conversation_platform_id ?? null,
         codebaseId: data.run.codebase_id ?? null,
         events: data.events,
+        runningTotalUsd:
+          (data.run.metadata.total_cost_usd as number | undefined) ??
+          data.events
+            .filter(ev => ev.event_type === 'node_completed')
+            .reduce((sum, ev) => sum + ((ev.data.cost_usd as number | undefined) ?? 0), 0),
       };
     },
     refetchInterval: (query): number | false => {
@@ -623,6 +642,9 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
             </button>
           )}
           <span className="text-xs text-text-secondary">{formatDurationMs(elapsed)}</span>
+          {queryData !== undefined && (
+            <CostMeter totalUsd={queryData.runningTotalUsd} isRunning={isRunning} />
+          )}
         </div>
       </div>
 

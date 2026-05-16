@@ -253,6 +253,7 @@ export const useWorkflowStore = create<WorkflowStoreState>()(
                 name: event.name,
                 status: event.status,
                 duration: event.duration,
+                costUsd: event.costUsd,
                 error: event.error,
                 reason: event.reason,
               };
