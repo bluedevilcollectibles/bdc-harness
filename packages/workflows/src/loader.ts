@@ -501,6 +501,15 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         nodes: dagNodes,
         ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
         ...(tags !== undefined ? { tags } : {}),
+        // 2026-05-16 fix: inputs block was declared in workflow.schemas.ts:104 +
+        // wired in dag-executor.ts:1362-1365 + 2576-2578, but the loader silently
+        // dropped raw.inputs from the returned workflow object. Result: every
+        // workflow's inputs surfaced as null at /api/workflows and $INPUT_* env
+        // vars were never injected into bash nodes. Anchor: bdc-author-wo-batch
+        // 3 fires died at read-inputs (WO #165 follow-up to extend the API).
+        ...(raw.inputs !== undefined
+          ? { inputs: raw.inputs as Record<string, { default: string }> }
+          : {}),
       },
       error: null,
     };
