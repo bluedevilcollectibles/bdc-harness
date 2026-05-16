@@ -11,7 +11,7 @@ import '@archon/paths/strip-cwd-env-boot';
 
 // Load environment variables — after CWD stripping, before application imports.
 import { config } from 'dotenv';
-import { resolve } from 'path';
+import { resolve, join } from 'path';
 import { existsSync } from 'fs';
 import { BUNDLED_IS_BINARY, getArchonEnvPath } from '@archon/paths';
 
@@ -48,6 +48,7 @@ if (
 }
 
 import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
+import { loadAgentRegistry, AgentRegistryError } from '@archon/workflows/agents/registry';
 
 // Bootstrap provider registry before any provider lookups
 registerBuiltinProviders();
@@ -191,6 +192,21 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       { checked: ['CODEX_ID_TOKEN', 'CODEX_ACCESS_TOKEN'] },
       'codex_credentials_missing'
     );
+  }
+
+  // Fail-closed agent registry validation (Stop condition 8 — malformed agent files block startup)
+  const agentsDir = join(process.cwd(), '.archon', 'agents');
+  try {
+    await loadAgentRegistry(agentsDir);
+  } catch (err) {
+    if (err instanceof AgentRegistryError) {
+      getLog().fatal(
+        { err, code: err.code, file: err.agentFile },
+        'agent_registry_validation_failed'
+      );
+      process.exit(1);
+    }
+    throw err;
   }
 
   // Test database connection

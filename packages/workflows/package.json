@@ -4,6 +4,7 @@
   "type": "module",
   "exports": {
     "./schemas/*": "./src/schemas/*.ts",
+    "./agents/registry": "./src/agents/registry.ts",
     "./executor": "./src/executor.ts",
     "./loader": "./src/loader.ts",
     "./router": "./src/router.ts",

@@ -27,6 +27,7 @@ import {
   isInlineScript,
   formatSubprocessFailure,
   classifyError,
+  resolveAgentPersona,
 } from './executor-shared';
 
 describe('substituteWorkflowVariables', () => {
@@ -590,5 +591,53 @@ describe('classifyError', () => {
 
   it('classifies unknown errors as UNKNOWN', () => {
     expect(classifyError(new Error('something completely unexpected happened'))).toBe('UNKNOWN');
+  });
+});
+
+describe('resolveAgentPersona', () => {
+  it('uses agent model, overriding node model', () => {
+    const persona = { name: 'war-council-architect', model: 'sonnet', systemPrompt: 'Plan only.' };
+    const result = resolveAgentPersona(persona, 'opus');
+    expect(result.model).toBe('sonnet');
+    expect(result.agentName).toBe('war-council-architect');
+  });
+
+  it('logs warning when agent model differs from node model', () => {
+    const persona = { name: 'war-council-architect', model: 'sonnet', systemPrompt: 'Plan only.' };
+    mockLogFn.mockClear();
+    resolveAgentPersona(persona, 'opus');
+    const warned = mockLogFn.mock.calls.some(args => args[1] === 'agent.model_mismatch_agent_wins');
+    expect(warned).toBe(true);
+  });
+
+  it('does not warn when currentModel is undefined', () => {
+    const persona = { name: 'captain-ci-validator', model: 'sonnet', systemPrompt: 'Validate.' };
+    mockLogFn.mockClear();
+    resolveAgentPersona(persona, undefined);
+    const warned = mockLogFn.mock.calls.some(args => args[1] === 'agent.model_mismatch_agent_wins');
+    expect(warned).toBe(false);
+  });
+
+  it('returns the agent system prompt in the resolution', () => {
+    const persona = { name: 'major-build', model: 'opus', systemPrompt: 'You are Major Build.' };
+    const result = resolveAgentPersona(persona, undefined);
+    expect(result.systemPrompt).toBe('You are Major Build.');
+  });
+
+  it('sets allowedTools from agent tools list', () => {
+    const persona = {
+      name: 'war-council-architect',
+      model: 'sonnet',
+      systemPrompt: 'Plan only.',
+      tools: ['Read', 'Grep', 'Glob'],
+    };
+    const result = resolveAgentPersona(persona, undefined);
+    expect(result.allowedTools).toEqual(['Read', 'Grep', 'Glob']);
+  });
+
+  it('leaves allowedTools undefined when agent has no tools', () => {
+    const persona = { name: 'major-build', model: 'opus', systemPrompt: 'You are Major Build.' };
+    const result = resolveAgentPersona(persona, undefined);
+    expect(result.allowedTools).toBeUndefined();
   });
 });
