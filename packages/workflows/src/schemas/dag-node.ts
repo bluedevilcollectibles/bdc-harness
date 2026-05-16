@@ -164,6 +164,21 @@ export const dagNodeBaseSchema = z.object({
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
   agent: z.string().min(1, "'agent' must be a non-empty string").optional(),
+  /**
+   * WO-170 (depends on WO-167 doctrine, not yet merged): mark this node as
+   * "load-bearing" — its output (commit-and-push, registry write, etc.) is
+   * critical to overall workflow success. When true, the DAG executor scans
+   * stdout for `STATUS=*_failed` patterns even on exit-0 and emits
+   * `node_completed_with_warning` instead of `node_completed` so Mission
+   * Control can show a yellow state instead of false-green.
+   *
+   * Independent of load_bearing, a small set of always-dangerous patterns
+   * (push_failed, commit_failed, pr_create_failed, registry_write_failed,
+   * artifact_persist_failed, bundle_save_failed, spec_save_failed) trigger
+   * the warning state too — those are silent-data-loss signals regardless of
+   * how the node was authored.
+   */
+  load_bearing: z.boolean().optional(),
 });
 
 export type DagNodeBase = z.infer<typeof dagNodeBaseSchema>;

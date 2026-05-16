@@ -105,6 +105,34 @@ interface NodeFailedEvent {
   error: string;
 }
 
+/**
+ * WO-170: node exited 0 but emitted a STATUS=*_failed string on stdout.
+ * Either the node was declared `load_bearing: true` (WO-167 doctrine) and any
+ * STATUS=*_failed appeared, OR stdout matched a known silent-data-loss
+ * pattern (push_failed, registry_write_failed, etc.) that is always treated
+ * as a warning regardless of load_bearing.
+ *
+ * Mission Control renders this as a yellow checkmark — a third state between
+ * green `node_completed` and red `node_failed`.
+ *
+ * Anchor: 2026-05-16 engine sortie completed all-green while silently losing
+ * 13 spec files; XO didn't notice for 25 minutes because UI showed success.
+ */
+interface NodeCompletedWithWarningEvent {
+  type: 'node_completed_with_warning';
+  runId: string;
+  nodeId: string;
+  nodeName: string;
+  duration: number;
+  /** Literal STATUS=... line(s) found in stdout (joined by \n). */
+  statusLine: string;
+  /** Pattern tokens that triggered the warning (e.g. ['push_failed']). */
+  patterns: string[];
+  /** True when triggered by `load_bearing: true`; false when matched on always-dangerous pattern. */
+  loadBearing: boolean;
+  costUsd?: number;
+}
+
 interface NodeSkippedEvent {
   type: 'node_skipped';
   runId: string;
@@ -151,6 +179,7 @@ export type WorkflowEmitterEvent =
   | LoopIterationFailedEvent
   | NodeStartedEvent
   | NodeCompletedEvent
+  | NodeCompletedWithWarningEvent
   | NodeFailedEvent
   | NodeSkippedEvent
   | WorkflowArtifactEvent
