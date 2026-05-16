@@ -84,6 +84,12 @@ describe('classifyError — provider classes (ported from router.py)', () => {
     expect(classifyError({ message: 'Credit balance is too low' })).toBe('out_of_credits');
   });
 
+  test("out_of_credits: 'Credit exhaustion detected - resume when credits reset' (detectCreditExhaustion emit, WO-158)", () => {
+    expect(
+      classifyError({ message: 'Credit exhaustion detected - resume when credits reset' })
+    ).toBe('out_of_credits');
+  });
+
   test('service_unavailable: 5xx status', () => {
     expect(classifyError({ statusCode: 503, message: 'Service unavailable' })).toBe(
       'service_unavailable'

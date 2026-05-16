@@ -101,6 +101,7 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   if (
     msg.includes('out_of_credits') ||
     msg.includes('credit balance is too low') ||
+    msg.includes('credit exhaustion detected') ||
     msg.includes('insufficient_quota')
   ) {
     return 'out_of_credits';
