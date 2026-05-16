@@ -106,6 +106,7 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         duration: event.type === 'node_completed' ? event.duration : undefined,
         error: event.type === 'node_failed' ? event.error : undefined,
         reason: event.type === 'node_skipped' ? event.reason : undefined,
+        costUsd: event.type === 'node_completed' ? event.costUsd : undefined,
         timestamp: Date.now(),
       });
 
