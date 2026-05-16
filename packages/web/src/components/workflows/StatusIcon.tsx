@@ -4,6 +4,9 @@ export function StatusIcon({ status }: { status: string }): React.ReactElement {
   switch (status) {
     case 'completed':
       return <span className="text-success text-sm">&#x2713;</span>;
+    case 'completed_with_warning':
+      // WO-170: yellow check — exit-0 but stdout STATUS=*_failed detected.
+      return <span className="text-warning text-sm">&#x2713;</span>;
     case 'running':
       return (
         <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-accent border-t-transparent" />
