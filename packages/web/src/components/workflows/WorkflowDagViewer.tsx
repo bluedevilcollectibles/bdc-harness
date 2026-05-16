@@ -92,6 +92,11 @@ export function WorkflowDagViewer({
           currentIteration: live?.currentIteration,
           maxIterations: live?.maxIterations,
           costUsd: live?.costUsd,
+          // WO-170: pass warning fields through to ExecutionDagNode so the
+          // node renders yellow + shows the STATUS=*_failed tooltip.
+          warningStatusLine: live?.warningStatusLine,
+          warningPatterns: live?.warningPatterns,
+          warningLoadBearing: live?.warningLoadBearing,
         },
       } as ExecutionFlowNode;
     });

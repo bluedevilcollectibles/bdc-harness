@@ -256,6 +256,11 @@ export const useWorkflowStore = create<WorkflowStoreState>()(
                 error: event.error,
                 reason: event.reason,
                 costUsd: event.costUsd,
+                // WO-170: forward warning fields when present so the DAG node can
+                // render yellow + show the STATUS=*_failed tooltip.
+                warningStatusLine: event.warningStatusLine,
+                warningPatterns: event.warningPatterns,
+                warningLoadBearing: event.warningLoadBearing,
               };
 
               if (existingIdx >= 0) {

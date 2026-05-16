@@ -65,7 +65,13 @@ function RunCostBadge({ usd }: { usd: number }): React.ReactElement {
   );
 }
 
-function StatusBadge({ status }: { status: string }): React.ReactElement {
+function StatusBadge({
+  status,
+  hasWarning,
+}: {
+  status: string;
+  hasWarning?: boolean;
+}): React.ReactElement {
   const colors: Record<string, string> = {
     pending: 'bg-accent/20 text-accent',
     running: 'bg-accent/20 text-accent',
@@ -73,12 +79,16 @@ function StatusBadge({ status }: { status: string }): React.ReactElement {
     failed: 'bg-error/20 text-error',
     cancelled: 'bg-surface text-text-secondary',
   };
+  // WO-170: workflow-level rollup — a "completed" workflow with any
+  // completed_with_warning node renders yellow.
+  const effectiveStatus = status === 'completed' && hasWarning ? 'completed_with_warning' : status;
+  const className =
+    effectiveStatus === 'completed_with_warning'
+      ? 'bg-warning/20 text-warning'
+      : (colors[status] ?? 'bg-surface text-text-secondary');
+  const label = effectiveStatus === 'completed_with_warning' ? 'completed (warning)' : status;
   return (
-    <span
-      className={`px-2 py-0.5 rounded-full text-xs font-medium ${colors[status] ?? 'bg-surface text-text-secondary'}`}
-    >
-      {status}
-    </span>
+    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${className}`}>{label}</span>
   );
 }
 
@@ -127,11 +137,14 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   ? 'running'
                   : e.event_type === 'node_completed'
                     ? 'completed'
-                    : e.event_type === 'node_failed'
-                      ? 'failed'
-                      : 'skipped';
+                    : e.event_type === 'node_completed_with_warning'
+                      ? 'completed_with_warning'
+                      : e.event_type === 'node_failed'
+                        ? 'failed'
+                        : 'skipped';
               const existing = nodeMap.get(nodeId);
-              // Keep the latest non-running status (completed/failed/skipped override running)
+              // Keep the latest non-running status (completed/failed/skipped override running).
+              // WO-170: node_completed_with_warning also overrides running.
               if (!existing || status !== 'running') {
                 nodeMap.set(nodeId, {
                   nodeId,
@@ -141,8 +154,22 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   error: e.data.error as string | undefined,
                   reason: e.data.reason as 'when_condition' | 'trigger_rule' | undefined,
                   costUsd:
-                    e.event_type === 'node_completed'
+                    e.event_type === 'node_completed' ||
+                    e.event_type === 'node_completed_with_warning'
                       ? (e.data.cost_usd as number | undefined)
+                      : undefined,
+                  // WO-170: surface warning detail on REST hydrate (matches SSE path).
+                  warningStatusLine:
+                    e.event_type === 'node_completed_with_warning'
+                      ? (e.data.statusLine as string | undefined)
+                      : undefined,
+                  warningPatterns:
+                    e.event_type === 'node_completed_with_warning'
+                      ? (e.data.patterns as string[] | undefined)
+                      : undefined,
+                  warningLoadBearing:
+                    e.event_type === 'node_completed_with_warning'
+                      ? (e.data.loadBearing as boolean | undefined)
                       : undefined,
                 });
               }
@@ -406,9 +433,12 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       if (e.event_type === 'node_started') startedNodes.add(nodeId);
       if (
         e.event_type === 'node_completed' ||
+        e.event_type === 'node_completed_with_warning' ||
         e.event_type === 'node_failed' ||
         e.event_type === 'node_skipped'
       ) {
+        // WO-170: completed_with_warning is still a terminal node state for
+        // the started-but-not-completed scan.
         completedNodes.add(nodeId);
       }
     }
@@ -454,6 +484,13 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           return `[${ts}] Node started: ${e.step_name ?? 'node'}`;
         case 'node_completed':
           return `[${ts}] Node completed: ${e.step_name ?? 'node'}`;
+        case 'node_completed_with_warning': {
+          // WO-170: surface the matched STATUS line in the per-step log so
+          // John can see what failed silently without opening the tooltip.
+          const sl = e.data.statusLine as string | undefined;
+          const slStr = sl ? ` — ${sl.split('\n')[0]}` : '';
+          return `[${ts}] Node completed with warning: ${e.step_name ?? 'node'}${slStr}`;
+        }
         case 'node_failed':
           return `[${ts}] Node failed: ${e.step_name ?? 'node'}: ${(e.data.error as string | undefined) ?? 'Unknown error'}`;
         case 'node_skipped':
@@ -626,7 +663,10 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         </button>
         <div className="flex items-center gap-2 min-w-0">
           <h2 className="font-semibold text-text-primary truncate">{workflow.workflowName}</h2>
-          <StatusBadge status={workflow.status} />
+          <StatusBadge
+            status={workflow.status}
+            hasWarning={workflow.dagNodes.some(n => n.status === 'completed_with_warning')}
+          />
         </div>
         <div className="flex items-center gap-2 ml-auto shrink-0">
           {codebaseName && <span className="text-xs text-text-secondary">{codebaseName}</span>}

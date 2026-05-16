@@ -52,6 +52,7 @@ import {
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
+import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
 import { evaluateCondition } from './condition-evaluator';
 import {
@@ -1397,6 +1398,65 @@ async function executeBashNode(
     }
 
     const duration = Date.now() - nodeStartTime;
+
+    // WO-170: detect silent-failure pattern in stdout even though exit code was 0.
+    // Load-bearing nodes (per WO-167 doctrine) get any STATUS=*_failed flagged;
+    // all nodes get always-dangerous patterns (push_failed, commit_failed, ...) flagged.
+    const warning = detectSilentFailure(output, node.load_bearing === true);
+
+    if (warning) {
+      getLog().warn(
+        {
+          nodeId: node.id,
+          durationMs: duration,
+          patterns: warning.patterns,
+          loadBearing: warning.loadBearing,
+        },
+        'dag_node_completed_with_warning'
+      );
+      await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', {
+        durationMs: duration,
+      });
+
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'node_completed_with_warning',
+          step_name: node.id,
+          data: {
+            duration_ms: duration,
+            type: 'bash',
+            node_output: output,
+            warning_status_line: warning.statusLine,
+            warning_patterns: warning.patterns,
+            warning_load_bearing: warning.loadBearing,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'node_completed_with_warning' },
+            'workflow_event_persist_failed'
+          );
+        });
+
+      emitter.emit({
+        type: 'node_completed_with_warning',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        nodeName: node.id,
+        duration,
+        statusLine: warning.statusLine,
+        patterns: warning.patterns,
+        loadBearing: warning.loadBearing,
+      });
+
+      // Downstream nodes still see this node as completed — the warning is an
+      // observability signal, not a graph-control change. Failing the node
+      // here would block dependents; rolling-up at workflow level is the UI's
+      // job (see WorkflowExecution.tsx).
+      return { state: 'completed', output };
+    }
+
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
@@ -1661,6 +1721,60 @@ async function executeScriptNode(
     }
 
     const duration = Date.now() - nodeStartTime;
+
+    // WO-170: same silent-failure detection on script nodes — STATUS=*_failed
+    // on stdout when exit code was 0 is a yellow-state signal.
+    const warning = detectSilentFailure(output, node.load_bearing === true);
+
+    if (warning) {
+      getLog().warn(
+        {
+          nodeId: node.id,
+          durationMs: duration,
+          patterns: warning.patterns,
+          loadBearing: warning.loadBearing,
+        },
+        'dag_node_completed_with_warning'
+      );
+      await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', {
+        durationMs: duration,
+      });
+
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'node_completed_with_warning',
+          step_name: node.id,
+          data: {
+            duration_ms: duration,
+            type: 'script',
+            node_output: output,
+            warning_status_line: warning.statusLine,
+            warning_patterns: warning.patterns,
+            warning_load_bearing: warning.loadBearing,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'node_completed_with_warning' },
+            'workflow_event_persist_failed'
+          );
+        });
+
+      emitter.emit({
+        type: 'node_completed_with_warning',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        nodeName: node.id,
+        duration,
+        statusLine: warning.statusLine,
+        patterns: warning.patterns,
+        loadBearing: warning.loadBearing,
+      });
+
+      return { state: 'completed', output };
+    }
+
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', { durationMs: duration });
 
