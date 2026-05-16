@@ -68,7 +68,11 @@ nodes:
     depends_on: [verify-baseline-commit]
     bash: |
       set -euo pipefail
-      MAIN_HEAD=$(printf '%s\n' "$verify-baseline-commit.output" | sed -n 's/^MAIN_HEAD=//p' | head -n 1)
+      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
+      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
+      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
+      VERIFY_BASELINE_COMMIT_OUTPUT=$verify-baseline-commit.output
+      MAIN_HEAD=$(printf '%s\n' "$VERIFY_BASELINE_COMMIT_OUTPUT" | sed -n 's/^MAIN_HEAD=//p' | head -n 1)
       if [ -z "$MAIN_HEAD" ]; then
         echo "Could not determine MAIN_HEAD from prior node" >&2
         exit 1
@@ -228,6 +232,10 @@ nodes:
     depends_on: [commit-and-push-main]
     bash: |
       set -euo pipefail
+      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
+      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
+      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
+      CREATE_RELEASE_CE_BRANCH_OUTPUT=$create-release-ce-branch.output
       # Hardcoded — must match commit-and-push-main BRANCH literal. See WO-HARNESS-OPEN-PR-BRANCH-INTERPOLATION-FIX-01.
       # Archon shell-quote-wraps node output (dag-executor.ts L300), corrupting bash parsing.
       BRANCH="wo/release-ce-branch-model-01"
@@ -259,7 +267,7 @@ nodes:
         echo "- Wiki: bdc-xo \`xo-wiki/wiki/concepts/ce-release-branch/_index.md\`"
         echo ""
         echo "## Stop conditions"
-        echo "- [x] release/ce exists ($create-release-ce-branch.output)"
+        echo "- [x] release/ce exists ($CREATE_RELEASE_CE_BRANCH_OUTPUT)"
         echo "$PROTECTION_CHECK"
         echo "- [x] CE branch policy doc committed"
         echo "- [x] Backport policy referenced (enforced separately by WO-RELEASE-CE-BACKPORT-POLICY-01)"

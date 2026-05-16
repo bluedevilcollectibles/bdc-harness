@@ -336,7 +336,11 @@ nodes:
     depends_on: [grader-loop]
     bash: |
       set -euo pipefail
-      verdict=$(printf '%s\n' "$grader-loop.output" | sed -n 's/^VERDICT:[[:space:]]*//p' | head -n 1 | tr '[:upper:]' '[:lower:]')
+      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
+      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
+      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
+      GRADER_LOOP_OUTPUT=$grader-loop.output
+      verdict=$(printf '%s\n' "$GRADER_LOOP_OUTPUT" | sed -n 's/^VERDICT:[[:space:]]*//p' | head -n 1 | tr '[:upper:]' '[:lower:]')
       case "$verdict" in
         satisfied)
           echo "OUTCOME=satisfied"
@@ -358,7 +362,7 @@ nodes:
           ;;
         *)
           echo "ERROR: Could not parse grader verdict from grader-loop output" >&2
-          printf '%s\n' "$grader-loop.output" >&2
+          printf '%s\n' "$GRADER_LOOP_OUTPUT" >&2
           exit 1
           ;;
       esac
@@ -384,6 +388,11 @@ nodes:
     depends_on: [post-builder-status]
     bash: |
       set -euo pipefail
+      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
+      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
+      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
+      DECIDE_OUTPUT=$decide.output
+      GRADER_LOOP_OUTPUT=$grader-loop.output
       DRY_RUN="${DRY_RUN:-false}"
       if [ "$DRY_RUN" = "true" ]; then
         echo "DRY_RUN=true -- skipping Notion mutation"
@@ -395,11 +404,11 @@ nodes:
       fi
 
       DECIDE_OUTPUT=$(cat <<'EOF_DECIDE'
-      $decide.output
+      $DECIDE_OUTPUT
       EOF_DECIDE
       )
       GRADER_OUTPUT=$(cat <<'EOF_GRADER'
-      $grader-loop.output
+      $GRADER_LOOP_OUTPUT
       EOF_GRADER
       )
       export DECIDE_OUTPUT GRADER_OUTPUT

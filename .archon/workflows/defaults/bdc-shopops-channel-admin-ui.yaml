@@ -396,6 +396,12 @@ nodes:
     depends_on: [commit-and-push]
     bash: |
       set -euo pipefail
+      # 2026-05-16 quote-fix: substituteNodeOutputRefs(escapedForBash=true) wraps
+      # output in single quotes. Wrapping in additional double quotes mis-tokenizes
+      # multi-line content. Engine fix: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
+      VERIFY_TESTS_OUTPUT=$verify-tests.output
+      VERIFY_GREP_OUTPUT=$verify-grep.output
+      BUILD_CHECK_OUTPUT=$build-check.output
       # Read actual branch from current HEAD (commit-and-push may have used unique suffix).
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       REPO="bluedevilcollectibles/lspro-react"
@@ -421,17 +427,17 @@ nodes:
         echo ""
         echo "## Test evidence"
         echo "\`\`\`"
-        echo "$verify-tests.output"
+        echo "$VERIFY_TESTS_OUTPUT"
         echo "\`\`\`"
         echo ""
         echo "## Grep assertions"
         echo "\`\`\`"
-        echo "$verify-grep.output"
+        echo "$VERIFY_GREP_OUTPUT"
         echo "\`\`\`"
         echo ""
         echo "## Build"
         echo "\`\`\`"
-        echo "$build-check.output"
+        echo "$BUILD_CHECK_OUTPUT"
         echo "\`\`\`"
         echo ""
         echo "Spec: bdc-xo \`docs/work-orders/WO-SHOPOPS-CHANNEL-ADMIN-UI-01.md\`"
