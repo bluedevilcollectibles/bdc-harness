@@ -111,6 +111,13 @@
         "typescript": "^5.0.0",
       },
     },
+    "packages/overseer": {
+      "name": "@archon/overseer",
+      "version": "0.1.0",
+      "devDependencies": {
+        "@types/node": "^22.10.5",
+      },
+    },
     "packages/paths": {
       "name": "@archon/paths",
       "version": "0.3.10",
@@ -218,6 +225,7 @@
       "version": "0.3.10",
       "dependencies": {
         "@archon/git": "workspace:*",
+        "@archon/overseer": "workspace:*",
         "@archon/paths": "workspace:*",
         "@archon/providers": "workspace:*",
         "@hono/zod-openapi": "^0.19.6",
@@ -271,6 +279,8 @@
     "@archon/git": ["@archon/git@workspace:packages/git"],
 
     "@archon/isolation": ["@archon/isolation@workspace:packages/isolation"],
+
+    "@archon/overseer": ["@archon/overseer@workspace:packages/overseer"],
 
     "@archon/paths": ["@archon/paths@workspace:packages/paths"],
 
