@@ -304,46 +304,75 @@ function shellQuote(value: string): string {
  * @param escapedForBash - When true, wraps substituted values in single quotes so
  *   they are safe to embed in bash scripts passed to `bash -c`. Set true only for
  *   bash node script substitution; AI/command prompt substitution should use false.
+ *
+ * When escapedForBash is on, this function ALSO detects the
+ *   "$node.output"   (exact double-quoted substitution)
+ * anti-pattern and swallows the surrounding double quotes. shellQuote already
+ * produces safe single-quote wrapping; wrapping that in additional double quotes
+ * mis-tokenizes multi-line node output — line 2+ of the output becomes bare
+ * commands. Anchor: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01 (bdc-xo#153) 2026-05-16.
+ * YAMLs that write `"$node.output"` are now safe to author this natural way; the
+ * older pattern of `VAR=$node.output ... "$VAR"` continues to work unchanged.
  */
 export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
   escapedForBash = false
 ): string {
-  return prompt.replace(
-    /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g,
-    (match, nodeId: string, field: string | undefined) => {
-      const nodeOutput = nodeOutputs.get(nodeId);
-      if (!nodeOutput) {
-        getLog().warn({ nodeId, match }, 'dag_node_output_ref_unknown_node');
-        return escapedForBash ? "''" : '';
-      }
-      if (!field) {
-        return escapedForBash ? shellQuote(nodeOutput.output) : nodeOutput.output;
-      }
-      try {
-        const parsed = JSON.parse(nodeOutput.output) as Record<string, unknown>;
-        const value = parsed[field];
-        if (typeof value === 'string') return escapedForBash ? shellQuote(value) : value;
-        // numbers and booleans from JSON.parse are shell-safe without quoting:
-        // JSON disallows NaN/Infinity, so String(number) contains only digits, sign, and '.'.
-        // String(boolean) is 'true' or 'false' — no shell metacharacters.
-        if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-        // arrays and objects: JSON-stringify. Bash passes substitution as a single
-        // argument, so downstream tools (jq, etc.) receive a JSON literal they can parse.
-        if (Array.isArray(value) || typeof value === 'object') {
-          return escapedForBash ? shellQuote(JSON.stringify(value)) : JSON.stringify(value);
-        }
-        return escapedForBash ? "''" : ''; // null, undefined, symbol, bigint → empty
-      } catch (jsonErr) {
-        getLog().warn(
-          { nodeId, field, outputPreview: nodeOutput.output.slice(0, 100), err: jsonErr as Error },
-          'dag_node_output_ref_json_parse_failed'
-        );
-        return escapedForBash ? "''" : '';
-      }
+  const pattern = escapedForBash
+    ? /(")?\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?(")?/g
+    : /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g;
+
+  return prompt.replace(pattern, (match: string, ...rest: (string | undefined)[]) => {
+    let leadingQuote: string;
+    let nodeId: string;
+    let field: string | undefined;
+    let trailingQuote: string;
+    if (escapedForBash) {
+      leadingQuote = rest[0] ?? '';
+      nodeId = rest[1] ?? '';
+      field = rest[2];
+      trailingQuote = rest[3] ?? '';
+    } else {
+      leadingQuote = '';
+      nodeId = rest[0] ?? '';
+      field = rest[1];
+      trailingQuote = '';
     }
-  );
+    const swallowQuotes = leadingQuote === '"' && trailingQuote === '"';
+    const wrap = (val: string): string =>
+      escapedForBash && !swallowQuotes ? `${leadingQuote}${val}${trailingQuote}` : val;
+
+    const nodeOutput = nodeOutputs.get(nodeId);
+    if (!nodeOutput) {
+      getLog().warn({ nodeId, match }, 'dag_node_output_ref_unknown_node');
+      return escapedForBash ? wrap("''") : '';
+    }
+    if (!field) {
+      return escapedForBash ? wrap(shellQuote(nodeOutput.output)) : nodeOutput.output;
+    }
+    try {
+      const parsed = JSON.parse(nodeOutput.output) as Record<string, unknown>;
+      const value = parsed[field];
+      if (typeof value === 'string') return escapedForBash ? wrap(shellQuote(value)) : value;
+      // numbers and booleans from JSON.parse are shell-safe without quoting:
+      // JSON disallows NaN/Infinity, so String(number) contains only digits, sign, and '.'.
+      // String(boolean) is 'true' or 'false' — no shell metacharacters.
+      if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+      // arrays and objects: JSON-stringify. Bash passes substitution as a single
+      // argument, so downstream tools (jq, etc.) receive a JSON literal they can parse.
+      if (Array.isArray(value) || typeof value === 'object') {
+        return escapedForBash ? wrap(shellQuote(JSON.stringify(value))) : JSON.stringify(value);
+      }
+      return escapedForBash ? wrap("''") : ''; // null, undefined, symbol, bigint → empty
+    } catch (jsonErr) {
+      getLog().warn(
+        { nodeId, field, outputPreview: nodeOutput.output.slice(0, 100), err: jsonErr as Error },
+        'dag_node_output_ref_json_parse_failed'
+      );
+      return escapedForBash ? wrap("''") : '';
+    }
+  });
 }
 
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
