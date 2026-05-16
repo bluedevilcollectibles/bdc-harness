@@ -21,6 +21,15 @@ if [ "$(id -u)" = "0" ]; then
     echo "ERROR: Failed to fix ownership of /home/appuser — volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
+  # WO-168 Tier 1: /host-artifacts is a host bind mount for load-bearing
+  # workflow output (git bundles, raw artifacts). Workflow nodes run as
+  # appuser, so we must own it. Best-effort: if the mount is missing
+  # (older docker-compose without the new volume), do not block startup.
+  if [ -d /host-artifacts ]; then
+    if ! chown -Rh appuser:appuser /host-artifacts 2>/dev/null; then
+      echo "WARN: Failed to chown /host-artifacts — bundles may fail to write. Check host directory permissions." >&2
+    fi
+  fi
   RUNNER="gosu appuser"
 else
   # Already running as non-root (e.g., --user flag or Kubernetes)

@@ -26,6 +26,15 @@
 #     ARCHON_USER_HOME=/opt/archon-user-home    # Any absolute path on the host
 #   Default: Docker-managed volume (archon_user_home)
 #
+# Harness artifacts (load-bearing workflow output — host-persistent, WO-168 Tier 1):
+#   /host-artifacts is a host bind mount where load-bearing workflow nodes save
+#   git bundles + raw artifacts BEFORE remote push, so work survives container
+#   prune / push failure / worktree cleanup. Anchor: 2026-05-16 engine sortie
+#   lost 13 specs when worktree pruned after silent push failure.
+#   Default: ./harness-artifacts (host path relative to compose file).
+#   Override: HARNESS_ARTIFACTS=/opt/harness-artifacts in .env if needed.
+#   Recovery procedure: docs/recovery/host-artifact-recovery.md
+#
 # Cloud (HTTPS):
 #   1. Set DOMAIN=archon.example.com in .env
 #   2. Point DNS A record to your server
@@ -47,6 +56,11 @@ services:
     volumes:
       - ${ARCHON_DATA:-archon_data}:/.archon
       - ${ARCHON_USER_HOME:-archon_user_home}:/home/appuser
+      # WO-168 Tier 1: host-persistent artifact mount. Load-bearing workflow
+      # nodes (bdc-author-wo-batch commit-and-push, etc.) write a git bundle +
+      # raw artifacts here BEFORE attempting remote push, so worktree prune /
+      # push failure does not destroy work. See docs/recovery/host-artifact-recovery.md.
+      - ${HARNESS_ARTIFACTS:-./harness-artifacts}:/host-artifacts
     networks:
       - archon-network
     restart: unless-stopped

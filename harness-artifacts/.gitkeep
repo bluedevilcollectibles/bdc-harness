@@ -1,0 +1,8 @@
+# WO-168 Tier 1: host-mounted artifact directory
+#
+# This directory is bind-mounted into the container at /host-artifacts and
+# receives load-bearing workflow output (git bundles, diff stats, manifests)
+# BEFORE any remote push. See docs/recovery/host-artifact-recovery.md.
+#
+# Actual artifact subdirectories (named by WORKFLOW_RUN_ID) are gitignored —
+# only this .gitkeep is tracked so the mount target exists on fresh clones.
