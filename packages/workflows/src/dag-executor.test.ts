@@ -758,6 +758,100 @@ describe('substituteNodeOutputRefs -- shell escaping', () => {
     );
   });
 
+  // WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01 (bdc-xo#153): when a node output
+  // reference is wrapped in double quotes inside a bash block, the outer double
+  // quotes are swallowed during substitution because shellQuote already produces
+  // safe single-quote wrapping. Without this, multi-line output mis-tokenized
+  // bash (line 2+ of output became bare commands).
+  describe('double-quote context handling (escapedForBash=true)', () => {
+    it('swallows outer double quotes for exact "$node.output" pattern with multi-line output', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'line1\nline2\nline3')]]);
+      // Author wrote: echo "$a.output"
+      // Without the fix: produces echo "'line1\nline2\nline3'" — bash mis-tokenizes line2/line3.
+      // With the fix:  produces echo 'line1\nline2\nline3' (single-quoted, bash-safe).
+      expect(substituteNodeOutputRefs('echo "$a.output"', outputs, true)).toBe(
+        "echo 'line1\nline2\nline3'"
+      );
+    });
+
+    it('swallows outer double quotes for single-line output', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'just one line')]]);
+      expect(substituteNodeOutputRefs('echo "$a.output"', outputs, true)).toBe(
+        "echo 'just one line'"
+      );
+    });
+
+    it('handles output containing both single quotes AND double quotes', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'it\'s a "trap"')]]);
+      // shellQuote escapes ' as '\''; " stays literal inside single quotes
+      expect(substituteNodeOutputRefs('echo "$a.output"', outputs, true)).toBe(
+        "echo 'it'\\''s a \"trap\"'"
+      );
+    });
+
+    it('handles hyphenated node ids in double-quote context', () => {
+      const outputs = new Map([
+        ['decide-push-target', makeOutput('completed', 'push_target: feature-branch:foo')],
+      ]);
+      expect(
+        substituteNodeOutputRefs('printf "%s\\n" "$decide-push-target.output"', outputs, true)
+      ).toBe('printf "%s\\n" \'push_target: feature-branch:foo\'');
+    });
+
+    it('handles JSON field access inside double quotes', () => {
+      const outputs = new Map([['a', makeOutput('completed', JSON.stringify({ cmd: 'foo bar' }))]]);
+      // "$a.output.cmd" -> 'foo bar' (outer double quotes swallowed)
+      expect(substituteNodeOutputRefs('run "$a.output.cmd"', outputs, true)).toBe("run 'foo bar'");
+    });
+
+    it('leaves bare $node.output (no surrounding quotes) producing shellQuote-wrapped value', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'hello world')]]);
+      // No surrounding double quotes — current behavior preserved.
+      expect(substituteNodeOutputRefs('echo $a.output', outputs, true)).toBe("echo 'hello world'");
+    });
+
+    it('asymmetric quotes (leading only) are NOT swallowed', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'hello')]]);
+      // `"$a.output and rest` (leading " but no trailing "): only one quote captured;
+      // we put it back, falling through to standard shellQuote behavior. Author's
+      // outer string remains intact.
+      expect(substituteNodeOutputRefs('echo "$a.output and rest"', outputs, true)).toBe(
+        'echo "\'hello\' and rest"'
+      );
+    });
+
+    it('asymmetric quotes (trailing only) are NOT swallowed', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'hello')]]);
+      // `$a.output"`: trailing " captured but leading " was a different char (here, none).
+      expect(substituteNodeOutputRefs('echo $a.output" extra', outputs, true)).toBe(
+        "echo 'hello'\" extra"
+      );
+    });
+
+    it('two adjacent quoted refs each swallow their own quotes', () => {
+      const outputs = new Map([
+        ['a', makeOutput('completed', 'A1')],
+        ['b', makeOutput('completed', 'B2')],
+      ]);
+      expect(substituteNodeOutputRefs('"$a.output" then "$b.output"', outputs, true)).toBe(
+        "'A1' then 'B2'"
+      );
+    });
+
+    it('non-shell mode (escapedForBash=false) keeps current behavior even with surrounding quotes', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'hello')]]);
+      // No escaping at all, no quote swallowing.
+      expect(substituteNodeOutputRefs('echo "$a.output"', outputs)).toBe('echo "hello"');
+    });
+
+    it('unknown node in double-quote context swallows the outer quotes too', () => {
+      mockLogFn.mockClear();
+      const outputs = new Map<string, NodeOutput>();
+      // "$missing.output" -> '' (outer " swallowed; empty single-quoted string)
+      expect(substituteNodeOutputRefs('echo "$missing.output"', outputs, true)).toBe("echo ''");
+    });
+  });
+
   it('array JSON field becomes JSON stringified', () => {
     const outputs = new Map([
       ['a', makeOutput('completed', JSON.stringify({ items: ['todo', 'fix'] }))],
