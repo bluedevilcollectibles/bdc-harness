@@ -52,6 +52,7 @@ import {
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
+import { handleNodeFailure } from './overseer-bridge';
 import { evaluateCondition } from './condition-evaluator';
 import {
   logNodeStart,
@@ -697,28 +698,13 @@ async function executeNodeInternal(
     if (!promptResult.success) {
       const errMsg = promptResult.message;
       getLog().error({ nodeId: node.id, error: errMsg }, 'dag_node_command_load_failed');
-      await logNodeError(logDir, workflowRun.id, node.id, errMsg);
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: node.id,
-          data: { error: errMsg },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: node.command,
-        error: errMsg,
-      });
-      return { state: 'failed', output: '', error: errMsg };
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        { errorMsg: errMsg, logDir, outputSoFar: '' }
+      );
+      return failResult.output;
     }
     rawPrompt = promptResult.content;
   } else {
@@ -1118,33 +1104,25 @@ async function executeNodeInternal(
         'dag_node_cancelled_during_streaming'
       );
 
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: node.id,
-          data: { error: 'Cancelled by user', duration_ms: duration },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: node.command ?? node.id,
-        error: 'Cancelled by user',
-      });
+      const cancelMsg = 'Cancelled by user';
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: cancelMsg,
+          logDir,
+          outputSoFar: nodeOutputText,
+          hasOutput: nodeOutputText.length > 0,
+          extraEventData: { duration_ms: duration },
+        }
+      );
 
       // Clean up throttle entries
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: nodeOutputText, error: 'Cancelled by user' };
+      return failResult.output;
     }
 
     if (streamingMode === 'batch' && batchMessages.length > 0) {
@@ -1161,34 +1139,24 @@ async function executeNodeInternal(
     if (creditError) {
       const duration = Date.now() - nodeStartTime;
       getLog().warn({ nodeId: node.id, durationMs: duration }, 'dag.node_credit_exhausted');
-      await logNodeError(logDir, workflowRun.id, node.id, creditError);
 
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: node.id,
-          data: { error: creditError },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: node.command ?? node.id,
-        error: creditError,
-      });
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: creditError,
+          logDir,
+          outputSoFar: nodeOutputText,
+          hasOutput: nodeOutputText.length > 0,
+          extraEventData: { duration_ms: duration },
+        }
+      );
 
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: nodeOutputText, error: creditError };
+      return failResult.output;
     }
 
     // Empty assistant output is a failure for AI nodes — a provider stream
@@ -1204,34 +1172,24 @@ async function executeNodeInternal(
       const duration = Date.now() - nodeStartTime;
       const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
-      await logNodeError(logDir, workflowRun.id, node.id, emptyError);
 
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: node.id,
-          data: { error: emptyError, duration_ms: duration },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: node.command ?? node.id,
-        error: emptyError,
-      });
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: emptyError,
+          logDir,
+          outputSoFar: '',
+          hasOutput: false,
+          extraEventData: { duration_ms: duration },
+        }
+      );
 
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: '', error: emptyError };
+      return failResult.output;
     }
 
     const duration = Date.now() - nodeStartTime;
