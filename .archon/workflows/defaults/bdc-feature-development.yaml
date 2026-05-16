@@ -9,7 +9,23 @@ policyFile: harness/policies/agent-behavior.md
 model: sonnet
 
 nodes:
+  # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
+  # Anchor: 2026-05-16 engine sortie. Container-side `git push` silently failed
+  # (no GITHUB_TOKEN); downstream `|| echo` swallow patterns let the workflow
+  # report success while no commits reached origin. Catch the auth gap up front.
+  - id: preflight-github-auth
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
   - id: read-spec
+    depends_on: [preflight-github-auth]
     bash: |
       set -euo pipefail
       WO_ID="${WO_ID:-}"
@@ -211,8 +227,14 @@ nodes:
       out_of_scope: true
       reason: use bdc-doctrine-update.yaml
 
+  # load_bearing: true (WO-167 doctrine, WO-169 anchor)
+  # 2026-05-16 engine sortie: container-side `git push` silently failed; downstream
+  # `|| echo "STATUS=*_failed"` swallow patterns let the workflow report success
+  # while no commits reached origin. Push retry is now real (3 attempts, exponential
+  # backoff) and node fails closed if all attempts fail.
   - id: commit-and-push
     depends_on: [decide-push-target]
+    load_bearing: true
     bash: |
       set -euo pipefail
       # 2026-05-16 quote-fix: substituteNodeOutputRefs with escapedForBash=true wraps
@@ -288,11 +310,28 @@ nodes:
         COMMIT_MESSAGE="feat: ${WO_ID} implementation"
       fi
       git commit -m "$COMMIT_MESSAGE"
-      git push -u origin "$BRANCH"
 
+      # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
+      # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push -u origin "$BRANCH" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+
+  # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     depends_on: [commit-and-push]
     task_class: clerical
+    load_bearing: true
     bash: |
       set -euo pipefail
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
@@ -324,7 +363,32 @@ nodes:
         echo "## Validator"
         echo "$VALIDATOR_OUTPUT"
       } > "$BODY_FILE"
-      gh pr create --title "$TITLE" --body-file "$BODY_FILE"
+      # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
+      # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
+      PR_OK=false
+      for attempt in 1 2 3; do
+        if gh pr create --title "$TITLE" --body-file "$BODY_FILE" 2>&1; then
+          PR_OK=true
+          break
+        fi
+        # Race-condition recovery: branch already has an open PR.
+        BRANCH_NOW=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        if [ -n "$BRANCH_NOW" ]; then
+          EXIST=$(gh pr list --head "$BRANCH_NOW" --state open \
+            --json url --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$EXIST" ]; then
+            echo "PR_URL=$EXIST"
+            PR_OK=true
+            break
+          fi
+        fi
+        echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PR_OK" = "false" ]; then
+        echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
 
   - id: build-manifest
     depends_on: [open-pr-if-needed]
