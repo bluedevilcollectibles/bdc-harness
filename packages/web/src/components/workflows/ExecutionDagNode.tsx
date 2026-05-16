@@ -59,17 +59,21 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
         <span className="text-xs font-medium text-text-primary truncate max-w-[100px]">
           {data.label}
         </span>
+        {data.currentIteration !== undefined && data.maxIterations !== undefined && (
+          <>
+            <span className="text-[10px] text-text-tertiary">·</span>
+            <span className="text-[10px] text-text-tertiary shrink-0">
+              iter {data.currentIteration}/{data.maxIterations}
+              {data.status === 'completed' ? ' (done)' : ''}
+            </span>
+          </>
+        )}
         {data.duration !== undefined && (
           <span className="text-[10px] text-text-tertiary ml-auto shrink-0">
             {formatDurationMs(data.duration)}
           </span>
         )}
       </div>
-      {data.currentIteration !== undefined && data.maxIterations !== undefined && (
-        <div className="text-[10px] text-text-tertiary mt-0.5">
-          {data.currentIteration}/{data.maxIterations} iterations
-        </div>
-      )}
       {data.error && (
         <div className="text-[10px] text-error mt-1 truncate" title={data.error}>
           {data.error.slice(0, 60)}
