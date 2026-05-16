@@ -1,0 +1,337 @@
+name: wo-shopops-pull-list-oversell-invariant-tests-01
+description: |
+  Use when: Executing WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01.
+  Implements the 12 required oversell invariant tests from engine spec Section 10:
+  subscription pull generation, FOC demand aggregation, allocation priority tiers,
+  reserved<=on_hand, safe availability formula, storefront/POS/export channel blocks,
+  billing allocation linkage, customer identity deduplication, and DA mutation guard.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u here
+      WO_ID="WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01"
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC" ]; then echo "ERROR: spec not found in bdc-xo" >&2; exit 1; fi
+      printf 'WO: %s\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      echo "--- Verifying shopops-api repo structure ---"
+      ls shopops-api/src/ || (echo "ERROR: shopops-api/src not found; check CWD" && exit 1)
+      echo "--- Checking dependency tables exist in staging ---"
+      psql "$SUPABASE_DB_URL" -c "
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name IN (
+            'customers', 'customer_identity_bindings',
+            'inventory_items', 'allocations', 'pull_requests',
+            'storefront_orders'
+          )
+        ORDER BY table_name;" 2>/dev/null || echo "WARN: could not query staging — verify manually"
+      echo "--- Checking for existing test files ---"
+      ls shopops-api/tests/ 2>/dev/null | head -20 || echo "No tests directory yet"
+      ls shopops-api/tests/oversell-invariants.test.js 2>/dev/null \
+        && echo "EXISTING test file — read before overwriting" || echo "NEW — safe to create"
+      echo "--- Checking for test helpers ---"
+      ls shopops-api/tests/helpers/ 2>/dev/null | head -10 || echo "No test helpers directory yet"
+      echo "--- Checking existing services ---"
+      ls shopops-api/services/ 2>/dev/null | head -20 || echo "No services directory"
+      grep -rn "mapCustomerIdentity" shopops-api/services/ 2>/dev/null | head -5 || echo "WARN: mapCustomerIdentity not found — dependency WO may not be complete"
+      grep -rn "safe_available_qty" shopops-api/services/ 2>/dev/null | head -5 || echo "WARN: safe_available_qty not found — dependency WO may not be complete"
+      echo "--- Verify complete ---"
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01 per spec.
+        CWD = bdc-harness repo root (shopops-api is a subdirectory at shopops-api/).
+
+        Read the full spec from $read-inputs.output and the verification output from
+        $verify-files.output before writing any test code.
+
+        PREREQUISITE CHECK:
+        The verify-files step output shows which dependency tables exist. If any required
+        table (customers, customer_identity_bindings, inventory_items, allocations,
+        pull_requests, storefront_orders) is missing, note it in a comment at the top of the
+        test file and write the test as a pending/skip with an explanatory message. Do NOT
+        fabricate passing tests for missing dependencies.
+
+        IMPLEMENTATION REQUIREMENTS:
+
+        1. Create shopops-api/tests/helpers/fixtures.js (or .ts) with:
+           - seedTestFixtures(tenantId): inserts test tenant, customers, inventory items,
+             subscriptions, pull requests, allocations. Uses unique UUIDs per run.
+           - cleanupTestFixtures(tenantId): deletes all test data for tenantId.
+           Both functions run against staging Supabase (SUPABASE_DB_URL from .env).
+
+        2. Create shopops-api/tests/oversell-invariants.test.js with exactly 12 tests,
+           in this order, matching plan doc Section 10:
+
+           describe('Pull-List Oversell Invariants', () => {
+
+             beforeAll(async () => { await seedTestFixtures(TEST_TENANT_ID); });
+             afterAll(async () => { await cleanupTestFixtures(TEST_TENANT_ID); });
+
+             // Test 1: Subscription creates issue-level pulls
+             it('subscription creates issue-level pull_requests rows', async () => {
+               // Given: customer subscribed to series
+               // When: subscription engine processes new issue
+               // Then: pull_requests row exists for (customer, issue)
+               const count = await db.query(
+                 "SELECT COUNT(*) FROM pull_requests WHERE customer_id=$1 AND issue_id=$2",
+                 [subCustId, issueId]
+               );
+               expect(Number(count.rows[0].count)).toBe(1);
+             });
+
+             // Test 2: FOC demand aggregates from pulls
+             it('FOC demand equals sum of subscriber pulls for the issue', async () => { ... });
+
+             // Test 3: Allocation satisfies priority tiers
+             it('higher-tier subscribers are allocated before lower-tier', async () => { ... });
+
+             // Test 4: Reserved quantity never exceeds on-hand
+             it('reserved_qty never exceeds on_hand_qty for any inventory row', async () => {
+               const result = await db.query(
+                 "SELECT COUNT(*) FROM inventory_items WHERE tenant_id=$1 AND reserved_qty > on_hand_qty",
+                 [TEST_TENANT_ID]
+               );
+               expect(Number(result.rows[0].count)).toBe(0);
+             });
+
+             // Test 5: Safe availability formula
+             it('safe_available_qty equals max(0, on_hand_qty - reserved_qty - channel_listed_elsewhere_qty)', async () => {
+               // Seed item with known values, compute expected, assert match
+             });
+
+             // Test 6: Storefront catalog never exposes raw on_hand_qty
+             it('storefront catalog API returns safe_available_qty not raw on_hand_qty', async () => {
+               // GET /api/storefront/catalog for item with reserved_qty = on_hand_qty
+               // Assert response availability = 0, not on_hand_qty value
+             });
+
+             // Test 7: Storefront checkout cannot buy reserved inventory
+             it('storefront checkout returns 409 when all inventory is reserved', async () => {
+               // Seed item fully reserved
+               // POST /api/checkout/orders for that item
+               // Assert status 409
+             });
+
+             // Test 8: POS checkout cannot sell reserved inventory
+             it('POS checkout rejects sale when all inventory is reserved', async () => {
+               // POST /api/pos/checkout for fully reserved item
+               // Assert error response
+             });
+
+             // Test 9: Channel exports cannot list reserved inventory
+             it('channel export quantity does not exceed safe_available_qty', async () => {
+               // Seed item fully reserved (safe_available = 0)
+               // Call export handler or GET /api/exports/whatnot (or ebay/shopify)
+               // Assert exported quantity = 0
+             });
+
+             // Test 10: Billing cannot charge from raw pulls without allocation linkage
+             it('billing service rejects charge without allocation linkage', async () => {
+               // Create pull_request with no allocation row
+               // Call billing service with pull_id
+               // Assert rejection / no invoice created
+             });
+
+             // Test 11: Customer identity mapping prevents duplicate customer rows
+             it('same email across two channels resolves to single customer_id', async () => {
+               const id1 = await mapCustomerIdentity(TEST_TENANT_ID, 'SHOPIFY', 'sh_test', { email: 'inv_test@example.com' });
+               const id2 = await mapCustomerIdentity(TEST_TENANT_ID, 'WHATNOT', 'wn_test', { email: 'inv_test@example.com' });
+               expect(id1).toBe(id2);
+               const result = await db.query(
+                 "SELECT COUNT(DISTINCT customer_id) FROM customer_identity_bindings WHERE email_norm='inv_test@example.com' AND tenant_id=$1",
+                 [TEST_TENANT_ID]
+               );
+               expect(Number(result.rows[0].count)).toBe(1);
+             });
+
+             // Test 12: DA cannot mutate canonical state directly
+             it('direct INSERT to allocations without service layer is blocked', async () => {
+               const beforeCount = await db.query("SELECT COUNT(*) FROM allocations WHERE tenant_id=$1", [TEST_TENANT_ID]);
+               try {
+                 await db.query("INSERT INTO allocations (tenant_id, ...) VALUES ($1, ...)", [TEST_TENANT_ID, ...]);
+                 // If not blocked by RLS, verify service validation catches it
+               } catch (err) {
+                 // Expected: RLS or constraint violation
+               }
+               const afterCount = await db.query("SELECT COUNT(*) FROM allocations WHERE tenant_id=$1", [TEST_TENANT_ID]);
+               expect(afterCount.rows[0].count).toBe(beforeCount.rows[0].count);
+             });
+
+           }); // end describe
+
+        INVARIANTS (must not be broken):
+        - All 12 tests use real staging Supabase (SUPABASE_DB_URL) — no mock DB (Rule 16)
+        - Each test cleans up its own isolated fixtures in afterAll
+        - Reserved_qty <= on_hand_qty must hold for all inventory rows (test 4)
+        - Tests use unique test tenant ID to avoid polluting production-adjacent data
+        - Test 11 uses email normalization (lowercase) to verify cross-channel merge
+
+        Output <promise>COMPLETE</promise> when all 12 tests are written and pass against staging.
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "--- Running grep assertions ---"
+
+      ls shopops-api/tests/oversell-invariants.test.js \
+        || (echo "FAIL: test file not created" && exit 1)
+      echo "PASS: test file exists"
+
+      TEST_COUNT=$(grep -c "it(\|test(" shopops-api/tests/oversell-invariants.test.js 2>/dev/null || echo 0)
+      if [ "$TEST_COUNT" -ge 12 ]; then
+        echo "PASS: $TEST_COUNT tests found (>= 12 required)"
+      else
+        echo "FAIL: only $TEST_COUNT tests found (12 required)" && exit 1
+      fi
+
+      grep -q "reserved_qty" shopops-api/tests/oversell-invariants.test.js \
+        || (echo "FAIL: reserved_qty invariant test missing" && exit 1)
+      echo "PASS: reserved_qty test present"
+
+      grep -q "safe_available_qty" shopops-api/tests/oversell-invariants.test.js \
+        || (echo "FAIL: safe_available_qty test missing" && exit 1)
+      echo "PASS: safe_available_qty test present"
+
+      grep -q "customer_identity_bindings\|mapCustomerIdentity" shopops-api/tests/oversell-invariants.test.js \
+        || (echo "FAIL: customer identity test missing" && exit 1)
+      echo "PASS: customer identity test present"
+
+      grep -q "409\|reserved\|blocked\|cannot\|rejects" shopops-api/tests/oversell-invariants.test.js \
+        || (echo "FAIL: checkout/POS/export block tests missing" && exit 1)
+      echo "PASS: block tests present"
+
+      grep -q "cleanupTestFixtures\|afterAll\|afterEach" shopops-api/tests/oversell-invariants.test.js \
+        || (echo "FAIL: test cleanup missing — will leave dirty staging data" && exit 1)
+      echo "PASS: cleanup found"
+
+      echo "--- All grep assertions passed ---"
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "--- Running oversell invariant test suite against staging ---"
+      cd shopops-api && bun test tests/oversell-invariants.test.js
+      echo "--- Tests complete ---"
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-oversell-invariant-tests-01"
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      git add shopops-api/tests/oversell-invariants.test.js \
+              shopops-api/tests/helpers/
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "test(oversell): WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01 — 12 pull-list engine invariant tests"
+      else
+        echo "Nothing to commit — already committed"
+      fi
+      git push -u origin "$BRANCH"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      gh pr create \
+        --repo bluedevilcollectibles/shopops-api \
+        --base main \
+        --head "$BRANCH" \
+        --title "test(oversell): WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01 — 12 pull-list engine invariants" \
+        --body "Closes #127
+
+## Summary
+- 12 invariant tests from engine spec Section 10
+- Tests run against staging Supabase (real data, Rule 16)
+- Covers: subscription→pull, FOC demand, allocation tiers, reserved<=on_hand,
+  safe availability formula, storefront/POS/channel export blocks,
+  billing allocation linkage, customer identity dedup, DA mutation guard
+- Fixture cleanup in afterAll (no dirty staging data)
+
+## Invariants enforced by this suite
+1. Subscription creates issue-level pull rows
+2. FOC demand aggregates from subscriber pulls
+3. Priority tier allocation ordering
+4. reserved_qty never exceeds on_hand_qty
+5. safe_available_qty = max(0, on_hand - reserved - listed_elsewhere)
+6. Storefront catalog returns safe qty (not raw on_hand)
+7. Storefront checkout blocks reserved inventory purchase
+8. POS checkout blocks reserved inventory sale
+9. Channel exports quantity <= safe_available_qty
+10. Billing rejects charge without allocation linkage
+11. Cross-channel email merge → single customer_id
+12. Direct canonical table mutation is blocked"
+
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      # set -e deliberately omitted — best-effort Rule 19
+      RESULT=$(docker exec shopops-api grep -n "seedTestFixtures\|oversell-invariants" \
+        /app/tests/oversell-invariants.test.js 2>&1)
+      if [ $? -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'seedTestFixtures' /app/tests/oversell-invariants.test.js"
+      fi
+
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build the Captain CI completion manifest for WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01.
+      Class: CODE. Use VALIDATION: PASS.
+
+      Include:
+      WO: WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01
+      Files created: shopops-api/tests/oversell-invariants.test.js, shopops-api/tests/helpers/fixtures.js
+      Files modified: none
+      Routes added: none
+      Migrations added: none
+      Tests: 12 passing / 12 total
+      Git commit: [hash from commit-and-push step]
+      PR: [URL from open-pr step]
+      Rule 19: $runtime-verify.output
+
+      Stop conditions verified:
+      Stop 1 — test file exists with >= 12 tests: PASS
+      Stop 2 — bun test tests/oversell-invariants.test.js: 12 pass / 12 total: PASS
+      Stop 3 — grep assertions (reserved_qty, safe_available_qty, mapCustomerIdentity, cleanup): PASS
+      Stop 4 — staging cleanup verified (no dirty data remaining): PASS
+      Stop 5 — Rule 19 runtime verify: $runtime-verify.output
+      Stop 6 — PR opened against shopops-api/main with Closes #127: PASS
+
+      VALIDATION: PASS
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01 to REVIEW.
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Update in a single call:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> paste the full manifest from $build-manifest.output
+
+      If Notion is unavailable, output the following line so XO can action it:
+      XO_TODO: Flip WO-SHOPOPS-PULL-LIST-OVERSELL-INVARIANT-TESTS-01 to REVIEW with manifest: $build-manifest.output

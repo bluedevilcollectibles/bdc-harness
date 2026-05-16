@@ -1,0 +1,221 @@
+name: wo-shopops-pull-list-fulfillment-handoff-01
+description: |
+  Use when: Executing WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01.
+  Wires pull-list fulfillment lifecycle in shopops-api. PULL_LIST rows reference
+  allocation_id. Channel rows reference canonical order + customer identity. All
+  nine source channels handled. Fulfillment state visible in Management UI.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u here
+      WO_ID="WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01"
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC" ]; then echo "ERROR: spec not found" >&2; exit 1; fi
+      printf 'WO: %s\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      # Verify shopops-api repo structure and dependency artifacts exist
+      ls shopops-api/services/
+      ls shopops-api/db/
+      ls shopops-api/routes/
+      ls shopops-api/tests/
+      ls shopops-api/migrations/
+      # Verify allocation engine dependency is present
+      ls shopops-api/db/allocations.js 2>/dev/null || \
+        { echo "ERROR: db/allocations.js missing — WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 not landed" >&2; exit 1; }
+      # Verify customer identity dependency is present
+      ls shopops-api/db/customers.js 2>/dev/null || \
+        { echo "ERROR: db/customers.js missing — WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 not landed" >&2; exit 1; }
+      echo "Repo structure and dependencies verified"
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        You are implementing WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01 in the shopops-api repo.
+
+        Full spec:
+        $read-inputs.output
+
+        Implementation requirements:
+
+        1. Create services/fulfillment.js with:
+           - validateFulfillmentSource(source, params): enforces the per-source required fields:
+             * PULL_LIST: allocation_id required. Missing -> throw FULFILLMENT_MISSING_ALLOCATION (422).
+             * STOREFRONT, POS, WHATNOT, SHOPIFY, EBAY, WOOCOMMERCE, TIKTOK: shopops_order_id required.
+               Missing -> throw FULFILLMENT_MISSING_ORDER (422). shopops_customer_id required ->
+               throw FULFILLMENT_MISSING_CUSTOMER (422).
+             * MANUAL: shopops_customer_id required (best-effort; throw FULFILLMENT_MISSING_CUSTOMER
+               if absent and caller is not flagged as anonymous).
+           - createFulfillmentRow(params): calls validateFulfillmentSource, then upsertFulfillmentRow
+             (idempotency by unique constraint). If PULL_LIST, calls getAllocationById to verify
+             allocation exists under correct tenant.
+           - updateFulfillmentStatus(fulfillmentRowId, status): updates status, stamps fulfilled_at
+             on fulfillment_rows when status = FULFILLED, and also stamps allocations.fulfilled_at
+             for PULL_LIST rows.
+           - getFulfillmentRuns(tenantId, filters): calls listFulfillmentRuns, returns array of
+             { source, status, allocation_id, shopops_order_id, shopops_customer_id, fulfilled_at }.
+
+        2. Create db/fulfillment.js with:
+           - upsertFulfillmentRow(params): INSERT with ON CONFLICT DO NOTHING on the compound unique
+             constraints defined in the spec §9. Returns existing row on conflict (idempotency).
+           - getFulfillmentRowById(fulfillmentRowId)
+           - getFulfillmentRowsByAllocation(allocationId)
+           - listFulfillmentRuns(tenantId, filters)
+
+        3. Create migrations/008_fulfillment_rows.sql with the schema from the spec §9:
+           table fulfillment_rows with columns: tenant_id, fulfillment_row_id (UUID PK), source (TEXT),
+           status (TEXT), allocation_id (UUID nullable), shopops_order_id (UUID nullable),
+           shopops_customer_id (UUID), fulfilled_at (TIMESTAMPTZ nullable), created_at, updated_at.
+           Include both unique constraints as specified.
+
+        4. Create routes/fulfillment.js with:
+           - POST /fulfillment/rows: calls createFulfillmentRow, returns 201 on create, 200 on
+             idempotent return, 422 with error code on validation failure.
+           - GET /fulfillment/runs: calls getFulfillmentRuns(tenantId, filters), returns array.
+
+        5. Extend routes/management.js (EXISTING) to surface fulfillment visibility for Management UI
+           if a dedicated management endpoint is needed (check existing file first — may already have
+           a fulfillment section; extend rather than replace).
+
+        6. Create tests/test_fulfillment_handoff.js with >= 6 tests:
+           - PULL_LIST row with valid allocation_id accepted (HTTP 201)
+           - PULL_LIST row without allocation_id rejected (HTTP 422, FULFILLMENT_MISSING_ALLOCATION)
+           - SHOPIFY row without shopops_order_id rejected (HTTP 422, FULFILLMENT_MISSING_ORDER)
+           - GET /fulfillment/runs returns correct shape for all 3 source types
+           - Idempotent second create returns 200, no duplicate row
+           - FULFILLED transition stamps both fulfillment_rows.fulfilled_at and allocations.fulfilled_at
+           Tests must run against staging Supabase with real allocation and customer fixtures.
+
+        Valid source values (exact strings): PULL_LIST, STOREFRONT, POS, WHATNOT, SHOPIFY, EBAY,
+        WOOCOMMERCE, TIKTOK, MANUAL.
+
+        Error codes (exact strings): FULFILLMENT_MISSING_ALLOCATION, FULFILLMENT_MISSING_ORDER,
+        FULFILLMENT_MISSING_CUSTOMER.
+
+        Do NOT use set -u in bash blocks. Follow Rule 19: source changes need image rebuild.
+        Follow Rule 6: no secrets in committed files.
+
+        Output <promise>COMPLETE</promise> when all files are written and tests pass locally.
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Fulfillment grep assertions ==="
+      grep -rn "createFulfillmentRow" shopops-api/services/fulfillment.js
+      grep -rn "FULFILLMENT_MISSING_ALLOCATION" shopops-api/services/fulfillment.js
+      grep -rn "FULFILLMENT_MISSING_ORDER" shopops-api/services/fulfillment.js
+      grep -rn "validateFulfillmentSource" shopops-api/services/fulfillment.js
+      grep -rn "PULL_LIST\|STOREFRONT\|WHATNOT\|SHOPIFY\|EBAY\|WOOCOMMERCE\|TIKTOK" shopops-api/services/fulfillment.js
+      grep -rn "fulfillment/runs" shopops-api/routes/fulfillment.js
+      grep -rn "fulfillment/rows" shopops-api/routes/fulfillment.js
+      echo "All grep assertions passed"
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      cd shopops-api
+      bun test tests/test_fulfillment_handoff.js
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-fulfillment-handoff-01"
+      cd shopops-api
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      git add services/fulfillment.js db/fulfillment.js routes/fulfillment.js \
+        routes/management.js migrations/008_fulfillment_rows.sql \
+        tests/test_fulfillment_handoff.js
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(fulfillment): WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01 — wire pull-list fulfillment lifecycle, all 9 sources, Management UI visibility"
+      fi
+      git push -u origin "$BRANCH"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(cd shopops-api && git rev-parse --abbrev-ref HEAD)
+      gh pr create --repo bluedevilcollectibles/shopops-api --base main \
+        --head "$BRANCH" \
+        --title "feat(fulfillment): wire pull-list fulfillment lifecycle with allocation linkage and Management UI visibility" \
+        --body "Closes #120
+
+Implements WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01.
+
+- PULL_LIST fulfillment rows require allocation_id
+- Channel rows (STOREFRONT/POS/WHATNOT/SHOPIFY/EBAY/WOOCOMMERCE/TIKTOK) require shopops_order_id + shopops_customer_id
+- MANUAL rows require shopops_customer_id (best-effort)
+- GET /fulfillment/runs exposes fulfillment state for Management UI
+- Error codes: FULFILLMENT_MISSING_ALLOCATION, FULFILLMENT_MISSING_ORDER, FULFILLMENT_MISSING_CUSTOMER
+- Idempotency via compound unique constraints
+- FULFILLED transition stamps both fulfillment_rows.fulfilled_at and allocations.fulfilled_at
+- Migration: 008_fulfillment_rows.sql
+- Tests: test_fulfillment_handoff.js (6 scenarios against staging Supabase)" \
+        2>/dev/null || echo "PR may already exist — skipping"
+
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      # set -e deliberately omitted — best-effort Rule 19
+      RESULT=$(docker exec shopops-api grep -n "createFulfillmentRow\|validateFulfillmentSource" /app/services/fulfillment.js 2>&1)
+      if [ $? -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'createFulfillmentRow' /app/services/fulfillment.js"
+        echo "Container must be rebuilt after PR merge to verify Rule 19."
+      fi
+
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build the Captain CI completion manifest for WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01 (CODE class).
+
+      Format:
+      WO: WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01
+      Files created: [list from implementation]
+      Files modified: [list from implementation]
+      Routes added: POST /fulfillment/rows, GET /fulfillment/runs
+      Migrations added: 008_fulfillment_rows.sql
+      Tests: [count passing / count total]
+      Git commit: [hash from commit-and-push]
+      PR: [URL from open-pr]
+      Rule 19: [STATUS from runtime-verify]
+      VALIDATION: PASS
+
+      Use outputs:
+      $read-inputs.output
+      $verify-grep.output
+      $verify-tests.output
+      $commit-and-push.output
+      $open-pr.output
+      $runtime-verify.output
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01 to REVIEW in Notion.
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+      Update the WO page: Claude Status -> REVIEW, Status -> Review.
+      Paste the full manifest from build-manifest into the Notes field.
+      If Notion is unavailable, output:
+      XO_TODO: Flip WO-SHOPOPS-PULL-LIST-FULFILLMENT-HANDOFF-01 to REVIEW and paste manifest into Notes.
+
+      $build-manifest.output

@@ -1,0 +1,570 @@
+name: wo-shopops-pull-list-customer-pull-model-01
+description: |
+  Use when: Executing WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01.
+  Does: Builds the canonical customer_pulls table and lifecycle state machine for Shop Ops HQ.
+  Lifecycle: REQUESTED -> FOC_LOCKED -> ALLOCATED -> READY_TO_INVOICE -> INVOICED
+             -> SHIPPED / PICKED_UP / CANCELLED
+  Pulls are demand, not billing entitlement. assertPullBillable() guards every invoice path.
+  Hard dependency: WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 (customers table) must be REVIEW
+  before this workflow executes.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u — WO_ID defined inline
+      WO_ID="WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01"
+      GH_ISSUE="115"
+      REPO="bluedevilcollectibles/shopops-api"
+      echo "WO: $WO_ID"
+      echo "GH_ISSUE: $GH_ISSUE"
+      echo "REPO: $REPO"
+
+      # Fetch spec from bdc-xo
+      SPEC=$(gh api \
+        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+
+      if [ -z "$SPEC" ]; then
+        echo "WARNING: spec not found in bdc-xo — falling back to local docs/" >&2
+        LOCAL_SPEC=$(cat docs/work-orders/${WO_ID}.md 2>/dev/null || true)
+        if [ -z "$LOCAL_SPEC" ]; then
+          echo "ERROR: spec not found in bdc-xo or local docs/" >&2
+          exit 1
+        fi
+        printf -- '--- SPEC (local fallback) ---\n%s\n' "$LOCAL_SPEC"
+      else
+        printf -- '--- SPEC (bdc-xo) ---\n%s\n' "$SPEC"
+      fi
+
+      echo "--- REPO CONTEXT ---"
+      ls shopops-api/ 2>/dev/null | head -20 || echo "shopops-api/ not found"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      echo "=== Pre-implementation file inventory + dependency checks ==="
+
+      if [ ! -d "shopops-api" ]; then
+        echo "ERROR: shopops-api/ not found — not in shopops repo root" >&2
+        exit 1
+      fi
+
+      echo "--- HARD DEPENDENCY: customers table ---"
+      CUSTOMERS_OK=$(psql "$SUPABASE_DB_URL" -t -c \
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema='public' AND table_name='customers';" 2>/dev/null | tr -d ' ' || echo "0")
+      if [ "$CUSTOMERS_OK" = "0" ] || [ -z "$CUSTOMERS_OK" ]; then
+        echo "BLOCKED: customers table does not exist in staging DB." >&2
+        echo "This WO requires WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 to complete first." >&2
+        echo "Either run that WO first or apply its migration manually." >&2
+        exit 1
+      fi
+      echo "PASS: customers table exists"
+
+      echo "--- DEPENDENCY: subscriptions table ---"
+      SUBS_OK=$(psql "$SUPABASE_DB_URL" -t -c \
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema='public' AND table_name='subscriptions';" 2>/dev/null | tr -d ' ' || echo "0")
+      if [ "$SUBS_OK" = "0" ] || [ -z "$SUBS_OK" ]; then
+        echo "INFO: subscriptions table does not exist — will be created by this WO"
+        echo "SUBS_STATUS=new"
+      else
+        echo "PASS: subscriptions table exists"
+        echo "SUBS_STATUS=existing"
+        psql "$SUPABASE_DB_URL" -c \
+          "SELECT column_name, data_type FROM information_schema.columns
+           WHERE table_schema='public' AND table_name='subscriptions'
+           ORDER BY ordinal_position;" 2>/dev/null || true
+      fi
+
+      echo "--- SOFT DEPENDENCY: v_inventory_availability view ---"
+      psql "$SUPABASE_DB_URL" -t -c \
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema='public' AND table_name='v_inventory_availability';" 2>/dev/null \
+        | grep -q "v_inventory_availability" \
+        && echo "PASS: v_inventory_availability view exists (allocation gate can use it)" \
+        || echo "INFO: v_inventory_availability not yet present — reconcilePullAllocation will use AVAILABILITY_CHECK_ENABLED flag"
+
+      echo "--- checking for prior customer_pulls migration ---"
+      ls shopops-api/db/migrations/ 2>/dev/null | grep -i "pull\|customer_pull" || echo "(none found)"
+
+      echo "--- existing service files ---"
+      ls shopops-api/services/ 2>/dev/null | grep -i "pull\|subscription" || echo "(none found)"
+
+      echo "--- existing route files ---"
+      ls shopops-api/routes/ 2>/dev/null | grep -i "pull\|subscription" || echo "(none found)"
+
+      echo "=== verify-files COMPLETE ==="
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        You are implementing WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 in the shopops-api
+        subdirectory. CWD is the shopops repo root.
+
+        SPEC OUTPUT:
+        $read-inputs.output
+
+        FILE INVENTORY AND DEPENDENCY CHECK:
+        $verify-files.output
+
+        PREVIOUS ITERATION OUTPUT (if any):
+        $LOOP_PREV_OUTPUT
+
+        === IMPLEMENTATION REQUIREMENTS ===
+
+        1. SUBSCRIPTIONS MIGRATION (only if SUBS_STATUS=new from verify-files output)
+           File: shopops-api/db/migrations/<YYYYMMDD>_subscriptions.sql
+           CREATE TABLE IF NOT EXISTS subscriptions (
+             subscription_id  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+             tenant_id        uuid NOT NULL,
+             customer_id      uuid NOT NULL REFERENCES customers(customer_id),
+             series_id        uuid,
+             status           text NOT NULL DEFAULT 'active'
+                                CHECK (status IN ('active','paused','cancelled','expired')),
+             quantity         integer NOT NULL DEFAULT 1 CHECK (quantity > 0),
+             start_date       date,
+             end_date         date,
+             preferences      jsonb DEFAULT '{}',
+             source           text,
+             created_at       timestamptz NOT NULL DEFAULT now(),
+             updated_at       timestamptz NOT NULL DEFAULT now()
+           );
+           CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant_customer
+             ON subscriptions (tenant_id, customer_id);
+
+        2. CUSTOMER PULLS MIGRATION
+           File: shopops-api/db/migrations/<YYYYMMDD>_customer_pulls.sql
+           CREATE TABLE IF NOT EXISTS customer_pulls (
+             pull_id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+             tenant_id             uuid NOT NULL,
+             customer_id           uuid NOT NULL REFERENCES customers(customer_id),
+             issue_id              uuid NOT NULL,
+             subscription_id       uuid REFERENCES subscriptions(subscription_id),
+             quantity_requested    integer NOT NULL CHECK (quantity_requested > 0),
+             quantity_allocated    integer NOT NULL DEFAULT 0 CHECK (quantity_allocated >= 0),
+             status                text NOT NULL DEFAULT 'REQUESTED'
+                                     CHECK (status IN (
+                                       'REQUESTED','FOC_LOCKED','ALLOCATED',
+                                       'READY_TO_INVOICE','INVOICED',
+                                       'SHIPPED','PICKED_UP','CANCELLED')),
+             foc_date              date,
+             request_source        text NOT NULL
+                                     CHECK (request_source IN (
+                                       'STOREFRONT','POS','SUBSCRIPTION','LOCG','MANUAL')),
+             created_at            timestamptz NOT NULL DEFAULT now(),
+             updated_at            timestamptz NOT NULL DEFAULT now()
+           );
+           CREATE INDEX IF NOT EXISTS idx_customer_pulls_tenant_customer
+             ON customer_pulls (tenant_id, customer_id);
+           CREATE INDEX IF NOT EXISTS idx_customer_pulls_tenant_issue
+             ON customer_pulls (tenant_id, issue_id);
+           CREATE INDEX IF NOT EXISTS idx_customer_pulls_status
+             ON customer_pulls (tenant_id, status);
+           CREATE INDEX IF NOT EXISTS idx_customer_pulls_foc_date
+             ON customer_pulls (tenant_id, foc_date) WHERE status = 'REQUESTED';
+
+        3. CUSTOMER PULLS SERVICE
+           File: shopops-api/services/customerPulls.js
+           Import: db, getSafeAvailability from inventoryAvailability.js (optional — guarded)
+
+           Define LEGAL_TRANSITIONS as a Map or plain object:
+           {
+             REQUESTED:        ['FOC_LOCKED', 'CANCELLED'],
+             FOC_LOCKED:       ['ALLOCATED', 'CANCELLED'],
+             ALLOCATED:        ['READY_TO_INVOICE', 'CANCELLED'],
+             READY_TO_INVOICE: ['INVOICED'],
+             INVOICED:         ['SHIPPED', 'PICKED_UP'],
+             SHIPPED:          [],   // terminal
+             PICKED_UP:        [],   // terminal
+             CANCELLED:        [],   // terminal
+           }
+
+           export class IllegalStateTransition extends Error {
+             constructor(from, to) {
+               super(`Illegal transition: ${from} -> ${to}`);
+               this.name = 'IllegalStateTransition';
+             }
+           }
+
+           export class InsufficientInventory extends Error {
+             constructor(pullId, requested, available) {
+               super(`Insufficient inventory for pull ${pullId}: requested ${requested}, available ${available}`);
+               this.name = 'InsufficientInventory';
+             }
+           }
+
+           export async function createPull(tenantId, payload)
+             payload: { customer_id, issue_id, subscription_id?, quantity_requested,
+                        foc_date?, request_source }
+             INSERT INTO customer_pulls (...) RETURNING pull_id, status, ...
+             Return full pull row.
+
+           export async function transitionPull(tenantId, pullId, newStatus)
+             1. SELECT status FROM customer_pulls WHERE pull_id=$1 AND tenant_id=$2 FOR UPDATE
+             2. Check LEGAL_TRANSITIONS[currentStatus].includes(newStatus)
+                If not: throw new IllegalStateTransition(currentStatus, newStatus)
+             3. If newStatus === currentStatus: return current pull (idempotent)
+             4. UPDATE customer_pulls SET status=$1, updated_at=now()
+                WHERE pull_id=$2 AND tenant_id=$3 RETURNING *
+             5. Return updated pull row.
+
+           export async function getPull(tenantId, pullId)
+             SELECT * FROM customer_pulls WHERE pull_id=$1 AND tenant_id=$2
+             Return pull or null.
+
+           export async function listPulls(tenantId, filters)
+             filters: { status?, customer_id?, issue_id?, limit?, offset? }
+             SELECT * FROM customer_pulls WHERE tenant_id=$1 [AND status=$2] ...
+             ORDER BY created_at DESC LIMIT $limit OFFSET $offset
+
+           export async function assertPullBillable(pull)
+             BILLABLE_STATES = ['ALLOCATED','READY_TO_INVOICE','INVOICED','SHIPPED','PICKED_UP']
+             if (!BILLABLE_STATES.includes(pull.status)) {
+               throw new Error(`Pull ${pull.pull_id} is not billable: status=${pull.status}`)
+             }
+             // returns undefined (void) on success
+
+           export async function reconcilePullAllocation(tenantId, pullId)
+             1. getPull(tenantId, pullId)
+             2. Verify pull.status === 'FOC_LOCKED' (else throw IllegalStateTransition)
+             3. If process.env.AVAILABILITY_CHECK_ENABLED !== 'false':
+                  call getSafeAvailability(tenantId, pull.issue_id) — note: may need to map
+                  issue_id to inventory_item_id; document this join in a TODO if not yet clear
+                  if (safeAvailableQty < pull.quantity_requested):
+                    throw new InsufficientInventory(pullId, pull.quantity_requested, safeAvailableQty)
+             4. In a transaction:
+                  UPDATE inventory_items SET reserved_qty = reserved_qty + pull.quantity_requested,
+                                             updated_at = now()
+                  WHERE tenant_id=$1 AND [item lookup for issue_id]
+                  UPDATE customer_pulls SET status='ALLOCATED',
+                                           quantity_allocated=pull.quantity_requested,
+                                           updated_at=now()
+                  WHERE pull_id=$1 AND tenant_id=$2 RETURNING *
+             5. Return updated pull row.
+
+        4. REST API ROUTES
+           File: shopops-api/routes/pulls.js
+           Register on router (match existing app pattern):
+           - POST /api/pulls — create pull (requires auth, tenant-scoped)
+             Body: { customer_id, issue_id, subscription_id?, quantity_requested, foc_date?, request_source }
+             Returns: 201 { pullId, status, ... }
+           - GET /api/pulls/:pullId — get pull (auth required, tenant-scoped)
+             Returns: 200 { ... pull fields ... } or 404
+           - PATCH /api/pulls/:pullId/status — manual transition (staff only)
+             Body: { status: 'CANCELLED' | ... }
+             Returns: 200 updated pull or 409 on illegal transition
+           Mount routes in shopops-api/app.js (or equivalent entry point).
+
+        5. UNIT TESTS
+           File: shopops-api/tests/customerPulls.test.js
+           Write 7 tests using bun:test or jest-compatible, against staging Supabase:
+           - Test 1: createPull happy path — row created with status=REQUESTED
+           - Test 2: transitionPull REQUESTED -> FOC_LOCKED legal
+           - Test 3: transitionPull INVOICED -> REQUESTED illegal (throws IllegalStateTransition)
+           - Test 4: assertPullBillable throws for REQUESTED, passes for ALLOCATED
+           - Test 5: transitionPull REQUESTED -> CANCELLED (terminal, no further transitions)
+           - Test 6: createPull with subscription_id (FK satisfied)
+           - Test 7: reconcilePullAllocation with insufficient inventory throws InsufficientInventory
+           Each test asserts exact DB state with SELECT queries — not just "no error thrown".
+
+        === INVARIANTS TO PRESERVE ===
+        - NEVER allow billing from REQUESTED or FOC_LOCKED pulls (assertPullBillable enforces)
+        - LEGAL_TRANSITIONS is the single source of truth for all state machine rules
+        - IllegalStateTransition must be thrown (not just returned) for illegal moves
+        - tenant_id always in WHERE clause — all queries are tenant-scoped
+        - Pulls are demand: quantity_allocated starts at 0, set only by reconcilePullAllocation
+        - subscription_id FK is optional (not all pulls come from subscriptions)
+        - Migration uses CREATE TABLE IF NOT EXISTS (idempotent)
+
+        === DO NOT ===
+        - Do not allow billing code to bypass assertPullBillable
+        - Do not create pull rows without customer_id (FK enforced at DB level)
+        - Do not use mocks — tests run against staging Supabase
+
+        When all files are written and tests pass, output:
+        <promise>COMPLETE</promise>
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Grep Assertions for WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 ==="
+
+      FAIL=0
+
+      grep -q "createPull" shopops-api/services/customerPulls.js \
+        && echo "PASS: createPull found" \
+        || { echo "FAIL: createPull not found in services/customerPulls.js"; FAIL=1; }
+
+      grep -q "transitionPull" shopops-api/services/customerPulls.js \
+        && echo "PASS: transitionPull found" \
+        || { echo "FAIL: transitionPull not found"; FAIL=1; }
+
+      grep -q "assertPullBillable" shopops-api/services/customerPulls.js \
+        && echo "PASS: assertPullBillable found" \
+        || { echo "FAIL: assertPullBillable not found — billing invariant at risk"; FAIL=1; }
+
+      grep -qi "IllegalStateTransition\|illegal.*state\|illegal.*transition" \
+        shopops-api/services/customerPulls.js \
+        && echo "PASS: illegal state transition guard found" \
+        || { echo "FAIL: IllegalStateTransition not found — state machine unguarded"; FAIL=1; }
+
+      grep -q "InsufficientInventory" shopops-api/services/customerPulls.js \
+        && echo "PASS: InsufficientInventory error class found" \
+        || { echo "FAIL: InsufficientInventory not found — allocation gate unimplemented"; FAIL=1; }
+
+      grep -r "customer_pulls" shopops-api/db/migrations/ > /dev/null 2>&1 \
+        && echo "PASS: customer_pulls migration found in db/migrations/" \
+        || { echo "FAIL: customer_pulls migration missing from db/migrations/"; FAIL=1; }
+
+      grep -q "REQUESTED\|FOC_LOCKED\|ALLOCATED" shopops-api/services/customerPulls.js \
+        && echo "PASS: lifecycle status constants present" \
+        || { echo "FAIL: status constants not found in service file"; FAIL=1; }
+
+      grep -q "reconcilePullAllocation" shopops-api/services/customerPulls.js \
+        && echo "PASS: reconcilePullAllocation found" \
+        || { echo "FAIL: reconcilePullAllocation not found — allocation gate missing"; FAIL=1; }
+
+      # Verify assertPullBillable references REQUESTED as non-billable
+      grep -A5 "assertPullBillable" shopops-api/services/customerPulls.js \
+        | grep -qi "REQUESTED\|not billable\|billable" \
+        && echo "PASS: assertPullBillable guards REQUESTED state" \
+        || { echo "WARN: assertPullBillable may not explicitly guard REQUESTED — verify manually"; }
+
+      if [ $FAIL -ne 0 ]; then
+        echo "=== GREP ASSERTIONS: FAILED ($FAIL failures) ==="
+        exit 1
+      fi
+      echo "=== GREP ASSERTIONS: ALL PASS ==="
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Running customer pulls unit tests ==="
+
+      if [ ! -f "shopops-api/tests/customerPulls.test.js" ]; then
+        echo "ERROR: test file shopops-api/tests/customerPulls.test.js not found" >&2
+        exit 1
+      fi
+
+      cd shopops-api
+      bun test tests/customerPulls.test.js 2>&1 | tee /tmp/pulls-test-output.txt
+      TEST_EXIT=${PIPESTATUS[0]}
+
+      if [ $TEST_EXIT -ne 0 ]; then
+        echo "ERROR: customer pulls tests failed (exit $TEST_EXIT)" >&2
+        exit 1
+      fi
+
+      echo "--- Verifying DB status constraint ---"
+      psql "$SUPABASE_DB_URL" -c \
+        "INSERT INTO customer_pulls
+           (tenant_id, customer_id, issue_id, status, quantity_requested, request_source)
+         VALUES
+           (gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+            'INVALID_STATUS', 1, 'MANUAL');" \
+        2>&1 | grep -q "violates check constraint" \
+        && echo "PASS: status CHECK constraint enforced at DB level" \
+        || echo "WARN: could not verify status constraint — check DB connectivity"
+
+      echo "=== TEST RESULTS ==="
+      cat /tmp/pulls-test-output.txt
+      echo "=== TESTS PASS ==="
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-customer-pull-model-01"
+
+      echo "=== Committing WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 ==="
+
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+
+      # Stage migrations
+      git add shopops-api/db/migrations/ 2>/dev/null || true
+
+      # Stage service, routes, tests
+      git add shopops-api/services/customerPulls.js \
+              shopops-api/routes/pulls.js \
+              shopops-api/tests/customerPulls.test.js \
+              2>/dev/null || true
+
+      # Stage app.js or index.js if route was mounted
+      git add shopops-api/app.js shopops-api/index.js 2>/dev/null || true
+
+      if git diff --cached --quiet; then
+        echo "WARNING: nothing staged" >&2
+      else
+        git -c user.name="John Ranson" \
+            -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(api): WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 — customer pull model and lifecycle
+
+- Add customer_pulls table: full lifecycle REQUESTED->FOC_LOCKED->ALLOCATED->READY_TO_INVOICE->INVOICED->SHIPPED/PICKED_UP/CANCELLED
+- Add subscriptions table (if not existing)
+- Add createPull(), transitionPull(), assertPullBillable(), reconcilePullAllocation() services
+- IllegalStateTransition + InsufficientInventory error classes enforce lifecycle integrity
+- LEGAL_TRANSITIONS map is single source of truth for state machine
+- assertPullBillable() guards all invoice paths from REQUESTED/FOC_LOCKED pulls
+- REST: POST /api/pulls, GET /api/pulls/:pullId, PATCH /api/pulls/:pullId/status
+- 7 unit + integration tests against staging Supabase
+
+Closes #115"
+      fi
+
+      git push -u origin "$BRANCH"
+      echo "BRANCH=$BRANCH"
+      echo "SHA=$(git rev-parse HEAD)"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+      EXISTING=$(gh pr list --repo bluedevilcollectibles/shopops-api \
+        --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null || true)
+
+      if [ -n "$EXISTING" ]; then
+        echo "PR already exists: #$EXISTING"
+        gh pr view "$EXISTING" --repo bluedevilcollectibles/shopops-api --json url --jq '.url'
+      else
+        gh pr create \
+          --repo bluedevilcollectibles/shopops-api \
+          --base main \
+          --head "$BRANCH" \
+          --title "feat(api): WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 — customer pull model and lifecycle" \
+          --body "$(cat <<'PRBODY'
+## Summary
+
+- Implements `customer_pulls` table with full 8-state lifecycle (REQUESTED through terminal states)
+- `LEGAL_TRANSITIONS` map enforces all legal state moves; `IllegalStateTransition` thrown on violation
+- `assertPullBillable()` guards every invoice path — pulls in REQUESTED/FOC_LOCKED cannot be billed
+- `reconcilePullAllocation()` checks `safe_available_qty` before ALLOCATED transition (guarded by `AVAILABILITY_CHECK_ENABLED` flag if view not yet present)
+- Subscriptions table created if not already existing; FK from customer_pulls enforced
+- REST: `POST /api/pulls`, `GET /api/pulls/:pullId`, `PATCH /api/pulls/:pullId/status`
+- 7 unit + integration tests against staging Supabase (no mocks)
+
+## Dependencies
+
+- Requires WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 (#112) merged first (`customers` table)
+- Soft dependency on WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 (#113) for allocation gate
+
+## Test plan
+
+- [ ] `bun test tests/customerPulls.test.js` — 7 pass
+- [ ] `psql $SUPABASE_DB_URL -c "INSERT INTO customer_pulls (...) VALUES (..., 'INVALID_STATUS', ...);"` raises check constraint violation
+- [ ] `assertPullBillable({ status: 'REQUESTED' })` throws (unit test)
+- [ ] `transitionPull(id, 'INVOICED', 'REQUESTED')` throws `IllegalStateTransition` (unit test)
+- [ ] `docker exec shopops-api grep -n createPull /app/services/customerPulls.js` (Rule 19)
+
+Closes #115
+
+WO: WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01
+PRBODY
+)"
+      fi
+
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      # set -e deliberately omitted — best-effort per Rule 19
+      echo "=== Rule 19 Runtime Verify ==="
+
+      RESULT=$(docker exec shopops-api grep -n \
+        "createPull\|transitionPull\|assertPullBillable\|IllegalStateTransition" \
+        /app/services/customerPulls.js 2>&1)
+      EXIT=$?
+
+      if [ $EXIT -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "shopops-api uses COPY . /app at image build — source changes need rebuild."
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'createPull' /app/services/customerPulls.js"
+        echo "To rebuild: docker compose up -d --build shopops-api"
+      fi
+
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build the Captain CI completion manifest for WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01.
+      WO Class: CODE. Include VALIDATION: PASS.
+
+      Structure the manifest exactly as:
+
+      WO: WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01
+      Files created:
+        - shopops-api/db/migrations/<date>_customer_pulls.sql
+        - shopops-api/db/migrations/<date>_subscriptions.sql (if created by this WO)
+        - shopops-api/services/customerPulls.js
+        - shopops-api/routes/pulls.js
+        - shopops-api/tests/customerPulls.test.js
+      Files modified:
+        - shopops-api/app.js (or index.js — where pulls router was mounted)
+      Routes added:
+        - POST /api/pulls
+        - GET /api/pulls/:pullId
+        - PATCH /api/pulls/:pullId/status
+      Migrations added:
+        - customer_pulls table migration
+        - subscriptions table migration (if new)
+      Tests: 7 passing / 7 total
+      Git commit: (SHA from commit-and-push output)
+      PR URL: (URL from open-pr output)
+      Branch: wo/shopops-pull-list-customer-pull-model-01
+
+      Dependency status:
+        - customers table: VERIFIED (from verify-files output)
+        - subscriptions table: (new or existing — from verify-files output)
+        - v_inventory_availability: (present or absent — from verify-files output; if absent, AVAILABILITY_CHECK_ENABLED=false documented)
+
+      GREP ASSERTIONS:
+      $verify-grep.output
+
+      TEST RESULTS:
+      $verify-tests.output
+
+      COMMIT + PUSH:
+      $commit-and-push.output
+
+      PR:
+      $open-pr.output
+
+      RULE 19 RUNTIME VERIFY:
+      $runtime-verify.output
+
+      VALIDATION: PASS
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 to REVIEW status.
+
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Steps:
+      1. Search for the Notion page with WO ID = "WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01"
+      2. Update the page:
+         - Property "Claude Status" -> "REVIEW"
+         - Property "Status" -> "Review"
+         - Append to Notes: the full manifest from $build-manifest.output
+      3. Confirm the update by fetching the page properties.
+
+      If Notion MCP is unavailable or page not found, output exactly:
+      XO_TODO: Manually flip WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 to REVIEW in Notion.
+      Paste manifest below into Notes field.
+
+      MANIFEST:
+      $build-manifest.output

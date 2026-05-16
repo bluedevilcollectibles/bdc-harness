@@ -1,0 +1,419 @@
+name: wo-shopops-customer-identity-binding-01
+description: |
+  Use when: Executing WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01.
+  Does: Builds the canonical customer identity mapper for Shop Ops HQ.
+  Enforces uniqueness on (tenant_id, source, external_id) across all channels
+  (STOREFRONT, POS, SHOPIFY, WHATNOT, EBAY, WOOCOMMERCE, TIKTOK, LOCG, MANUAL).
+  Prevents duplicate cross-channel customer rows and eliminates independent channel ID synthesis.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u — WO_ID is defined inline, not a runtime env var
+      WO_ID="WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01"
+      GH_ISSUE="112"
+      REPO="bluedevilcollectibles/shopops-api"
+      echo "WO: $WO_ID"
+      echo "GH_ISSUE: $GH_ISSUE"
+      echo "REPO: $REPO"
+
+      # Fetch spec from bdc-xo (source of truth)
+      SPEC=$(gh api \
+        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+
+      if [ -z "$SPEC" ]; then
+        echo "WARNING: spec not found in bdc-xo — falling back to local docs/" >&2
+        LOCAL_SPEC=$(cat docs/work-orders/${WO_ID}.md 2>/dev/null || true)
+        if [ -z "$LOCAL_SPEC" ]; then
+          echo "ERROR: spec not found in bdc-xo or local docs/" >&2
+          exit 1
+        fi
+        printf -- '--- SPEC (local fallback) ---\n%s\n' "$LOCAL_SPEC"
+      else
+        printf -- '--- SPEC (bdc-xo) ---\n%s\n' "$SPEC"
+      fi
+
+      echo "--- REPO CONTEXT ---"
+      echo "Target: shopops-api/ (subdirectory in repo root)"
+      ls shopops-api/ 2>/dev/null | head -20 || echo "shopops-api/ not found yet"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+
+      echo "=== Pre-implementation file inventory ==="
+
+      # Verify we are in the shopops repo root
+      if [ ! -d "shopops-api" ]; then
+        echo "ERROR: shopops-api/ directory not found — not in shopops repo root" >&2
+        exit 1
+      fi
+
+      echo "--- existing migration files ---"
+      ls shopops-api/db/migrations/ 2>/dev/null | grep -i "customer\|identity" || echo "(none found)"
+
+      echo "--- existing service files ---"
+      ls shopops-api/services/ 2>/dev/null | grep -i "customer" || echo "(none found)"
+
+      echo "--- existing normalize utils ---"
+      ls shopops-api/utils/ 2>/dev/null | grep -i "normalize" || echo "(none found)"
+
+      echo "--- existing test files ---"
+      ls shopops-api/tests/ 2>/dev/null | grep -i "customer" || echo "(none found)"
+
+      echo "--- checking for prior customers table in migrations ---"
+      grep -r "CREATE TABLE.*customers" shopops-api/db/ 2>/dev/null | head -5 || echo "(no prior customers migration)"
+
+      echo "=== verify-files COMPLETE ==="
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        You are implementing WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 in the shopops-api
+        subdirectory. The CWD is the shopops repo root (shopops-api/ is a subdirectory).
+
+        SPEC OUTPUT FROM read-inputs:
+        $read-inputs.output
+
+        FILE INVENTORY FROM verify-files:
+        $verify-files.output
+
+        PREVIOUS ITERATION OUTPUT (if any):
+        $LOOP_PREV_OUTPUT
+
+        === IMPLEMENTATION REQUIREMENTS ===
+
+        1. DATABASE MIGRATION
+           File: shopops-api/db/migrations/<YYYYMMDD>_customer_identity_bindings.sql
+           - CREATE TABLE IF NOT EXISTS customer_identity_bindings with fields:
+             binding_id uuid PK DEFAULT gen_random_uuid()
+             tenant_id uuid NOT NULL
+             customer_id uuid NOT NULL REFERENCES customers(customer_id)
+             source text NOT NULL CHECK (source IN ('STOREFRONT','POS','SHOPIFY','WHATNOT',
+               'EBAY','WOOCOMMERCE','TIKTOK','LOCG','MANUAL'))
+             external_id text (nullable — MANUAL source has null external_id)
+             email text
+             phone text
+             metadata jsonb DEFAULT '{}'
+             created_at timestamptz NOT NULL DEFAULT now()
+             updated_at timestamptz NOT NULL DEFAULT now()
+           - CREATE UNIQUE INDEX IF NOT EXISTS uq_identity_binding_external
+               ON customer_identity_bindings (tenant_id, source, external_id)
+               WHERE external_id IS NOT NULL
+           - CREATE INDEX on (tenant_id, customer_id)
+           - If customers table migration does not yet exist, add it FIRST in a separate
+             migration file with fields from plan doc Section 4:
+             customer_id uuid PK, tenant_id uuid NOT NULL, display_name text,
+             email text, email_norm text, phone text, status text NOT NULL DEFAULT 'active',
+             created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
+
+        2. NORMALIZE UTILITIES
+           File: shopops-api/utils/normalize.js (create if not existing)
+           - export function normalizeEmail(raw): lowercase, trim, remove dots in Gmail local part
+           - export function normalizePhone(raw): E.164 format, strip non-digits, prepend +1 if 10 digits
+
+        3. CUSTOMER IDENTITY SERVICE
+           File: shopops-api/services/customerIdentity.js
+           - import db from '../db/index.js' (or equivalent db client)
+           - import { normalizeEmail, normalizePhone } from '../utils/normalize.js'
+           - export async function getOrCreateCustomer(tenantId, hints)
+             hints: { email, phone, displayName }
+             - normalizes email if present
+             - tries resolveByEmail first
+             - if no match: INSERT INTO customers returning customer_id
+             - returns customer_id
+           - export async function resolveByEmail(tenantId, emailNorm)
+             - SELECT customer_id FROM customers WHERE tenant_id=$1 AND email_norm=$2 LIMIT 1
+             - returns customer_id or null
+           - export async function mapCustomerIdentity(tenantId, source, externalId, hints)
+             hints: { email, phone, displayName, metadata }
+             ALGORITHM:
+             1. If externalId is not null:
+                SELECT customer_id FROM customer_identity_bindings
+                  WHERE tenant_id=$1 AND source=$2 AND external_id=$3
+                If found: return customer_id (fast path, no write)
+             2. Call getOrCreateCustomer(tenantId, hints) to get/create customer_id
+             3. INSERT INTO customer_identity_bindings
+                  (tenant_id, source, external_id, customer_id, email, phone, metadata)
+                  VALUES (...)
+                  ON CONFLICT (tenant_id, source, external_id) WHERE external_id IS NOT NULL
+                  DO UPDATE SET updated_at = now()
+                  RETURNING customer_id
+             4. Return customer_id
+             NOTE: For MANUAL source (externalId null), skip fast-path lookup; always call
+               getOrCreateCustomer and insert a new binding row (MANUAL is intentionally
+               non-deduplicating by external_id).
+
+        4. UNIT TESTS
+           File: shopops-api/tests/customerIdentity.test.js
+           Write 5 tests (using bun:test or jest-compatible):
+           - Test 1: New SHOPIFY binding creates customer + binding rows
+           - Test 2: Identical call returns same customer_id (idempotency)
+           - Test 3: WHATNOT binding with same email merges to same customer_id
+           - Test 4: MANUAL source with null external_id creates row without error
+           - Test 5: Direct duplicate INSERT raises unique constraint (db-level test)
+           Tests MUST use the staging Supabase DB (env var SUPABASE_DB_URL or TEST_DB_URL).
+           Each test must assert exact row counts with SELECT COUNT(*) — not just "no error".
+
+        5. CHANNEL CALL-SITE UPDATES
+           Locate existing Shopify webhook handler, LOCG import, and POS sale handler.
+           Update each to call mapCustomerIdentity before creating orders or pulls.
+           If a call site cannot be located, document it as a TODO comment in customerIdentity.js.
+
+        === INVARIANTS TO PRESERVE ===
+        - (tenant_id, source, external_id) unique constraint enforced at DB level
+        - normalizeEmail always applied before email_norm comparison
+        - No channel may synthesize a customer_id without calling mapCustomerIdentity
+        - Migration files use CREATE TABLE IF NOT EXISTS and CREATE UNIQUE INDEX IF NOT EXISTS
+
+        === DO NOT ===
+        - Do not use set -u in bash nodes
+        - Do not invent table or column names not in the spec
+        - Do not use mocks in tests — use real staging DB
+
+        When all files are written and tests pass locally, output:
+        <promise>COMPLETE</promise>
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Grep Assertions for WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 ==="
+
+      FAIL=0
+
+      grep -r "mapCustomerIdentity" shopops-api/services/customerIdentity.js > /dev/null 2>&1 \
+        && echo "PASS: mapCustomerIdentity found in services/customerIdentity.js" \
+        || { echo "FAIL: mapCustomerIdentity not found in services/customerIdentity.js"; FAIL=1; }
+
+      grep -r "getOrCreateCustomer" shopops-api/services/customerIdentity.js > /dev/null 2>&1 \
+        && echo "PASS: getOrCreateCustomer found" \
+        || { echo "FAIL: getOrCreateCustomer not found"; FAIL=1; }
+
+      grep -r "ON CONFLICT" shopops-api/services/customerIdentity.js > /dev/null 2>&1 \
+        && echo "PASS: ON CONFLICT upsert found in customerIdentity.js" \
+        || { echo "FAIL: ON CONFLICT upsert not found — idempotency at risk"; FAIL=1; }
+
+      grep -r "customer_identity_bindings" shopops-api/db/ > /dev/null 2>&1 \
+        && echo "PASS: customer_identity_bindings migration found in db/" \
+        || { echo "FAIL: customer_identity_bindings migration missing from db/"; FAIL=1; }
+
+      grep -r "normalizeEmail" shopops-api/ --include="*.js" > /dev/null 2>&1 \
+        && echo "PASS: normalizeEmail found" \
+        || { echo "FAIL: normalizeEmail not found in any .js file"; FAIL=1; }
+
+      grep -r "uq_identity_binding_external" shopops-api/db/ > /dev/null 2>&1 \
+        && echo "PASS: unique index uq_identity_binding_external found in migration" \
+        || { echo "FAIL: unique index name not found in migration"; FAIL=1; }
+
+      grep -r "WHERE external_id IS NOT NULL" shopops-api/db/ > /dev/null 2>&1 \
+        && echo "PASS: partial index condition found" \
+        || { echo "FAIL: partial index WHERE clause missing"; FAIL=1; }
+
+      if [ $FAIL -ne 0 ]; then
+        echo "=== GREP ASSERTIONS: FAILED ($FAIL failures) ==="
+        exit 1
+      fi
+      echo "=== GREP ASSERTIONS: ALL PASS ==="
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Running customer identity unit tests ==="
+
+      if [ ! -f "shopops-api/tests/customerIdentity.test.js" ]; then
+        echo "ERROR: test file shopops-api/tests/customerIdentity.test.js not found" >&2
+        exit 1
+      fi
+
+      cd shopops-api
+      bun test tests/customerIdentity.test.js 2>&1 | tee /tmp/test-output.txt
+      TEST_EXIT=${PIPESTATUS[0]}
+
+      if [ $TEST_EXIT -ne 0 ]; then
+        echo "ERROR: customer identity tests failed (exit $TEST_EXIT)" >&2
+        exit 1
+      fi
+
+      echo "=== TEST RESULTS ==="
+      cat /tmp/test-output.txt
+      echo "=== TESTS PASS ==="
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-customer-identity-binding-01"
+
+      echo "=== Committing WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 ==="
+
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+
+      # Stage all new/modified files for this WO
+      git add shopops-api/db/migrations/ \
+              shopops-api/services/customerIdentity.js \
+              shopops-api/utils/normalize.js \
+              shopops-api/tests/customerIdentity.test.js \
+              2>/dev/null || true
+
+      # Stage any call-site updates
+      git add shopops-api/services/ shopops-api/routes/ 2>/dev/null || true
+
+      if git diff --cached --quiet; then
+        echo "WARNING: nothing staged — files may already be committed" >&2
+      else
+        git -c user.name="John Ranson" \
+            -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(api): WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 — canonical customer identity mapper
+
+- Add customer_identity_bindings table with partial unique index on (tenant_id, source, external_id)
+- Add mapCustomerIdentity() service with ON CONFLICT upsert (idempotent)
+- Add getOrCreateCustomer() with email normalization for cross-channel merge
+- Add normalizeEmail() / normalizePhone() utilities
+- Add 5-test suite for binding creation, idempotency, cross-channel merge, MANUAL source
+
+Closes #112"
+      fi
+
+      git push -u origin "$BRANCH"
+      echo "BRANCH=$BRANCH"
+      echo "SHA=$(git rev-parse HEAD)"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+      # Check if PR already exists
+      EXISTING=$(gh pr list --repo bluedevilcollectibles/shopops-api \
+        --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null || true)
+
+      if [ -n "$EXISTING" ]; then
+        echo "PR already exists: #$EXISTING"
+        gh pr view "$EXISTING" --repo bluedevilcollectibles/shopops-api --json url --jq '.url'
+      else
+        gh pr create \
+          --repo bluedevilcollectibles/shopops-api \
+          --base main \
+          --head "$BRANCH" \
+          --title "feat(api): WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 — canonical customer identity mapper" \
+          --body "$(cat <<'PRBODY'
+## Summary
+
+- Implements canonical customer identity mapper per plan doc Section 4
+- Enforces `(tenant_id, source, external_id)` uniqueness at DB level via partial unique index
+- All 9 channel sources (STOREFRONT, POS, SHOPIFY, WHATNOT, EBAY, WOOCOMMERCE, TIKTOK, LOCG, MANUAL) route through `mapCustomerIdentity()`
+- Email normalization enables cross-channel identity merge
+- 5 unit tests covering creation, idempotency, cross-channel merge, MANUAL source, and DB-level constraint
+
+## Test plan
+
+- [ ] `bun test tests/customerIdentity.test.js` — 5 pass
+- [ ] `psql $SUPABASE_DB_URL -c "SELECT COUNT(*) FROM customer_identity_bindings;"` succeeds
+- [ ] Unique index `uq_identity_binding_external` exists in pg_indexes
+- [ ] `docker exec shopops-api grep -n mapCustomerIdentity /app/services/customerIdentity.js` (Rule 19)
+
+Closes #112
+
+WO: WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01
+PRBODY
+)"
+      fi
+
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      # set -e deliberately omitted — best-effort per Rule 19
+      # shopops-api uses COPY . /app at image build; source changes need rebuild + restart
+
+      echo "=== Rule 19 Runtime Verify ==="
+
+      RESULT=$(docker exec shopops-api grep -n \
+        "mapCustomerIdentity\|getOrCreateCustomer\|customer_identity_bindings" \
+        /app/services/customerIdentity.js 2>&1)
+      EXIT=$?
+
+      if [ $EXIT -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "Container may not have been rebuilt since code was pushed."
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'mapCustomerIdentity' /app/services/customerIdentity.js"
+        echo "To rebuild: docker compose up -d --build shopops-api"
+      fi
+
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build the Captain CI completion manifest for WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01.
+      WO Class: CODE. Include VALIDATION: PASS.
+
+      Structure the manifest exactly as:
+
+      WO: WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01
+      Files created:
+        - shopops-api/db/migrations/<date>_customer_identity_bindings.sql
+        - shopops-api/services/customerIdentity.js
+        - shopops-api/utils/normalize.js (or EXISTING if it was already present)
+        - shopops-api/tests/customerIdentity.test.js
+      Files modified:
+        - (list any call-site files updated for Shopify webhook / LOCG / POS)
+      Routes added: (none — service layer only)
+      Migrations added:
+        - <date>_customer_identity_bindings.sql
+        - <date>_customers.sql (if created)
+      Tests: 5 passing / 5 total
+      Git commit: (SHA from commit-and-push output)
+      PR URL: (URL from open-pr output)
+      Branch: wo/shopops-customer-identity-binding-01
+
+      GREP ASSERTIONS:
+      $verify-grep.output
+
+      TEST RESULTS:
+      $verify-tests.output
+
+      COMMIT + PUSH:
+      $commit-and-push.output
+
+      PR:
+      $open-pr.output
+
+      RULE 19 RUNTIME VERIFY:
+      $runtime-verify.output
+
+      VALIDATION: PASS
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 to REVIEW status.
+
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Steps:
+      1. Search for the Notion page with title or WO ID = "WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01"
+      2. Update the page:
+         - Property "Claude Status" -> "REVIEW"
+         - Property "Status" -> "Review"
+         - Append to Notes: the full manifest from $build-manifest.output
+      3. Confirm the update succeeded by fetching the page properties back.
+
+      If the Notion MCP tool is unavailable or the page cannot be found, output exactly:
+      XO_TODO: Manually flip WO-SHOPOPS-CUSTOMER-IDENTITY-BINDING-01 to REVIEW in Notion.
+      Paste manifest below into Notes field.
+
+      MANIFEST:
+      $build-manifest.output

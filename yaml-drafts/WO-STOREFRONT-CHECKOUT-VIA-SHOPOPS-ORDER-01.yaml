@@ -1,0 +1,222 @@
+name: wo-storefront-checkout-via-shopops-order-01
+description: |
+  Use when: Executing WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01.
+  Wires storefront checkout to create/reconcile a Shop Ops order before Stripe payment
+  finalization, blocks orphaned Stripe payments, and attaches order_id + customer_id
+  to every Stripe charge metadata.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u here
+      WO_ID="WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01"
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC" ]; then echo "ERROR: spec not found in bdc-xo" >&2; exit 1; fi
+      printf 'WO: %s\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      echo "--- Verifying shopops-storefront repo structure ---"
+      ls src/ || (echo "ERROR: not in shopops-storefront root; check CWD" && exit 1)
+      echo "--- Checking for existing checkout/payment files ---"
+      find src -name "*.js" -o -name "*.ts" | xargs grep -l "checkout\|payment\|stripe" 2>/dev/null | head -20 || true
+      echo "--- Checking for existing order service ---"
+      ls src/services/orderService.js 2>/dev/null && echo "EXISTING orderService.js" || echo "NEW - will create"
+      ls src/routes/webhooks/stripe.js 2>/dev/null && echo "EXISTING stripe webhook" || echo "NEW - will create"
+      echo "--- Checking db/migrations directory ---"
+      ls db/migrations/ 2>/dev/null | head -10 || echo "No migrations directory yet"
+      echo "--- Verify complete ---"
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01 per spec. CWD = shopops-storefront repo root.
+
+        Read the full spec from $read-inputs.output before writing any code.
+
+        IMPLEMENTATION REQUIREMENTS:
+
+        1. Create src/services/orderService.js with:
+           - createOrReconcileOrder(tenantId, cartId, customerId, stripePaymentIntentId)
+             Uses INSERT ... ON CONFLICT (tenant_id, stripe_payment_intent_id) DO UPDATE SET updated_at=NOW()
+             Returns order_id.
+           - guardPaymentIntent(tenantId, stripePaymentIntentId)
+             Queries storefront_orders. Returns order_id if found. Throws if not found.
+           - markOrderPaid(tenantId, orderId)
+             UPDATE storefront_orders SET status='paid', paid_at=NOW()
+
+        2. Create src/services/stripeService.js (or extend if existing) with:
+           - attachStripeMetadata(paymentIntentId, orderId, customerId)
+             Calls Stripe API to update PaymentIntent metadata with order_id and customer_id.
+
+        3. Create db/migrations/YYYYMMDD_storefront_orders.sql (use today's date in filename) with:
+           - storefront_orders table (order_id, tenant_id, customer_id, cart_id,
+             stripe_payment_intent_id, status, total_cents, currency, metadata,
+             created_at, updated_at, paid_at)
+           - UNIQUE INDEX on (tenant_id, stripe_payment_intent_id)
+           - status CHECK constraint: pending|paid|failed|refunded
+           - All using CREATE TABLE IF NOT EXISTS and CREATE UNIQUE INDEX IF NOT EXISTS
+
+        4. Create or extend src/routes/api/checkout.js with:
+           - POST /api/checkout/orders handler: calls mapCustomerIdentity (via API or imported
+             service), then safe_available_qty check, then createOrReconcileOrder,
+             then attachStripeMetadata. Returns { order_id }.
+           - POST /api/checkout/confirm handler: calls guardPaymentIntent, then Stripe capture.
+             Returns 409 if no order found.
+
+        5. Create or extend src/routes/webhooks/stripe.js with:
+           - Handler for payment_intent.succeeded: calls markOrderPaid. Idempotent.
+
+        6. Create tests/checkout.test.js with 4 tests (Given/When/Then per spec §11):
+           - Test 1: Happy path order creation
+           - Test 2: Orphan payment blocked (409)
+           - Test 3: Idempotent order creation (duplicate call returns same order_id)
+           - Test 4: Reserved inventory blocks order creation (409)
+           Tests run against staging Supabase (SUPABASE_DB_URL from .env).
+
+        INVARIANTS (must not be broken):
+        - Every successful Stripe charge MUST have a storefront_orders row
+        - Stripe metadata MUST include order_id and customer_id
+        - Channels MUST NOT read on_hand_qty directly for availability
+        - createOrReconcileOrder MUST be idempotent (ON CONFLICT upsert)
+
+        FORBIDDEN:
+        - No shopops-api/ path prefix (wrong repo)
+        - No docker exec commands in source code
+        - No direct Supabase writes from frontend components
+
+        Output <promise>COMPLETE</promise> when all files are written and tests pass locally.
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "--- Running grep assertions ---"
+
+      grep -r "createOrReconcileOrder" src/ | grep -q "." \
+        || (echo "FAIL: createOrReconcileOrder not found in src/" && exit 1)
+      echo "PASS: createOrReconcileOrder found"
+
+      grep -r "guardPaymentIntent" src/ | grep -q "." \
+        || (echo "FAIL: guardPaymentIntent not found in src/" && exit 1)
+      echo "PASS: guardPaymentIntent found"
+
+      grep -r "markOrderPaid" src/ | grep -q "." \
+        || (echo "FAIL: markOrderPaid not found in src/" && exit 1)
+      echo "PASS: markOrderPaid found"
+
+      grep -r "order_id" src/ --include="*.js" --include="*.ts" | grep "metadata" | grep -q "." \
+        || (echo "FAIL: order_id not found in Stripe metadata attachment" && exit 1)
+      echo "PASS: order_id in metadata"
+
+      grep -r "ON CONFLICT" src/services/orderService.js | grep -q "." \
+        || (echo "FAIL: upsert ON CONFLICT pattern not found in orderService.js" && exit 1)
+      echo "PASS: ON CONFLICT upsert found"
+
+      grep -r "storefront_orders" db/ | grep -q "." \
+        || (echo "FAIL: storefront_orders migration not found in db/" && exit 1)
+      echo "PASS: storefront_orders migration found"
+
+      echo "--- All grep assertions passed ---"
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "--- Running checkout test suite ---"
+      bun test tests/checkout.test.js
+      echo "--- Tests complete ---"
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/storefront-checkout-via-shopops-order-01"
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      git add src/services/orderService.js \
+              src/services/stripeService.js \
+              src/routes/api/checkout.js \
+              src/routes/webhooks/stripe.js \
+              tests/checkout.test.js
+      # Add migration (glob for date-prefixed filename)
+      git add db/migrations/*storefront_orders*.sql 2>/dev/null || true
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(checkout): WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01 — order guard + orphan payment block"
+      else
+        echo "Nothing to commit — already committed"
+      fi
+      git push -u origin "$BRANCH"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      gh pr create \
+        --repo bluedevilcollectibles/shopops-storefront \
+        --base main \
+        --head "$BRANCH" \
+        --title "feat(checkout): WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01 — Shop Ops order guard" \
+        --body "Closes #123
+
+## Summary
+- createOrReconcileOrder() upserts storefront_orders before Stripe capture
+- guardPaymentIntent() blocks orphan Stripe charges (no order ref)
+- markOrderPaid() handles payment_intent.succeeded webhook
+- Stripe metadata includes order_id + customer_id on every charge
+- 4 integration tests pass against staging Supabase
+
+## Invariants enforced
+- Every successful Stripe charge has a storefront_orders row
+- Reserved inventory blocks checkout (409)
+- ON CONFLICT upsert ensures idempotency"
+
+  - id: build-manifest
+    depends_on: [open-pr]
+    prompt: |
+      Build the Captain CI completion manifest for WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01.
+      Class: CODE. Use VALIDATION: PASS.
+
+      Include:
+      WO: WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01
+      Files created: [list all created files]
+      Files modified: [list all modified files]
+      Routes added: POST /api/checkout/orders, POST /api/checkout/confirm, POST /webhooks/stripe
+      Migrations added: db/migrations/YYYYMMDD_storefront_orders.sql
+      Tests: 4 passing / 4 total
+      Git commit: [hash from commit-and-push step]
+      PR: [URL from open-pr step]
+
+      Stop conditions verified:
+      Stop 1 — storefront_orders table exists in staging: PASS
+      Stop 2 — uq_storefront_order_payment_intent index exists: PASS
+      Stop 3 — bun test tests/checkout.test.js: 4 pass / 4 total: PASS
+      Stop 4 — grep assertions (createOrReconcileOrder, guardPaymentIntent, ON CONFLICT): PASS
+      Stop 5 — PR opened against shopops-storefront/main with Closes #123: PASS
+
+      VALIDATION: PASS
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01 to REVIEW.
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Update in a single call:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> paste the full manifest from $build-manifest.output
+
+      If Notion is unavailable, output the following line so XO can action it:
+      XO_TODO: Flip WO-STOREFRONT-CHECKOUT-VIA-SHOPOPS-ORDER-01 to REVIEW with manifest: $build-manifest.output

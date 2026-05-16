@@ -1,0 +1,451 @@
+# WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01.yaml
+# Drafted 2026-05-16 for WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 (GH Issue #117, P0).
+# Pattern: bdc-shopops-cover-cascade-prh-visibility-01.yaml (gold-standard DAG shape).
+# Doctrine compliance: bdc-harness CLAUDE.md + YAML format rules.
+#
+# Pre-flight:
+#   - Codebase bluedevilcollectibles/shopops must be registered in Archon.
+#   - WO spec committed in bdc-xo at docs/work-orders/WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01.md
+#   - Dependency WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 DONE (customer_pulls table exists).
+#   - Dependency WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 DONE (inventory_items receipt fields exist).
+#
+# NOTE ON CWD: Archon clones bluedevilcollectibles/shopops into its worktree.
+#   CWD = shopops repo root. shopops-api/ is a SUBDIRECTORY.
+#
+# NOTE ON BRANCH: shopops default branch is master (NOT main). PRs target master.
+#
+# NOTE ON RULE 19: shopops-api uses COPY . /app at image build time.
+#   Source changes need container rebuild + restart. runtime-verify enforces with docker exec grep.
+#
+# parallel_ok: false — P0 priority; allocation engine is core to billing path.
+#   Do NOT fire while any other allocation WO is in-flight.
+#
+# Deploy sync: C:\Users\pcmed\projects\BDC_XO\scripts\archon-bridge\sync-workflows.sh \
+#   WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01.yaml
+
+name: wo-shopops-pull-list-allocation-engine-01
+description: |
+  Use when: Executing WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 —
+        Build the pull-list allocation engine and supporting schema.
+  Does: (1) reads WO spec from bdc-xo cross-repo;
+        (2) verifies dependency tables exist (customer_pulls, pull_list_allocations,
+            allocation_lifecycle_events, inventory_items);
+        (3) writes migration 20260517_allocation_engine_fields.sql (fulfilled_at,
+            invoiced_at, allocated_at columns; RELEASED status; allocation_exceptions table);
+        (4) writes services/allocationEngine.js (runAllocationPass, reserveForPull,
+            createShortageException) with four priority tiers;
+        (5) extends routes/allocations.js with POST /allocations/run,
+            GET /allocations/exceptions, POST /allocations/:id/release;
+        (6) writes tests/test_allocation_engine_p0.js (6 scenarios);
+        (7) runs bun tests (new + existing test_allocation_engine_v2.js);
+        (8) commits + pushes + opens PR against master;
+        (9) Rule 19 runtime grep;
+        (10) builds CODE-class manifest;
+        (11) flips Notion to REVIEW.
+  Repo: bluedevilcollectibles/shopops (master branch). shopops-api/ subdir.
+  Spec lives in bluedevilcollectibles/bdc-xo (docs/work-orders/).
+  parallel_ok: false — billing-critical path.
+  NOT for: any other WO.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+
+  # ---------------------------------------------------------------------------
+  # 1. READ-INPUTS — fetch WO spec from bdc-xo cross-repo
+  # ---------------------------------------------------------------------------
+  - id: read-inputs
+    bash: |
+      WO_ID="WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01"
+      echo "WO: $WO_ID"
+
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+
+      if [ -z "$SPEC" ]; then
+        echo "ERROR: spec not found for ${WO_ID} in bdc-xo docs/work-orders/" >&2
+        exit 1
+      fi
+
+      printf 'WO_ID=%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$WORKFLOW_ID"
+      printf -- '--- SPEC ---\n%s\n' "$SPEC"
+
+  # ---------------------------------------------------------------------------
+  # 2. VERIFY-FILES — confirm all dependency tables and existing service files
+  # ---------------------------------------------------------------------------
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      ls shopops-api/ || (echo "ERROR: not in shopops repo root" >&2; exit 1)
+
+      echo "=== shopops-api/routes/allocations.js ==="
+      ls shopops-api/routes/allocations.js || (echo "ERROR: allocations.js not found" >&2; exit 1)
+      echo "allocations.js: OK"
+
+      echo ""
+      echo "=== Verify pull_list_allocations exists (migration reference) ==="
+      ALLOC=$(grep -rl "pull_list_allocations" shopops-api/migrations/ 2>/dev/null | head -1 || true)
+      if [ -z "$ALLOC" ]; then
+        echo "ERROR: pull_list_allocations not found in migrations — dependency WOs incomplete" >&2
+        exit 1
+      fi
+      echo "pull_list_allocations found: $ALLOC"
+
+      echo ""
+      echo "=== Verify allocation_lifecycle_events exists ==="
+      ALE=$(grep -rl "allocation_lifecycle_events" shopops-api/migrations/ 2>/dev/null | head -1 || true)
+      if [ -z "$ALE" ]; then
+        echo "ERROR: allocation_lifecycle_events not found in migrations — migration 092 missing?" >&2
+        exit 1
+      fi
+      echo "allocation_lifecycle_events found: $ALE"
+
+      echo ""
+      echo "=== Verify customer_pulls exists ==="
+      CPULLS=$(grep -rl "customer_pulls" shopops-api/migrations/ shopops-api/routes/ 2>/dev/null | head -1 || true)
+      if [ -z "$CPULLS" ]; then
+        echo "ERROR: customer_pulls not found — dependency WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 incomplete" >&2
+        exit 1
+      fi
+      echo "customer_pulls found: $CPULLS"
+
+      echo ""
+      echo "=== Verify inventory_items exists ==="
+      INV=$(grep -rl "inventory_items" shopops-api/migrations/ 2>/dev/null | head -1 || true)
+      if [ -z "$INV" ]; then
+        echo "ERROR: inventory_items not found in migrations" >&2
+        exit 1
+      fi
+      echo "inventory_items found: $INV"
+
+      echo ""
+      echo "=== Current allocations.js routes ==="
+      grep -n "router\." shopops-api/routes/allocations.js 2>/dev/null | head -20 || echo "(none)"
+
+      echo ""
+      echo "=== Existing allocationEngine.js ==="
+      ls shopops-api/services/allocationEngine.js 2>/dev/null && \
+        grep -n "runAllocationPass\|reserveForPull\|tier" shopops-api/services/allocationEngine.js | head -10 || \
+        echo "(allocationEngine.js not yet present — will create)"
+
+      echo ""
+      echo "=== Migration directory (tail) ==="
+      ls shopops-api/migrations/ | sort | tail -10
+
+      echo "STATUS=ok"
+
+  # ---------------------------------------------------------------------------
+  # 3. IMPLEMENT — write migration, allocationEngine.js, extend allocations.js, write tests
+  # ---------------------------------------------------------------------------
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 per the spec.
+
+        CWD = shopops repo root. shopops-api/ is a subdirectory.
+
+        ## Spec
+        $read-inputs.output
+
+        ## Current state
+        $verify-files.output
+
+        ## Execution Rules
+
+        1. Create `shopops-api/migrations/20260517_allocation_engine_fields.sql`:
+           - ADD COLUMN fulfilled_at TIMESTAMPTZ to pull_list_allocations.
+           - ADD COLUMN invoiced_at TIMESTAMPTZ to pull_list_allocations.
+           - ADD COLUMN allocated_at TIMESTAMPTZ NOT NULL DEFAULT now() to pull_list_allocations.
+           - DROP and recreate fulfillment_status CHECK to include RELEASED and PICKED_UP (replacing SHOW_PICKUP).
+             Do NOT break existing rows — the migration must handle existing SHOW_PICKUP values
+             by UPDATE-ing them to PICKED_UP before dropping the old constraint.
+           - CREATE TABLE allocation_exceptions with columns:
+             id UUID PK, tenant_id TEXT NOT NULL, foc_date DATE NOT NULL,
+             pull_id UUID NOT NULL REFERENCES customer_pulls(id) ON DELETE CASCADE,
+             customer_id TEXT NOT NULL,
+             inventory_item_id UUID REFERENCES inventory_items(id),
+             tier INTEGER NOT NULL,
+             exception_type TEXT NOT NULL CHECK (exception_type IN ('SHORTAGE','NO_INVENTORY','PARTIAL')),
+             quantity_requested INTEGER NOT NULL,
+             quantity_available INTEGER NOT NULL,
+             resolved_at TIMESTAMPTZ,
+             resolved_by TEXT,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now().
+
+        2. Create or extend `shopops-api/services/allocationEngine.js`:
+           - Export `runAllocationPass(client, tenantId, focDate)`:
+             a. SELECT customer_pulls WHERE foc_date = focDate AND tenant_id = tenantId
+                AND status NOT IN ('CANCELLED','PICKED_UP','FULFILLED','VOID') AND deleted_at IS NULL
+                ORDER BY tier ASC NULLS LAST, created_at ASC.
+             b. For each pull in Tier 1, then Tier 2, then Tier 3:
+                - SELECT on_hand_qty, reserved_qty FROM inventory_items WHERE issue_id = pull.issue_id AND tenant_id = tenantId AND deleted_at IS NULL.
+                - available_qty = MAX(0, on_hand_qty - reserved_qty).
+                - If available_qty >= pull.quantity_requested: call reserveForPull(pull, pull.quantity_requested).
+                - If 0 < available_qty < pull.quantity_requested: call reserveForPull(pull, available_qty) then createShortageException(pull, pull.quantity_requested, available_qty).
+                - If available_qty == 0: call createShortageException(pull, pull.quantity_requested, 0).
+             c. Tier 4 (shelf/live): no customer pull action. Remaining available_qty stays sellable.
+             d. Return { allocations_created, shortage_exceptions }.
+           - Export `reserveForPull(client, tenantId, pull, inventoryItemId, qty)`:
+             a. UPDATE inventory_items SET reserved_qty = reserved_qty + qty
+                WHERE id = inventoryItemId AND (on_hand_qty - reserved_qty) >= qty — fail with error if 0 rows updated.
+             b. INSERT INTO pull_list_allocations (tenant_id, pull_id, customer_id, inventory_item_id,
+                qty_allocated, tier, fulfillment_status='RESERVED', allocated_at=now())
+                ON CONFLICT (tenant_id, pull_id, inventory_item_id) DO NOTHING.
+             c. UPDATE customer_pulls SET quantity_allocated = qty, status = 'ALLOCATED' WHERE id = pull.id.
+             d. INSERT INTO allocation_lifecycle_events (tenant_id, allocation_id, fulfillment_status_before=NULL,
+                fulfillment_status_after='RESERVED', trigger='allocation-run', actor='system').
+           - Export `createShortageException(client, tenantId, pull, qtyRequested, qtyAvailable)`:
+             INSERT INTO allocation_exceptions (...) with exception_type based on qtyAvailable:
+             0 -> 'NO_INVENTORY', 0 < qtyAvailable < qtyRequested -> 'PARTIAL' or 'SHORTAGE'.
+
+        3. Extend `shopops-api/routes/allocations.js`:
+           - Add POST /allocations/run: validates body ({ foc_date, idempotency_key }),
+             checks idempotency_key, calls allocationEngine.runAllocationPass(), returns summary.
+           - Add GET /allocations/exceptions: returns rows from allocation_exceptions WHERE
+             tenant_id = current AND resolved_at IS NULL ORDER BY foc_date, tier, created_at.
+           - Add POST /allocations/:id/release: sets fulfillment_status='RELEASED';
+             decrements inventory_items.reserved_qty by qty_allocated;
+             logs to allocation_lifecycle_events.
+           - Extend PATCH /allocations/:id: add RELEASED and PICKED_UP (rename from SHOW_PICKUP) to
+             the allowed transitions; set fulfilled_at = now() on SHIPPED or PICKED_UP;
+             set invoiced_at = now() on INVOICED.
+
+        4. Write `shopops-api/tests/test_allocation_engine_p0.js` with 6 scenarios:
+           - Scenario 1: Tier 1 fully satisfied before Tier 2 (Tier 2 gets shortage).
+           - Scenario 2: Shortage exception created, not auto-resolved.
+           - Scenario 3: reserved_qty never exceeds on_hand_qty (invariant).
+           - Scenario 4: INVOICED transition sets invoiced_at, logs lifecycle event.
+           - Scenario 5: RELEASE decrements reserved_qty.
+           - Scenario 6: runAllocationPass is idempotent (run twice, no duplicate rows).
+           Each scenario must assert actual database row values.
+
+        5. Run `cd shopops-api && bun tests/test_allocation_engine_p0.js` and confirm exit code 0.
+           Also run `bun tests/test_allocation_engine_v2.js` and confirm it still passes.
+
+        6. Do NOT call ssh. Do NOT push to git.
+           Do NOT auto-reassign exception rows — only operator can resolve.
+
+        ## Completion criteria
+        Output <promise>COMPLETE</promise> ONLY when:
+          - shopops-api/migrations/20260517_allocation_engine_fields.sql exists with fulfilled_at, invoiced_at, RELEASED status, allocation_exceptions table
+          - shopops-api/services/allocationEngine.js exports runAllocationPass, reserveForPull, createShortageException
+          - shopops-api/routes/allocations.js has POST /allocations/run, GET /allocations/exceptions, POST /allocations/:id/release
+          - shopops-api/tests/test_allocation_engine_p0.js exists with >= 6 scenarios
+          - bun tests/test_allocation_engine_p0.js exits 0
+          - bun tests/test_allocation_engine_v2.js still exits 0
+
+  # ---------------------------------------------------------------------------
+  # 4. VERIFY-GREP — bash-executable grep assertions
+  # ---------------------------------------------------------------------------
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+
+      echo "=== A1: runAllocationPass exported ==="
+      RUN=$(grep -c "runAllocationPass" shopops-api/services/allocationEngine.js || true)
+      echo "runAllocationPass count: $RUN (expected >= 2)"
+      [ "$RUN" -ge 2 ] || (echo "FAIL: runAllocationPass not defined or not exported" >&2; exit 1)
+
+      echo ""
+      echo "=== A2: reserveForPull defined ==="
+      RESERVE=$(grep -c "function reserveForPull\|reserveForPull" shopops-api/services/allocationEngine.js || true)
+      echo "reserveForPull count: $RESERVE (expected >= 2)"
+      [ "$RESERVE" -ge 2 ] || (echo "FAIL: reserveForPull not defined or not called" >&2; exit 1)
+
+      echo ""
+      echo "=== A3: createShortageException defined ==="
+      SHORTAGE=$(grep -c "createShortageException\|allocation_exceptions" shopops-api/services/allocationEngine.js || true)
+      echo "createShortageException/allocation_exceptions count: $SHORTAGE (expected >= 2)"
+      [ "$SHORTAGE" -ge 2 ] || (echo "FAIL: shortage exception logic missing" >&2; exit 1)
+
+      echo ""
+      echo "=== A4: tier ordering enforced ==="
+      TIER=$(grep -c "ORDER BY tier\|tier ASC\|tier.*order" shopops-api/services/allocationEngine.js || true)
+      echo "tier ordering count: $TIER (expected >= 1)"
+      [ "$TIER" -ge 1 ] || (echo "FAIL: tier ordering not enforced in allocation engine" >&2; exit 1)
+
+      echo ""
+      echo "=== A5: reserved_qty conditional UPDATE ==="
+      COND=$(grep -c "reserved_qty.*on_hand_qty\|on_hand_qty.*reserved_qty\|reserved_qty + " shopops-api/services/allocationEngine.js || true)
+      echo "reserved_qty conditional count: $COND (expected >= 1)"
+      [ "$COND" -ge 1 ] || (echo "FAIL: reserved_qty invariant not enforced in conditional UPDATE" >&2; exit 1)
+
+      echo ""
+      echo "=== A6: POST /allocations/run route in allocations.js ==="
+      RUN_ROUTE=$(grep -c "router.post.*run\|/run\|allocations/run" shopops-api/routes/allocations.js || true)
+      echo "POST /allocations/run count: $RUN_ROUTE (expected >= 1)"
+      [ "$RUN_ROUTE" -ge 1 ] || (echo "FAIL: POST /allocations/run not defined" >&2; exit 1)
+
+      echo ""
+      echo "=== A7: RELEASED status in migration ==="
+      RELEASED=$(grep -c "RELEASED" shopops-api/migrations/20260517_allocation_engine_fields.sql || true)
+      echo "RELEASED status in migration: $RELEASED (expected >= 1)"
+      [ "$RELEASED" -ge 1 ] || (echo "FAIL: RELEASED not in migration" >&2; exit 1)
+
+      echo ""
+      echo "=== A8: allocation_exceptions in migration ==="
+      EXCEP=$(grep -c "allocation_exceptions" shopops-api/migrations/20260517_allocation_engine_fields.sql || true)
+      echo "allocation_exceptions in migration: $EXCEP (expected >= 1)"
+      [ "$EXCEP" -ge 1 ] || (echo "FAIL: allocation_exceptions table not in migration" >&2; exit 1)
+
+      echo ""
+      echo "ALL GREP ASSERTIONS: PASS"
+
+  # ---------------------------------------------------------------------------
+  # 5. VERIFY-TESTS — run both new and existing bun tests
+  # ---------------------------------------------------------------------------
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      cd shopops-api
+      echo "=== bun tests/test_allocation_engine_p0.js ==="
+      bun tests/test_allocation_engine_p0.js
+      echo "P0_TESTS=PASS"
+      echo ""
+      echo "=== bun tests/test_allocation_engine_v2.js (regression) ==="
+      bun tests/test_allocation_engine_v2.js
+      echo "V2_REGRESSION=PASS"
+
+  # ---------------------------------------------------------------------------
+  # 6. COMMIT-AND-PUSH
+  # ---------------------------------------------------------------------------
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-allocation-engine-01"
+
+      if git show-ref --quiet "refs/heads/$BRANCH"; then
+        git checkout "$BRANCH"
+      else
+        git checkout -b "$BRANCH"
+      fi
+
+      git add \
+        shopops-api/migrations/20260517_allocation_engine_fields.sql \
+        shopops-api/services/allocationEngine.js \
+        shopops-api/routes/allocations.js \
+        shopops-api/tests/test_allocation_engine_p0.js
+
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(api): WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 — allocation engine with four priority tiers, shortage exceptions, RELEASED lifecycle"
+      else
+        echo "No staged changes; branch already contains the work"
+      fi
+
+      git push -u origin "$BRANCH"
+      echo "BRANCH=$BRANCH"
+      echo "BRANCH_SHA=$(git rev-parse HEAD)"
+
+  # ---------------------------------------------------------------------------
+  # 7. OPEN-PR
+  # ---------------------------------------------------------------------------
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-allocation-engine-01"
+      REPO="bluedevilcollectibles/shopops"
+      BASE="master"
+
+      EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXISTING_PR" ]; then
+        echo "PR_URL=$EXISTING_PR"
+        exit 0
+      fi
+
+      PR_URL=$(gh pr create --repo "$REPO" --base "$BASE" \
+        --head "$BRANCH" \
+        --title "feat(api): WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 — allocation engine P0" \
+        --body "$(cat <<'PRBODY'
+## Summary
+- Migration 20260517_allocation_engine_fields.sql: adds fulfilled_at, invoiced_at, allocated_at columns; extends fulfillment_status CHECK to include RELEASED + PICKED_UP; creates allocation_exceptions table.
+- services/allocationEngine.js: runAllocationPass() with four priority tiers; reserveForPull() with conditional reserved_qty UPDATE; createShortageException().
+- routes/allocations.js: POST /allocations/run, GET /allocations/exceptions, POST /allocations/:id/release, extended PATCH lifecycle transitions.
+- 6 test scenarios in tests/test_allocation_engine_p0.js; existing test_allocation_engine_v2.js still passes.
+
+Closes #117
+PRBODY
+)")
+      echo "PR_URL=$PR_URL"
+
+  # ---------------------------------------------------------------------------
+  # 8. RUNTIME-VERIFY — Rule 19 (best-effort)
+  # ---------------------------------------------------------------------------
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      RESULT=$(docker exec shopops-api grep -n "runAllocationPass" /app/services/allocationEngine.js 2>&1)
+      EXIT=$?
+      if [ $EXIT -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'runAllocationPass' /app/services/allocationEngine.js"
+      fi
+
+  # ---------------------------------------------------------------------------
+  # 9. BUILD-MANIFEST
+  # ---------------------------------------------------------------------------
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build Captain CI manifest for WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 (CODE class).
+
+      Required fields (Rule 2 / Three Rules):
+      - WO: WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01
+      - Builder: Codex (wo-shopops-pull-list-allocation-engine-01 workflow)
+      - Files created: shopops-api/migrations/20260517_allocation_engine_fields.sql, shopops-api/services/allocationEngine.js, shopops-api/tests/test_allocation_engine_p0.js
+      - Files modified: shopops-api/routes/allocations.js
+      - Tests: count passing / count total (from verify-tests output — both p0 and v2)
+      - PR URL: from open-pr output
+      - Commit SHA: from commit-and-push output
+      - Grep assertions: from verify-grep output (all PASS)
+      - Runtime verification (Rule 19): from runtime-verify output
+      - VALIDATION: PASS or VALIDATION: PASS_PENDING_REBUILD
+
+      ## Inputs
+      $read-inputs.output
+      $verify-grep.output
+      $verify-tests.output
+      $commit-and-push.output
+      $open-pr.output
+      $runtime-verify.output
+
+  # ---------------------------------------------------------------------------
+  # 10. FLIP-NOTION
+  # ---------------------------------------------------------------------------
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 to REVIEW with the manifest
+      in the Notes property.
+
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Search the database for the page with WO ID = WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01.
+
+      Required Notion changes:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> set to $build-manifest.output verbatim (entire manifest body)
+
+      DO NOT set Claude Status=DONE. DO NOT set Status=Done.
+      Only Captain CI can close both fields after its VALIDATED verdict.
+
+      If Notion MCP unavailable, output:
+      XO_TODO: flip-notion failed for WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 — manifest in run log
+      and print the full manifest body so XO can manually update.
+
+      $build-manifest.output

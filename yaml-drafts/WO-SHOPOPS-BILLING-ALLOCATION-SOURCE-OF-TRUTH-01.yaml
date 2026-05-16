@@ -1,0 +1,210 @@
+name: wo-shopops-billing-allocation-source-of-truth-01
+description: |
+  Use when: Executing WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01.
+  Enforces billing source-of-truth in shopops-api: invoice/statement lines must
+  reference allocations or fulfillment rows. Blocks charges from raw customer_pulls
+  without allocation linkage. Rejects orphaned Stripe payments.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u here
+      WO_ID="WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01"
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC" ]; then echo "ERROR: spec not found" >&2; exit 1; fi
+      printf 'WO: %s\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      # Verify shopops-api repo structure and dependency artifacts exist
+      ls shopops-api/services/
+      ls shopops-api/db/
+      ls shopops-api/routes/
+      ls shopops-api/middleware/
+      ls shopops-api/tests/
+      ls shopops-api/migrations/
+      # Verify dependency WO artifacts are present (allocation engine must be in)
+      ls shopops-api/db/allocations.js 2>/dev/null || \
+        { echo "ERROR: db/allocations.js missing — WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 dependency not landed" >&2; exit 1; }
+      echo "Repo structure verified"
+      echo "$verify_files_output"
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        You are implementing WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01 in the shopops-api repo.
+
+        Full spec:
+        $read-inputs.output
+
+        Implementation requirements:
+        1. Create or extend services/billing.js with:
+           - validateBillingAllocation(allocationId): reads allocation via getAllocationById, checks
+             status in {READY_TO_INVOICE, INVOICED, SHIPPED, PICKED_UP}. Throws error code
+             BILLING_NO_ALLOCATION_LINKAGE if not found or wrong status, BILLING_NOT_READY_TO_INVOICE
+             if status is RESERVED.
+           - validateBillingFulfillmentBridge(fulfillmentRowId): resolves fulfillment row, derives
+             allocation_id. Throws BILLING_NO_ALLOCATION_LINKAGE if no bridge found.
+           - createInvoiceLine(params): validates allocation or fulfillment bridge, then calls
+             upsertInvoiceLine with idempotency check on (allocation_id, idempotency_key).
+           - createStatementLine(params): same validation, calls upsertStatementLine.
+
+        2. Create or extend services/stripe.js with:
+           - reconcileStripePayment(stripeCharge): checks for shopops_order_id OR shopops_invoice_id
+             OR shopops_customer_id in charge metadata. Throws BILLING_ORPHANED_STRIPE_PAYMENT if
+             none present.
+
+        3. Create db/billing.js with:
+           - upsertInvoiceLine(params): inserts into invoice_lines with ON CONFLICT DO NOTHING on
+             (tenant_id, idempotency_key) unique constraint. Returns existing row if conflict.
+           - upsertStatementLine(params): same pattern for statement_lines.
+
+        4. Add getAllocationById(allocationId) and getAllocationByPullId(pullId) to db/allocations.js
+           if not already present.
+
+        5. Create migrations/006_invoice_lines.sql and migrations/007_statement_lines.sql with the
+           schema defined in the spec (sections 9).
+
+        6. Create or extend routes/billing.js:
+           - POST /billing/invoice-lines: calls createInvoiceLine, returns 201 on create, 200 on
+             idempotent return, 422 with error code on validation failure.
+           - POST /billing/statement-lines: same pattern.
+
+        7. Add validateBillingRequest middleware to middleware/validate.js.
+
+        8. Create tests/test_billing_allocation.js with >= 5 tests covering:
+           - Valid allocation accepted (HTTP 201)
+           - Unlinked pull rejected (HTTP 422, BILLING_NO_ALLOCATION_LINKAGE)
+           - Orphaned Stripe payment rejected (HTTP 422, BILLING_ORPHANED_STRIPE_PAYMENT)
+           - Idempotent second call returns 200
+           - RESERVED allocation rejected (HTTP 422, BILLING_NOT_READY_TO_INVOICE)
+           Tests must use staging Supabase, not mocks, not local SQLite.
+
+        Error codes (exact strings, no variation):
+        - BILLING_NO_ALLOCATION_LINKAGE
+        - BILLING_ORPHANED_STRIPE_PAYMENT
+        - BILLING_NOT_READY_TO_INVOICE
+
+        Do NOT use set -u in bash blocks. Follow Rule 19: source changes need image rebuild.
+        Follow Rule 6: no secrets in committed files.
+
+        Output <promise>COMPLETE</promise> when all files are written and tests pass locally.
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Billing grep assertions ==="
+      grep -rn "BILLING_NO_ALLOCATION_LINKAGE" shopops-api/services/billing.js
+      grep -rn "BILLING_ORPHANED_STRIPE_PAYMENT" shopops-api/services/stripe.js
+      grep -rn "validateBillingAllocation" shopops-api/services/billing.js
+      grep -rn "READY_TO_INVOICE" shopops-api/services/billing.js
+      grep -rn "createInvoiceLine" shopops-api/routes/billing.js
+      grep -rn "createStatementLine" shopops-api/routes/billing.js
+      grep -rn "getAllocationById" shopops-api/db/allocations.js
+      echo "All grep assertions passed"
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      cd shopops-api
+      bun test tests/test_billing_allocation.js
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-billing-allocation-source-of-truth-01"
+      cd shopops-api
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      git add services/billing.js services/stripe.js db/billing.js db/allocations.js \
+        routes/billing.js middleware/validate.js \
+        migrations/006_invoice_lines.sql migrations/007_statement_lines.sql \
+        tests/test_billing_allocation.js
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(billing): WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01 — enforce allocation linkage on invoice/statement lines, reject orphaned Stripe payments"
+      fi
+      git push -u origin "$BRANCH"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(cd shopops-api && git rev-parse --abbrev-ref HEAD)
+      gh pr create --repo bluedevilcollectibles/shopops-api --base main \
+        --head "$BRANCH" \
+        --title "feat(billing): enforce allocation source-of-truth for invoice lines and Stripe reconciliation" \
+        --body "Closes #119
+
+Implements WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01.
+
+- Invoice/statement lines must reference allocation_id or fulfillment_row_id
+- Stripe payments without shopops_order_id/invoice_id/customer_id are rejected
+- Error codes: BILLING_NO_ALLOCATION_LINKAGE, BILLING_ORPHANED_STRIPE_PAYMENT, BILLING_NOT_READY_TO_INVOICE
+- Idempotency via (tenant_id, idempotency_key) unique constraint
+- Migrations: 006_invoice_lines.sql, 007_statement_lines.sql
+- Tests: test_billing_allocation.js (5 scenarios against staging Supabase)" \
+        2>/dev/null || echo "PR may already exist — skipping"
+
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      # set -e deliberately omitted — best-effort Rule 19
+      RESULT=$(docker exec shopops-api grep -n "validateBillingAllocation\|BILLING_NO_ALLOCATION_LINKAGE" /app/services/billing.js 2>&1)
+      if [ $? -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'validateBillingAllocation' /app/services/billing.js"
+        echo "Container must be rebuilt after PR merge to verify Rule 19."
+      fi
+
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build the Captain CI completion manifest for WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01 (CODE class).
+
+      Format:
+      WO: WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01
+      Files created: [list from implementation]
+      Files modified: [list from implementation]
+      Routes added: POST /billing/invoice-lines, POST /billing/statement-lines
+      Migrations added: 006_invoice_lines.sql, 007_statement_lines.sql
+      Tests: [count passing / count total]
+      Git commit: [hash from commit-and-push]
+      PR: [URL from open-pr]
+      Rule 19: [STATUS from runtime-verify]
+      VALIDATION: PASS
+
+      Use outputs:
+      $read-inputs.output
+      $verify-grep.output
+      $verify-tests.output
+      $commit-and-push.output
+      $open-pr.output
+      $runtime-verify.output
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01 to REVIEW in Notion.
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+      Update the WO page: Claude Status -> REVIEW, Status -> Review.
+      Paste the full manifest from build-manifest into the Notes field.
+      If Notion is unavailable, output:
+      XO_TODO: Flip WO-SHOPOPS-BILLING-ALLOCATION-SOURCE-OF-TRUTH-01 to REVIEW and paste manifest into Notes.
+
+      $build-manifest.output

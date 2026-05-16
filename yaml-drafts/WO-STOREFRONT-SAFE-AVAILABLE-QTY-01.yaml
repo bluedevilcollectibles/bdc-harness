@@ -1,0 +1,184 @@
+name: wo-storefront-safe-available-qty-01
+description: |
+  Use when: Executing WO-STOREFRONT-SAFE-AVAILABLE-QTY-01.
+  Replaces raw on_hand_qty reads in the buyer-facing shopops-storefront with
+  Shop Ops safe_available_qty. Catalog, PDP, category, search, and checkout
+  all gate on safe availability. Adds invariant test.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u here
+      WO_ID="WO-STOREFRONT-SAFE-AVAILABLE-QTY-01"
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC" ]; then echo "ERROR: spec not found" >&2; exit 1; fi
+      printf 'WO: %s\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      # shopops-storefront is the repo root — no shopops-api/ subdirectory
+      # Verify storefront repo structure exists
+      ls lib/ 2>/dev/null || ls src/ 2>/dev/null || \
+        { echo "ERROR: cannot find lib/ or src/ — confirm storefront repo root" >&2; exit 1; }
+      ls tests/ 2>/dev/null || mkdir -p tests && echo "tests/ created"
+      # Verify Shop Ops API client exists (to extend)
+      ls lib/shopops-client.js 2>/dev/null || ls src/lib/shopops-client.js 2>/dev/null || \
+        echo "WARN: shopops-client.js not found at expected path — will create"
+      echo "Storefront repo structure verified"
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        You are implementing WO-STOREFRONT-SAFE-AVAILABLE-QTY-01 in the shopops-storefront repo.
+        This repo is the repository ROOT — there is no shopops-api/ subdirectory.
+        Rule 19 docker exec does NOT apply (this is a storefront, not a Docker shopops-api service).
+
+        Full spec:
+        $read-inputs.output
+
+        Implementation requirements:
+
+        1. Audit the repo to find all files that read on_hand_qty for display or availability gating:
+           - Search for: on_hand_qty, onHandQty, on_hand, raw inventory quantity reads
+           - Check: lib/, src/, pages/, components/, routes/ (whatever exists in this repo)
+           - Document each file and line number found
+
+        2. Extend lib/shopops-client.js (or create if absent) with:
+           - getSafeAvailableQty(inventoryItemId): calls GET /inventory/safe-available/:inventoryItemId
+             on the Shop Ops API. Returns { safe_available_qty, reserved_qty, on_hand_qty }.
+           - checkSafeAvailability(inventoryItemId, requestedQty): calls getSafeAvailableQty, returns
+             { available: boolean, safe_available_qty, shortfall } where shortfall = requestedQty - safe_available_qty.
+
+        3. Replace each raw on_hand_qty read found in step 1 with getSafeAvailableQty or
+           checkSafeAvailability as appropriate:
+           - Catalog / category page / search results: use getSafeAvailableQty for availability badge
+           - PDP quantity display and Add to Cart gate: use getSafeAvailableQty
+           - Checkout inventory gate: use checkSafeAvailability(inventoryItemId, requestedQty)
+
+        4. Create tests/test_safe_qty_invariant.js with >= 5 tests:
+           Test 1: Catalog shows OUT OF STOCK when safe_available_qty = 0 and on_hand_qty = 5
+           Test 2: PDP Add to Cart disabled when safe_available_qty = 0
+           Test 3: Checkout blocked when safe_available_qty < requestedQty (e.g., safe=1, requested=2)
+           Test 4: Checkout allowed when safe_available_qty >= requestedQty (e.g., safe=5, requested=2)
+           Test 5: Invariant — the quantity used for gating equals safe_available_qty, not on_hand_qty
+                   when they differ. Mock Shop Ops API to return on_hand_qty=5, safe_available_qty=0.
+                   Assert catalog/PDP/checkout all treat item as unavailable.
+
+           Use bun test compatible syntax. Mock the Shop Ops API client (not real network calls in unit
+           tests, but integration tests should verify against staging if available).
+
+        5. Verify that after your changes, no catalog/PDP/checkout code path uses on_hand_qty as the
+           sellable figure. The invariant test must fail if on_hand_qty leaks as the gate.
+
+        The formula for safe_available_qty (from spec):
+          max(0, on_hand_qty - reserved_qty - channel_listed_elsewhere_qty)
+        This is computed server-side by the Shop Ops API. The storefront must not recompute it.
+
+        Follow Rule 6: no secrets in committed files.
+
+        Output <promise>COMPLETE</promise> when all files are written and tests pass locally.
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Storefront safe-qty grep assertions ==="
+      grep -rn "getSafeAvailableQty" lib/shopops-client.js 2>/dev/null || \
+        grep -rn "getSafeAvailableQty" src/lib/shopops-client.js
+      grep -rn "checkSafeAvailability" lib/shopops-client.js 2>/dev/null || \
+        grep -rn "checkSafeAvailability" src/lib/shopops-client.js
+      grep -rn "safe-available" lib/shopops-client.js 2>/dev/null || \
+        grep -rn "safe-available" src/lib/shopops-client.js
+      grep -rn "on_hand_qty" tests/test_safe_qty_invariant.js
+      grep -rn "safe_available_qty" tests/test_safe_qty_invariant.js
+      echo "All grep assertions passed"
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      bun test tests/test_safe_qty_invariant.js
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/storefront-safe-available-qty-01"
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      # Add all modified storefront files (discovered during implement)
+      git add lib/shopops-client.js tests/test_safe_qty_invariant.js 2>/dev/null || true
+      git add src/lib/shopops-client.js 2>/dev/null || true
+      # Add any catalog/PDP/checkout files modified during implement
+      git add -u
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(storefront): WO-STOREFRONT-SAFE-AVAILABLE-QTY-01 — replace raw on_hand_qty with safe_available_qty in catalog, PDP, checkout"
+      fi
+      git push -u origin "$BRANCH"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      gh pr create --repo bluedevilcollectibles/shopops-storefront --base main \
+        --head "$BRANCH" \
+        --title "feat(storefront): consume safe_available_qty — never expose raw on_hand_qty to buyers" \
+        --body "Closes #121
+
+Implements WO-STOREFRONT-SAFE-AVAILABLE-QTY-01.
+
+- All catalog/PDP/category/search/checkout surfaces now call getSafeAvailableQty or checkSafeAvailability
+- Raw on_hand_qty is no longer used as the sellable/gating figure in any buyer-facing surface
+- Checkout gates on checkSafeAvailability(inventoryItemId, requestedQty)
+- Invariant test: test_safe_qty_invariant.js asserts correct behavior when safe_available_qty=0 and on_hand_qty>0
+- Dependency: WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 must be deployed to Shop Ops API first
+
+Formula: safe_available_qty = max(0, on_hand_qty - reserved_qty - channel_listed_elsewhere_qty)" \
+        2>/dev/null || echo "PR may already exist — skipping"
+
+  - id: build-manifest
+    depends_on: [open-pr]
+    prompt: |
+      Build the Captain CI completion manifest for WO-STOREFRONT-SAFE-AVAILABLE-QTY-01 (CODE class).
+
+      Format:
+      WO: WO-STOREFRONT-SAFE-AVAILABLE-QTY-01
+      Files created: [list from implementation]
+      Files modified: [list from implementation]
+      Routes added: none (storefront is a frontend — no new API routes)
+      Migrations added: none
+      Tests: [count passing / count total]
+      Git commit: [hash from commit-and-push]
+      PR: [URL from open-pr]
+      Rule 19: N/A (shopops-storefront is not a Docker shopops-api service)
+      VALIDATION: PASS
+
+      Use outputs:
+      $read-inputs.output
+      $verify-grep.output
+      $verify-tests.output
+      $commit-and-push.output
+      $open-pr.output
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip WO-STOREFRONT-SAFE-AVAILABLE-QTY-01 to REVIEW in Notion.
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+      Update the WO page: Claude Status -> REVIEW, Status -> Review.
+      Paste the full manifest from build-manifest into the Notes field.
+      If Notion is unavailable, output:
+      XO_TODO: Flip WO-STOREFRONT-SAFE-AVAILABLE-QTY-01 to REVIEW and paste manifest into Notes.
+
+      $build-manifest.output

@@ -1,0 +1,393 @@
+# WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01.yaml
+# Drafted 2026-05-16 for WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01 (GH Issue #116).
+# Pattern: bdc-shopops-cover-cascade-prh-visibility-01.yaml (gold-standard DAG shape).
+# Doctrine compliance: bdc-harness CLAUDE.md + YAML format rules.
+#
+# Pre-flight:
+#   - Codebase bluedevilcollectibles/shopops must be registered in Archon.
+#   - WO spec committed in bdc-xo at docs/work-orders/WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01.md
+#   - Dependency WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 must be DONE (customer_pulls table exists).
+#
+# NOTE ON CWD: Archon clones bluedevilcollectibles/shopops into its worktree.
+#   CWD = shopops repo root. shopops-api/ is a SUBDIRECTORY. All paths are relative
+#   to shopops repo root (e.g., shopops-api/routes/foc.js).
+#   WO spec lives in bdc-xo, fetched cross-repo at read-inputs.
+#
+# NOTE ON BRANCH: shopops default branch is master (NOT main). PRs target master.
+#
+# NOTE ON RULE 19: shopops-api uses COPY . /app at image build time with NO bind-mount.
+#   Source changes need container rebuild + restart to take effect.
+#   runtime-verify enforces this with docker exec shopops-api grep.
+#
+# parallel_ok: true — no DDL view redefinition or production-mutating schema change.
+#   Migration adds a nullable column (shelf_qty) only.
+#
+# Deploy sync: C:\Users\pcmed\projects\BDC_XO\scripts\archon-bridge\sync-workflows.sh \
+#   WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01.yaml
+
+name: wo-shopops-pull-list-foc-demand-engine-01
+description: |
+  Use when: Executing WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01 —
+        Build the FOC demand aggregation engine for Shop Ops HQ.
+  Does: (1) reads WO spec from bdc-xo cross-repo;
+        (2) verifies dependency tables exist;
+        (3) implements computeFocDemandByDistributor(), buildDistributorCsv(),
+            shelf_qty support in confirm route, demand_breakdown in export route,
+            and migration 20260517_foc_orders_shelf_qty.sql;
+        (4) writes tests/test_foc_demand_engine.js (5 scenarios);
+        (5) runs bun tests locally;
+        (6) commits + pushes feature branch + opens PR against master;
+        (7) Rule 19 runtime grep inside shopops-api container;
+        (8) builds CODE-class manifest;
+        (9) flips Notion to REVIEW.
+  Repo: bluedevilcollectibles/shopops (master branch). shopops-api/ subdir.
+  Spec lives in bluedevilcollectibles/bdc-xo (docs/work-orders/).
+  NOT for: any other WO.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+
+  # ---------------------------------------------------------------------------
+  # 1. READ-INPUTS — fetch WO spec from bdc-xo cross-repo
+  # ---------------------------------------------------------------------------
+  - id: read-inputs
+    bash: |
+      WO_ID="WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01"
+      echo "WO: $WO_ID"
+
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+
+      if [ -z "$SPEC" ]; then
+        echo "ERROR: spec not found for ${WO_ID} in bdc-xo docs/work-orders/" >&2
+        exit 1
+      fi
+
+      printf 'WO_ID=%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$WORKFLOW_ID"
+      printf -- '--- SPEC ---\n%s\n' "$SPEC"
+
+  # ---------------------------------------------------------------------------
+  # 2. VERIFY-FILES — confirm dependency tables and existing foc.js route file
+  # ---------------------------------------------------------------------------
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      ls shopops-api/ || (echo "ERROR: not in shopops repo root" >&2; exit 1)
+
+      echo "=== shopops-api/routes/foc.js ==="
+      ls shopops-api/routes/foc.js || (echo "ERROR: foc.js not found" >&2; exit 1)
+      echo "foc.js: OK"
+
+      echo ""
+      echo "=== Verify customer_pulls table exists (migration or service reference) ==="
+      CPULLS=$(grep -rl "customer_pulls" shopops-api/migrations/ shopops-api/routes/ 2>/dev/null | head -1 || true)
+      if [ -z "$CPULLS" ]; then
+        echo "ERROR: customer_pulls not found in migrations or routes — dependency WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 may not be complete" >&2
+        exit 1
+      fi
+      echo "customer_pulls reference found: $CPULLS"
+
+      echo ""
+      echo "=== Verify solicitations table exists ==="
+      SOLIC=$(grep -rl "solicitations" shopops-api/migrations/ shopops-api/routes/ 2>/dev/null | head -1 || true)
+      if [ -z "$SOLIC" ]; then
+        echo "ERROR: solicitations not found — dependency table missing" >&2
+        exit 1
+      fi
+      echo "solicitations reference found: $SOLIC"
+
+      echo ""
+      echo "=== Current foc_orders aggregate function ==="
+      grep -n "aggregate\|computeFocDemand\|shelf_qty" shopops-api/routes/foc.js 2>/dev/null | head -20 || echo "(none yet — fresh add)"
+
+      echo ""
+      echo "=== Migration directory ==="
+      ls shopops-api/migrations/ | tail -10
+
+      echo "STATUS=ok"
+
+  # ---------------------------------------------------------------------------
+  # 3. IMPLEMENT — add shelf_qty, computeFocDemandByDistributor, buildDistributorCsv,
+  #                update confirm/export routes, write migration and tests
+  # ---------------------------------------------------------------------------
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01 per the spec.
+
+        CWD = shopops repo root. shopops-api/ is a subdirectory.
+
+        ## Spec
+        $read-inputs.output
+
+        ## Current state
+        $verify-files.output
+
+        ## Execution Rules
+
+        1. Create `shopops-api/migrations/20260517_foc_orders_shelf_qty.sql`:
+           ```sql
+           -- WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01
+           -- Adds shelf_qty column to foc_orders.
+           -- order_qty formula: pull_count + shelf_qty + buffer_qty
+           ALTER TABLE foc_orders ADD COLUMN IF NOT EXISTS shelf_qty INTEGER NOT NULL DEFAULT 0;
+           ```
+
+        2. Edit `shopops-api/routes/foc.js`:
+           a. Add `computeFocDemandByDistributor(client, tenantId, focDate)` as a named async
+              function before the router declarations. It must:
+              - SELECT from solicitations JOIN customer_pulls grouped by solicitation_id, distributor, foc_date.
+              - Exclude customer_pulls with status IN ('CANCELLED','PICKED_UP','FULFILLED') and deleted_at IS NOT NULL.
+              - Return rows: { solicitation_id, distributor, foc_date, pull_count }.
+           b. Add `buildDistributorCsv(rows)` as a named function that accepts foc_orders rows
+              and returns a CSV string. Columns: code, title, publisher, upc, qty, price_dollars,
+              pull_qty, shelf_qty, buffer_qty. This extracts the inline CSV-building logic from
+              the existing POST /foc/:foc_date/export route.
+           c. Extend POST /foc/aggregate to:
+              - Call computeFocDemandByDistributor for the aggregate period.
+              - Include `distributor` in the UPSERT statement.
+              - `order_qty = pull_count + shelf_qty + buffer_qty` (use COALESCE on shelf_qty, buffer_qty).
+           d. Extend GET /foc/upcoming to SELECT `shelf_qty` from foc_orders (add to fo.* columns).
+           e. Extend GET /foc/:foc_date to include `shelf_qty` in response.
+           f. Extend POST /foc/:foc_date/confirm:
+              - Accept `shelf_qty` in adjustment body items alongside `buffer_qty`.
+              - UPDATE: `order_qty = pull_count + COALESCE(shelf_qty, 0) + COALESCE(buffer_qty, 0)`.
+              - Enforce: `order_qty >= pull_count` — reject 400 if staff sets order_qty below pull_count.
+           g. Extend POST /foc/:foc_date/export:
+              - Call `buildDistributorCsv(rows)` instead of inline CSV logic.
+              - Add `demand_breakdown` to each row in `order_data` JSONB:
+                `{ pull_qty: r.pull_count, shelf_qty: r.shelf_qty, buffer_qty: r.buffer_qty, order_qty: r.order_qty }`.
+              - Return `demand_summary: { total_units, total_cost_cents }` in response body.
+
+        3. Write `shopops-api/tests/test_foc_demand_engine.js` with 5 test scenarios:
+           - Scenario 1: aggregate groups by distributor, excludes CANCELLED pulls, correct pull_count per distributor.
+           - Scenario 2: confirm route sets shelf_qty and recomputes order_qty = pull_count + shelf_qty + buffer_qty.
+           - Scenario 3: export returns CSV with demand_breakdown and inserts distributor_orders row.
+           - Scenario 4: aggregate is idempotent (run twice, single foc_orders row).
+           - Scenario 5: aggregate excludes DELETED (deleted_at IS NOT NULL) and FULFILLED/CANCELLED pulls.
+           Use real SQL queries against a test database (test_tenant). Each assertion must check
+           actual row values, not just that the call succeeded.
+
+        4. Run `cd shopops-api && bun tests/test_foc_demand_engine.js` and confirm exit code 0.
+
+        5. Do NOT call ssh. Do NOT push to git. Do NOT modify channel adapters.
+
+        ## Completion criteria
+        Output <promise>COMPLETE</promise> ONLY when:
+          - shopops-api/migrations/20260517_foc_orders_shelf_qty.sql exists and contains ADD COLUMN shelf_qty
+          - shopops-api/routes/foc.js contains computeFocDemandByDistributor and buildDistributorCsv as named functions
+          - shelf_qty appears in confirm and export routes
+          - demand_breakdown appears in export route's order_data
+          - shopops-api/tests/test_foc_demand_engine.js exists with >= 5 test cases
+          - bun tests/test_foc_demand_engine.js exits 0
+
+  # ---------------------------------------------------------------------------
+  # 4. VERIFY-GREP — bash-executable grep assertions (WO §12 stop conditions)
+  # ---------------------------------------------------------------------------
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+
+      echo "=== A1: computeFocDemandByDistributor present ==="
+      COUNT=$(grep -c "computeFocDemandByDistributor" shopops-api/routes/foc.js || true)
+      echo "computeFocDemandByDistributor count: $COUNT (expected >= 2)"
+      [ "$COUNT" -ge 2 ] || (echo "FAIL: computeFocDemandByDistributor not defined or not called" >&2; exit 1)
+
+      echo ""
+      echo "=== A2: buildDistributorCsv present ==="
+      CSV_COUNT=$(grep -c "function buildDistributorCsv\|buildDistributorCsv" shopops-api/routes/foc.js || true)
+      echo "buildDistributorCsv count: $CSV_COUNT (expected >= 2)"
+      [ "$CSV_COUNT" -ge 2 ] || (echo "FAIL: buildDistributorCsv not defined or not called" >&2; exit 1)
+
+      echo ""
+      echo "=== A3: shelf_qty in foc.js ==="
+      SHELF_COUNT=$(grep -c "shelf_qty" shopops-api/routes/foc.js || true)
+      echo "shelf_qty occurrences: $SHELF_COUNT (expected >= 4)"
+      [ "$SHELF_COUNT" -ge 4 ] || (echo "FAIL: shelf_qty not threaded through all routes" >&2; exit 1)
+
+      echo ""
+      echo "=== A4: demand_breakdown in export ==="
+      DEMAND_COUNT=$(grep -c "demand_breakdown" shopops-api/routes/foc.js || true)
+      echo "demand_breakdown occurrences: $DEMAND_COUNT (expected >= 1)"
+      [ "$DEMAND_COUNT" -ge 1 ] || (echo "FAIL: demand_breakdown missing from export route" >&2; exit 1)
+
+      echo ""
+      echo "=== A5: order_qty formula correct (pull_count + shelf_qty + buffer_qty) ==="
+      FORMULA=$(grep -c "pull_count.*shelf_qty.*buffer_qty\|shelf_qty.*buffer_qty\|shelf_qty + buffer_qty\|COALESCE.*shelf_qty" shopops-api/routes/foc.js || true)
+      echo "order_qty formula occurrences: $FORMULA (expected >= 1)"
+      [ "$FORMULA" -ge 1 ] || (echo "FAIL: order_qty formula does not include shelf_qty" >&2; exit 1)
+
+      echo ""
+      echo "=== A6: migration file present ==="
+      ls shopops-api/migrations/20260517_foc_orders_shelf_qty.sql \
+        || (echo "FAIL: migration file missing" >&2; exit 1)
+      grep -q "shelf_qty" shopops-api/migrations/20260517_foc_orders_shelf_qty.sql \
+        || (echo "FAIL: migration does not add shelf_qty column" >&2; exit 1)
+      echo "migration: OK"
+
+      echo ""
+      echo "=== A7: test file present with >= 5 test cases ==="
+      [ -f shopops-api/tests/test_foc_demand_engine.js ] \
+        || (echo "FAIL: test_foc_demand_engine.js missing" >&2; exit 1)
+      TEST_COUNT=$(grep -cE "test\(|it\(|describe\(|assert\.|expect\(" shopops-api/tests/test_foc_demand_engine.js || true)
+      echo "test assertions/cases: $TEST_COUNT (expected >= 5)"
+      [ "$TEST_COUNT" -ge 5 ] || (echo "FAIL: fewer than 5 test cases in test_foc_demand_engine.js" >&2; exit 1)
+
+      echo ""
+      echo "ALL GREP ASSERTIONS: PASS"
+
+  # ---------------------------------------------------------------------------
+  # 5. VERIFY-TESTS — run bun tests
+  # ---------------------------------------------------------------------------
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      cd shopops-api
+      echo "=== bun tests/test_foc_demand_engine.js ==="
+      bun tests/test_foc_demand_engine.js
+      echo "TESTS=PASS"
+
+  # ---------------------------------------------------------------------------
+  # 6. COMMIT-AND-PUSH — idempotent branch checkout, commit, push
+  # ---------------------------------------------------------------------------
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-foc-demand-engine-01"
+
+      if git show-ref --quiet "refs/heads/$BRANCH"; then
+        git checkout "$BRANCH"
+      else
+        git checkout -b "$BRANCH"
+      fi
+
+      git add \
+        shopops-api/routes/foc.js \
+        shopops-api/migrations/20260517_foc_orders_shelf_qty.sql \
+        shopops-api/tests/test_foc_demand_engine.js
+
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(api): WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01 — FOC demand engine with shelf_qty, distributor grouping, demand breakdown"
+      else
+        echo "No staged changes; branch already contains the work"
+      fi
+
+      git push -u origin "$BRANCH"
+      echo "BRANCH=$BRANCH"
+      echo "BRANCH_SHA=$(git rev-parse HEAD)"
+
+  # ---------------------------------------------------------------------------
+  # 7. OPEN-PR — idempotent PR creation against master
+  # ---------------------------------------------------------------------------
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-foc-demand-engine-01"
+      REPO="bluedevilcollectibles/shopops"
+      BASE="master"
+
+      EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXISTING_PR" ]; then
+        echo "PR_URL=$EXISTING_PR"
+        exit 0
+      fi
+
+      PR_URL=$(gh pr create --repo "$REPO" --base "$BASE" \
+        --head "$BRANCH" \
+        --title "feat(api): WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01 — FOC demand engine" \
+        --body "$(cat <<'PRBODY'
+## Summary
+- Adds `shelf_qty` column to `foc_orders` (migration 20260517_foc_orders_shelf_qty.sql).
+- Extracts `computeFocDemandByDistributor()` and `buildDistributorCsv()` as named functions in routes/foc.js.
+- Extends confirm route to accept `shelf_qty`; order_qty = pull_count + shelf_qty + buffer_qty.
+- Extends export route to include demand_breakdown in order_data JSONB.
+- 5 test scenarios in tests/test_foc_demand_engine.js.
+
+Closes #116
+PRBODY
+)")
+      echo "PR_URL=$PR_URL"
+
+  # ---------------------------------------------------------------------------
+  # 8. RUNTIME-VERIFY — Rule 19 (best-effort, set -e omitted)
+  # ---------------------------------------------------------------------------
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      RESULT=$(docker exec shopops-api grep -n "computeFocDemandByDistributor" /app/routes/foc.js 2>&1)
+      EXIT=$?
+      if [ $EXIT -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'computeFocDemandByDistributor' /app/routes/foc.js"
+      fi
+
+  # ---------------------------------------------------------------------------
+  # 9. BUILD-MANIFEST — CODE class manifest
+  # ---------------------------------------------------------------------------
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build Captain CI manifest for WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01 (CODE class).
+
+      Required fields (Rule 2 / Three Rules):
+      - WO: WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01
+      - Builder: Codex (wo-shopops-pull-list-foc-demand-engine-01 workflow)
+      - Files modified: shopops-api/routes/foc.js
+      - Files created: shopops-api/migrations/20260517_foc_orders_shelf_qty.sql, shopops-api/tests/test_foc_demand_engine.js
+      - Tests: count passing / count total (from verify-tests output)
+      - PR URL: from open-pr output
+      - Commit SHA: from commit-and-push output
+      - Grep assertions: from verify-grep output (all PASS)
+      - Runtime verification (Rule 19): from runtime-verify output
+      - VALIDATION: PASS (if all ok) or VALIDATION: PASS_PENDING_REBUILD (if runtime-verify skipped)
+
+      ## Inputs
+      $read-inputs.output
+      $verify-grep.output
+      $verify-tests.output
+      $commit-and-push.output
+      $open-pr.output
+      $runtime-verify.output
+
+  # ---------------------------------------------------------------------------
+  # 10. FLIP-NOTION — flip to REVIEW (NEVER DONE)
+  # ---------------------------------------------------------------------------
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01 to REVIEW with the manifest
+      in the Notes property.
+
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Search the database for the page with WO ID = WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01.
+
+      Required Notion changes:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> set to $build-manifest.output verbatim (entire manifest body)
+
+      DO NOT set Claude Status=DONE. DO NOT set Status=Done.
+      Only Captain CI can close both fields after its VALIDATED verdict.
+
+      If Notion MCP unavailable, output:
+      XO_TODO: flip-notion failed for WO-SHOPOPS-PULL-LIST-FOC-DEMAND-ENGINE-01 — manifest in run log
+      and print the full manifest body so XO can manually update.
+
+      $build-manifest.output

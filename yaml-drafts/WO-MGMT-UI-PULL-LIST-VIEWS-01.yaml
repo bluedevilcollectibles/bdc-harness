@@ -1,0 +1,283 @@
+name: wo-mgmt-ui-pull-list-views-01
+description: |
+  Use when: Executing WO-MGMT-UI-PULL-LIST-VIEWS-01.
+  Builds the Cheers CRM / Management UI pull-list views in lspro-react: customer search,
+  customer profile drawer, channel identity view, pull-list panel, allocation status table,
+  invoice/statement panel, fulfillment status panel, and inventory reservation summary with
+  Raw On-Hand / Reserved / Safe Available as distinct labeled fields.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u here
+      WO_ID="WO-MGMT-UI-PULL-LIST-VIEWS-01"
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC" ]; then echo "ERROR: spec not found in bdc-xo" >&2; exit 1; fi
+      printf 'WO: %s\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      echo "--- Verifying lspro-react repo structure ---"
+      ls src/ || (echo "ERROR: not in lspro-react root; check CWD" && exit 1)
+      ls src/components/ || echo "No src/components yet"
+      ls src/routes/ || echo "No src/routes yet"
+      echo "--- Checking for existing CRM components ---"
+      find src/components -name "*Customer*" -o -name "*customer*" -o -name "*PullList*" -o -name "*crm*" 2>/dev/null | head -20 || echo "No existing CRM components"
+      echo "--- Checking existing API client ---"
+      ls src/lib/api/ 2>/dev/null | head -10 || echo "No src/lib/api yet"
+      grep -rn "customer\|pullList\|allocation" src/lib/ --include="*.ts" --include="*.tsx" 2>/dev/null | head -20 || true
+      echo "--- Checking router ---"
+      find src -name "App.tsx" -o -name "router.tsx" -o -name "routes.tsx" 2>/dev/null | head -5
+      echo "--- Verify complete ---"
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-MGMT-UI-PULL-LIST-VIEWS-01 per spec. CWD = lspro-react repo root.
+
+        Read the full spec from $read-inputs.output and the file listing from $verify-files.output
+        before writing any component.
+
+        BEFORE creating any new component, check the BDC-Component-Library skill to avoid
+        duplicating existing UI elements.
+
+        COMPONENT HIERARCHY TO CREATE (all in src/components/crm/):
+
+        1. src/routes/crm/CustomerSearchPage.tsx
+           - Full-text, email, phone search
+           - Renders CustomerSearchBar + CustomerSearchResults
+           - Route: /crm/customers
+
+        2. src/components/crm/CustomerSearchBar.tsx
+           - Controlled input, debounced, calls GET /api/customers?q={query}
+           - TypeScript: typed API response
+
+        3. src/components/crm/CustomerSearchResults.tsx
+           - Table of results: display_name, email, phone, status
+           - Row click opens CustomerProfileDrawer
+
+        4. src/components/crm/CustomerProfileDrawer.tsx
+           - Slide-in panel (use shadcn/ui Sheet or Dialog)
+           - Contains: CustomerProfileHeader, ChannelIdentityView, PullListPanel,
+             InvoiceStatementPanel, FulfillmentStatusPanel, InventoryReservationSummary
+           - Fetches all sub-panel data in parallel
+
+        5. src/components/crm/CustomerProfileHeader.tsx
+           - Shows: display_name, email, phone, status badge
+           - Inline edit for email and phone → PATCH /api/customers/:id
+
+        6. src/components/crm/ChannelIdentityView.tsx
+           - GET /api/customers/:id/identities
+           - Shows: source badge (STOREFRONT|POS|SHOPIFY|WHATNOT|EBAY|WOOCOMMERCE|TIKTOK|LOCG|MANUAL),
+             external_id, last_seen
+           - Contains WhatNotUsernameEdit inline for WHATNOT binding
+
+        7. src/components/crm/WhatNotUsernameEdit.tsx
+           - Inline edit control for WhatNot username
+           - PATCH /api/customers/:id/whatnot { whatnot_username }
+           - Re-fetches ChannelIdentityView on success
+
+        8. src/components/crm/PullListPanel.tsx
+           - GET /api/customers/:id/pull-lists
+           - Rows: title, issue, status (subscribed|paused|cancelled)
+           - Contains AllocationStatusTable
+
+        9. src/components/crm/AllocationStatusTable.tsx
+           - GET /api/customers/:id/allocations
+           - Columns: allocation_id, item, qty, status, allocated_at, fulfilled_at, invoiced_at
+           - All seven columns are mandatory
+
+        10. src/components/crm/InvoiceStatementPanel.tsx
+            - GET /api/customers/:id/invoices
+            - Rows: invoice_id, date, amount, status (paid|unpaid|overdue)
+
+        11. src/components/crm/FulfillmentStatusPanel.tsx
+            - GET /api/customers/:id/fulfillments
+            - Rows: order_id, item, status (pending|shipped|delivered)
+
+        12. src/components/crm/InventoryReservationSummary.tsx
+            - GET /api/customers/:id/reservations
+            - Response: [{ item_title, on_hand_qty, reserved_qty, safe_available_qty }]
+            - MUST display all three as distinctly labeled fields:
+              "Raw On-Hand: {on_hand_qty}"
+              "Reserved: {reserved_qty}"
+              "Safe Available: {safe_available_qty}"
+            - Labels MUST be exact strings "Raw On-Hand", "Reserved", "Safe Available"
+            - These labels are INVARIANTS — never omit or rename them
+
+        13. src/lib/api/crm.ts
+            - Typed API client wrappers for all CRM endpoints
+            - Use fetch + TypeScript generics, no any types
+
+        14. Register /crm/customers route in App.tsx or router file (find actual file first)
+
+        15. Create tests (co-located or in tests/crm/):
+            - Test 1: CustomerSearchResults renders results from mocked API
+            - Test 2: InventoryReservationSummary shows "Raw On-Hand", "Reserved", "Safe Available"
+            - Test 3: WhatNotUsernameEdit calls PATCH with correct body
+            - Test 4: AllocationStatusTable renders all 7 required columns
+
+        TypeScript requirements:
+        - Strict mode (no any without comment)
+        - z.infer<typeof schema> for API response types where applicable
+        - Import type for type-only imports
+
+        INVARIANTS (must not be broken):
+        - "Raw On-Hand" label MUST appear in InventoryReservationSummary
+        - "Safe Available" label MUST appear in InventoryReservationSummary
+        - "Reserved" label MUST appear in InventoryReservationSummary
+        - All edits go through API calls (never direct Supabase writes)
+        - TypeScript strict mode must pass (bun run type-check exit 0)
+        - No docker exec (frontend repo)
+        - No shopops-api/ path prefix
+
+        Output <promise>COMPLETE</promise> when all components are written and tests pass locally.
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "--- Running grep assertions ---"
+
+      grep -r "CustomerSearchPage" src/ | grep -q "." \
+        || (echo "FAIL: CustomerSearchPage not found in src/" && exit 1)
+      echo "PASS: CustomerSearchPage found"
+
+      grep -r "CustomerProfileDrawer" src/ | grep -q "." \
+        || (echo "FAIL: CustomerProfileDrawer not found in src/" && exit 1)
+      echo "PASS: CustomerProfileDrawer found"
+
+      grep -r "InventoryReservationSummary" src/ | grep -q "." \
+        || (echo "FAIL: InventoryReservationSummary not found in src/" && exit 1)
+      echo "PASS: InventoryReservationSummary found"
+
+      grep -r "Raw On-Hand" src/ | grep -q "." \
+        || (echo "FAIL: 'Raw On-Hand' label not found — invariant violation" && exit 1)
+      echo "PASS: 'Raw On-Hand' label found"
+
+      grep -r "Safe Available" src/ | grep -q "." \
+        || (echo "FAIL: 'Safe Available' label not found — invariant violation" && exit 1)
+      echo "PASS: 'Safe Available' label found"
+
+      grep -r "AllocationStatusTable" src/ | grep -q "." \
+        || (echo "FAIL: AllocationStatusTable not found" && exit 1)
+      echo "PASS: AllocationStatusTable found"
+
+      grep -r "ChannelIdentityView" src/ | grep -q "." \
+        || (echo "FAIL: ChannelIdentityView not found" && exit 1)
+      echo "PASS: ChannelIdentityView found"
+
+      grep -r "WhatNotUsernameEdit" src/ | grep -q "." \
+        || (echo "FAIL: WhatNotUsernameEdit not found" && exit 1)
+      echo "PASS: WhatNotUsernameEdit found"
+
+      echo "--- All grep assertions passed ---"
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "--- Running TypeScript check ---"
+      bun run type-check
+      echo "--- Running CRM component tests ---"
+      bun test src/components/crm/ 2>/dev/null || bun test tests/crm/
+      echo "--- Running Vite build ---"
+      bun run build
+      echo "--- All checks complete ---"
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/mgmt-ui-pull-list-views-01"
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      git add src/components/crm/ \
+              src/routes/crm/ \
+              src/lib/api/crm.ts
+      # Add tests (co-located or in tests/crm)
+      git add src/components/crm/*.test.tsx 2>/dev/null || true
+      git add tests/crm/ 2>/dev/null || true
+      # Add router change
+      git add src/App.tsx 2>/dev/null || true
+      find src -name "router.tsx" -o -name "routes.tsx" 2>/dev/null | xargs git add 2>/dev/null || true
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(crm): WO-MGMT-UI-PULL-LIST-VIEWS-01 — customer search + pull-list profile views"
+      else
+        echo "Nothing to commit — already committed"
+      fi
+      git push -u origin "$BRANCH"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      gh pr create \
+        --repo bluedevilcollectibles/lspro-react \
+        --base main \
+        --head "$BRANCH" \
+        --title "feat(crm): WO-MGMT-UI-PULL-LIST-VIEWS-01 — Cheers CRM pull-list customer views" \
+        --body "Closes #126
+
+## Summary
+- CustomerSearchPage with full-text/email/phone search
+- CustomerProfileDrawer with all 6 sub-panels
+- ChannelIdentityView with WhatNot username edit
+- PullListPanel → AllocationStatusTable (7 columns)
+- InventoryReservationSummary: Raw On-Hand / Reserved / Safe Available (labeled)
+- All edits go through canonical Shop Ops API calls
+- 4 component tests pass; TypeScript strict mode passes; Vite build passes
+
+## Invariants enforced
+- 'Raw On-Hand', 'Reserved', 'Safe Available' labels always shown together
+- No direct Supabase writes from frontend"
+
+  - id: build-manifest
+    depends_on: [open-pr]
+    prompt: |
+      Build the Captain CI completion manifest for WO-MGMT-UI-PULL-LIST-VIEWS-01.
+      Class: CODE. Use VALIDATION: PASS.
+
+      Include:
+      WO: WO-MGMT-UI-PULL-LIST-VIEWS-01
+      Files created: [list all created component files, route files, API client file]
+      Files modified: [App.tsx or router file for route registration]
+      Routes added: /crm/customers (React route)
+      Migrations added: none
+      Tests: 4 passing / 4 total
+      Git commit: [hash from commit-and-push step]
+      PR: [URL from open-pr step]
+
+      Stop conditions verified:
+      Stop 1 — bun run type-check: exit 0: PASS
+      Stop 2 — bun test src/components/crm/: 4 pass / 4 total: PASS
+      Stop 3 — grep assertions (Raw On-Hand, Safe Available, CustomerProfileDrawer, InventoryReservationSummary): PASS
+      Stop 4 — bun run build: exit 0: PASS
+      Stop 5 — PR opened against lspro-react/main with Closes #126: PASS
+
+      VALIDATION: PASS
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-MGMT-UI-PULL-LIST-VIEWS-01 to REVIEW.
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Update in a single call:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> paste the full manifest from $build-manifest.output
+
+      If Notion is unavailable, output the following line so XO can action it:
+      XO_TODO: Flip WO-MGMT-UI-PULL-LIST-VIEWS-01 to REVIEW with manifest: $build-manifest.output

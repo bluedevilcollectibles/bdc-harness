@@ -1,0 +1,260 @@
+name: wo-shopops-export-qty-audit-01
+description: |
+  Use when: Executing WO-SHOPOPS-EXPORT-QTY-AUDIT-01.
+  Audits all channel export paths (WhatNot, eBay, Shopify, WooCommerce, TikTok, native
+  storefront) to verify each reads safe_available_qty not raw on_hand_qty. Produces a
+  findings document and tags NON-COMPLIANT paths with TODO comments.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u here
+      WO_ID="WO-SHOPOPS-EXPORT-QTY-AUDIT-01"
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC" ]; then echo "ERROR: spec not found in bdc-xo" >&2; exit 1; fi
+      printf 'WO: %s\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      echo "--- Verifying shopops-api repo structure ---"
+      ls shopops-api/src/ || (echo "ERROR: shopops-api/src not found; check CWD" && exit 1)
+      echo "--- Scanning for export files ---"
+      find shopops-api/src -name "*.js" -o -name "*.ts" \
+        | xargs grep -l "whatnot\|ebay\|shopify\|woocommerce\|tiktok\|catalog" 2>/dev/null \
+        | head -20 || echo "No export files found yet"
+      echo "--- Scanning for on_hand_qty references ---"
+      grep -rn "on_hand_qty" shopops-api/src/ --include="*.js" --include="*.ts" 2>/dev/null | head -30 || true
+      echo "--- Scanning for safe_available_qty references ---"
+      grep -rn "safe_available_qty" shopops-api/src/ --include="*.js" --include="*.ts" 2>/dev/null | head -30 || true
+      echo "--- Checking docs/audits directory ---"
+      ls shopops-api/docs/audits/ 2>/dev/null | head -10 || echo "No docs/audits directory yet — will create"
+      echo "--- Verify complete ---"
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-SHOPOPS-EXPORT-QTY-AUDIT-01 per spec. CWD = bdc-harness repo root
+        (shopops-api is a subdirectory at shopops-api/).
+
+        Read the full spec from $read-inputs.output and the file listing from $verify-files.output
+        before starting the audit.
+
+        AUDIT TASKS:
+
+        1. Find every channel export path in shopops-api/src/ using:
+           find shopops-api/src -name "*.js" -o -name "*.ts" | \
+             xargs grep -l "whatnot\|ebay\|shopify\|woocommerce\|tiktok\|catalog" 2>/dev/null
+
+        2. For each export file found, read the relevant function that emits inventory quantities.
+           Classify as:
+           - COMPLIANT: reads safe_available_qty (not on_hand_qty directly for availability)
+           - NON-COMPLIANT: reads on_hand_qty directly as the available/listing quantity
+           - UNKNOWN: integration not yet built or quantity source unclear
+
+        3. For each NON-COMPLIANT path, add the following inline comment immediately above
+           the offending line:
+           // TODO WO-EXPORT-FIX: use safe_available_qty instead of on_hand_qty
+
+        4. Create directory shopops-api/docs/audits/ if it does not exist.
+
+        5. Create shopops-api/docs/audits/2026-05-16-channel-export-qty-audit.md with:
+
+           # Channel Export Quantity Source Audit
+           **Date:** 2026-05-16
+           **WO:** WO-SHOPOPS-EXPORT-QTY-AUDIT-01
+           **Auditor:** Codex (Major Build)
+
+           ## Summary Table
+           | Channel | Export Function | File:Line | Quantity Source | Status |
+           |---|---|---|---|---|
+           [one row per channel: WhatNot, eBay, Shopify, WooCommerce, TikTok, native storefront]
+
+           ## Per-Channel Detail
+           ### WhatNot
+           [function name, file:line, relevant code excerpt, classification]
+           ### eBay
+           [function name, file:line, relevant code excerpt, classification]
+           ### Shopify
+           [function name, file:line, relevant code excerpt, classification]
+           ### WooCommerce
+           [function name, file:line, relevant code excerpt, classification]
+           ### TikTok
+           [function name, file:line, relevant code excerpt, or "UNKNOWN — integration not built"]
+           ### Native Storefront
+           [function name, file:line, relevant code excerpt, classification]
+
+           ## Gap List
+           [List of all NON-COMPLIANT paths with recommended fix]
+
+           ## V1 Limitations
+           - Does not auto-fix export queries (audit only, findings doc)
+           - Does not cover POS export paths (separate WO)
+           - Does not validate TikTok export if that integration is not yet built
+           - Does not cover third-party marketplace APIs not yet integrated
+
+        6. Create shopops-api/tests/exportAudit.test.js with 4 tests that assert:
+           - Findings doc exists at expected path
+           - All 6 channels are covered in findings doc
+           - V1 Limitations section is present
+           - Any NON-COMPLIANT entries listed in doc match TODO comments in source
+
+        INVARIANTS (must not be broken):
+        - Audit is READ-ONLY for all query logic (only TODO comments added, no logic changes)
+        - Every channel in the summary table must correspond to an actual file search result
+          or be explicitly marked UNKNOWN
+        - V1 Limitations section is MANDATORY (MEDIUM polish bar WO)
+
+        Output <promise>COMPLETE</promise> when findings doc is written and tests pass locally.
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "--- Running grep assertions ---"
+
+      ls shopops-api/docs/audits/*channel-export-qty-audit* | grep -q "." \
+        || (echo "FAIL: audit findings doc not created" && exit 1)
+      echo "PASS: audit findings doc exists"
+
+      grep -q "COMPLIANT\|NON-COMPLIANT\|UNKNOWN" \
+        shopops-api/docs/audits/*channel-export-qty-audit*.md \
+        || (echo "FAIL: findings doc missing status classifications" && exit 1)
+      echo "PASS: status classifications found"
+
+      grep -qi "WhatNot\|whatnot" shopops-api/docs/audits/*channel-export-qty-audit*.md \
+        || (echo "FAIL: WhatNot not covered in audit" && exit 1)
+      echo "PASS: WhatNot covered"
+
+      grep -qi "eBay\|ebay" shopops-api/docs/audits/*channel-export-qty-audit*.md \
+        || (echo "FAIL: eBay not covered in audit" && exit 1)
+      echo "PASS: eBay covered"
+
+      grep -qi "Shopify\|shopify" shopops-api/docs/audits/*channel-export-qty-audit*.md \
+        || (echo "FAIL: Shopify not covered in audit" && exit 1)
+      echo "PASS: Shopify covered"
+
+      grep -qi "WooCommerce\|woocommerce" shopops-api/docs/audits/*channel-export-qty-audit*.md \
+        || (echo "FAIL: WooCommerce not covered in audit" && exit 1)
+      echo "PASS: WooCommerce covered"
+
+      grep -q "V1 Limitations" shopops-api/docs/audits/*channel-export-qty-audit*.md \
+        || (echo "FAIL: V1 Limitations section missing" && exit 1)
+      echo "PASS: V1 Limitations present"
+
+      echo "--- All grep assertions passed ---"
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "--- Running export audit test suite ---"
+      cd shopops-api && bun test tests/exportAudit.test.js
+      echo "--- Tests complete ---"
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-export-qty-audit-01"
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+      git add shopops-api/docs/audits/
+      git add shopops-api/tests/exportAudit.test.js
+      # Stage any TODO-tagged source files
+      git add shopops-api/src/ 2>/dev/null || true
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "audit(exports): WO-SHOPOPS-EXPORT-QTY-AUDIT-01 — channel export qty source audit findings"
+      else
+        echo "Nothing to commit — already committed"
+      fi
+      git push -u origin "$BRANCH"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      gh pr create \
+        --repo bluedevilcollectibles/shopops-api \
+        --base main \
+        --head "$BRANCH" \
+        --title "audit(exports): WO-SHOPOPS-EXPORT-QTY-AUDIT-01 — channel export quantity source audit" \
+        --body "Closes #124
+
+## Summary
+- Audited all channel export paths for safe_available_qty compliance
+- Produced findings doc at docs/audits/2026-05-16-channel-export-qty-audit.md
+- Tagged all NON-COMPLIANT paths with TODO WO-EXPORT-FIX comments
+- 4 audit assertion tests pass
+
+## Channels audited
+WhatNot, eBay, Shopify, WooCommerce, TikTok, native storefront
+
+## V1 Limitations
+- Audit only (no auto-fix of export queries)
+- POS export paths deferred to separate WO
+- TikTok listed as UNKNOWN if integration not yet built"
+
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      # set -e deliberately omitted — best-effort Rule 19
+      RESULT=$(docker exec shopops-api grep -rn "TODO WO-EXPORT-FIX" /app/src/ 2>&1)
+      if [ $? -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "RULE19_RERUN=docker exec shopops-api grep -rn 'TODO WO-EXPORT-FIX' /app/src/"
+      fi
+
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build the Captain CI completion manifest for WO-SHOPOPS-EXPORT-QTY-AUDIT-01.
+      Class: CODE. Use VALIDATION: PASS.
+
+      Include:
+      WO: WO-SHOPOPS-EXPORT-QTY-AUDIT-01
+      Files created: [list all created files including findings doc and test file]
+      Files modified: [list all source files with TODO WO-EXPORT-FIX comments added]
+      Routes added: none
+      Migrations added: none
+      Tests: 4 passing / 4 total
+      Git commit: [hash from commit-and-push step]
+      PR: [URL from open-pr step]
+      Rule 19: $runtime-verify.output
+
+      Stop conditions verified:
+      Stop 1 — findings doc exists: PASS
+      Stop 2 — all 6 channels covered: PASS
+      Stop 3 — V1 Limitations section present: PASS
+      Stop 4 — bun test tests/exportAudit.test.js: 4 pass / 4 total: PASS
+      Stop 5 — Rule 19 runtime verify: $runtime-verify.output
+      Stop 6 — PR opened against shopops-api/main with Closes #124: PASS
+
+      VALIDATION: PASS
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-SHOPOPS-EXPORT-QTY-AUDIT-01 to REVIEW.
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Update in a single call:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> paste the full manifest from $build-manifest.output
+
+      If Notion is unavailable, output the following line so XO can action it:
+      XO_TODO: Flip WO-SHOPOPS-EXPORT-QTY-AUDIT-01 to REVIEW with manifest: $build-manifest.output

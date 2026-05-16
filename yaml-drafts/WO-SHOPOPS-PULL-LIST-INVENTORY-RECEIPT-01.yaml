@@ -1,0 +1,454 @@
+# WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01.yaml
+# Drafted 2026-05-16 for WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 (GH Issue #118, P0).
+# Pattern: bdc-shopops-cover-cascade-prh-visibility-01.yaml (gold-standard DAG shape).
+# Doctrine compliance: bdc-harness CLAUDE.md + YAML format rules.
+#
+# Pre-flight:
+#   - Codebase bluedevilcollectibles/shopops must be registered in Archon.
+#   - WO spec committed in bdc-xo at docs/work-orders/WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01.md
+#   - Dependency WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 DONE (customer_pulls table exists).
+#   - Dependency WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 DONE (available_qty = max(0, on_hand_qty - reserved_qty)).
+#   - Dependency WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 DONE (allocationEngine.js:runAllocationPass exists).
+#
+# NOTE ON CWD: Archon clones bluedevilcollectibles/shopops into its worktree.
+#   CWD = shopops repo root. shopops-api/ is a SUBDIRECTORY.
+#
+# NOTE ON BRANCH: shopops default branch is master (NOT main). PRs target master.
+#
+# NOTE ON BACKWARD COMPAT: existing POST /shipments/ingest must remain functional
+#   as a backward-compat alias that delegates to the new receiveShipment() function.
+#
+# NOTE ON RULE 19: shopops-api uses COPY . /app at image build time.
+#   Source changes need container rebuild + restart. runtime-verify enforces with docker exec grep.
+#
+# parallel_ok: false — P0; modifies on_hand_qty write path, which is billing-critical.
+#
+# Deploy sync: C:\Users\pcmed\projects\BDC_XO\scripts\archon-bridge\sync-workflows.sh \
+#   WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01.yaml
+
+name: wo-shopops-pull-list-inventory-receipt-01
+description: |
+  Use when: Executing WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 —
+        Build the distributor shipment receipt path for Shop Ops HQ.
+  Does: (1) reads WO spec from bdc-xo cross-repo;
+        (2) verifies dependency tables and allocationEngine.js exist;
+        (3) writes migration 20260517_inventory_items_receipt_fields.sql
+            (received_at, source, issue_id columns; shipment_receipts table);
+        (4) adds POST /shipments/receive route to routes/shipments.js with
+            receiveShipment(), matchUpcToSolicitation(), upsertInventoryItem()
+            and allocationEngine.runAllocationPass() call;
+        (5) keeps POST /shipments/ingest as backward-compat alias;
+        (6) writes tests/test_inventory_receipt.js (6 scenarios);
+        (7) runs bun tests (new + existing test_inventory_availability.js);
+        (8) commits + pushes + opens PR against master;
+        (9) Rule 19 runtime grep;
+        (10) builds CODE-class manifest;
+        (11) flips Notion to REVIEW.
+  Repo: bluedevilcollectibles/shopops (master branch). shopops-api/ subdir.
+  Spec lives in bluedevilcollectibles/bdc-xo (docs/work-orders/).
+  parallel_ok: false — on_hand_qty write path, billing-critical.
+  NOT for: any other WO.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+
+  # ---------------------------------------------------------------------------
+  # 1. READ-INPUTS — fetch WO spec from bdc-xo cross-repo
+  # ---------------------------------------------------------------------------
+  - id: read-inputs
+    bash: |
+      WO_ID="WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01"
+      echo "WO: $WO_ID"
+
+      SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+
+      if [ -z "$SPEC" ]; then
+        echo "ERROR: spec not found for ${WO_ID} in bdc-xo docs/work-orders/" >&2
+        exit 1
+      fi
+
+      printf 'WO_ID=%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$WORKFLOW_ID"
+      printf -- '--- SPEC ---\n%s\n' "$SPEC"
+
+  # ---------------------------------------------------------------------------
+  # 2. VERIFY-FILES — confirm all dependency tables and service files exist
+  # ---------------------------------------------------------------------------
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      ls shopops-api/ || (echo "ERROR: not in shopops repo root" >&2; exit 1)
+
+      echo "=== shopops-api/routes/shipments.js ==="
+      ls shopops-api/routes/shipments.js || (echo "ERROR: shipments.js not found" >&2; exit 1)
+      echo "shipments.js: OK"
+
+      echo ""
+      echo "=== Verify allocationEngine.js:runAllocationPass exists ==="
+      ALLOC_ENG=$(grep -c "runAllocationPass" shopops-api/services/allocationEngine.js 2>/dev/null || true)
+      if [ "$ALLOC_ENG" -lt 1 ]; then
+        echo "ERROR: allocationEngine.js:runAllocationPass not found — dependency WO-SHOPOPS-PULL-LIST-ALLOCATION-ENGINE-01 must be DONE first" >&2
+        exit 1
+      fi
+      echo "runAllocationPass found in allocationEngine.js: OK"
+
+      echo ""
+      echo "=== Verify customer_pulls exists ==="
+      CPULLS=$(grep -rl "customer_pulls" shopops-api/migrations/ shopops-api/routes/ 2>/dev/null | head -1 || true)
+      if [ -z "$CPULLS" ]; then
+        echo "ERROR: customer_pulls not found — dependency WO-SHOPOPS-PULL-LIST-CUSTOMER-PULL-MODEL-01 incomplete" >&2
+        exit 1
+      fi
+      echo "customer_pulls found: $CPULLS"
+
+      echo ""
+      echo "=== Verify inventory_items exists ==="
+      INV=$(grep -rl "inventory_items" shopops-api/migrations/ 2>/dev/null | head -1 || true)
+      if [ -z "$INV" ]; then
+        echo "ERROR: inventory_items not found in migrations" >&2
+        exit 1
+      fi
+      echo "inventory_items found: $INV"
+
+      echo ""
+      echo "=== Verify solicitations table exists ==="
+      SOLIC=$(grep -rl "solicitations" shopops-api/migrations/ shopops-api/routes/ 2>/dev/null | head -1 || true)
+      if [ -z "$SOLIC" ]; then
+        echo "ERROR: solicitations not found" >&2
+        exit 1
+      fi
+      echo "solicitations found: $SOLIC"
+
+      echo ""
+      echo "=== Current shipments.js ingest route ==="
+      grep -n "router.post\|/ingest\|/receive\|receiveShipment\|on_hand_qty" shopops-api/routes/shipments.js 2>/dev/null | head -20 || echo "(none)"
+
+      echo ""
+      echo "=== Existing inventory_items columns (from recent migrations) ==="
+      grep -h "ADD COLUMN\|on_hand_qty\|reserved_qty\|received_at\|source" \
+        shopops-api/migrations/089_inventory_items_bpcomicid.sql \
+        shopops-api/migrations/100_inventory_items_clz_fields.sql \
+        2>/dev/null | head -20 || echo "(migrations not found locally)"
+
+      echo ""
+      echo "=== Migration directory (tail) ==="
+      ls shopops-api/migrations/ | sort | tail -10
+
+      echo "STATUS=ok"
+
+  # ---------------------------------------------------------------------------
+  # 3. IMPLEMENT — write migration, extend shipments.js, write tests
+  # ---------------------------------------------------------------------------
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 per the spec.
+
+        CWD = shopops repo root. shopops-api/ is a subdirectory.
+
+        ## Spec
+        $read-inputs.output
+
+        ## Current state
+        $verify-files.output
+
+        ## Execution Rules
+
+        1. Create `shopops-api/migrations/20260517_inventory_items_receipt_fields.sql`:
+           ```sql
+           -- WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01
+           -- Adds receipt tracking fields to inventory_items.
+           ALTER TABLE inventory_items
+             ADD COLUMN IF NOT EXISTS received_at TIMESTAMPTZ,
+             ADD COLUMN IF NOT EXISTS source TEXT,
+             ADD COLUMN IF NOT EXISTS issue_id UUID REFERENCES solicitations(id);
+
+           -- Shipment receipt dedup table
+           CREATE TABLE IF NOT EXISTS shipment_receipts (
+             id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+             tenant_id        TEXT NOT NULL,
+             distributor      TEXT NOT NULL,
+             idempotency_key  TEXT NOT NULL,
+             content_hash     TEXT NOT NULL,
+             item_count       INTEGER NOT NULL,
+             received_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+             summary          JSONB,
+             CONSTRAINT shipment_receipts_tenant_key_uniq UNIQUE (tenant_id, idempotency_key)
+           );
+           ```
+
+        2. Extend `shopops-api/routes/shipments.js`:
+           a. Require allocationEngine at the top:
+              `var allocationEngine = require('../services/allocationEngine');`
+           b. Add `matchUpcToSolicitation(client, tenantId, upc)` function:
+              - SELECT id AS solicitation_id, foc_date, id AS issue_id FROM solicitations
+                WHERE upc = $1 AND status = 'active' LIMIT 1.
+              - Return the row or null.
+           c. Add `upsertInventoryItem(client, tenantId, item, solicitation)` function:
+              - SELECT id, on_hand_qty FROM inventory_items WHERE upc = $1 AND tenant_id = tenantId AND deleted_at IS NULL LIMIT 1.
+              - If found: UPDATE inventory_items SET on_hand_qty = on_hand_qty + item.quantity, received_at = now(), source = distributor WHERE id = existing.id RETURNING id.
+              - If not found: INSERT INTO inventory_items (tenant_id, title, upc, on_hand_qty, reserved_qty, sold_qty, issue_id, source, received_at) VALUES (...) RETURNING id.
+              - Return inventory_item_id.
+           d. Add `receiveShipment(client, tenantId, idempotencyKey, distributor, items)` function:
+              - Compute content_hash via computeContentHash(items).
+              - INSERT INTO shipment_receipts ... ON CONFLICT (tenant_id, idempotency_key) DO NOTHING.
+              - If INSERT returned 0 rows: SELECT summary FROM shipment_receipts WHERE tenant_id=$1 AND idempotency_key=$2; return cached summary.
+              - For each item: call matchUpcToSolicitation, call upsertInventoryItem, collect foc_dates.
+              - For each unique foc_date: call allocationEngine.runAllocationPass(client, tenantId, focDate).
+              - Build summary { items_received, items_created, items_incremented, foc_dates_processed, allocations_created, shortage_exceptions }.
+              - UPDATE shipment_receipts SET summary = $summary WHERE tenant_id=$1 AND idempotency_key=$2.
+              - Return summary.
+           e. Add POST /shipments/receive route:
+              - Validates body: distributor required, items array required and non-empty, each item must have upc and quantity > 0, idempotency_key required.
+              - Opens transaction, calls beginSession, calls receiveShipment, commits, responds { ok: true, receipt_id, summary }.
+           f. Modify POST /shipments/ingest (EXISTING at line ~108):
+              - Keep the route signature unchanged.
+              - Delegate its body to receiveShipment() (backward compat alias).
+              - If items is empty or malformed: keep existing early-return behavior.
+
+        3. Write `shopops-api/tests/test_inventory_receipt.js` with 6 scenarios:
+           - Scenario 1: POST /shipments/receive creates new inventory_item and triggers allocation pass.
+           - Scenario 2: POST /shipments/receive increments on_hand_qty on existing item.
+           - Scenario 3: Unmatched UPC creates inventory with source='unmatched_receipt', no allocation pass.
+           - Scenario 4: Same idempotency_key second call does NOT increment on_hand_qty again.
+           - Scenario 5: reserved_qty invariant (on_hand_qty=2, 3 pulls -> reserved_qty=2, 1 exception).
+           - Scenario 6: Channel adapters do not write on_hand_qty (grep assertion in test).
+           Each scenario must assert actual database row values, not just HTTP 200.
+
+        4. Run `cd shopops-api && bun tests/test_inventory_receipt.js` and confirm exit code 0.
+           Also run `bun tests/test_inventory_availability.js` and confirm it still passes.
+
+        5. Do NOT call ssh. Do NOT push to git.
+           Do NOT add any write path to on_hand_qty in channel adapter files.
+
+        ## Completion criteria
+        Output <promise>COMPLETE</promise> ONLY when:
+          - shopops-api/migrations/20260517_inventory_items_receipt_fields.sql exists with received_at, source, shipment_receipts table
+          - shopops-api/routes/shipments.js has POST /shipments/receive route
+          - receiveShipment, matchUpcToSolicitation, upsertInventoryItem functions defined in shipments.js
+          - allocationEngine.runAllocationPass called from receiveShipment
+          - POST /shipments/ingest still functional (backward compat alias)
+          - shopops-api/tests/test_inventory_receipt.js exists with >= 6 scenarios
+          - bun tests/test_inventory_receipt.js exits 0
+          - bun tests/test_inventory_availability.js still exits 0
+
+  # ---------------------------------------------------------------------------
+  # 4. VERIFY-GREP — bash-executable grep assertions
+  # ---------------------------------------------------------------------------
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+
+      echo "=== A1: POST /shipments/receive route defined ==="
+      RECV=$(grep -c "router.post.*receive\|'\/receive'\|\"/receive\"" shopops-api/routes/shipments.js || true)
+      echo "receive route count: $RECV (expected >= 1)"
+      [ "$RECV" -ge 1 ] || (echo "FAIL: POST /shipments/receive not defined" >&2; exit 1)
+
+      echo ""
+      echo "=== A2: receiveShipment function defined ==="
+      RS=$(grep -c "function receiveShipment\|receiveShipment" shopops-api/routes/shipments.js || true)
+      echo "receiveShipment count: $RS (expected >= 2)"
+      [ "$RS" -ge 2 ] || (echo "FAIL: receiveShipment not defined or not called" >&2; exit 1)
+
+      echo ""
+      echo "=== A3: matchUpcToSolicitation defined ==="
+      MATCH=$(grep -c "function matchUpcToSolicitation\|matchUpcToSolicitation" shopops-api/routes/shipments.js || true)
+      echo "matchUpcToSolicitation count: $MATCH (expected >= 2)"
+      [ "$MATCH" -ge 2 ] || (echo "FAIL: matchUpcToSolicitation not defined or not called" >&2; exit 1)
+
+      echo ""
+      echo "=== A4: allocationEngine called from shipments.js ==="
+      ALLOC=$(grep -c "runAllocationPass\|allocationEngine" shopops-api/routes/shipments.js || true)
+      echo "allocationEngine/runAllocationPass count: $ALLOC (expected >= 1)"
+      [ "$ALLOC" -ge 1 ] || (echo "FAIL: allocationEngine not called from receipt path" >&2; exit 1)
+
+      echo ""
+      echo "=== A5: received_at set in upsert paths ==="
+      RECV_AT=$(grep -c "received_at" shopops-api/routes/shipments.js || true)
+      echo "received_at occurrences: $RECV_AT (expected >= 2)"
+      [ "$RECV_AT" -ge 2 ] || (echo "FAIL: received_at not set in both INSERT and UPDATE paths" >&2; exit 1)
+
+      echo ""
+      echo "=== A6: migration file present ==="
+      ls shopops-api/migrations/20260517_inventory_items_receipt_fields.sql \
+        || (echo "FAIL: migration file missing" >&2; exit 1)
+      grep -q "shipment_receipts" shopops-api/migrations/20260517_inventory_items_receipt_fields.sql \
+        || (echo "FAIL: shipment_receipts table not in migration" >&2; exit 1)
+      grep -q "idempotency_key.*UNIQUE\|tenant_key_uniq\|UNIQUE.*idempotency" shopops-api/migrations/20260517_inventory_items_receipt_fields.sql \
+        || (echo "FAIL: idempotency_key unique constraint not in migration" >&2; exit 1)
+      echo "migration: OK"
+
+      echo ""
+      echo "=== A7: channels do NOT write on_hand_qty ==="
+      CHANNEL_WRITES=$(grep -rn "on_hand_qty" shopops-api/services/channel-adapter-shopify.js shopops-api/services/channel-adapter-ebay.js 2>/dev/null | wc -l || echo "0")
+      echo "channel on_hand_qty writes: $CHANNEL_WRITES (expected 0)"
+      [ "$CHANNEL_WRITES" -eq 0 ] || (echo "FAIL: channel adapters write to on_hand_qty — not allowed" >&2; exit 1)
+
+      echo ""
+      echo "=== A8: test file present with >= 6 test cases ==="
+      [ -f shopops-api/tests/test_inventory_receipt.js ] \
+        || (echo "FAIL: test_inventory_receipt.js missing" >&2; exit 1)
+      TEST_COUNT=$(grep -cE "test\(|it\(|describe\(|assert\.|expect\(" shopops-api/tests/test_inventory_receipt.js || true)
+      echo "test assertions/cases: $TEST_COUNT (expected >= 6)"
+      [ "$TEST_COUNT" -ge 6 ] || (echo "FAIL: fewer than 6 test cases in test_inventory_receipt.js" >&2; exit 1)
+
+      echo ""
+      echo "ALL GREP ASSERTIONS: PASS"
+
+  # ---------------------------------------------------------------------------
+  # 5. VERIFY-TESTS — run new + existing tests
+  # ---------------------------------------------------------------------------
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      cd shopops-api
+      echo "=== bun tests/test_inventory_receipt.js ==="
+      bun tests/test_inventory_receipt.js
+      echo "RECEIPT_TESTS=PASS"
+      echo ""
+      echo "=== bun tests/test_inventory_availability.js (regression) ==="
+      bun tests/test_inventory_availability.js
+      echo "AVAILABILITY_REGRESSION=PASS"
+
+  # ---------------------------------------------------------------------------
+  # 6. COMMIT-AND-PUSH
+  # ---------------------------------------------------------------------------
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-inventory-receipt-01"
+
+      if git show-ref --quiet "refs/heads/$BRANCH"; then
+        git checkout "$BRANCH"
+      else
+        git checkout -b "$BRANCH"
+      fi
+
+      git add \
+        shopops-api/migrations/20260517_inventory_items_receipt_fields.sql \
+        shopops-api/routes/shipments.js \
+        shopops-api/tests/test_inventory_receipt.js
+
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(api): WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 — distributor shipment receipt path with allocation engine integration"
+      else
+        echo "No staged changes; branch already contains the work"
+      fi
+
+      git push -u origin "$BRANCH"
+      echo "BRANCH=$BRANCH"
+      echo "BRANCH_SHA=$(git rev-parse HEAD)"
+
+  # ---------------------------------------------------------------------------
+  # 7. OPEN-PR
+  # ---------------------------------------------------------------------------
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-pull-list-inventory-receipt-01"
+      REPO="bluedevilcollectibles/shopops"
+      BASE="master"
+
+      EXISTING_PR=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXISTING_PR" ]; then
+        echo "PR_URL=$EXISTING_PR"
+        exit 0
+      fi
+
+      PR_URL=$(gh pr create --repo "$REPO" --base "$BASE" \
+        --head "$BRANCH" \
+        --title "feat(api): WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 — shipment receipt path P0" \
+        --body "$(cat <<'PRBODY'
+## Summary
+- Migration 20260517_inventory_items_receipt_fields.sql: adds received_at, source, issue_id to inventory_items; creates shipment_receipts table with unique idempotency constraint.
+- routes/shipments.js: POST /shipments/receive (new full receipt path); receiveShipment(), matchUpcToSolicitation(), upsertInventoryItem() functions; allocationEngine.runAllocationPass() called after upsert; POST /shipments/ingest kept as backward-compat alias.
+- 6 test scenarios in tests/test_inventory_receipt.js; existing test_inventory_availability.js still passes.
+
+Closes #118
+PRBODY
+)")
+      echo "PR_URL=$PR_URL"
+
+  # ---------------------------------------------------------------------------
+  # 8. RUNTIME-VERIFY — Rule 19 (best-effort)
+  # ---------------------------------------------------------------------------
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      RESULT=$(docker exec shopops-api grep -n "receiveShipment" /app/routes/shipments.js 2>&1)
+      EXIT=$?
+      if [ $EXIT -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'receiveShipment' /app/routes/shipments.js"
+      fi
+
+  # ---------------------------------------------------------------------------
+  # 9. BUILD-MANIFEST
+  # ---------------------------------------------------------------------------
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build Captain CI manifest for WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 (CODE class).
+
+      Required fields (Rule 2 / Three Rules):
+      - WO: WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01
+      - Builder: Codex (wo-shopops-pull-list-inventory-receipt-01 workflow)
+      - Files created: shopops-api/migrations/20260517_inventory_items_receipt_fields.sql, shopops-api/tests/test_inventory_receipt.js
+      - Files modified: shopops-api/routes/shipments.js
+      - Tests: count passing / count total (from verify-tests output — receipt + availability regression)
+      - PR URL: from open-pr output
+      - Commit SHA: from commit-and-push output
+      - Grep assertions: from verify-grep output (all PASS)
+      - Runtime verification (Rule 19): from runtime-verify output
+      - VALIDATION: PASS or VALIDATION: PASS_PENDING_REBUILD
+
+      ## Inputs
+      $read-inputs.output
+      $verify-grep.output
+      $verify-tests.output
+      $commit-and-push.output
+      $open-pr.output
+      $runtime-verify.output
+
+  # ---------------------------------------------------------------------------
+  # 10. FLIP-NOTION
+  # ---------------------------------------------------------------------------
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 to REVIEW with the manifest
+      in the Notes property.
+
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Search the database for the page with WO ID = WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01.
+
+      Required Notion changes:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> set to $build-manifest.output verbatim (entire manifest body)
+
+      DO NOT set Claude Status=DONE. DO NOT set Status=Done.
+      Only Captain CI can close both fields after its VALIDATED verdict.
+
+      If Notion MCP unavailable, output:
+      XO_TODO: flip-notion failed for WO-SHOPOPS-PULL-LIST-INVENTORY-RECEIPT-01 — manifest in run log
+      and print the full manifest body so XO can manually update.
+
+      $build-manifest.output

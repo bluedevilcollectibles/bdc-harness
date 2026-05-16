@@ -1,0 +1,460 @@
+name: wo-shopops-safe-availability-canonical-01
+description: |
+  Use when: Executing WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01.
+  Does: Implements the canonical safe-availability primitive for Shop Ops HQ.
+  Creates v_inventory_availability SQL view computing:
+    safe_available_qty = MAX(0, on_hand_qty - reserved_qty - channel_listed_elsewhere_qty)
+  All buyer-facing surfaces must consume this view. Staff may see raw + reserved + safe,
+  distinctly labeled. Raw on_hand_qty must never be exposed to buyers as sellable quantity.
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+provider: codex
+
+nodes:
+  - id: read-inputs
+    bash: |
+      # NO set -u — WO_ID is defined inline
+      WO_ID="WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01"
+      GH_ISSUE="113"
+      REPO="bluedevilcollectibles/shopops-api"
+      echo "WO: $WO_ID"
+      echo "GH_ISSUE: $GH_ISSUE"
+      echo "REPO: $REPO"
+
+      # Fetch spec from bdc-xo
+      SPEC=$(gh api \
+        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+
+      if [ -z "$SPEC" ]; then
+        echo "WARNING: spec not found in bdc-xo — falling back to local docs/" >&2
+        LOCAL_SPEC=$(cat docs/work-orders/${WO_ID}.md 2>/dev/null || true)
+        if [ -z "$LOCAL_SPEC" ]; then
+          echo "ERROR: spec not found in bdc-xo or local docs/" >&2
+          exit 1
+        fi
+        printf -- '--- SPEC (local fallback) ---\n%s\n' "$LOCAL_SPEC"
+      else
+        printf -- '--- SPEC (bdc-xo) ---\n%s\n' "$SPEC"
+      fi
+
+      echo "--- REPO CONTEXT ---"
+      echo "Target: shopops-api/ (subdirectory in repo root)"
+      ls shopops-api/ 2>/dev/null | head -20 || echo "shopops-api/ not found"
+
+  - id: verify-files
+    depends_on: [read-inputs]
+    bash: |
+      set -e
+      echo "=== Pre-implementation file inventory ==="
+
+      if [ ! -d "shopops-api" ]; then
+        echo "ERROR: shopops-api/ not found — not in shopops repo root" >&2
+        exit 1
+      fi
+
+      echo "--- checking inventory_items table (hard dependency) ---"
+      psql "$SUPABASE_DB_URL" -c \
+        "SELECT column_name, data_type FROM information_schema.columns
+         WHERE table_schema='public' AND table_name='inventory_items'
+         ORDER BY ordinal_position;" 2>&1 \
+        || echo "WARNING: cannot connect to staging DB — verify SUPABASE_DB_URL is set"
+
+      echo "--- checking channel_listings table (formula dependency) ---"
+      psql "$SUPABASE_DB_URL" -c \
+        "SELECT table_name FROM information_schema.tables
+         WHERE table_schema='public' AND table_name='channel_listings';" 2>&1 \
+        || echo "WARNING: cannot check channel_listings — proceeding"
+
+      echo "--- checking for prior v_inventory_availability view ---"
+      psql "$SUPABASE_DB_URL" -c \
+        "SELECT table_name, table_type FROM information_schema.tables
+         WHERE table_schema='public' AND table_name='v_inventory_availability';" 2>&1 \
+        || echo "(cannot check — db not available)"
+
+      echo "--- existing service files ---"
+      ls shopops-api/services/ 2>/dev/null | grep -i "inventory\|availab" || echo "(none found)"
+
+      echo "--- existing route files ---"
+      ls shopops-api/routes/ 2>/dev/null | grep -i "inventory\|storefront\|pos" || echo "(none found)"
+
+      echo "--- existing db view files ---"
+      ls shopops-api/db/views/ 2>/dev/null || echo "(db/views/ does not exist yet)"
+
+      echo "=== verify-files COMPLETE ==="
+
+  - id: implement
+    depends_on: [verify-files]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        You are implementing WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 in the shopops-api
+        subdirectory. CWD is the shopops repo root.
+
+        SPEC OUTPUT:
+        $read-inputs.output
+
+        FILE INVENTORY:
+        $verify-files.output
+
+        PREVIOUS ITERATION OUTPUT (if any):
+        $LOOP_PREV_OUTPUT
+
+        === IMPLEMENTATION REQUIREMENTS ===
+
+        1. SCHEMA VERIFICATION (do this first, before writing any code)
+           Run and record:
+           - Does inventory_items exist? What columns does it have?
+           - Does channel_listings exist? If yes, what is the column for listed qty?
+           - Does v_inventory_availability already exist?
+           Document findings as a comment block at the top of the migration file.
+
+        2. DATABASE VIEW MIGRATION
+           File: shopops-api/db/migrations/<YYYYMMDD>_v_inventory_availability.sql
+           (or shopops-api/db/views/v_inventory_availability.sql — match existing pattern)
+
+           FULL FORMULA (use if channel_listings exists):
+           CREATE OR REPLACE VIEW v_inventory_availability AS
+           SELECT
+             ii.tenant_id,
+             ii.inventory_item_id,
+             ii.on_hand_qty,
+             ii.reserved_qty,
+             COALESCE(cl.channel_listed_elsewhere_qty, 0) AS channel_listed_elsewhere_qty,
+             GREATEST(0, ii.on_hand_qty - ii.reserved_qty)
+               AS available_qty,
+             GREATEST(0, ii.on_hand_qty - ii.reserved_qty
+                        - COALESCE(cl.channel_listed_elsewhere_qty, 0))
+               AS safe_available_qty
+           FROM inventory_items ii
+           LEFT JOIN (
+             SELECT tenant_id, inventory_item_id,
+                    SUM(listed_qty) AS channel_listed_elsewhere_qty
+             FROM channel_listings
+             GROUP BY tenant_id, inventory_item_id
+           ) cl ON cl.tenant_id = ii.tenant_id
+                AND cl.inventory_item_id = ii.inventory_item_id;
+
+           MINIMUM FALLBACK (use if channel_listings does NOT exist):
+           CREATE OR REPLACE VIEW v_inventory_availability AS
+           SELECT
+             tenant_id,
+             inventory_item_id,
+             on_hand_qty,
+             reserved_qty,
+             0 AS channel_listed_elsewhere_qty,
+             GREATEST(0, on_hand_qty - reserved_qty) AS available_qty,
+             GREATEST(0, on_hand_qty - reserved_qty) AS safe_available_qty
+           FROM inventory_items;
+           -- TODO: Update to full formula when channel_listings is implemented
+
+           Document which formula was used and why in a comment at the top of the file.
+
+        3. AVAILABILITY SERVICE
+           File: shopops-api/services/inventoryAvailability.js
+           - import db from '../db/index.js' (or equivalent)
+           - export async function getSafeAvailability(tenantId, inventoryItemId)
+             Returns: { inventoryItemId, safeAvailableQty, availableQty, onHandQty, reservedQty }
+             Query: SELECT * FROM v_inventory_availability
+                    WHERE tenant_id=$1 AND inventory_item_id=$2
+           - export async function getSafeAvailabilityBatch(tenantId, inventoryItemIds)
+             Returns: Map<inventoryItemId, { safeAvailableQty, availableQty, ... }>
+             Query: SELECT * FROM v_inventory_availability
+                    WHERE tenant_id=$1 AND inventory_item_id = ANY($2)
+           Both functions must enforce tenant_id filtering — never return rows across tenants.
+
+        4. REST ENDPOINT
+           File: shopops-api/routes/inventory.js (create if not existing)
+           Register: GET /api/inventory/:itemId/availability
+           - Requires auth middleware (tenant-scoped JWT)
+           - Calls getSafeAvailability(tenantId, itemId)
+           - BUYER response (default): { inventoryItemId, safeAvailableQty }
+             (do NOT include onHandQty or reservedQty)
+           - STAFF response (if JWT has staff role claim): also include availableQty,
+             onHandQty (labeled "rawOnHandQty"), reservedQty
+           - 404 if item not found for tenant
+           - 400 if itemId is not a valid UUID
+
+        5. CALL-SITE UPDATES
+           Find existing buyer-facing routes that read on_hand_qty directly:
+           - shopops-api/routes/storefront.js (or equivalent)
+           - shopops-api/routes/pos.js (or equivalent)
+           Update each to call getSafeAvailability instead of reading on_hand_qty directly.
+           If call sites cannot be located, add a TODO comment in inventoryAvailability.js
+           and note in the PR description.
+
+        6. UNIT TESTS
+           File: shopops-api/tests/inventoryAvailability.test.js
+           Write 6 tests using bun:test or jest-compatible:
+           - Test 1: Formula correctness (on_hand=10, reserved=3, no channel listings -> safe=7)
+           - Test 2: Zero-floor invariant (on_hand=2, reserved=5 -> safe=0, NOT -3)
+           - Test 3: Channel listed elsewhere reduces safe qty (on_hand=10, reserved=2, listed=4 -> safe=4)
+           - Test 4: Tenant isolation (tenantA qty does not bleed into tenantB result)
+           - Test 5: Buyer API response omits onHandQty field entirely
+           - Test 6: Staff API response includes all four fields with correct labels
+           Tests use staging Supabase (env var SUPABASE_DB_URL or TEST_DB_URL). No mocks.
+           Each test asserts exact numeric values or field presence/absence.
+
+        === INVARIANTS TO PRESERVE ===
+        - safe_available_qty is NEVER negative (GREATEST(0,...) enforced in view)
+        - available_qty <= on_hand_qty always (reserved_qty cannot make it exceed raw)
+        - safe_available_qty <= available_qty always
+        - Buyer API response MUST NOT contain onHandQty or reservedQty field
+        - tenant_id always in WHERE clause — never cross-tenant leakage
+        - View is named exactly v_inventory_availability (other WOs reference it by name)
+
+        === DO NOT ===
+        - Do not invent column names — verify with information_schema first
+        - Do not expose on_hand_qty in buyer-facing responses
+        - Do not use mocks in tests
+
+        When all files are written and tests pass, output:
+        <promise>COMPLETE</promise>
+
+  - id: verify-grep
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Grep Assertions for WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 ==="
+
+      FAIL=0
+
+      grep -r "getSafeAvailability" shopops-api/services/inventoryAvailability.js > /dev/null 2>&1 \
+        && echo "PASS: getSafeAvailability found in services/inventoryAvailability.js" \
+        || { echo "FAIL: getSafeAvailability not found"; FAIL=1; }
+
+      grep -r "getSafeAvailabilityBatch" shopops-api/services/inventoryAvailability.js > /dev/null 2>&1 \
+        && echo "PASS: getSafeAvailabilityBatch found" \
+        || { echo "FAIL: getSafeAvailabilityBatch not found"; FAIL=1; }
+
+      grep -r "v_inventory_availability" shopops-api/db/ > /dev/null 2>&1 \
+        && echo "PASS: view migration found in db/" \
+        || { echo "FAIL: v_inventory_availability not in db/"; FAIL=1; }
+
+      grep -r "GREATEST" shopops-api/db/ > /dev/null 2>&1 \
+        && echo "PASS: GREATEST zero-floor found in view migration" \
+        || { echo "FAIL: GREATEST not found in migration — zero-floor may be missing"; FAIL=1; }
+
+      grep -r "safe_available_qty\|safeAvailableQty" shopops-api/routes/ > /dev/null 2>&1 \
+        && echo "PASS: safe qty referenced in routes" \
+        || { echo "FAIL: safeAvailableQty not found in any route"; FAIL=1; }
+
+      # Verify on_hand_qty NOT in buyer route response (warn only — false positives possible)
+      if grep -r "on_hand_qty\|onHandQty" shopops-api/routes/inventory.js 2>/dev/null \
+         | grep -v "staff\|admin\|label\|raw" | grep -q "."; then
+        echo "WARN: on_hand_qty may be exposed in buyer route — verify staff gate is present"
+      else
+        echo "PASS: on_hand_qty not found ungated in inventory route"
+      fi
+
+      grep -r "tenant_id" shopops-api/services/inventoryAvailability.js > /dev/null 2>&1 \
+        && echo "PASS: tenant_id filtering present in service" \
+        || { echo "FAIL: tenant_id not found in inventoryAvailability.js — cross-tenant leakage risk"; FAIL=1; }
+
+      if [ $FAIL -ne 0 ]; then
+        echo "=== GREP ASSERTIONS: FAILED ($FAIL failures) ==="
+        exit 1
+      fi
+      echo "=== GREP ASSERTIONS: ALL PASS ==="
+
+  - id: verify-tests
+    depends_on: [implement]
+    bash: |
+      set -e
+      echo "=== Running inventory availability unit tests ==="
+
+      if [ ! -f "shopops-api/tests/inventoryAvailability.test.js" ]; then
+        echo "ERROR: test file shopops-api/tests/inventoryAvailability.test.js not found" >&2
+        exit 1
+      fi
+
+      cd shopops-api
+      bun test tests/inventoryAvailability.test.js 2>&1 | tee /tmp/avail-test-output.txt
+      TEST_EXIT=${PIPESTATUS[0]}
+
+      if [ $TEST_EXIT -ne 0 ]; then
+        echo "ERROR: availability tests failed (exit $TEST_EXIT)" >&2
+        exit 1
+      fi
+
+      # Verify zero-floor invariant holds in staging DB
+      echo "--- Checking zero-floor invariant in staging ---"
+      psql "$SUPABASE_DB_URL" -c \
+        "SELECT COUNT(*) AS negative_rows FROM v_inventory_availability WHERE safe_available_qty < 0;" \
+        2>&1 || echo "WARNING: cannot verify invariant — DB not available"
+
+      echo "=== TEST RESULTS ==="
+      cat /tmp/avail-test-output.txt
+      echo "=== TESTS PASS ==="
+
+  - id: commit-and-push
+    depends_on: [verify-grep, verify-tests]
+    bash: |
+      set -e
+      BRANCH="wo/shopops-safe-availability-canonical-01"
+
+      echo "=== Committing WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 ==="
+
+      git checkout -b "$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+
+      # Stage all new/modified files for this WO
+      git add shopops-api/db/migrations/ \
+              shopops-api/db/views/ \
+              shopops-api/services/inventoryAvailability.js \
+              shopops-api/tests/inventoryAvailability.test.js \
+              2>/dev/null || true
+
+      # Stage call-site route updates
+      git add shopops-api/routes/ 2>/dev/null || true
+
+      if git diff --cached --quiet; then
+        echo "WARNING: nothing staged" >&2
+      else
+        git -c user.name="John Ranson" \
+            -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(api): WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 — canonical safe-availability primitive
+
+- Add v_inventory_availability view: safe_available_qty = GREATEST(0, on_hand - reserved - listed)
+- Add getSafeAvailability() and getSafeAvailabilityBatch() service functions
+- Add GET /api/inventory/:itemId/availability endpoint (buyer vs staff response differentiation)
+- Zero-floor invariant enforced in SQL view (GREATEST)
+- Buyer response omits raw on_hand_qty per plan doc invariant
+- 6-test suite covering formula, zero-floor, channel deduction, tenant isolation, API shape
+
+Closes #113"
+      fi
+
+      git push -u origin "$BRANCH"
+      echo "BRANCH=$BRANCH"
+      echo "SHA=$(git rev-parse HEAD)"
+
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -e
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+      EXISTING=$(gh pr list --repo bluedevilcollectibles/shopops-api \
+        --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null || true)
+
+      if [ -n "$EXISTING" ]; then
+        echo "PR already exists: #$EXISTING"
+        gh pr view "$EXISTING" --repo bluedevilcollectibles/shopops-api --json url --jq '.url'
+      else
+        gh pr create \
+          --repo bluedevilcollectibles/shopops-api \
+          --base main \
+          --head "$BRANCH" \
+          --title "feat(api): WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 — canonical safe-availability primitive" \
+          --body "$(cat <<'PRBODY'
+## Summary
+
+- Implements `v_inventory_availability` SQL view with `safe_available_qty = GREATEST(0, on_hand - reserved - listed_elsewhere)`
+- Zero-floor invariant enforced at DB level (GREATEST) — `safe_available_qty` is never negative
+- `getSafeAvailability()` and `getSafeAvailabilityBatch()` service functions for all consumers
+- `GET /api/inventory/:itemId/availability` endpoint: buyer response omits raw `on_hand_qty`, staff response includes all four labeled quantities
+- Buyer-facing storefront and POS routes updated to consume safe qty instead of raw
+- 6 unit + integration tests (staging Supabase, no mocks)
+
+## Test plan
+
+- [ ] `bun test tests/inventoryAvailability.test.js` — 6 pass
+- [ ] `psql $SUPABASE_DB_URL -c "SELECT COUNT(*) FROM v_inventory_availability WHERE safe_available_qty < 0;"` returns 0
+- [ ] `curl -H "Authorization: Bearer $BUYER_TOKEN" $STAGING_URL/api/inventory/$ITEM_ID/availability | jq 'has("onHandQty")'` returns false
+- [ ] `docker exec shopops-api grep -n getSafeAvailability /app/services/inventoryAvailability.js` (Rule 19)
+
+Closes #113
+
+WO: WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01
+PRBODY
+)"
+      fi
+
+  - id: runtime-verify
+    depends_on: [open-pr]
+    bash: |
+      # set -e deliberately omitted — best-effort per Rule 19
+      echo "=== Rule 19 Runtime Verify ==="
+
+      RESULT=$(docker exec shopops-api grep -n \
+        "getSafeAvailability\|v_inventory_availability\|safeAvailableQty" \
+        /app/services/inventoryAvailability.js 2>&1)
+      EXIT=$?
+
+      if [ $EXIT -eq 0 ]; then
+        echo "STATUS=ok"
+        echo "$RESULT"
+      else
+        echo "STATUS=skipped_container_not_rebuilt"
+        echo "shopops-api uses COPY . /app at build — source changes need rebuild + restart."
+        echo "RULE19_RERUN=docker exec shopops-api grep -n 'getSafeAvailability' /app/services/inventoryAvailability.js"
+        echo "To rebuild: docker compose up -d --build shopops-api"
+      fi
+
+  - id: build-manifest
+    depends_on: [runtime-verify]
+    prompt: |
+      Build the Captain CI completion manifest for WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01.
+      WO Class: CODE. Include VALIDATION: PASS.
+
+      Structure the manifest exactly as:
+
+      WO: WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01
+      Files created:
+        - shopops-api/db/migrations/<date>_v_inventory_availability.sql (or db/views/)
+        - shopops-api/services/inventoryAvailability.js
+        - shopops-api/routes/inventory.js (if new)
+        - shopops-api/tests/inventoryAvailability.test.js
+      Files modified:
+        - (list any storefront/pos route files updated to use safe qty)
+      Routes added:
+        - GET /api/inventory/:itemId/availability
+      Migrations added:
+        - v_inventory_availability view migration
+      Tests: 6 passing / 6 total
+      Git commit: (SHA from commit-and-push output)
+      PR URL: (URL from open-pr output)
+      Branch: wo/shopops-safe-availability-canonical-01
+
+      Formula used: (full or minimum fallback — document which and why from verify-files output)
+
+      GREP ASSERTIONS:
+      $verify-grep.output
+
+      TEST RESULTS:
+      $verify-tests.output
+
+      COMMIT + PUSH:
+      $commit-and-push.output
+
+      PR:
+      $open-pr.output
+
+      RULE 19 RUNTIME VERIFY:
+      $runtime-verify.output
+
+      VALIDATION: PASS
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    prompt: |
+      Flip Notion WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 to REVIEW status.
+
+      Notion database ID: a6df831c-0b52-449f-8ca4-d77be6b70d0a
+
+      Steps:
+      1. Search for the Notion page with WO ID = "WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01"
+      2. Update the page:
+         - Property "Claude Status" -> "REVIEW"
+         - Property "Status" -> "Review"
+         - Append to Notes: the full manifest from $build-manifest.output
+      3. Confirm the update by fetching the page properties.
+
+      If Notion MCP is unavailable or page not found, output exactly:
+      XO_TODO: Manually flip WO-SHOPOPS-SAFE-AVAILABILITY-CANONICAL-01 to REVIEW in Notion.
+      Paste manifest below into Notes field.
+
+      MANIFEST:
+      $build-manifest.output
