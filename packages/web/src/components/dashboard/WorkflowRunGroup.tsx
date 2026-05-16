@@ -13,6 +13,8 @@ interface WorkflowRunGroupProps {
   onDelete?: (runId: string) => void;
   onApprove?: (runId: string) => void;
   onReject?: (runId: string, reason?: string) => void;
+  onArchive?: (runId: string, reason?: string) => void;
+  onUnarchive?: (runId: string) => void;
 }
 
 export function WorkflowRunGroup({
@@ -25,6 +27,8 @@ export function WorkflowRunGroup({
   onDelete,
   onApprove,
   onReject,
+  onArchive,
+  onUnarchive,
 }: WorkflowRunGroupProps): React.ReactElement {
   const navigate = useNavigate();
 
@@ -60,6 +64,8 @@ export function WorkflowRunGroup({
             onDelete={onDelete}
             onApprove={onApprove}
             onReject={onReject}
+            onArchive={onArchive}
+            onUnarchive={onUnarchive}
           />
         ))}
       </div>

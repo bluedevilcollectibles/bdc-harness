@@ -1,5 +1,14 @@
 import { Link } from 'react-router';
-import { Globe, Terminal, Hash, Send, GitBranch, Trash2 } from 'lucide-react';
+import {
+  Globe,
+  Terminal,
+  Hash,
+  Send,
+  GitBranch,
+  Trash2,
+  Archive,
+  ArchiveRestore,
+} from 'lucide-react';
 import type { DashboardRunResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { formatDuration, formatStarted } from '@/lib/format';
@@ -8,6 +17,8 @@ import { ConfirmRunActionDialog } from './ConfirmRunActionDialog';
 interface WorkflowHistoryTableProps {
   runs: DashboardRunResponse[];
   onDelete?: (runId: string) => void;
+  onArchive?: (runId: string) => void;
+  onUnarchive?: (runId: string) => void;
 }
 
 const STATUS_DOT_COLORS: Record<string, string> = {
@@ -27,6 +38,8 @@ const PLATFORM_ICONS: Record<string, React.ReactElement> = {
 export function WorkflowHistoryTable({
   runs,
   onDelete,
+  onArchive,
+  onUnarchive,
 }: WorkflowHistoryTableProps): React.ReactElement {
   if (runs.length === 0) {
     return (
@@ -56,7 +69,8 @@ export function WorkflowHistoryTable({
               key={run.id}
               className={cn(
                 'hover:bg-surface-elevated transition-colors',
-                run.status === 'failed' && 'border-l-2 border-l-destructive'
+                run.status === 'failed' && 'border-l-2 border-l-destructive',
+                run.archived_at != null && 'opacity-50'
               )}
             >
               <td className="px-3 py-2">
@@ -101,7 +115,29 @@ export function WorkflowHistoryTable({
                   >
                     View Logs
                   </Link>
-                  {onDelete && (
+                  {onArchive && run.archived_at == null && (
+                    <button
+                      onClick={(): void => {
+                        onArchive(run.id);
+                      }}
+                      className="text-text-tertiary hover:text-text-secondary transition-colors"
+                      title="Archive run"
+                    >
+                      <Archive className="h-3 w-3" />
+                    </button>
+                  )}
+                  {onUnarchive && run.archived_at != null && (
+                    <button
+                      onClick={(): void => {
+                        onUnarchive(run.id);
+                      }}
+                      className="text-text-tertiary hover:text-text-secondary transition-colors"
+                      title="Unarchive run"
+                    >
+                      <ArchiveRestore className="h-3 w-3" />
+                    </button>
+                  )}
+                  {onDelete && run.archived_at != null && (
                     <ConfirmRunActionDialog
                       trigger={
                         <button
