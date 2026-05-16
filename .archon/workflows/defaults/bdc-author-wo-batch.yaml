@@ -354,6 +354,43 @@ nodes:
       DRY_RUN="${DRY_RUN:-false}"
       BRANCH="wo/author-wo-batch-run-$(date +%Y%m%d%H%M%S)"
 
+      # WO-168 Tier 1: save load-bearing artifacts to host-mounted volume BEFORE
+      # any remote operation. If push fails or the worktree is pruned, the bundle
+      # on the host disk is the recovery source of truth.
+      # Recovery procedure: docs/recovery/host-artifact-recovery.md
+      save_bundle_to_host() {
+        local run_id="${WORKFLOW_RUN_ID:-${WORKFLOW_ID:-unknown-$(date +%Y%m%d%H%M%S)}}"
+        local dest="/host-artifacts/${run_id}"
+        if [ ! -d /host-artifacts ]; then
+          echo "WARN: /host-artifacts not mounted -- skipping bundle save (recovery from worktree only)" >&2
+          return 0
+        fi
+        mkdir -p "$dest" 2>/dev/null || {
+          echo "WARN: could not mkdir $dest -- skipping bundle save" >&2
+          return 0
+        }
+        # git bundle of HEAD captures the entire reachable history of the branch
+        # in a single file -- can be fetched back even after the branch is gone.
+        if git bundle create "$dest/branch.bundle" HEAD 2>"$dest/bundle.err"; then
+          echo "  host-artifact: bundle saved $dest/branch.bundle ($(stat -c%s "$dest/branch.bundle" 2>/dev/null || echo '?') bytes)"
+        else
+          echo "WARN: git bundle create failed -- see $dest/bundle.err" >&2
+        fi
+        # Human-readable diff stat for quick triage without unpacking the bundle
+        git diff --stat HEAD~1 HEAD > "$dest/changes.txt" 2>/dev/null \
+          || git log -1 --name-status HEAD > "$dest/changes.txt" 2>/dev/null \
+          || echo "(no diff/log available)" > "$dest/changes.txt"
+        # Recovery breadcrumb: branch name + commit + timestamp
+        {
+          echo "branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+          echo "sha=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+          echo "saved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "workflow_run_id=${run_id}"
+          echo "recovery_cmd=git fetch ${dest}/branch.bundle main:rescue-${run_id}"
+        } > "$dest/MANIFEST.txt"
+        echo "  host-artifact: manifest written $dest/MANIFEST.txt"
+      }
+
       git checkout -b "$BRANCH"
       git add docs/work-orders/ yaml-drafts/ 2>/dev/null || true
 
@@ -373,8 +410,11 @@ nodes:
 
       Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
 
+      # WO-168 Tier 1: bundle BEFORE push so a push failure does not destroy work.
+      save_bundle_to_host
+
       if [ "$DRY_RUN" = "true" ]; then
-        echo "DRY_RUN=true -- skipping push"
+        echo "DRY_RUN=true -- skipping push (bundle still saved to host)"
         echo "BRANCH=$BRANCH"
         echo "SHA=$(git rev-parse HEAD)"
         exit 0
