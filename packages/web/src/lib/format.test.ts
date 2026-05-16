@@ -1,5 +1,11 @@
 import { describe, test, expect } from 'bun:test';
-import { ensureUtc, formatDuration, formatDurationMs, formatStarted } from './format';
+import {
+  ensureUtc,
+  formatDuration,
+  formatDurationMs,
+  formatStarted,
+  formatCostUsd,
+} from './format';
 
 describe('ensureUtc', () => {
   test('returns timestamp unchanged when it already ends with Z', () => {
@@ -164,5 +170,23 @@ describe('formatDurationMs', () => {
 
   test('one decimal place for minutes', () => {
     expect(formatDurationMs(75000)).toBe('1.3m');
+  });
+});
+
+describe('formatCostUsd', () => {
+  test('zero shows 4 decimal places', () => {
+    expect(formatCostUsd(0)).toBe('$0.0000');
+  });
+
+  test('sub-cent shows 4 decimal places', () => {
+    expect(formatCostUsd(0.0042)).toBe('$0.0042');
+  });
+
+  test('sub-dollar shows 4 decimal places', () => {
+    expect(formatCostUsd(0.5)).toBe('$0.5000');
+  });
+
+  test('over-dollar shows 2 decimal places', () => {
+    expect(formatCostUsd(2.34)).toBe('$2.34');
   });
 });

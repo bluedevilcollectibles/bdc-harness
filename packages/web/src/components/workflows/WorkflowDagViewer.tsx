@@ -87,6 +87,7 @@ export function WorkflowDagViewer({
           ...display,
           status: live?.status,
           duration: live?.duration,
+          costUsd: live?.costUsd,
           error: live?.error,
           selected: node.id === selectedNodeId,
           currentIteration: live?.currentIteration,

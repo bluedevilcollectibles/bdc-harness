@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router';
 import { MessageSquare } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
+import { CostMeter } from './CostMeter';
 import { DagNodeProgress } from './DagNodeProgress';
 import { StepLogs } from './StepLogs';
 import { WorkflowLogs } from './WorkflowLogs';
@@ -129,6 +130,10 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   name: nodeId,
                   status: status as WorkflowStepStatus,
                   duration: e.data.duration_ms as number | undefined,
+                  costUsd:
+                    e.event_type === 'node_completed'
+                      ? (e.data.cost_usd as number | undefined)
+                      : undefined,
                   error: e.data.error as string | undefined,
                   reason: e.data.reason as 'when_condition' | 'trigger_rule' | undefined,
                 });
@@ -476,6 +481,11 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     setNodeScrollTrigger(prev => prev + 1);
   }, []);
 
+  const runTotalCostUsd = useMemo(
+    () => (workflow?.dagNodes ?? []).reduce((sum, n) => sum + (n.costUsd ?? 0), 0),
+    [workflow]
+  );
+
   if (error) {
     return (
       <div className="flex items-center justify-center h-full text-error">
@@ -623,6 +633,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
             </button>
           )}
           <span className="text-xs text-text-secondary">{formatDurationMs(elapsed)}</span>
+          <CostMeter totalCostUsd={runTotalCostUsd} />
         </div>
       </div>
 

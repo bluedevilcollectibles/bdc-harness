@@ -122,6 +122,19 @@ describe('handleDagNode', () => {
     expect(wf!.dagNodes).toHaveLength(1);
     expect(wf!.dagNodes[0].status).toBe('completed');
   });
+
+  test('propagates costUsd to DagNodeState', () => {
+    useWorkflowStore
+      .getState()
+      .handleWorkflowStatus(statusEvent({ runId: 'run-cost1', workflowName: 'cost-wf' }));
+    useWorkflowStore
+      .getState()
+      .handleDagNode(
+        dagNodeEvent({ runId: 'run-cost1', nodeId: 'node-c', status: 'completed', costUsd: 0.0042 })
+      );
+    const wf = useWorkflowStore.getState().workflows.get('run-cost1');
+    expect(wf!.dagNodes[0].costUsd).toBe(0.0042);
+  });
 });
 
 describe('handleWorkflowArtifact', () => {

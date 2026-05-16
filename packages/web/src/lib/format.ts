@@ -30,3 +30,9 @@ export function formatDurationMs(ms: number): string {
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${(ms / 60000).toFixed(1)}m`;
 }
+
+/** Format a USD cost for display. Sub-dollar amounts use 4 decimal places; $1+ uses 2. */
+export function formatCostUsd(usd: number): string {
+  if (usd < 1) return `$${usd.toFixed(4)}`;
+  return `$${usd.toFixed(2)}`;
+}
