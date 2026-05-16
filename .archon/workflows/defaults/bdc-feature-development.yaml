@@ -215,12 +215,19 @@ nodes:
     depends_on: [decide-push-target]
     bash: |
       set -euo pipefail
-      echo "$decide-push-target.output"
-      if printf '%s\n' "$decide-push-target.output" | grep -q '^out_of_scope: true'; then
+      # 2026-05-16 quote-fix: substituteNodeOutputRefs with escapedForBash=true wraps
+      # the output in single quotes. Wrapping the substitution in double quotes here
+      # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes — line 2+ of
+      # the agent output becomes bare commands. Assign directly to bash vars, then
+      # quote the var reference. Engine-level fix tracked in WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$plan.output
+      echo "$DECIDE_OUTPUT"
+      if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
         echo "Out of scope for bdc-feature-development; failing closed." >&2
         exit 1
       fi
-      BRANCH=$(printf '%s\n' "$decide-push-target.output" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
       if [ -z "$BRANCH" ]; then
         echo "No feature branch target found in decide-push-target output." >&2
         exit 1
@@ -236,7 +243,7 @@ nodes:
         if [ -z "$path" ]; then
           continue
         fi
-        if ! printf '%s\n' "$plan.output" | grep -F -- "$path" >/dev/null; then
+        if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
           echo "Changed file was not listed in plan output: $path" >&2
           exit 1
         fi
@@ -246,7 +253,7 @@ nodes:
         echo "No changes staged; cannot commit." >&2
         exit 1
       fi
-      COMMIT_MESSAGE=$(printf '%s\n' "$plan.output" | sed -n 's/^Commit message: //p' | head -n 1)
+      COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$COMMIT_MESSAGE" ]; then
         # Re-derive WO_ID locally — see post-started for rationale
         WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
@@ -260,18 +267,23 @@ nodes:
     task_class: clerical
     bash: |
       set -euo pipefail
-      if ! printf '%s\n' "$decide-push-target.output" | grep -q '^pr_required: true'; then
+      # 2026-05-16 quote-fix: see commit-and-push for rationale.
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$plan.output
+      IMPLEMENT_OUTPUT=$implement.output
+      VALIDATOR_OUTPUT=$war-council-validator.output
+      if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
       fi
-      TITLE=$(printf '%s\n' "$plan.output" | sed -n 's/^Commit message: //p' | head -n 1)
+      TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$TITLE" ]; then
         TITLE="BDC feature Work Order implementation"
       fi
       BODY_FILE=$(mktemp)
       {
         echo "## Summary"
-        echo "$plan.output"
+        echo "$PLAN_OUTPUT"
         echo
         echo "## Validation"
         echo "Workflow-time verify-* nodes were removed 2026-05-16 (Patch 1) — agent self-verifies in implement loop;"
@@ -279,10 +291,10 @@ nodes:
         echo "See implement output below for what the builder verified locally."
         echo
         echo "## Implement output"
-        echo "$implement.output"
+        echo "$IMPLEMENT_OUTPUT"
         echo
         echo "## Validator"
-        echo "$war-council-validator.output"
+        echo "$VALIDATOR_OUTPUT"
       } > "$BODY_FILE"
       gh pr create --title "$TITLE" --body-file "$BODY_FILE"
 
