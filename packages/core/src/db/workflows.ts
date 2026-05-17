@@ -932,6 +932,63 @@ export async function failOrphanedRuns(): Promise<{ count: number }> {
 }
 
 /**
+ * Cancel all 'running' workflow runs with no activity in the last `staleSinceMinutes` minutes.
+ * Returns the count and IDs of cancelled runs for event-logging by the caller.
+ */
+export async function cancelStaleWorkflowRuns(
+  staleSinceMinutes: number
+): Promise<{ count: number; ids: string[] }> {
+  if (!Number.isInteger(staleSinceMinutes) || staleSinceMinutes < 1) {
+    throw new Error(
+      `Invalid staleSinceMinutes: ${String(staleSinceMinutes)} (must be a positive integer)`
+    );
+  }
+  const dialect = getDialect();
+  const cutoff =
+    getDatabaseType() === 'postgresql'
+      ? `NOW() - INTERVAL '${String(staleSinceMinutes)} minutes'`
+      : `datetime('now', '-${String(staleSinceMinutes)} minutes')`;
+
+  // SELECT first (SQLite does not support RETURNING on UPDATE)
+  let ids: string[];
+  try {
+    const selectResult = await pool.query<{ id: string }>(
+      `SELECT id FROM remote_agent_workflow_runs
+       WHERE status = 'running'
+         AND (last_activity_at IS NULL OR last_activity_at < ${cutoff})`,
+      []
+    );
+    ids = selectResult.rows.map(r => r.id);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, staleSinceMinutes }, 'db.workflow_runs_cancel_stale_select_failed');
+    throw new Error(`Failed to query stale workflow runs: ${err.message}`);
+  }
+
+  if (ids.length === 0) return { count: 0, ids: [] };
+
+  try {
+    const placeholders = ids.map((_, i) => `$${String(i + 1)}`).join(', ');
+    await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'cancelled', completed_at = ${dialect.now()}
+       WHERE id IN (${placeholders})`,
+      ids
+    );
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, staleSinceMinutes, count: ids.length },
+      'db.workflow_runs_cancel_stale_update_failed'
+    );
+    throw new Error(`Failed to cancel stale workflow runs: ${err.message}`);
+  }
+
+  getLog().info({ count: ids.length, staleSinceMinutes }, 'db.workflow_runs_stale_cancelled');
+  return { count: ids.length, ids };
+}
+
+/**
  * Delete terminal workflow runs older than the given number of days.
  * Returns the count of deleted runs.
  */
