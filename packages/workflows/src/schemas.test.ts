@@ -783,9 +783,10 @@ describe('loopNodeConfigSchema', () => {
 });
 
 describe('LOOP_NODE_AI_FIELDS', () => {
-  test('excludes model and provider (loop nodes support them)', () => {
+  test('excludes model, provider, and agent (loop nodes support them)', () => {
     expect(LOOP_NODE_AI_FIELDS).not.toContain('model');
     expect(LOOP_NODE_AI_FIELDS).not.toContain('provider');
+    expect(LOOP_NODE_AI_FIELDS).not.toContain('agent');
   });
 
   test('contains all other AI-specific fields from BASH_NODE_AI_FIELDS', () => {
@@ -807,6 +808,28 @@ describe('LOOP_NODE_AI_FIELDS', () => {
     ];
     for (const field of expectedFields) {
       expect(LOOP_NODE_AI_FIELDS).toContain(field);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dagNodeSchema — loop node with agent field (schema transform round-trip)
+// ---------------------------------------------------------------------------
+
+describe('dagNodeSchema — loop node with agent', () => {
+  test('accepts loop node with agent: field and preserves it through transform', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'iterate',
+      agent: 'major-build',
+      loop: {
+        prompt: 'Do the work.',
+        until: 'COMPLETE',
+        max_iterations: 5,
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { agent?: string }).agent).toBe('major-build');
     }
   });
 });
