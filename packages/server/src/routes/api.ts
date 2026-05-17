@@ -92,6 +92,11 @@ import {
   workflowRunsQuerySchema,
   approveWorkflowRunBodySchema,
   rejectWorkflowRunBodySchema,
+  archiveWorkflowRunBodySchema,
+  bulkArchiveBodySchema,
+  bulkArchiveResponseSchema,
+  bulkDeleteFailedBodySchema,
+  bulkDeleteFailedResponseSchema,
 } from './schemas/workflow.schemas';
 import {
   conversationListResponseSchema,
@@ -621,6 +626,77 @@ const listWorkflowRunsRoute = createRoute({
     200: {
       content: { 'application/json': { schema: workflowRunListResponseSchema } },
       description: 'OK',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const archiveWorkflowRunRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/archive',
+  tags: ['Workflows'],
+  summary: 'Archive a workflow run (removes from default view, keeps DB row)',
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: { content: { 'application/json': { schema: archiveWorkflowRunBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: workflowRunActionResponseSchema } },
+      description: 'Archived',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const unarchiveWorkflowRunRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/unarchive',
+  tags: ['Workflows'],
+  summary: 'Unarchive a workflow run (restores to default view)',
+  request: { params: z.object({ runId: z.string() }) },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: workflowRunActionResponseSchema } },
+      description: 'Unarchived',
+    },
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const bulkArchiveWorkflowRunsRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/bulk-archive',
+  tags: ['Workflows'],
+  summary: 'Bulk-archive all runs matching a status (idempotent)',
+  request: {
+    body: { content: { 'application/json': { schema: bulkArchiveBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: bulkArchiveResponseSchema } },
+      description: 'Archived',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const bulkDeleteFailedRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/bulk-delete-failed',
+  tags: ['Workflows'],
+  summary: 'Bulk-delete archived failed runs (dryRun previews without deleting)',
+  request: {
+    body: { content: { 'application/json': { schema: bulkDeleteFailedBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: bulkDeleteFailedResponseSchema } },
+      description: 'Deleted',
     },
     500: jsonError('Server error'),
   },
@@ -1998,6 +2074,9 @@ export function registerApiRoutes(
       const offsetRaw = Number(c.req.query('offset'));
       const offset = Number.isNaN(offsetRaw) ? 0 : Math.max(0, offsetRaw);
 
+      const includeArchivedParam = c.req.query('includeArchived');
+      const includeArchived = includeArchivedParam === 'true';
+
       const result = await workflowDb.listDashboardRuns({
         status,
         codebaseId,
@@ -2006,11 +2085,66 @@ export function registerApiRoutes(
         before,
         limit,
         offset,
+        includeArchived,
       });
       return c.json(result);
     } catch (error) {
       getLog().error({ err: error }, 'list_dashboard_runs_failed');
       return apiError(c, 500, 'Failed to list dashboard runs');
+    }
+  });
+
+  // POST /api/workflows/runs/bulk-archive - Bulk-archive runs by status (must be before {runId} routes)
+  registerOpenApiRoute(bulkArchiveWorkflowRunsRoute, async c => {
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as {
+        status?: string;
+        olderThan?: string;
+        by?: string;
+      };
+      const validStatuses = ['failed', 'cancelled', 'completed'] as const;
+      if (!body.status || !(validStatuses as readonly string[]).includes(body.status)) {
+        return apiError(c, 400, 'status must be one of: failed, cancelled, completed');
+      }
+      const result = await workflowDb.bulkArchiveWorkflowRuns({
+        status: body.status as 'failed' | 'cancelled' | 'completed',
+        olderThan: body.olderThan,
+        by: body.by,
+      });
+      getLog().info(
+        { operator: body.by ?? 'operator', count: result.archivedCount, status: body.status },
+        'api.workflow_run.bulk_archive_completed'
+      );
+      return c.json(result);
+    } catch (error) {
+      getLog().error({ err: error }, 'api.workflow_run_bulk_archive_failed');
+      return apiError(c, 500, 'Failed to bulk archive workflow runs');
+    }
+  });
+
+  // POST /api/workflows/runs/bulk-delete-failed - Bulk-delete archived failed runs (must be before {runId} routes)
+  registerOpenApiRoute(bulkDeleteFailedRoute, async c => {
+    try {
+      const body = (await c.req.json().catch(() => ({}))) as {
+        olderThan?: string;
+        dryRun?: boolean;
+        by?: string;
+      };
+      const result = await workflowDb.bulkDeleteArchivedFailed({
+        olderThan: body.olderThan,
+        dryRun: body.dryRun,
+        by: body.by,
+      });
+      if (!result.dryRun) {
+        getLog().info(
+          { operator: body.by ?? 'operator', count: result.count },
+          'api.workflow_run.bulk_delete_failed_completed'
+        );
+      }
+      return c.json(result);
+    } catch (error) {
+      getLog().error({ err: error }, 'api.workflow_run_bulk_delete_failed_error');
+      return apiError(c, 500, 'Failed to bulk delete archived failed runs');
     }
   });
 
@@ -2203,6 +2337,48 @@ export function registerApiRoutes(
     }
   });
 
+  // POST /api/workflows/runs/:runId/archive - Archive a workflow run
+  registerOpenApiRoute(archiveWorkflowRunRoute, async c => {
+    const runId = c.req.param('runId') ?? '';
+    try {
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        return apiError(c, 404, 'Workflow run not found');
+      }
+      if (run.status === 'running') {
+        return apiError(c, 400, 'Cannot archive a running workflow run — cancel it first');
+      }
+      const body = (await c.req.json().catch(() => ({}))) as { reason?: string; by?: string };
+      await workflowDb.archiveWorkflowRun(runId, body.by ?? 'operator', body.reason);
+      getLog().info(
+        { operator: body.by ?? 'operator', runId, reason: body.reason },
+        'workflow_run.archive_completed'
+      );
+      return c.json({ success: true, message: `Archived workflow run: ${run.workflow_name}` });
+    } catch (error) {
+      getLog().error({ err: error, runId }, 'api.workflow_run_archive_failed');
+      return apiError(c, 500, 'Failed to archive workflow run');
+    }
+  });
+
+  // POST /api/workflows/runs/:runId/unarchive - Unarchive a workflow run
+  registerOpenApiRoute(unarchiveWorkflowRunRoute, async c => {
+    const runId = c.req.param('runId') ?? '';
+    try {
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        return apiError(c, 404, 'Workflow run not found');
+      }
+      const body = (await c.req.json().catch(() => ({}))) as { by?: string };
+      await workflowDb.unarchiveWorkflowRun(runId, body.by ?? 'operator');
+      getLog().info({ operator: body.by ?? 'operator', runId }, 'workflow_run.unarchive_completed');
+      return c.json({ success: true, message: `Unarchived workflow run: ${run.workflow_name}` });
+    } catch (error) {
+      getLog().error({ err: error, runId }, 'api.workflow_run_unarchive_failed');
+      return apiError(c, 500, 'Failed to unarchive workflow run');
+    }
+  });
+
   // DELETE /api/workflows/runs/:runId - Delete a workflow run
   registerOpenApiRoute(deleteWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
@@ -2218,7 +2394,13 @@ export function registerApiRoutes(
           `Cannot delete workflow in '${run.status}' status — cancel it first`
         );
       }
-      await workflowDb.deleteWorkflowRun(runId);
+      const forceParam = c.req.query('force');
+      const force = forceParam === 'true';
+      if (!run.archived_at && !force) {
+        return apiError(c, 400, 'Archive this run first, or pass force=true to bypass');
+      }
+      await workflowDb.deleteWorkflowRun(runId, force);
+      getLog().info({ operator: 'operator', runId, force }, 'workflow_run.delete_completed');
       return c.json({ success: true, message: `Deleted workflow run: ${run.workflow_name}` });
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_delete_failed');

@@ -227,6 +227,9 @@ export interface WorkflowRunResponse {
   worker_platform_id?: string;
   parent_platform_id?: string;
   conversation_platform_id?: string;
+  archived_at?: string | null;
+  archived_by?: string | null;
+  archive_reason?: string | null;
 }
 
 export interface WorkflowEventResponse {
@@ -275,6 +278,9 @@ export interface DashboardRunResponse extends Omit<
   agents_completed: number | null;
   agents_failed: number | null;
   agents_total: number | null;
+  archived_at: string | null;
+  archived_by: string | null;
+  archive_reason: string | null;
 }
 
 /** Status counts across all matching runs (ignoring status filter). */
@@ -303,6 +309,7 @@ export async function listDashboardRuns(options?: {
   before?: string;
   limit?: number;
   offset?: number;
+  includeArchived?: boolean;
 }): Promise<DashboardRunsResult> {
   const params = new URLSearchParams();
   if (options?.status) params.set('status', options.status);
@@ -312,6 +319,7 @@ export async function listDashboardRuns(options?: {
   if (options?.before) params.set('before', options.before);
   if (options?.limit) params.set('limit', String(options.limit));
   if (options?.offset) params.set('offset', String(options.offset));
+  if (options?.includeArchived) params.set('includeArchived', 'true');
   const qs = params.toString();
   return fetchJSON<DashboardRunsResult>(`/api/dashboard/runs${qs ? `?${qs}` : ''}`);
 }
@@ -341,10 +349,55 @@ export async function abandonWorkflowRun(
 }
 
 export async function deleteWorkflowRun(
+  runId: string,
+  force = false
+): Promise<{ success: boolean; message: string }> {
+  const qs = force ? '?force=true' : '';
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}${qs}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function archiveWorkflowRun(
+  runId: string,
+  opts?: { reason?: string; by?: string }
+): Promise<{ success: boolean; message: string }> {
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/archive`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts ?? {}),
+  });
+}
+
+export async function unarchiveWorkflowRun(
   runId: string
 ): Promise<{ success: boolean; message: string }> {
-  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}`, {
-    method: 'DELETE',
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/unarchive`, {
+    method: 'POST',
+  });
+}
+
+export async function bulkArchiveWorkflowRuns(opts: {
+  status: 'failed' | 'cancelled' | 'completed';
+  olderThan?: string;
+  by?: string;
+}): Promise<{ archivedCount: number; runIds: string[] }> {
+  return fetchJSON('/api/workflows/runs/bulk-archive', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts),
+  });
+}
+
+export async function bulkDeleteFailedRuns(opts?: {
+  olderThan?: string;
+  dryRun?: boolean;
+  by?: string;
+}): Promise<{ count: number; runIds: string[]; dryRun: boolean }> {
+  return fetchJSON('/api/workflows/runs/bulk-delete-failed', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(opts ?? {}),
   });
 }
 

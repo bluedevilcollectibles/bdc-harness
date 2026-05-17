@@ -1,13 +1,15 @@
 import { useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router';
-import { Workflow } from 'lucide-react';
+import { Workflow, Trash2 } from 'lucide-react';
 import {
   listDashboardRuns,
   cancelWorkflowRun,
   resumeWorkflowRun,
   abandonWorkflowRun,
   deleteWorkflowRun,
+  archiveWorkflowRun,
+  unarchiveWorkflowRun,
   approveWorkflowRun,
   rejectWorkflowRun,
   listCodebases,
@@ -21,6 +23,7 @@ import { StatusSummaryBar } from '@/components/dashboard/StatusSummaryBar';
 import { WorkflowRunGroup } from '@/components/dashboard/WorkflowRunGroup';
 import { WorkflowRunCard } from '@/components/dashboard/WorkflowRunCard';
 import { WorkflowHistoryTable } from '@/components/dashboard/WorkflowHistoryTable';
+import { BulkCleanupModal } from '@/components/dashboard/BulkCleanupModal';
 import { useDashboardSSE } from '@/hooks/useDashboardSSE';
 import { useWorkflowStore } from '@/stores/workflow-store';
 
@@ -58,6 +61,7 @@ export function DashboardPage(): React.ReactElement {
   const searchQuery = searchParams.get('q') ?? '';
   const projectFilter = searchParams.get('project') ?? null;
   const dateRange: DateRange = (searchParams.get('range') as DateRange) ?? 'all';
+  const showArchived = searchParams.get('archived') === 'true';
   const page = Math.max(0, Number(searchParams.get('page') ?? '0'));
   const pageSizeParam = Number(searchParams.get('pageSize') ?? '0');
   const pageSize = PAGE_SIZE_OPTIONS.includes(pageSizeParam as (typeof PAGE_SIZE_OPTIONS)[number])
@@ -112,6 +116,12 @@ export function DashboardPage(): React.ReactElement {
     },
     [updateParams]
   );
+  const setShowArchived = useCallback(
+    (v: boolean) => {
+      updateParams({ archived: v ? 'true' : null, page: null });
+    },
+    [updateParams]
+  );
   const setPage = useCallback(
     (p: number) => {
       updateParams({ page: p === 0 ? null : String(p) });
@@ -158,6 +168,7 @@ export function DashboardPage(): React.ReactElement {
         codebaseId: projectFilter,
         search: searchQuery,
         dateRange,
+        showArchived,
         page,
         pageSize,
       },
@@ -171,6 +182,7 @@ export function DashboardPage(): React.ReactElement {
         before: dateBounds.before,
         limit: pageSize,
         offset: page * pageSize,
+        includeArchived: showArchived || undefined,
       }),
     refetchInterval: 5_000,
   });
@@ -291,6 +303,10 @@ export function DashboardPage(): React.ReactElement {
     runAction(abandonWorkflowRun, runId, 'Failed to abandon workflow');
   const handleDelete = (runId: string): Promise<void> =>
     runAction(deleteWorkflowRun, runId, 'Failed to delete workflow run');
+  const handleArchive = (runId: string): Promise<void> =>
+    runAction(archiveWorkflowRun, runId, 'Failed to archive workflow run');
+  const handleUnarchive = (runId: string): Promise<void> =>
+    runAction(unarchiveWorkflowRun, runId, 'Failed to unarchive workflow run');
   const handleApprove = (runId: string): Promise<void> =>
     runAction(approveWorkflowRun, runId, 'Failed to approve workflow');
   // Reject differs from the rest of the lifecycle actions because it takes a
@@ -336,6 +352,8 @@ export function DashboardPage(): React.ReactElement {
           onDateRangeChange={setDateRange}
           codebases={codebases}
           health={health}
+          showArchived={showArchived}
+          onShowArchivedChange={setShowArchived}
         />
 
         {actionError && (
@@ -407,8 +425,29 @@ export function DashboardPage(): React.ReactElement {
             {/* History */}
             {historyRuns.length > 0 && (
               <section>
-                <h2 className="mb-3 text-sm font-semibold text-text-secondary">History</h2>
-                <WorkflowHistoryTable runs={historyRuns} onDelete={handleDelete} />
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-semibold text-text-secondary">History</h2>
+                  <BulkCleanupModal
+                    trigger={
+                      <button
+                        className="flex items-center gap-1.5 rounded-md border border-border bg-surface-elevated px-2.5 py-1 text-xs text-text-secondary hover:text-text-primary transition-colors"
+                        title="Bulk delete archived failed runs"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        Cleanup
+                      </button>
+                    }
+                    onComplete={(): void => {
+                      void queryClient.invalidateQueries({ queryKey: ['dashboardRuns'] });
+                    }}
+                  />
+                </div>
+                <WorkflowHistoryTable
+                  runs={historyRuns}
+                  onDelete={handleDelete}
+                  onArchive={handleArchive}
+                  onUnarchive={handleUnarchive}
+                />
               </section>
             )}
 

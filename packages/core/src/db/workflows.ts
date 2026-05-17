@@ -24,6 +24,9 @@ function rollback(): Promise<void> {
 /** Guard error for deleteWorkflowRun — re-thrown without wrapping in the outer catch. */
 class WorkflowRunGuardError extends Error {}
 
+/** Guard error for archiveWorkflowRun — re-thrown without wrapping. */
+class WorkflowRunArchiveError extends Error {}
+
 /**
  * Normalize a WorkflowRun row from the database.
  * SQLite stores metadata as TEXT (JSON string), PostgreSQL returns parsed objects.
@@ -641,6 +644,8 @@ export interface ListDashboardRunsOptions {
   before?: string;
   limit?: number;
   offset?: number;
+  /** When true, include archived runs in results. Default false hides archived rows. */
+  includeArchived?: boolean;
 }
 
 /** Response envelope for paginated dashboard runs. */
@@ -667,6 +672,11 @@ function buildDashboardWhereClauses(
   values: unknown[]
 ): string[] {
   const whereClauses: string[] = [];
+
+  // Hide archived rows by default; operator must opt-in with includeArchived=true.
+  if (!options?.includeArchived) {
+    whereClauses.push('r.archived_at IS NULL');
+  }
 
   if (options?.status) {
     values.push(options.status);
@@ -977,13 +987,14 @@ export async function deleteOldWorkflowRuns(olderThanDays: number): Promise<{ co
 /**
  * Delete a workflow run and its associated events.
  * Only terminal runs (completed, failed, cancelled) can be deleted.
+ * Unless force=true, the run must be archived first (archived_at IS NOT NULL).
  */
-export async function deleteWorkflowRun(id: string): Promise<void> {
+export async function deleteWorkflowRun(id: string, force = false): Promise<void> {
   try {
     await pool.query('BEGIN', []);
     // Guard: verify run exists and is terminal before deleting
-    const check = await pool.query<{ status: string }>(
-      'SELECT status FROM remote_agent_workflow_runs WHERE id = $1',
+    const check = await pool.query<{ status: string; archived_at: string | null }>(
+      'SELECT status, archived_at FROM remote_agent_workflow_runs WHERE id = $1',
       [id]
     );
     if (check.rows.length === 0) {
@@ -994,6 +1005,9 @@ export async function deleteWorkflowRun(id: string): Promise<void> {
         `Cannot delete workflow run in '${check.rows[0].status}' status — cancel it first`
       );
     }
+    if (!check.rows[0].archived_at && !force) {
+      throw new WorkflowRunGuardError('Archive this run first, or pass force=true to bypass');
+    }
     await pool.query('DELETE FROM remote_agent_workflow_events WHERE workflow_run_id = $1', [id]);
     await pool.query('DELETE FROM remote_agent_workflow_runs WHERE id = $1', [id]);
     await pool.query('COMMIT', []);
@@ -1003,5 +1017,184 @@ export async function deleteWorkflowRun(id: string): Promise<void> {
     const err = error as Error;
     getLog().error({ err, workflowRunId: id }, 'db.workflow_run_delete_failed');
     throw new Error(`Failed to delete workflow run: ${err.message}`);
+  }
+}
+
+/**
+ * Archive a workflow run by setting archived_at, archived_by, archive_reason.
+ * Running runs cannot be archived — cancel first.
+ * Idempotent: re-archiving a row that's already archived is a no-op.
+ */
+export async function archiveWorkflowRun(
+  id: string,
+  by = 'operator',
+  reason?: string
+): Promise<void> {
+  const dialect = getDialect();
+  try {
+    const check = await pool.query<{ status: string; archived_at: string | null }>(
+      'SELECT status, archived_at FROM remote_agent_workflow_runs WHERE id = $1',
+      [id]
+    );
+    if (check.rows.length === 0) {
+      throw new WorkflowRunArchiveError(`Workflow run not found: ${id}`);
+    }
+    if (check.rows[0].status === 'running') {
+      throw new WorkflowRunArchiveError('Cannot archive a running workflow run — cancel it first');
+    }
+    // Idempotent: already archived is a no-op
+    if (check.rows[0].archived_at) {
+      return;
+    }
+    await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET archived_at = ${dialect.now()}, archived_by = $1, archive_reason = $2
+       WHERE id = $3`,
+      [by, reason ?? null, id]
+    );
+    getLog().info({ operator: by, workflowRunId: id, reason }, 'workflow_run.archive_completed');
+  } catch (error) {
+    if (error instanceof WorkflowRunArchiveError) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_archive_failed');
+    throw new Error(`Failed to archive workflow run: ${err.message}`);
+  }
+}
+
+/**
+ * Unarchive a workflow run by clearing archived_at, archived_by, archive_reason.
+ * Idempotent: unarchiving an active row is a no-op.
+ */
+export async function unarchiveWorkflowRun(id: string, by = 'operator'): Promise<void> {
+  try {
+    const check = await pool.query<{ id: string }>(
+      'SELECT id FROM remote_agent_workflow_runs WHERE id = $1',
+      [id]
+    );
+    if (check.rows.length === 0) {
+      throw new WorkflowRunArchiveError(`Workflow run not found: ${id}`);
+    }
+    await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET archived_at = NULL, archived_by = NULL, archive_reason = NULL
+       WHERE id = $1`,
+      [id]
+    );
+    getLog().info({ operator: by, workflowRunId: id }, 'workflow_run.unarchive_completed');
+  } catch (error) {
+    if (error instanceof WorkflowRunArchiveError) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_unarchive_failed');
+    throw new Error(`Failed to unarchive workflow run: ${err.message}`);
+  }
+}
+
+/**
+ * Bulk-archive all runs matching the given status (and optional olderThan timestamp).
+ * Idempotent: already-archived rows are skipped.
+ * Returns the count of newly archived rows and their IDs.
+ */
+export async function bulkArchiveWorkflowRuns(options: {
+  status: 'failed' | 'cancelled' | 'completed';
+  olderThan?: string;
+  by?: string;
+}): Promise<{ archivedCount: number; runIds: string[] }> {
+  const dialect = getDialect();
+  const by = options.by ?? 'operator';
+
+  const params: unknown[] = [options.status];
+  const clauses: string[] = ['status = $1', 'archived_at IS NULL'];
+
+  if (options.olderThan) {
+    params.push(options.olderThan);
+    clauses.push(`started_at < $${String(params.length)}`);
+  }
+
+  const whereStr = clauses.join(' AND ');
+
+  try {
+    // First collect the IDs that will be archived
+    const selectResult = await pool.query<{ id: string }>(
+      `SELECT id FROM remote_agent_workflow_runs WHERE ${whereStr}`,
+      params
+    );
+    if (selectResult.rows.length === 0) {
+      return { archivedCount: 0, runIds: [] };
+    }
+
+    const runIds = selectResult.rows.map(r => r.id);
+    await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET archived_at = ${dialect.now()}, archived_by = $1, archive_reason = NULL
+       WHERE id IN (${runIds.map((_, i) => `$${String(i + 2)}`).join(', ')})`,
+      [by, ...runIds]
+    );
+    getLog().info(
+      { operator: by, count: runIds.length, status: options.status },
+      'workflow_run.bulk_archive_completed'
+    );
+    return { archivedCount: runIds.length, runIds };
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err }, 'db.workflow_run_bulk_archive_failed');
+    throw new Error(`Failed to bulk archive workflow runs: ${err.message}`);
+  }
+}
+
+/**
+ * Bulk-delete archived failed workflow runs.
+ * Only operates on rows with archived_at IS NOT NULL AND status = 'failed'.
+ * dryRun=true returns the count and IDs without deleting.
+ */
+export async function bulkDeleteArchivedFailed(options: {
+  olderThan?: string;
+  dryRun?: boolean;
+  by?: string;
+}): Promise<{ count: number; runIds: string[]; dryRun: boolean }> {
+  const by = options.by ?? 'operator';
+  const dryRun = options.dryRun ?? false;
+
+  const params: unknown[] = [];
+  const clauses: string[] = ["status = 'failed'", 'archived_at IS NOT NULL'];
+
+  if (options.olderThan) {
+    params.push(options.olderThan);
+    clauses.push(`started_at < $${String(params.length)}`);
+  }
+
+  const whereStr = clauses.join(' AND ');
+
+  try {
+    const selectResult = await pool.query<{ id: string }>(
+      `SELECT id FROM remote_agent_workflow_runs WHERE ${whereStr}`,
+      params
+    );
+    const runIds = selectResult.rows.map(r => r.id);
+
+    if (dryRun || runIds.length === 0) {
+      return { count: runIds.length, runIds, dryRun };
+    }
+
+    await pool.query('BEGIN', []);
+    await pool.query(
+      `DELETE FROM remote_agent_workflow_events WHERE workflow_run_id IN (${runIds.map((_, i) => `$${String(i + 1)}`).join(', ')})`,
+      runIds
+    );
+    await pool.query(
+      `DELETE FROM remote_agent_workflow_runs WHERE id IN (${runIds.map((_, i) => `$${String(i + 1)}`).join(', ')})`,
+      runIds
+    );
+    await pool.query('COMMIT', []);
+
+    getLog().info(
+      { operator: by, count: runIds.length },
+      'workflow_run.bulk_delete_failed_completed'
+    );
+    return { count: runIds.length, runIds, dryRun };
+  } catch (error) {
+    await rollback();
+    const err = error as Error;
+    getLog().error({ err }, 'db.workflow_run_bulk_delete_failed_error');
+    throw new Error(`Failed to bulk delete archived failed runs: ${err.message}`);
   }
 }

@@ -141,6 +141,9 @@ export const workflowRunSchema = z
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),
     working_path: z.string().nullable(),
+    archived_at: z.string().nullable(),
+    archived_by: z.string().nullable(),
+    archive_reason: z.string().nullable(),
   })
   .openapi('WorkflowRun');
 
@@ -240,6 +243,49 @@ export const runWorkflowBodySchema = z
   })
   .openapi('RunWorkflowBody');
 
+/** POST /api/workflows/runs/:runId/archive request body. */
+export const archiveWorkflowRunBodySchema = z
+  .object({
+    reason: z.string().optional(),
+    by: z.string().optional(),
+  })
+  .openapi('ArchiveWorkflowRunBody');
+
+/** POST /api/workflows/runs/bulk-archive request body. */
+export const bulkArchiveBodySchema = z
+  .object({
+    status: z.enum(['failed', 'cancelled', 'completed']),
+    olderThan: z.string().optional(),
+    by: z.string().optional(),
+  })
+  .openapi('BulkArchiveBody');
+
+/** POST /api/workflows/runs/bulk-archive response. */
+export const bulkArchiveResponseSchema = z
+  .object({
+    archivedCount: z.number(),
+    runIds: z.array(z.string()),
+  })
+  .openapi('BulkArchiveResponse');
+
+/** POST /api/workflows/runs/bulk-delete-failed request body. */
+export const bulkDeleteFailedBodySchema = z
+  .object({
+    olderThan: z.string().optional(),
+    dryRun: z.boolean().optional(),
+    by: z.string().optional(),
+  })
+  .openapi('BulkDeleteFailedBody');
+
+/** POST /api/workflows/runs/bulk-delete-failed response. */
+export const bulkDeleteFailedResponseSchema = z
+  .object({
+    count: z.number(),
+    runIds: z.array(z.string()),
+    dryRun: z.boolean(),
+  })
+  .openapi('BulkDeleteFailedResponse');
+
 /** GET /api/dashboard/runs query params. */
 export const dashboardRunsQuerySchema = z.object({
   // z.string() — handler validates the enum value and ignores invalid values
@@ -250,6 +296,7 @@ export const dashboardRunsQuerySchema = z.object({
   before: z.string().optional(),
   limit: z.string().optional(),
   offset: z.string().optional(),
+  includeArchived: z.string().optional(),
 });
 
 /** GET /api/workflows/runs query params. */

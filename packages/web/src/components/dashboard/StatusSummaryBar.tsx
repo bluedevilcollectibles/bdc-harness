@@ -16,6 +16,8 @@ interface StatusSummaryBarProps {
   onDateRangeChange: (range: DateRange) => void;
   codebases: CodebaseResponse[] | undefined;
   health: HealthResponse | undefined;
+  showArchived: boolean;
+  onShowArchivedChange: (v: boolean) => void;
 }
 
 const STATUS_CHIPS = ['running', 'paused', 'completed', 'failed', 'cancelled', 'pending'] as const;
@@ -39,6 +41,8 @@ export function StatusSummaryBar({
   onDateRangeChange,
   codebases,
   health,
+  showArchived,
+  onShowArchivedChange,
 }: StatusSummaryBarProps): React.ReactElement {
   return (
     <div className="rounded-lg border border-border bg-surface p-4 space-y-3">
@@ -123,6 +127,18 @@ export function StatusSummaryBar({
             className="w-full rounded-md border border-border bg-surface-elevated py-1.5 pl-7 pr-2 text-xs text-text-primary placeholder:text-text-tertiary focus:border-primary focus:outline-none"
           />
         </div>
+
+        <label className="flex items-center gap-1.5 cursor-pointer shrink-0">
+          <input
+            type="checkbox"
+            checked={showArchived}
+            onChange={(e): void => {
+              onShowArchivedChange(e.target.checked);
+            }}
+            className="rounded border border-border accent-primary"
+          />
+          <span className="text-xs text-text-secondary">Show archived</span>
+        </label>
 
         {health && (
           <span className="text-xs text-text-tertiary shrink-0">

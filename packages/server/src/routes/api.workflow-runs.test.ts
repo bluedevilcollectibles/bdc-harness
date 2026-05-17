@@ -72,6 +72,9 @@ type MockWorkflowRun = {
   metadata: Record<string, unknown>;
   working_path: string | null;
   last_activity_at: string | null;
+  archived_at: string | null;
+  archived_by: string | null;
+  archive_reason: string | null;
 };
 
 type MockWorkflowEvent = {
@@ -182,8 +185,19 @@ mock.module('@archon/core/db/isolation-environments', () => ({
   updateStatus: mock(async () => {}),
 }));
 
-const mockDeleteWorkflowRun = mock(async (_id: string) => {});
+const mockDeleteWorkflowRun = mock(async (_id: string, _force?: boolean) => {});
 const mockUpdateWorkflowRun = mock(async (_id: string, _update: unknown) => {});
+const mockArchiveWorkflowRun = mock(async (_id: string, _by?: string, _reason?: string) => {});
+const mockUnarchiveWorkflowRun = mock(async (_id: string, _by?: string) => {});
+const mockBulkArchiveWorkflowRuns = mock(async (_opts: unknown) => ({
+  archivedCount: 0,
+  runIds: [] as string[],
+}));
+const mockBulkDeleteArchivedFailed = mock(async (_opts: unknown) => ({
+  count: 0,
+  runIds: [] as string[],
+  dryRun: false,
+}));
 
 mock.module('@archon/core/db/workflows', () => ({
   listWorkflowRuns: mockListWorkflowRuns,
@@ -193,6 +207,10 @@ mock.module('@archon/core/db/workflows', () => ({
   deleteWorkflowRun: mockDeleteWorkflowRun,
   updateWorkflowRun: mockUpdateWorkflowRun,
   getWorkflowRunByWorkerPlatformId: mockGetWorkflowRunByWorkerPlatformId,
+  archiveWorkflowRun: mockArchiveWorkflowRun,
+  unarchiveWorkflowRun: mockUnarchiveWorkflowRun,
+  bulkArchiveWorkflowRuns: mockBulkArchiveWorkflowRuns,
+  bulkDeleteArchivedFailed: mockBulkDeleteArchivedFailed,
 }));
 
 const mockCreateWorkflowEvent = mock(async (_event: unknown) => {});
@@ -232,6 +250,9 @@ const MOCK_RUNNING_RUN: MockWorkflowRun = {
   metadata: {},
   working_path: '/tmp/worktrees/feature',
   last_activity_at: NOW,
+  archived_at: null,
+  archived_by: null,
+  archive_reason: null,
 };
 
 const MOCK_COMPLETED_RUN: MockWorkflowRun = {
@@ -1310,8 +1331,24 @@ describe('DELETE /api/workflows/runs/:runId', () => {
     expect(body.error).toContain('Cannot delete');
   });
 
-  test('returns 200 and deletes a completed run', async () => {
+  test('returns 400 when deleting a non-archived completed run without force', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(MOCK_COMPLETED_RUN);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-2', {
+      method: 'DELETE',
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Archive this run first');
+  });
+
+  test('returns 200 and deletes an archived completed run', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_COMPLETED_RUN,
+      archived_at: NOW,
+      archived_by: 'operator',
+    });
+    mockDeleteWorkflowRun.mockResolvedValueOnce(undefined);
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-uuid-2', {
       method: 'DELETE',
@@ -1320,17 +1357,18 @@ describe('DELETE /api/workflows/runs/:runId', () => {
     const body = (await response.json()) as { success: boolean; message: string };
     expect(body.success).toBe(true);
     expect(body.message).toContain('Deleted');
-    expect(mockDeleteWorkflowRun).toHaveBeenCalledWith('run-uuid-2');
+    expect(mockDeleteWorkflowRun).toHaveBeenCalledWith('run-uuid-2', false);
   });
 
-  test('returns 200 and deletes a failed run', async () => {
-    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_FAILED_RUN);
+  test('returns 200 and deletes a non-archived completed run with force=true', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_COMPLETED_RUN);
+    mockDeleteWorkflowRun.mockResolvedValueOnce(undefined);
     const { app } = makeApp();
-    const response = await app.request('/api/workflows/runs/run-uuid-4', {
+    const response = await app.request('/api/workflows/runs/run-uuid-2?force=true', {
       method: 'DELETE',
     });
     expect(response.status).toBe(200);
-    expect(mockDeleteWorkflowRun).toHaveBeenCalledWith('run-uuid-4');
+    expect(mockDeleteWorkflowRun).toHaveBeenCalledWith('run-uuid-2', true);
   });
 });
 
@@ -1768,5 +1806,201 @@ describe('approve/reject auto-resume', () => {
     // Cancellation path doesn't auto-resume — nothing to resume to.
     expect(mockHandleMessage).not.toHaveBeenCalled();
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-paused-1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: POST /api/workflows/runs/:runId/archive
+// ---------------------------------------------------------------------------
+
+describe('POST /api/workflows/runs/:runId/archive', () => {
+  beforeEach(() => {
+    mockGetWorkflowRun.mockReset();
+    mockArchiveWorkflowRun.mockReset();
+  });
+
+  test('returns 404 when run not found', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(null);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/missing/archive', { method: 'POST' });
+    expect(response.status).toBe(404);
+  });
+
+  test('returns 400 when run is running', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_RUNNING_RUN);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-1/archive', {
+      method: 'POST',
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('cancel');
+  });
+
+  test('returns 200 and archives a completed run', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(MOCK_COMPLETED_RUN);
+    mockArchiveWorkflowRun.mockResolvedValueOnce(undefined);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-2/archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'test' }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { success: boolean; message: string };
+    expect(body.success).toBe(true);
+    expect(mockArchiveWorkflowRun).toHaveBeenCalledWith('run-uuid-2', 'operator', 'test');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: POST /api/workflows/runs/:runId/unarchive
+// ---------------------------------------------------------------------------
+
+describe('POST /api/workflows/runs/:runId/unarchive', () => {
+  beforeEach(() => {
+    mockGetWorkflowRun.mockReset();
+    mockUnarchiveWorkflowRun.mockReset();
+  });
+
+  test('returns 404 when run not found', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(null);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/missing/unarchive', { method: 'POST' });
+    expect(response.status).toBe(404);
+  });
+
+  test('returns 200 and unarchives a run', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce({
+      ...MOCK_COMPLETED_RUN,
+      archived_at: new Date().toISOString(),
+      archived_by: 'operator',
+    });
+    mockUnarchiveWorkflowRun.mockResolvedValueOnce(undefined);
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-2/unarchive', {
+      method: 'POST',
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { success: boolean };
+    expect(body.success).toBe(true);
+    expect(mockUnarchiveWorkflowRun).toHaveBeenCalledWith('run-uuid-2', 'operator');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: POST /api/workflows/runs/bulk-archive
+// ---------------------------------------------------------------------------
+
+describe('POST /api/workflows/runs/bulk-archive', () => {
+  beforeEach(() => {
+    mockBulkArchiveWorkflowRuns.mockReset();
+  });
+
+  test('returns 400 when status is missing', async () => {
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/bulk-archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(response.status).toBe(400);
+  });
+
+  test('returns 400 when status is invalid', async () => {
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/bulk-archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'running' }),
+    });
+    expect(response.status).toBe(400);
+  });
+
+  test('archives failed runs and returns count', async () => {
+    mockBulkArchiveWorkflowRuns.mockResolvedValueOnce({
+      archivedCount: 3,
+      runIds: ['r1', 'r2', 'r3'],
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/bulk-archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'failed' }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { archivedCount: number; runIds: string[] };
+    expect(body.archivedCount).toBe(3);
+    expect(body.runIds).toHaveLength(3);
+  });
+
+  test('is idempotent — second call returns 0', async () => {
+    mockBulkArchiveWorkflowRuns.mockResolvedValueOnce({ archivedCount: 0, runIds: [] });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/bulk-archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status: 'failed' }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { archivedCount: number };
+    expect(body.archivedCount).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: POST /api/workflows/runs/bulk-delete-failed
+// ---------------------------------------------------------------------------
+
+describe('POST /api/workflows/runs/bulk-delete-failed', () => {
+  beforeEach(() => {
+    mockBulkDeleteArchivedFailed.mockReset();
+  });
+
+  test('dry-run returns count without deleting', async () => {
+    mockBulkDeleteArchivedFailed.mockResolvedValueOnce({
+      count: 5,
+      runIds: ['r1', 'r2', 'r3', 'r4', 'r5'],
+      dryRun: true,
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/bulk-delete-failed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun: true }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { count: number; dryRun: boolean };
+    expect(body.count).toBe(5);
+    expect(body.dryRun).toBe(true);
+  });
+
+  test('permanent delete returns count and dryRun=false', async () => {
+    mockBulkDeleteArchivedFailed.mockResolvedValueOnce({
+      count: 3,
+      runIds: ['r1', 'r2', 'r3'],
+      dryRun: false,
+    });
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/bulk-delete-failed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dryRun: false }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { count: number; dryRun: boolean };
+    expect(body.count).toBe(3);
+    expect(body.dryRun).toBe(false);
+  });
+
+  test('returns 500 when DB throws', async () => {
+    mockBulkDeleteArchivedFailed.mockRejectedValueOnce(new Error('DB error'));
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/bulk-delete-failed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(response.status).toBe(500);
   });
 });

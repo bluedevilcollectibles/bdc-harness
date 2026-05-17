@@ -89,7 +89,9 @@ export type AgentRegistry = Map<string, AgentPersona>;
  *
  * Returns `null` if the file does not start with `---\n`.
  */
-export function parseFrontmatter(content: string): { frontmatter: Record<string, unknown>; body: string } | null {
+export function parseFrontmatter(
+  content: string
+): { frontmatter: Record<string, unknown>; body: string } | null {
   if (!content.startsWith('---\n') && !content.startsWith('---\r\n')) return null;
 
   const afterOpening = content.startsWith('---\r\n') ? content.slice(5) : content.slice(4);
@@ -97,7 +99,9 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
   if (closingIdx === -1) return null;
 
   const fmText = afterOpening.slice(0, closingIdx);
-  const bodyStart = closingIdx + afterOpening.slice(closingIdx).match(/^---(\r?\n|$)/m)![0].length;
+  const closingMatch = /^---(\r?\n|$)/m.exec(afterOpening.slice(closingIdx));
+  if (!closingMatch) return null;
+  const bodyStart = closingIdx + closingMatch[0].length;
   const body = afterOpening.slice(bodyStart).trim();
 
   const frontmatter: Record<string, unknown> = {};
@@ -106,10 +110,16 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 
   while (i < lines.length) {
     const line = lines[i];
-    if (!line || line.startsWith('#')) { i++; continue; }
+    if (!line || line.startsWith('#')) {
+      i++;
+      continue;
+    }
 
     const colonIdx = line.indexOf(':');
-    if (colonIdx === -1) { i++; continue; }
+    if (colonIdx === -1) {
+      i++;
+      continue;
+    }
 
     const key = line.slice(0, colonIdx).trim();
     const rest = line.slice(colonIdx + 1).trim();
@@ -242,8 +252,8 @@ export async function loadAgentFile(filePath: string): Promise<AgentPersona> {
   }
 
   const persona: AgentPersona = {
-    name: frontmatter.name as string,
-    model: frontmatter.model as string,
+    name: frontmatter.name,
+    model: frontmatter.model,
     systemPrompt: body,
   };
 
@@ -307,10 +317,7 @@ export async function loadAgentRegistry(agentsDir: string): Promise<AgentRegistr
  * Throws `AgentRegistryError` with code `agent_not_found` if the registry was
  * loaded but the name is absent.
  */
-export function resolveAgent(
-  name: string,
-  registry: AgentRegistry
-): AgentPersona | undefined {
+export function resolveAgent(name: string, registry: AgentRegistry): AgentPersona | undefined {
   if (registry.size === 0) return undefined;
 
   const persona = registry.get(name);
