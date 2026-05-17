@@ -30,7 +30,6 @@ COPY packages/server/package.json ./packages/server/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
 COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
-COPY packages/personas/package.json ./packages/personas/
 
 # Install ALL dependencies (including devDependencies needed for web build)
 # --linker=hoisted: Bun's default "isolated" linker stores packages in
@@ -143,7 +142,6 @@ COPY packages/server/package.json ./packages/server/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
 COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
-COPY packages/personas/package.json ./packages/personas/
 
 # Install production dependencies only (--ignore-scripts skips husky prepare hook)
 RUN bun install --frozen-lockfile --production --ignore-scripts --linker=hoisted
@@ -160,7 +158,6 @@ COPY packages/providers/ ./packages/providers/
 COPY packages/server/ ./packages/server/
 COPY packages/workflows/ ./packages/workflows/
 COPY packages/persona-context-loader/ ./packages/persona-context-loader/
-COPY packages/personas/ ./packages/personas/
 
 # Copy pre-built web UI from build stage
 COPY --from=web-build /app/packages/web/dist/ ./packages/web/dist/
