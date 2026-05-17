@@ -1165,32 +1165,47 @@ export async function bulkDeleteArchivedFailed(options: {
   const whereStr = clauses.join(' AND ');
 
   try {
+    // Dry-run: count without deleting (no transaction needed)
+    if (dryRun) {
+      const selectResult = await pool.query<{ id: string }>(
+        `SELECT id FROM remote_agent_workflow_runs WHERE ${whereStr}`,
+        params
+      );
+      const runIds = selectResult.rows.map(r => r.id);
+      return { count: runIds.length, runIds, dryRun: true };
+    }
+
+    // Live delete: SELECT inside the transaction so the safety predicate is
+    // re-evaluated atomically — prevents a concurrent unarchive from causing
+    // deletion of a non-archived row (TOCTOU guard).
+    await pool.query('BEGIN', []);
     const selectResult = await pool.query<{ id: string }>(
       `SELECT id FROM remote_agent_workflow_runs WHERE ${whereStr}`,
       params
     );
     const runIds = selectResult.rows.map(r => r.id);
 
-    if (dryRun || runIds.length === 0) {
-      return { count: runIds.length, runIds, dryRun };
+    if (runIds.length === 0) {
+      await pool.query('COMMIT', []);
+      return { count: 0, runIds: [], dryRun: false };
     }
 
-    await pool.query('BEGIN', []);
+    // Delete events first (FK constraint), then runs — both scoped to the
+    // same WHERE predicate so only rows still satisfying the guard are removed.
     await pool.query(
-      `DELETE FROM remote_agent_workflow_events WHERE workflow_run_id IN (${runIds.map((_, i) => `$${String(i + 1)}`).join(', ')})`,
-      runIds
+      `DELETE FROM remote_agent_workflow_events WHERE workflow_run_id IN (
+        SELECT id FROM remote_agent_workflow_runs WHERE ${whereStr}
+      )`,
+      params
     );
-    await pool.query(
-      `DELETE FROM remote_agent_workflow_runs WHERE id IN (${runIds.map((_, i) => `$${String(i + 1)}`).join(', ')})`,
-      runIds
-    );
+    await pool.query(`DELETE FROM remote_agent_workflow_runs WHERE ${whereStr}`, params);
     await pool.query('COMMIT', []);
 
     getLog().info(
       { operator: by, count: runIds.length },
       'workflow_run.bulk_delete_failed_completed'
     );
-    return { count: runIds.length, runIds, dryRun };
+    return { count: runIds.length, runIds, dryRun: false };
   } catch (error) {
     await rollback();
     const err = error as Error;

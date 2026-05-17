@@ -2356,6 +2356,10 @@ export function registerApiRoutes(
       );
       return c.json({ success: true, message: `Archived workflow run: ${run.workflow_name}` });
     } catch (error) {
+      const err = error as Error;
+      if (err.name === 'WorkflowRunArchiveError') {
+        return apiError(c, 400, err.message);
+      }
       getLog().error({ err: error, runId }, 'api.workflow_run_archive_failed');
       return apiError(c, 500, 'Failed to archive workflow run');
     }

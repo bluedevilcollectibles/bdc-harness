@@ -19,7 +19,7 @@ interface BulkCleanupModalProps {
   onComplete?: () => void;
 }
 
-type Phase = 'idle' | 'previewing' | 'confirming' | 'done';
+type Phase = 'idle' | 'confirming' | 'done';
 
 /**
  * Two-phase cleanup modal for bulk-deleting archived failed workflow runs.
@@ -86,7 +86,7 @@ export function BulkCleanupModal({
           </AlertDialogTitle>
           <AlertDialogDescription asChild>
             <div className="space-y-2">
-              {phase === 'idle' || phase === 'previewing' ? (
+              {phase === 'idle' ? (
                 <p>
                   This will permanently delete all <strong>archived failed</strong> workflow run
                   rows and their events. Worktree directories on disk are not affected.

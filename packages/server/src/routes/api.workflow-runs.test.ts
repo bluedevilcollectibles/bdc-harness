@@ -18,7 +18,7 @@ const mockListWorkflowRuns = mock(async () => [] as MockWorkflowRun[]);
 const mockListDashboardRuns = mock(async () => ({
   runs: [] as MockWorkflowRun[],
   total: 0,
-  counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+  counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
 }));
 const mockGetWorkflowRunByWorkerPlatformId = mock(
   async (_id: string) => null as null | MockWorkflowRun
@@ -1046,7 +1046,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [MOCK_RUNNING_RUN, MOCK_COMPLETED_RUN],
       total: 2,
-      counts: { all: 5, running: 1, completed: 2, failed: 1, cancelled: 1, pending: 0 },
+      counts: { all: 5, running: 1, completed: 2, failed: 1, cancelled: 1, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1068,7 +1068,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [],
       total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1082,7 +1082,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [],
       total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1096,7 +1096,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [],
       total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1110,7 +1110,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [],
       total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1124,7 +1124,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [],
       total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1138,7 +1138,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [],
       total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1155,7 +1155,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [],
       total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1169,7 +1169,7 @@ describe('GET /api/dashboard/runs', () => {
     mockListDashboardRuns.mockImplementationOnce(async () => ({
       runs: [],
       total: 0,
-      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
     }));
 
     const { app } = makeApp();
@@ -1190,6 +1190,34 @@ describe('GET /api/dashboard/runs', () => {
 
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('Failed to list dashboard runs');
+  });
+
+  test('forwards includeArchived=true to listDashboardRuns', async () => {
+    mockListDashboardRuns.mockImplementationOnce(async () => ({
+      runs: [],
+      total: 0,
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
+    }));
+
+    const { app } = makeApp();
+    await app.request('/api/dashboard/runs?includeArchived=true');
+
+    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ includeArchived?: boolean }]][];
+    expect(callArgs?.includeArchived).toBe(true);
+  });
+
+  test('does not set includeArchived when param is absent', async () => {
+    mockListDashboardRuns.mockImplementationOnce(async () => ({
+      runs: [],
+      total: 0,
+      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0, paused: 0 },
+    }));
+
+    const { app } = makeApp();
+    await app.request('/api/dashboard/runs');
+
+    const [[callArgs]] = mockListDashboardRuns.mock.calls as [[{ includeArchived?: boolean }]][];
+    expect(callArgs?.includeArchived).toBeFalsy();
   });
 });
 
