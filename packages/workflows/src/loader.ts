@@ -487,6 +487,15 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.tags }, 'invalid_tags_block_ignored');
     }
 
+    // Parse optional target_repo — Rule 28 cross-repo guard.
+    // Must be a non-empty string (owner/repo). Invalid values are warned and ignored.
+    let targetRepo: string | undefined;
+    if (typeof raw.target_repo === 'string' && raw.target_repo.trim().length > 0) {
+      targetRepo = raw.target_repo.trim();
+    } else if (raw.target_repo !== undefined) {
+      getLog().warn({ filename, value: raw.target_repo }, 'invalid_target_repo_ignored');
+    }
+
     return {
       workflow: {
         name: raw.name,
@@ -501,6 +510,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         nodes: dagNodes,
         ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
         ...(tags !== undefined ? { tags } : {}),
+        ...(targetRepo !== undefined ? { target_repo: targetRepo } : {}),
         // 2026-05-16 fix: inputs block was declared in workflow.schemas.ts:104 +
         // wired in dag-executor.ts:1362-1365 + 2576-2578, but the loader silently
         // dropped raw.inputs from the returned workflow object. Result: every

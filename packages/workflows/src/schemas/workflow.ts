@@ -78,6 +78,14 @@ export const workflowBaseSchema = z.object({
    */
   mutates_checkout: z.boolean().optional(),
   tags: z.array(z.string().min(1)).optional(),
+  /**
+   * Rule 28: When set, the executor verifies `git remote get-url origin` in the
+   * worktree matches this owner/repo before starting any nodes. Mismatches fail
+   * immediately with a `dag_workflow_failed` event (reason: target_repo_mismatch).
+   * Format: "owner/repo" (e.g. "bluedevilcollectibles/bdc-xo").
+   * Anchor: 2026-05-16 cross-repo incident (26 files pushed to wrong remote).
+   */
+  target_repo: z.string().optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;

@@ -102,6 +102,33 @@ describe('workflowDefinitionSchema', () => {
 
     expect(result.success).toBe(false);
   });
+
+  test('accepts target_repo field (Rule 28)', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'repo-scoped-workflow',
+      description: 'Workflow with target_repo',
+      target_repo: 'bluedevilcollectibles/bdc-xo',
+      nodes: [{ id: 'n', prompt: 'Do something' }],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.target_repo).toBe('bluedevilcollectibles/bdc-xo');
+    }
+  });
+
+  test('target_repo is optional — workflow without it still validates', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'no-target-repo',
+      description: 'Workflow without target_repo',
+      nodes: [{ id: 'n', bash: 'echo hi' }],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.target_repo).toBeUndefined();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

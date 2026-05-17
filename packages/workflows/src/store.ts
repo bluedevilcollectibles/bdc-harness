@@ -11,6 +11,7 @@ export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
   'workflow_completed',
   'workflow_failed',
+  'dag_workflow_failed',
   'node_started',
   'node_completed',
   // WO-170: emitted when a node exited 0 but stdout contained STATUS=*_failed.
