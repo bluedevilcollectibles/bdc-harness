@@ -26,6 +26,7 @@
     "@archon/git": "workspace:*",
     "@archon/overseer": "workspace:*",
     "@archon/paths": "workspace:*",
+    "@archon/persona-context-loader": "workspace:*",
     "@archon/providers": "workspace:*",
     "@hono/zod-openapi": "^0.19.6",
     "zod": "^3.25.28"

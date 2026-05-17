@@ -81,6 +81,7 @@ import {
 } from './executor-shared';
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
+import { loadContext } from '@archon/persona-context-loader';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -507,6 +508,19 @@ async function resolveNodeProviderAndModel(
       // Agent tools only apply when node doesn't already restrict tools
       if (personaResolution.allowedTools && !effectiveAllowedTools) {
         effectiveAllowedTools = personaResolution.allowedTools;
+      }
+
+      // Load persona context (wiki + oracle) and prepend to system prompt
+      if (persona.context) {
+        const contextBlock = await loadContext(persona).catch(err => {
+          getLog().warn({ agentName, err: (err as Error).message }, 'agent.context_load_failed');
+          return '';
+        });
+        if (contextBlock) {
+          effectiveSystemPrompt = effectiveSystemPrompt
+            ? `${contextBlock}\n\n${effectiveSystemPrompt}`
+            : contextBlock;
+        }
       }
     }
   }

@@ -28,6 +28,7 @@ export type AgentErrorCode =
   | 'agent_missing_model'
   | 'agent_invalid_model'
   | 'agent_invalid_tool'
+  | 'agent_invalid_context'
   | 'agent_empty_prompt'
   | 'agent_not_found'
   | 'agent_file_read_error';
@@ -58,12 +59,22 @@ export const KNOWN_MODEL_ALIASES: ReadonlySet<string> = new Set([
   'claude-haiku-4-5-20251001',
 ]);
 
+/** Context block configuration for a persona (wiki + oracle lookups) */
+export interface AgentContext {
+  wiki?: string[];
+  oracle?: string[];
+  ad_hoc?: 'allowed' | 'restricted' | 'denied';
+  cache_seconds?: number;
+  max_chars?: number;
+}
+
 /** Parsed frontmatter from an agent .md file */
 export interface AgentFrontmatter {
   name: string;
   model: string;
   tools?: string[];
   description?: string;
+  context?: AgentContext;
 }
 
 /** A fully loaded and validated agent persona */
@@ -72,6 +83,7 @@ export interface AgentPersona {
   model: string;
   tools?: string[];
   description?: string;
+  context?: AgentContext;
   systemPrompt: string;
 }
 
@@ -89,7 +101,9 @@ export type AgentRegistry = Map<string, AgentPersona>;
  *
  * Returns `null` if the file does not start with `---\n`.
  */
-export function parseFrontmatter(content: string): { frontmatter: Record<string, unknown>; body: string } | null {
+export function parseFrontmatter(
+  content: string
+): { frontmatter: Record<string, unknown>; body: string } | null {
   if (!content.startsWith('---\n') && !content.startsWith('---\r\n')) return null;
 
   const afterOpening = content.startsWith('---\r\n') ? content.slice(5) : content.slice(4);
@@ -97,7 +111,8 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
   if (closingIdx === -1) return null;
 
   const fmText = afterOpening.slice(0, closingIdx);
-  const bodyStart = closingIdx + afterOpening.slice(closingIdx).match(/^---(\r?\n|$)/m)![0].length;
+  const closingMatch = /^---(\r?\n|$)/m.exec(afterOpening.slice(closingIdx));
+  const bodyStart = closingIdx + (closingMatch?.[0].length ?? 3);
   const body = afterOpening.slice(bodyStart).trim();
 
   const frontmatter: Record<string, unknown> = {};
@@ -106,24 +121,86 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 
   while (i < lines.length) {
     const line = lines[i];
-    if (!line || line.startsWith('#')) { i++; continue; }
+    if (!line || line.startsWith('#')) {
+      i++;
+      continue;
+    }
 
     const colonIdx = line.indexOf(':');
-    if (colonIdx === -1) { i++; continue; }
+    if (colonIdx === -1) {
+      i++;
+      continue;
+    }
 
     const key = line.slice(0, colonIdx).trim();
     const rest = line.slice(colonIdx + 1).trim();
 
     if (rest === '' || rest === null) {
-      // Could be a block sequence on next lines
-      const items: string[] = [];
-      i++;
-      while (i < lines.length && lines[i]?.startsWith('  - ')) {
-        items.push((lines[i] ?? '').slice(4).trim());
+      // Peek at next line to determine if this is a block sequence or nested object
+      const nextLine = lines[i + 1] ?? '';
+      if (nextLine.startsWith('  - ')) {
+        // Block sequence
+        const items: string[] = [];
         i++;
-      }
-      if (items.length > 0) {
-        frontmatter[key] = items;
+        while (i < lines.length && lines[i]?.startsWith('  - ')) {
+          items.push((lines[i] ?? '').slice(4).trim());
+          i++;
+        }
+        if (items.length > 0) {
+          frontmatter[key] = items;
+        }
+      } else if (
+        nextLine.startsWith('  ') &&
+        nextLine.includes(':') &&
+        !nextLine.startsWith('  - ')
+      ) {
+        // Nested object (2-space indented key: value pairs)
+        const obj: Record<string, unknown> = {};
+        i++;
+        while (i < lines.length) {
+          const subLine = lines[i] ?? '';
+          if (!subLine.startsWith('  ') || subLine.startsWith('    - ')) {
+            // Sub-sequence under nested key
+            if (subLine.startsWith('    - ') && Object.keys(obj).length > 0) {
+              const lastKey = Object.keys(obj).at(-1);
+              if (lastKey === undefined) {
+                i++;
+                continue;
+              }
+              if (!Array.isArray(obj[lastKey])) obj[lastKey] = [];
+              (obj[lastKey] as string[]).push(subLine.slice(6).trim());
+              i++;
+              continue;
+            }
+            break;
+          }
+          const subColonIdx = subLine.indexOf(':');
+          if (subColonIdx === -1) {
+            i++;
+            continue;
+          }
+          const subKey = subLine.slice(0, subColonIdx).trim();
+          const subRest = subLine.slice(subColonIdx + 1).trim();
+          if (subRest === '') {
+            // This sub-key might have a block sequence at 4-space indent
+            obj[subKey] = [];
+            i++;
+            while (i < lines.length && (lines[i] ?? '').startsWith('    - ')) {
+              (obj[subKey] as string[]).push((lines[i] ?? '').slice(6).trim());
+              i++;
+            }
+          } else {
+            // Scalar sub-value — parse as number or string
+            const asNum = Number(subRest);
+            obj[subKey] = isNaN(asNum) ? subRest.replace(/^["']|["']$/g, '') : asNum;
+            i++;
+          }
+        }
+        if (Object.keys(obj).length > 0) {
+          frontmatter[key] = obj;
+        }
+      } else {
+        i++;
       }
       continue;
     }
@@ -232,6 +309,101 @@ export async function loadAgentFile(filePath: string): Promise<AgentPersona> {
     }
   }
 
+  // --- context validation ---
+  if (frontmatter.context !== undefined) {
+    const ctx = frontmatter.context as Record<string, unknown>;
+
+    if (ctx.wiki !== undefined) {
+      if (!Array.isArray(ctx.wiki)) {
+        throw new AgentRegistryError(
+          'agent_invalid_context',
+          filePath,
+          `Agent file '${filePath}': context.wiki must be a list of paths [agent_invalid_context]`
+        );
+      }
+      for (const p of ctx.wiki as string[]) {
+        if (typeof p !== 'string' || !p) {
+          throw new AgentRegistryError(
+            'agent_invalid_context',
+            filePath,
+            `Agent file '${filePath}': context.wiki entries must be non-empty strings [agent_invalid_context]`
+          );
+        }
+        if (p.includes('../') || p.startsWith('/')) {
+          throw new AgentRegistryError(
+            'agent_invalid_context',
+            filePath,
+            `Agent file '${filePath}': context.wiki path traversal denied: '${p}' [agent_invalid_context]`
+          );
+        }
+        if (/deploy|secrets|credentials/i.test(p)) {
+          throw new AgentRegistryError(
+            'agent_invalid_context',
+            filePath,
+            `Agent file '${filePath}': context.wiki forbidden path: '${p}' [agent_invalid_context]`
+          );
+        }
+      }
+    }
+
+    if (ctx.oracle !== undefined) {
+      if (!Array.isArray(ctx.oracle)) {
+        throw new AgentRegistryError(
+          'agent_invalid_context',
+          filePath,
+          `Agent file '${filePath}': context.oracle must be a list of query strings [agent_invalid_context]`
+        );
+      }
+      for (const q of ctx.oracle as string[]) {
+        if (typeof q !== 'string' || !q) {
+          throw new AgentRegistryError(
+            'agent_invalid_context',
+            filePath,
+            `Agent file '${filePath}': context.oracle entries must be non-empty strings [agent_invalid_context]`
+          );
+        }
+      }
+    }
+
+    if (ctx.ad_hoc !== undefined) {
+      if (!['allowed', 'restricted', 'denied'].includes(ctx.ad_hoc as string)) {
+        throw new AgentRegistryError(
+          'agent_invalid_context',
+          filePath,
+          `Agent file '${filePath}': context.ad_hoc must be 'allowed', 'restricted', or 'denied' [agent_invalid_context]`
+        );
+      }
+    }
+
+    if (ctx.cache_seconds !== undefined) {
+      if (
+        typeof ctx.cache_seconds !== 'number' ||
+        ctx.cache_seconds <= 0 ||
+        !Number.isInteger(ctx.cache_seconds)
+      ) {
+        throw new AgentRegistryError(
+          'agent_invalid_context',
+          filePath,
+          `Agent file '${filePath}': context.cache_seconds must be a positive integer [agent_invalid_context]`
+        );
+      }
+    }
+
+    if (ctx.max_chars !== undefined) {
+      if (
+        typeof ctx.max_chars !== 'number' ||
+        ctx.max_chars <= 0 ||
+        !Number.isInteger(ctx.max_chars)
+      ) {
+        throw new AgentRegistryError(
+          'agent_invalid_context',
+          filePath,
+          `Agent file '${filePath}': context.max_chars must be a positive integer [agent_invalid_context]`
+        );
+      }
+    }
+  }
+
   // --- body (system prompt) validation ---
   if (!body) {
     throw new AgentRegistryError(
@@ -242,8 +414,8 @@ export async function loadAgentFile(filePath: string): Promise<AgentPersona> {
   }
 
   const persona: AgentPersona = {
-    name: frontmatter.name as string,
-    model: frontmatter.model as string,
+    name: frontmatter.name,
+    model: frontmatter.model,
     systemPrompt: body,
   };
 
@@ -252,6 +424,18 @@ export async function loadAgentFile(filePath: string): Promise<AgentPersona> {
   }
   if (typeof frontmatter.description === 'string' && frontmatter.description) {
     persona.description = frontmatter.description;
+  }
+  if (frontmatter.context !== undefined) {
+    const ctx = frontmatter.context as Record<string, unknown>;
+    persona.context = {
+      ...(ctx.wiki !== undefined && { wiki: ctx.wiki as string[] }),
+      ...(ctx.oracle !== undefined && { oracle: ctx.oracle as string[] }),
+      ...(ctx.ad_hoc !== undefined && {
+        ad_hoc: ctx.ad_hoc as 'allowed' | 'restricted' | 'denied',
+      }),
+      ...(ctx.cache_seconds !== undefined && { cache_seconds: ctx.cache_seconds as number }),
+      ...(ctx.max_chars !== undefined && { max_chars: ctx.max_chars as number }),
+    };
   }
 
   return persona;
@@ -307,10 +491,7 @@ export async function loadAgentRegistry(agentsDir: string): Promise<AgentRegistr
  * Throws `AgentRegistryError` with code `agent_not_found` if the registry was
  * loaded but the name is absent.
  */
-export function resolveAgent(
-  name: string,
-  registry: AgentRegistry
-): AgentPersona | undefined {
+export function resolveAgent(name: string, registry: AgentRegistry): AgentPersona | undefined {
   if (registry.size === 0) return undefined;
 
   const persona = registry.get(name);
