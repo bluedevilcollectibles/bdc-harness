@@ -323,7 +323,8 @@ nodes:
       TITLE="infra: deployment via WO"
       BODY="Infra deployment WO. See manifest in Notion for evidence."
 
-      gh pr create --title "$TITLE" --body "$BODY" || true
+      # Rule 29: infra-deploy PRs always target bdc-harness (source file changes only).
+      gh pr create --repo bluedevilcollectibles/bdc-harness --title "$TITLE" --body "$BODY" || true
 
   - id: build-manifest
     depends_on: [open-pr-if-needed]
