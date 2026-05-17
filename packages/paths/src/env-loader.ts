@@ -22,7 +22,7 @@
  *     output.
  */
 import { config } from 'dotenv';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { getArchonEnvPath, getRepoArchonEnvPath } from './archon-paths';
 
@@ -53,6 +53,7 @@ function displayPath(p: string): string {
 export function loadArchonEnv(cwd: string = process.cwd()): void {
   const homePath = getArchonEnvPath();
   if (existsSync(homePath)) {
+    warnIfCrlf(homePath);
     const result = config({ path: homePath, override: true, quiet: true });
     if (result.error) {
       console.error(`Error loading .env from ${homePath}: ${result.error.message}`);
@@ -67,6 +68,7 @@ export function loadArchonEnv(cwd: string = process.cwd()): void {
 
   const repoPath = getRepoArchonEnvPath(cwd);
   if (existsSync(repoPath)) {
+    warnIfCrlf(repoPath);
     const result = config({ path: repoPath, override: true, quiet: true });
     if (result.error) {
       console.error(`Error loading .env from ${repoPath}: ${result.error.message}`);
@@ -79,5 +81,24 @@ export function loadArchonEnv(cwd: string = process.cwd()): void {
         `[archon] loaded ${count} keys from ${displayPath(repoPath)} (repo scope, overrides user scope)\n`
       );
     }
+  }
+}
+
+/**
+ * Emit a stderr warning when an env file has CRLF line endings on Linux.
+ * dotenv handles CRLF natively, but operators should be aware because other
+ * tooling (e.g. Node --env-file) may include the trailing \r in values.
+ */
+function warnIfCrlf(filePath: string): void {
+  if (process.platform !== 'linux') return;
+  try {
+    const content = readFileSync(filePath, 'utf8');
+    if (content.includes('\r\n')) {
+      process.stderr.write(
+        `[archon] env_file_crlf_detected: CRLF line endings found in ${displayPath(filePath)} — dotenv handles this correctly, but other tooling (e.g. Node --env-file) may include trailing \\r in values\n`
+      );
+    }
+  } catch {
+    // Unreadable file — dotenv.config will surface the real error below
   }
 }
