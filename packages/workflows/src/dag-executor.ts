@@ -2723,6 +2723,10 @@ export async function executeDagWorkflow(
     'dag_workflow_starting'
   );
 
+  // Eager registry validation: fail before any node fires if any agent file is malformed.
+  // Cached after first load — zero overhead on subsequent runs from the same cwd.
+  await getAgentRegistry(cwd);
+
   // Session threading: for sequential single-node layers, thread the session forward.
   // For parallel layers (>1 node), always fresh (can't share a session).
   let lastSequentialSessionId: string | undefined;

@@ -27,7 +27,9 @@ import {
   isInlineScript,
   formatSubprocessFailure,
   classifyError,
+  resolveAgentPersona,
 } from './executor-shared';
+import type { AgentPersona } from './agents/registry';
 
 describe('substituteWorkflowVariables', () => {
   it('replaces $WORKFLOW_ID with the run ID', () => {
@@ -590,5 +592,60 @@ describe('classifyError', () => {
 
   it('classifies unknown errors as UNKNOWN', () => {
     expect(classifyError(new Error('something completely unexpected happened'))).toBe('UNKNOWN');
+  });
+});
+
+describe('resolveAgentPersona', () => {
+  it('returns persona model, systemPrompt, agentName, and allowedTools when no node model', () => {
+    const persona: AgentPersona = {
+      name: 'war-council-architect',
+      model: 'sonnet',
+      systemPrompt: 'You are the architect.',
+      tools: ['Read', 'Grep', 'Glob', 'WebFetch'],
+    };
+    const result = resolveAgentPersona(persona, undefined);
+    expect(result.model).toBe('sonnet');
+    expect(result.agentName).toBe('war-council-architect');
+    expect(result.systemPrompt).toBe('You are the architect.');
+    expect(result.allowedTools).toEqual(['Read', 'Grep', 'Glob', 'WebFetch']);
+  });
+
+  it('persona model wins over node model and restricted tools are enforced', () => {
+    // Executor-level agent_tool_not_allowed enforcement: allowedTools is set to
+    // the agent's restricted list; Write/Edit/Bash are excluded for read-only agents.
+    const persona: AgentPersona = {
+      name: 'war-council-architect',
+      model: 'sonnet',
+      systemPrompt: 'You plan.',
+      tools: ['Read', 'Grep', 'Glob'],
+    };
+    const result = resolveAgentPersona(persona, 'opus');
+    expect(result.model).toBe('sonnet'); // agent model wins
+    expect(result.allowedTools).not.toContain('Write');
+    expect(result.allowedTools).not.toContain('Edit');
+    expect(result.allowedTools).not.toContain('Bash');
+  });
+
+  it('allowedTools is undefined when agent declares no tools (full toolset)', () => {
+    const persona: AgentPersona = {
+      name: 'major-build',
+      model: 'opus[1m]',
+      systemPrompt: 'You build.',
+    };
+    const result = resolveAgentPersona(persona, undefined);
+    expect(result.allowedTools).toBeUndefined();
+  });
+
+  it('persona resolution is a pure function — does not mutate the caller node model reference', () => {
+    const persona: AgentPersona = {
+      name: 'captain-ci-validator',
+      model: 'sonnet',
+      systemPrompt: 'You validate.',
+      tools: ['Read', 'Grep', 'Glob', 'Bash'],
+    };
+    let nodeModel: string | undefined = 'haiku';
+    const result = resolveAgentPersona(persona, nodeModel);
+    expect(nodeModel).toBe('haiku'); // caller's variable unchanged
+    expect(result.model).toBe('sonnet');
   });
 });
