@@ -39,6 +39,7 @@ import {
   checkTriggerRule,
   substituteNodeOutputRefs,
   executeDagWorkflow,
+  clearAgentRegistryCache,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
@@ -7313,5 +7314,148 @@ describe('executeDagWorkflow -- final status derivation', () => {
       expect.anything(),
       expect.stringContaining('b')
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agent persona dispatch tests
+// Verify that executeDagWorkflow resolves agent: fields to persona model +
+// allowed_tools, and that nodes without agent: continue using current behavior.
+// ---------------------------------------------------------------------------
+
+describe('agent persona dispatch', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `agent-dispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(join(testDir, '.archon', 'agents'), { recursive: true });
+    await mkdir(join(testDir, 'artifacts'), { recursive: true });
+    await mkdir(join(testDir, 'logs'), { recursive: true });
+    clearAgentRegistryCache();
+    mockSendQueryDag.mockClear();
+  });
+
+  afterEach(async () => {
+    clearAgentRegistryCache();
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  async function writeAgentFile(name: string, model: string, tools?: string[]): Promise<void> {
+    const toolsLine = tools ? `tools: [${tools.join(', ')}]` : '';
+    const content = `---\nname: ${name}\nmodel: ${model}\n${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
+    await writeFile(join(testDir, '.archon', 'agents', `${name}.md`), content, 'utf-8');
+  }
+
+  it('prompt node with agent: applies persona allowed_tools to nodeConfig', async () => {
+    await writeAgentFile('read-only-test-agent', 'sonnet', ['Read', 'Grep']);
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-run-1');
+
+    const nodes: DagNode[] = [
+      { id: 'plan', agent: 'read-only-test-agent', prompt: 'Plan the work.' } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'agent-persona-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig.allowed_tools).toEqual(['Read', 'Grep']);
+  });
+
+  it('prompt node with agent: and model: mismatch — persona model wins', async () => {
+    await writeAgentFile('sonnet-test-agent', 'sonnet');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-run-2');
+
+    // Node declares model: opus but agent persona is sonnet — persona should win
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'sonnet-test-agent',
+        model: 'opus',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'mismatch-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    // Persona model (sonnet) wins over node model (opus)
+    expect(optionsArg.model).toBe('sonnet');
+  });
+
+  it('backward compat: node without agent: does not inject persona allowed_tools', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-run-3');
+
+    // No agent: field — uses current behavior (no persona tool restriction)
+    const nodes: DagNode[] = [{ id: 'step', prompt: 'Do the thing.' } as DagNode];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'backward-compat-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
+    // No agent = no persona-injected allowed_tools
+    expect(nodeConfig.allowed_tools).toBeUndefined();
   });
 });

@@ -100,7 +100,9 @@ function DagNodeRender({ data, selected }: NodeProps<DagFlowNode>): React.ReactE
           {data.agentPersona && (
             <>
               <span className="text-[10px] text-text-tertiary shrink-0">·</span>
-              <span className="text-[10px] text-text-tertiary italic truncate">{data.agentPersona}</span>
+              <span className="text-[10px] text-text-tertiary italic truncate">
+                {data.agentPersona}
+              </span>
             </>
           )}
         </div>

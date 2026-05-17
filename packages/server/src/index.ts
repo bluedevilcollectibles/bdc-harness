@@ -11,7 +11,7 @@ import '@archon/paths/strip-cwd-env-boot';
 
 // Load environment variables — after CWD stripping, before application imports.
 import { config } from 'dotenv';
-import { resolve } from 'path';
+import { resolve, join } from 'path';
 import { existsSync } from 'fs';
 import { BUNDLED_IS_BINARY, getArchonEnvPath } from '@archon/paths';
 
@@ -48,6 +48,7 @@ if (
 }
 
 import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
+import { loadAgentRegistry } from '@archon/workflows/agents/registry';
 
 // Bootstrap provider registry before any provider lookups
 registerBuiltinProviders();
@@ -204,6 +205,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
   const config = await loadConfig();
   logConfig(config);
+
+  // Validate agent registry at startup — fail closed if any agent file is malformed.
+  // loadAgentRegistry already handles ENOENT (no agents dir) by returning an empty registry.
+  try {
+    await loadAgentRegistry(join(process.cwd(), '.archon', 'agents'));
+    getLog().info('agent_registry_validated');
+  } catch (error) {
+    getLog().fatal({ err: error }, 'agent_registry_invalid');
+    process.exit(1);
+  }
 
   // Start cleanup scheduler
   startCleanupScheduler();
