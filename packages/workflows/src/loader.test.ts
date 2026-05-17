@@ -2447,6 +2447,41 @@ nodes:
         'interactive_loop_in_non_interactive_workflow'
       );
     });
+
+    it('should preserve agent: field on loop node and not fire ai_fields_ignored warning', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-agent.yaml'),
+        `
+name: loop-agent
+description: Loop with agent persona
+nodes:
+  - id: iterate
+    agent: major-build
+    loop:
+      prompt: "Do the work."
+      until: "COMPLETE"
+      max_iterations: 5
+`
+      );
+
+      (mockLogger.warn as Mock<() => undefined>).mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+
+      const node = result.workflows[0].workflow.nodes[0];
+      expect(isLoopNode(node)).toBe(true);
+      expect((node as { agent?: string }).agent).toBe('major-build');
+
+      const warnCalls = (mockLogger.warn as Mock<() => undefined>).mock.calls;
+      const aiFieldWarnings = warnCalls.filter(
+        call => typeof call[1] === 'string' && (call[1] as string).includes('ai_fields_ignored')
+      );
+      expect(aiFieldWarnings).toHaveLength(0);
+    });
   });
 
   // -------------------------------------------------------------------------

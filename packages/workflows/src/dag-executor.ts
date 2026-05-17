@@ -1948,6 +1948,23 @@ async function executeLoopNode(
     workflowLevelOptions
   );
 
+  // Resolve agent persona for loop node (if agent: is declared).
+  // Applied to every iteration — same semantics as prompt/command nodes:
+  // persona model overrides the loop-resolved model; persona system prompt is
+  // prepended to any node-level systemPrompt.
+  const loopAgentName = (node as { agent?: string }).agent;
+  if (loopAgentName) {
+    const registry = await getAgentRegistry(cwd);
+    const persona = resolveAgent(loopAgentName, registry);
+    if (persona) {
+      const personaResolution = resolveAgentPersona(persona, resolvedOptions.model);
+      resolvedOptions.model = personaResolution.model;
+      resolvedOptions.systemPrompt = resolvedOptions.systemPrompt
+        ? `${personaResolution.systemPrompt}\n\n${resolvedOptions.systemPrompt}`
+        : personaResolution.systemPrompt;
+    }
+  }
+
   // Helper to log event store errors consistently
   const logEventStoreError = (err: Error, iteration: number): void => {
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
