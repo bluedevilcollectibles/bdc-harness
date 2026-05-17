@@ -315,33 +315,51 @@ nodes:
       fi
       git checkout -B "$BRANCH"
       git status --short
-      CHANGED_FILES=$(git status --porcelain | awk '{print substr($0,4)}')
-      if [ -z "$CHANGED_FILES" ]; then
-        echo "No changed files found; cannot commit." >&2
-        exit 1
-      fi
-      while IFS= read -r path; do
-        if [ -z "$path" ]; then
-          continue
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        # Already fully synced: implement loop committed + pushed to origin
+        if git rev-parse --quiet --verify "origin/$BRANCH" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed to origin/$BRANCH (HEAD matches)."
+          exit 0
         fi
-        if ! printf '%s\n' "$plan-fix.output" | grep -F -- "$path" >/dev/null; then
-          echo "Changed file was not listed in plan output: $path" >&2
+        # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: clean tree != no work.
+        # Count commits ahead to distinguish pre-committed work from true no-op.
+        if git rev-parse --quiet --verify "origin/${BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          echo "No changed files and no commits ahead of origin/${BRANCH} -- implement loop did not produce work" >&2
           exit 1
         fi
-        git add -- "$path"
-      done <<EOF
+        echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
+      else
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        while IFS= read -r path; do
+          if [ -z "$path" ]; then
+            continue
+          fi
+          if ! printf '%s\n' "$plan-fix.output" | grep -F -- "$path" >/dev/null; then
+            echo "Changed file was not listed in plan output: $path" >&2
+            exit 1
+          fi
+          git add -- "$path"
+        done <<EOF
       $CHANGED_FILES
-      EOF
-      if git diff --cached --quiet; then
-        echo "No changes staged; cannot commit." >&2
-        exit 1
+EOF
+        if git diff --cached --quiet; then
+          echo "No changes staged; cannot commit." >&2
+          exit 1
+        fi
+        COMMIT_MESSAGE=$(printf '%s\n' "$plan-fix.output" | sed -n 's/^Commit message: //p' | head -n 1)
+        if [ -z "$COMMIT_MESSAGE" ]; then
+          WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
+          COMMIT_MESSAGE="fix: ${WO_ID} bug fix"
+        fi
+        git commit -m "$COMMIT_MESSAGE"
       fi
-      COMMIT_MESSAGE=$(printf '%s\n' "$plan-fix.output" | sed -n 's/^Commit message: //p' | head -n 1)
-      if [ -z "$COMMIT_MESSAGE" ]; then
-        WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
-        COMMIT_MESSAGE="fix: ${WO_ID} bug fix"
-      fi
-      git commit -m "$COMMIT_MESSAGE"
       git push -u origin "$BRANCH"
 
   - id: open-pr-if-needed

@@ -256,60 +256,64 @@ nodes:
       fi
       git checkout -B "$BRANCH"
       git status --short
-      # Backstop no-op detection (Patch 6, 2026-05-16):
-      # The implement loop now commits + pushes its own work (Patch 2, Rule 23).
-      # If it succeeded, the working tree + index are clean here — this backstop
-      # should exit 0 as a no-op, NOT exit 1 with "no changed files." Anchor:
-      # 2026-05-16 smoketest3 reached commit-and-push cleanly through the quote-fix
-      # (#65) but died exit 1 here because implement loop had already pushed.
-      CHANGED_FILES=$(git status --porcelain | awk '{print substr($0,4)}')
-      if [ -z "$CHANGED_FILES" ]; then
-        # Verify HEAD is on the expected branch + remote has it.
-        # If yes: implement loop did its job — backstop is no-op, exit clean.
-        # If no: something is genuinely wrong (implement skipped commit AND working tree clean).
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        # Already fully synced: implement loop committed + pushed to origin
         if git rev-parse --quiet --verify "origin/$BRANCH" >/dev/null 2>&1 && \
            [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ]; then
           echo "Backstop no-op: implement loop already committed + pushed to origin/$BRANCH (HEAD matches)."
           exit 0
         fi
-        echo "No changed files AND remote branch missing/behind — implement loop did not commit." >&2
-        exit 1
-      fi
-      # Auto-tolerated files: dependency lockfiles + standard auto-regenerated
-      # artifacts. These are managed by package managers (bun install, etc.)
-      # during the implement loop and won't be listed in any plan output.
-      # Patch 7 (2026-05-16, anchor smoketest4): without this allowlist, a plan
-      # that adds even one dependency to package.json causes the implement loop
-      # to regenerate bun.lock, which trips this strict-allowlist check and
-      # kills the workflow with "Changed file was not listed in plan output".
-      AUTO_TOLERATED='^(bun\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.bun-tag|node_modules/)$'
-      printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
-        if [ -z "$path" ]; then
-          continue
+        # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: a clean working
+        # tree does NOT mean the implement loop skipped work — it may have committed
+        # and left the tree clean. Count COMMITS_AHEAD to distinguish true no-op
+        # from pre-committed work that still needs pushing.
+        if git rev-parse --quiet --verify "origin/${BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
         fi
-        # Skip allowlist check for auto-managed files; just stage them.
-        if printf '%s\n' "$path" | grep -Eq "$AUTO_TOLERATED"; then
-          echo "Auto-tolerated change (lockfile/managed): $path"
-          git add -- "$path"
-          continue
-        fi
-        if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
-          echo "Changed file was not listed in plan output: $path" >&2
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          echo "No changed files and no commits ahead of origin/${BRANCH} -- implement loop did not produce work" >&2
           exit 1
         fi
-        git add -- "$path"
-      done
-      if git diff --cached --quiet; then
-        echo "No changes staged; nothing for backstop to commit." >&2
-        exit 0
+        echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
+      else
+        # Dirty working tree: stage + validate against plan + commit
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        # Auto-tolerated files: dependency lockfiles + standard auto-regenerated
+        # artifacts managed by package managers during the implement loop.
+        # Without this allowlist, adding a dependency causes bun.lock regeneration
+        # which trips the strict-allowlist check.
+        AUTO_TOLERATED='^(bun\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.bun-tag|node_modules/)$'
+        printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
+          if [ -z "$path" ]; then
+            continue
+          fi
+          # Skip allowlist check for auto-managed files; just stage them.
+          if printf '%s\n' "$path" | grep -Eq "$AUTO_TOLERATED"; then
+            echo "Auto-tolerated change (lockfile/managed): $path"
+            git add -- "$path"
+            continue
+          fi
+          if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
+            echo "Changed file was not listed in plan output: $path" >&2
+            exit 1
+          fi
+          git add -- "$path"
+        done
+        if git diff --cached --quiet; then
+          echo "No changes staged; nothing for backstop to commit." >&2
+          exit 0
+        fi
+        COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+        if [ -z "$COMMIT_MESSAGE" ]; then
+          # Re-derive WO_ID locally — see post-started for rationale
+          WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+          COMMIT_MESSAGE="feat: ${WO_ID} implementation"
+        fi
+        git commit -m "$COMMIT_MESSAGE"
       fi
-      COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
-      if [ -z "$COMMIT_MESSAGE" ]; then
-        # Re-derive WO_ID locally — see post-started for rationale
-        WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
-        COMMIT_MESSAGE="feat: ${WO_ID} implementation"
-      fi
-      git commit -m "$COMMIT_MESSAGE"
 
       # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
       # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.

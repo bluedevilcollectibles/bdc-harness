@@ -190,38 +190,55 @@ nodes:
       echo "Currently on branch: $CURRENT_BRANCH"
 
       git status --short
-      CHANGED_FILES=$(git status --porcelain | awk '{print substr($0,4)}')
-      if [ -z "$CHANGED_FILES" ]; then
-        echo "No changed files found; cannot commit." >&2
-        exit 1
-      fi
-
-      # Verify all changed files are in the plan
-      while IFS= read -r path; do
-        if [ -z "$path" ]; then
-          continue
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        # Already fully synced: implement loop committed + pushed to origin
+        if git rev-parse --quiet --verify "origin/${CURRENT_BRANCH}" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${CURRENT_BRANCH}")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed to origin/${CURRENT_BRANCH} (HEAD matches)."
+          exit 0
         fi
-        if ! printf '%s\n' "$plan.output" | grep -F -- "$path" >/dev/null; then
-          echo "Changed file was not listed in plan output: $path" >&2
+        # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: clean tree != no work.
+        # Count commits ahead to distinguish pre-committed work from true no-op.
+        if git rev-parse --quiet --verify "origin/${CURRENT_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${CURRENT_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          echo "No changed files and no commits ahead of origin/${CURRENT_BRANCH} -- implement loop did not produce work" >&2
           exit 1
         fi
-        git add -- "$path"
-      done <<EOF
+        echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin/${CURRENT_BRANCH} -- pushing pre-committed work."
+      else
+        # Verify all changed files are in the plan
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        while IFS= read -r path; do
+          if [ -z "$path" ]; then
+            continue
+          fi
+          if ! printf '%s\n' "$plan.output" | grep -F -- "$path" >/dev/null; then
+            echo "Changed file was not listed in plan output: $path" >&2
+            exit 1
+          fi
+          git add -- "$path"
+        done <<EOF
       $CHANGED_FILES
-      EOF
+EOF
 
-      if git diff --cached --quiet; then
-        echo "No changes staged; cannot commit." >&2
-        exit 1
+        if git diff --cached --quiet; then
+          echo "No changes staged; cannot commit." >&2
+          exit 1
+        fi
+
+        COMMIT_MESSAGE=$(printf '%s\n' "$plan.output" | sed -n 's/^Commit message: //p' | head -n 1)
+        if [ -z "$COMMIT_MESSAGE" ]; then
+          WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
+          COMMIT_MESSAGE="docs(doctrine): ${WO_ID}"
+        fi
+
+        git commit -m "$COMMIT_MESSAGE"
       fi
-
-      COMMIT_MESSAGE=$(printf '%s\n' "$plan.output" | sed -n 's/^Commit message: //p' | head -n 1)
-      if [ -z "$COMMIT_MESSAGE" ]; then
-        WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
-        COMMIT_MESSAGE="docs(doctrine): ${WO_ID}"
-      fi
-
-      git commit -m "$COMMIT_MESSAGE"
       git push origin "$CURRENT_BRANCH"
 
   - id: build-manifest
