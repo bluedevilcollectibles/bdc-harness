@@ -10,6 +10,10 @@ import {
   deleteWorkflowRun,
   approveWorkflowRun,
   rejectWorkflowRun,
+  archiveWorkflowRun,
+  unarchiveWorkflowRun,
+  bulkArchiveWorkflowRuns,
+  bulkDeleteArchivedFailedRuns,
   listCodebases,
   getHealth,
   type DashboardCounts,
@@ -21,6 +25,7 @@ import { StatusSummaryBar } from '@/components/dashboard/StatusSummaryBar';
 import { WorkflowRunGroup } from '@/components/dashboard/WorkflowRunGroup';
 import { WorkflowRunCard } from '@/components/dashboard/WorkflowRunCard';
 import { WorkflowHistoryTable } from '@/components/dashboard/WorkflowHistoryTable';
+import { CleanupModal } from '@/components/dashboard/CleanupModal';
 import { useDashboardSSE } from '@/hooks/useDashboardSSE';
 import { useWorkflowStore } from '@/stores/workflow-store';
 
@@ -63,6 +68,8 @@ export function DashboardPage(): React.ReactElement {
   const pageSize = PAGE_SIZE_OPTIONS.includes(pageSizeParam as (typeof PAGE_SIZE_OPTIONS)[number])
     ? pageSizeParam
     : DEFAULT_PAGE_SIZE;
+
+  const [showArchived, setShowArchived] = useState(false);
 
   // Debounced search: type instantly in the input, but delay the server request
   const [searchInput, setSearchInput] = useState(searchQuery);
@@ -160,6 +167,7 @@ export function DashboardPage(): React.ReactElement {
         dateRange,
         page,
         pageSize,
+        showArchived,
       },
     ],
     queryFn: () =>
@@ -171,6 +179,7 @@ export function DashboardPage(): React.ReactElement {
         before: dateBounds.before,
         limit: pageSize,
         offset: page * pageSize,
+        includeArchived: showArchived,
       }),
     refetchInterval: 5_000,
   });
@@ -268,6 +277,16 @@ export function DashboardPage(): React.ReactElement {
   );
 
   const [actionError, setActionError] = useState<string | null>(null);
+  const [archiveNotice, setArchiveNotice] = useState<string | null>(null);
+  const archiveNoticeTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  function showArchiveNotice(message: string): void {
+    setArchiveNotice(message);
+    if (archiveNoticeTimerRef.current) clearTimeout(archiveNoticeTimerRef.current);
+    archiveNoticeTimerRef.current = setTimeout(() => {
+      setArchiveNotice(null);
+    }, 5000);
+  }
 
   async function runAction(
     action: (runId: string) => Promise<unknown>,
@@ -293,6 +312,35 @@ export function DashboardPage(): React.ReactElement {
     runAction(deleteWorkflowRun, runId, 'Failed to delete workflow run');
   const handleApprove = (runId: string): Promise<void> =>
     runAction(approveWorkflowRun, runId, 'Failed to approve workflow');
+  async function handleArchive(runId: string, reason?: string): Promise<void> {
+    try {
+      setActionError(null);
+      await archiveWorkflowRun(runId, reason);
+      void queryClient.invalidateQueries({ queryKey: ['dashboardRuns'] });
+      showArchiveNotice('Run archived. Toggle "Show archived" to see it.');
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to archive workflow run');
+    }
+  }
+  async function handleUnarchive(runId: string): Promise<void> {
+    try {
+      setActionError(null);
+      await unarchiveWorkflowRun(runId);
+      void queryClient.invalidateQueries({ queryKey: ['dashboardRuns'] });
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to unarchive workflow run');
+    }
+  }
+  async function handleBulkArchive(status: 'failed' | 'cancelled' | 'completed'): Promise<void> {
+    try {
+      setActionError(null);
+      const result = await bulkArchiveWorkflowRuns({ status });
+      void queryClient.invalidateQueries({ queryKey: ['dashboardRuns'] });
+      showArchiveNotice(`Archived ${String(result.archivedCount)} ${status} run(s).`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to bulk archive workflow runs');
+    }
+  }
   // Reject differs from the rest of the lifecycle actions because it takes a
   // second argument (the optional reason). Inline it rather than squeezing
   // through `runAction`'s `(id) => Promise` signature with a closure — keeps
@@ -316,11 +364,17 @@ export function DashboardPage(): React.ReactElement {
         {/* Header */}
         <div className="flex items-center justify-between">
           <h1 className="text-lg font-semibold text-text-primary">Mission Control</h1>
-          {dataUpdatedAt > 0 && (
-            <span className="text-xs text-text-tertiary">
-              Last updated {new Date(dataUpdatedAt).toLocaleTimeString()}
-            </span>
-          )}
+          <div className="flex items-center gap-3">
+            {dataUpdatedAt > 0 && (
+              <span className="text-xs text-text-tertiary">
+                Last updated {new Date(dataUpdatedAt).toLocaleTimeString()}
+              </span>
+            )}
+            <CleanupModal
+              onBulkArchive={handleBulkArchive}
+              onBulkDeleteFailed={bulkDeleteArchivedFailedRuns}
+            />
+          </div>
         </div>
 
         {/* Status Summary Bar — receives real server counts */}
@@ -336,7 +390,15 @@ export function DashboardPage(): React.ReactElement {
           onDateRangeChange={setDateRange}
           codebases={codebases}
           health={health}
+          showArchived={showArchived}
+          onShowArchivedChange={setShowArchived}
         />
+
+        {archiveNotice && (
+          <div className="rounded-md border border-border bg-surface-elevated px-4 py-3 text-sm text-text-secondary">
+            {archiveNotice}
+          </div>
+        )}
 
         {actionError && (
           <div className="rounded-md border border-error/30 bg-error/5 px-4 py-3 text-sm text-error">
@@ -381,6 +443,8 @@ export function DashboardPage(): React.ReactElement {
                           onDelete={handleDelete}
                           onApprove={handleApprove}
                           onReject={handleReject}
+                          onArchive={handleArchive}
+                          onUnarchive={handleUnarchive}
                         />
                       ))}
                     </div>
@@ -398,6 +462,8 @@ export function DashboardPage(): React.ReactElement {
                       onDelete={handleDelete}
                       onApprove={handleApprove}
                       onReject={handleReject}
+                      onArchive={handleArchive}
+                      onUnarchive={handleUnarchive}
                     />
                   ))}
                 </div>
@@ -408,7 +474,12 @@ export function DashboardPage(): React.ReactElement {
             {historyRuns.length > 0 && (
               <section>
                 <h2 className="mb-3 text-sm font-semibold text-text-secondary">History</h2>
-                <WorkflowHistoryTable runs={historyRuns} onDelete={handleDelete} />
+                <WorkflowHistoryTable
+                  runs={historyRuns}
+                  onDelete={handleDelete}
+                  onArchive={handleArchive}
+                  onUnarchive={handleUnarchive}
+                />
               </section>
             )}
 

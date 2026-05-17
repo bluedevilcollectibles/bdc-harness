@@ -196,7 +196,10 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
   started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   completed_at TIMESTAMP WITH TIME ZONE,
   last_activity_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  working_path TEXT
+  working_path TEXT,
+  archived_at TIMESTAMP WITH TIME ZONE,
+  archived_by TEXT,
+  archive_reason TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_conversation
@@ -312,3 +315,15 @@ ALTER TABLE remote_agent_sessions
 -- From migration 021: allow_env_keys on codebases
 ALTER TABLE remote_agent_codebases
   ADD COLUMN IF NOT EXISTS allow_env_keys BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- From migration 022: archive fields on workflow_runs
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS archived_at TIMESTAMP WITH TIME ZONE;
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS archived_by TEXT;
+ALTER TABLE remote_agent_workflow_runs
+  ADD COLUMN IF NOT EXISTS archive_reason TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_archived
+  ON remote_agent_workflow_runs(archived_at)
+  WHERE archived_at IS NOT NULL;
