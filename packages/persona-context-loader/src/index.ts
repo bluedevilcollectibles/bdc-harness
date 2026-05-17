@@ -84,7 +84,17 @@ export async function loadContext(agent: PersonaContextInput): Promise<string> {
   }
 
   const maxChars = context.max_chars ?? 50000;
+  const totalRaw =
+    wikiResults.reduce((s, w) => s + w.content.length, 0) +
+    oracleResults.reduce((s, o) => s + o.answer.length, 0);
   const { block, wikiChars, oracleChars } = truncate(wikiResults, oracleResults, maxChars);
+
+  if (block.length < totalRaw) {
+    getLog().warn(
+      { name: agent.name, rawChars: totalRaw, truncatedTo: block.length, maxChars },
+      'context_loader.truncated'
+    );
+  }
 
   getLog().info(
     { name: agent.name, wikiChars, oracleChars, totalChars: block.length },

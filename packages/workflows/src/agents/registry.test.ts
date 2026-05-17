@@ -334,3 +334,168 @@ describe('resolveAgent', () => {
     expect(err?.code).toBe('agent_not_found');
   });
 });
+
+// ---------------------------------------------------------------------------
+// parseFrontmatter — nested context: block
+// ---------------------------------------------------------------------------
+
+describe('parseFrontmatter nested context:', () => {
+  test('parses valid context block with wiki, oracle, and scalar fields', () => {
+    const content = [
+      '---',
+      'name: a',
+      'model: sonnet',
+      'context:',
+      '  wiki:',
+      '    - docs/arch.md',
+      '  oracle:',
+      '    - BDC patterns',
+      '  cache_seconds: 3600',
+      '  max_chars: 50000',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const result = parseFrontmatter(content);
+    expect(result?.frontmatter.context).toEqual({
+      wiki: ['docs/arch.md'],
+      oracle: ['BDC patterns'],
+      cache_seconds: 3600,
+      max_chars: 50000,
+    });
+  });
+
+  test('parses ad_hoc scalar under context:', () => {
+    const content = [
+      '---',
+      'name: a',
+      'model: sonnet',
+      'context:',
+      '  ad_hoc: allowed',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const result = parseFrontmatter(content);
+    expect((result?.frontmatter.context as Record<string, unknown>)?.ad_hoc).toBe('allowed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadAgentFile — context validation (agent_invalid_context)
+// ---------------------------------------------------------------------------
+
+describe('loadAgentFile context validation', () => {
+  test('loads agent with valid context block', async () => {
+    const content = [
+      '---',
+      'name: ctx-agent',
+      'model: sonnet',
+      'context:',
+      '  wiki:',
+      '    - docs/a.md',
+      '---',
+      '',
+      'You are a test agent.',
+    ].join('\n');
+    const filePath = await writeAgent('ctx-agent.md', content);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.context?.wiki).toEqual(['docs/a.md']);
+  });
+
+  test('agent_invalid_context: wiki path traversal (../)', async () => {
+    const content = [
+      '---',
+      'name: trav-ctx',
+      'model: sonnet',
+      'context:',
+      '  wiki:',
+      '    - ../etc/passwd',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const filePath = await writeAgent('trav-ctx.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_context');
+  });
+
+  test('agent_invalid_context: secrets path in wiki', async () => {
+    const content = [
+      '---',
+      'name: sec-ctx',
+      'model: sonnet',
+      'context:',
+      '  wiki:',
+      '    - docs/secrets/keys.md',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const filePath = await writeAgent('sec-ctx.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_context');
+  });
+
+  test('agent_invalid_context: invalid ad_hoc value', async () => {
+    const content = [
+      '---',
+      'name: adhoc-ctx',
+      'model: sonnet',
+      'context:',
+      '  ad_hoc: maybe',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const filePath = await writeAgent('adhoc-ctx.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_context');
+  });
+
+  test('agent_invalid_context: cache_seconds as non-integer', async () => {
+    const content = [
+      '---',
+      'name: cache-ctx',
+      'model: sonnet',
+      'context:',
+      '  cache_seconds: 3.5',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const filePath = await writeAgent('cache-ctx.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_context');
+  });
+
+  test('agent without context: loads as before (backward compat)', async () => {
+    const filePath = await writeAgent('test-agent.md', VALID_AGENT);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.context).toBeUndefined();
+  });
+});
