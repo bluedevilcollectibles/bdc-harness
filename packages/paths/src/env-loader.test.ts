@@ -116,6 +116,37 @@ describe('loadArchonEnv', () => {
     expect(anyLoaded).toBeUndefined();
   });
 
+  it('emits env_file_crlf_detected warning on Linux when repo .env has CRLF', () => {
+    if (process.platform !== 'linux') return; // test is Linux-specific
+    writeFileSync(join(repoDir, '.archon', '.env'), 'TEST_EL_REPO_ONLY=val\r\n');
+
+    loadArchonEnv(repoDir);
+
+    const warn = stderrWrites.find(s => s.includes('env_file_crlf_detected'));
+    expect(warn).toBeDefined();
+    expect(warn).toContain('.archon');
+  });
+
+  it('does not emit env_file_crlf_detected when repo .env uses LF only', () => {
+    if (process.platform !== 'linux') return; // test is Linux-specific
+    writeFileSync(join(repoDir, '.archon', '.env'), 'TEST_EL_REPO_ONLY=val\n');
+
+    loadArchonEnv(repoDir);
+
+    const warn = stderrWrites.find(s => s.includes('env_file_crlf_detected'));
+    expect(warn).toBeUndefined();
+  });
+
+  it('does not emit env_file_crlf_detected on non-Linux even with CRLF', () => {
+    if (process.platform === 'linux') return; // only runs on non-Linux
+    writeFileSync(join(repoDir, '.archon', '.env'), 'TEST_EL_REPO_ONLY=val\r\n');
+
+    loadArchonEnv(repoDir);
+
+    const warn = stderrWrites.find(s => s.includes('env_file_crlf_detected'));
+    expect(warn).toBeUndefined();
+  });
+
   it('exits with error when env file has a dotenv-unparseable layout', () => {
     // dotenv.parse is very permissive — lines without `=` are silently ignored,
     // so syntactic errors that actually surface are rare. We instead simulate
