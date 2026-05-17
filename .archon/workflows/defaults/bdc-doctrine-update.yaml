@@ -10,6 +10,7 @@ model: claude-sonnet-4-5
 
 nodes:
   - id: read-spec
+    persona: xo
     bash: |
       set -euo pipefail
       WO_ID="${WO_ID:-}"
@@ -34,6 +35,7 @@ nodes:
       cat "$SPEC_PATH"
 
   - id: post-started
+    persona: xo
     depends_on: [read-spec]
     bash: |
       set -euo pipefail
@@ -43,6 +45,7 @@ nodes:
         -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
 
   - id: plan
+    persona: war-council-architect
     depends_on: [read-spec]
     task_class: medium_work
     prompt: |
@@ -79,6 +82,7 @@ nodes:
       $read-spec.output
 
   - id: implement
+    persona: major-build
     depends_on: [plan]
     task_class: medium_work
     model: opus[1m]
@@ -106,6 +110,7 @@ nodes:
       fresh_context: true
 
   - id: verify-greps
+    persona: major-build
     depends_on: [implement]
     bash: |
       set -euo pipefail
@@ -157,6 +162,7 @@ nodes:
       fi
 
   - id: decide-push-target
+    persona: major-build
     depends_on: [verify-greps]
     task_class: clerical
     prompt: |
@@ -176,6 +182,7 @@ nodes:
       pr_required: false
 
   - id: commit-and-push
+    persona: overseer
     depends_on: [decide-push-target]
     bash: |
       set -euo pipefail
@@ -242,6 +249,7 @@ EOF
       git push origin "$CURRENT_BRANCH"
 
   - id: build-manifest
+    persona: major-build
     depends_on: [commit-and-push]
     task_class: clerical
     prompt: |
@@ -272,6 +280,7 @@ EOF
       Return as a structured block suitable for pasting into the Notion Notes field.
 
   - id: post-completed
+    persona: xo
     depends_on: [build-manifest]
     bash: |
       set -euo pipefail
@@ -282,6 +291,7 @@ EOF
         -d "{\"action\":\"completed\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":${DETAIL}}"
 
   - id: flip-notion
+    persona: xo
     depends_on: [post-completed]
     task_class: clerical
     prompt: |

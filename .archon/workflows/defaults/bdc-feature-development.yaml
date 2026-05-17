@@ -14,6 +14,7 @@ nodes:
   # (no GITHUB_TOKEN); downstream `|| echo` swallow patterns let the workflow
   # report success while no commits reached origin. Catch the auth gap up front.
   - id: preflight-github-auth
+    persona: major-build
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -25,6 +26,7 @@ nodes:
       echo "preflight-github-auth PASS"
 
   - id: read-spec
+    persona: xo
     depends_on: [preflight-github-auth]
     bash: |
       set -euo pipefail
@@ -61,6 +63,7 @@ nodes:
       printf '%s\n' "$SPEC_CONTENT"
 
   - id: plan
+    persona: war-council-architect
     depends_on: [read-spec]
     agent: war-council-architect
     task_class: medium_work
@@ -92,6 +95,7 @@ nodes:
       $read-spec.output
 
   - id: implement
+    persona: major-build
     depends_on: [plan]
     agent: major-build
     task_class: medium_work
@@ -168,6 +172,7 @@ nodes:
   # (verify-scope-to-changed-files) and WO-146 (npm→bun sweep) for the deeper structural fixes.
 
   - id: war-council-validator
+    persona: captain-ci-validator
     depends_on: [implement]
     task_class: medium_work
     prompt: |
@@ -195,6 +200,7 @@ nodes:
       - needs_revision: with exact file/path/behavior findings
 
   - id: decide-push-target
+    persona: major-build
     depends_on: [war-council-validator]
     task_class: clerical
     prompt: |
@@ -233,6 +239,7 @@ nodes:
   # while no commits reached origin. Push retry is now real (3 attempts, exponential
   # backoff) and node fails closed if all attempts fail.
   - id: commit-and-push
+    persona: overseer
     depends_on: [decide-push-target]
     load_bearing: true
     bash: |
@@ -333,6 +340,7 @@ nodes:
 
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
+    persona: major-build
     depends_on: [commit-and-push]
     task_class: clerical
     load_bearing: true
@@ -395,6 +403,7 @@ nodes:
       fi
 
   - id: build-manifest
+    persona: major-build
     depends_on: [open-pr-if-needed]
     task_class: clerical
     prompt: |
@@ -430,6 +439,7 @@ nodes:
       - Staging gate status, if required
 
   - id: flip-notion
+    persona: xo
     depends_on: [build-manifest]
     task_class: clerical
     prompt: |

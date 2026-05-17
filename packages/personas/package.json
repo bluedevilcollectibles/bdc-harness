@@ -1,9 +1,0 @@
-{
-  "name": "@archon/personas",
-  "version": "0.1.0",
-  "description": "Archon agent persona files (markdown). Overseer: watches for known Cauldron failure classes and executes salvage before paging the operator.",
-  "private": true,
-  "scripts": {
-    "test": "bun test"
-  }
-}
