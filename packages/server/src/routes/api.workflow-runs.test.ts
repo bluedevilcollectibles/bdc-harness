@@ -569,20 +569,20 @@ describe('POST /api/workflows/runs/:runId/cancel', () => {
     expect(body.error).toContain('not found');
   });
 
-  test('returns 400 when trying to cancel a completed run', async () => {
+  test('returns 422 when trying to cancel a completed run', async () => {
     mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_COMPLETED_RUN);
 
     const { app } = makeApp();
     const response = await app.request('/api/workflows/runs/run-uuid-2/cancel', {
       method: 'POST',
     });
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(422);
 
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('completed');
   });
 
-  test('returns 400 when trying to cancel an already-cancelled run', async () => {
+  test('returns 409 when trying to cancel an already-cancelled run', async () => {
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
       ...MOCK_RUNNING_RUN,
       status: 'cancelled' as const,
@@ -592,13 +592,13 @@ describe('POST /api/workflows/runs/:runId/cancel', () => {
     const response = await app.request('/api/workflows/runs/run-uuid-1/cancel', {
       method: 'POST',
     });
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(409);
 
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('cancelled');
   });
 
-  test('returns 400 when trying to cancel a failed run', async () => {
+  test('returns 422 when trying to cancel a failed run', async () => {
     mockGetWorkflowRun.mockImplementationOnce(async () => ({
       ...MOCK_RUNNING_RUN,
       status: 'failed' as const,
@@ -608,7 +608,7 @@ describe('POST /api/workflows/runs/:runId/cancel', () => {
     const response = await app.request('/api/workflows/runs/run-uuid-1/cancel', {
       method: 'POST',
     });
-    expect(response.status).toBe(400);
+    expect(response.status).toBe(422);
   });
 
   test('returns 500 when DB throws during cancel', async () => {

@@ -84,7 +84,9 @@ import {
   workflowRunListResponseSchema,
   workflowRunDetailSchema,
   workflowRunByWorkerResponseSchema,
+  cancelWorkflowRunBodySchema,
   cancelWorkflowRunResponseSchema,
+  cancelStaleRunsResponseSchema,
   workflowRunActionResponseSchema,
   dashboardRunsResponseSchema,
   runWorkflowBodySchema,
@@ -631,7 +633,13 @@ const cancelWorkflowRunRoute = createRoute({
   path: '/api/workflows/runs/{runId}/cancel',
   tags: ['Workflows'],
   summary: 'Cancel a workflow run',
-  request: { params: z.object({ runId: z.string() }) },
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: {
+      content: { 'application/json': { schema: cancelWorkflowRunBodySchema } },
+      required: false,
+    },
+  },
   responses: {
     200: {
       content: { 'application/json': { schema: cancelWorkflowRunResponseSchema } },
@@ -639,6 +647,22 @@ const cancelWorkflowRunRoute = createRoute({
     },
     400: jsonError('Bad request'),
     404: jsonError('Not found'),
+    409: jsonError('Already cancelled'),
+    422: jsonError('Cannot cancel a terminal run'),
+    500: jsonError('Server error'),
+  },
+});
+
+const cancelStaleWorkflowRunsRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/cancel-stale',
+  tags: ['Workflows'],
+  summary: 'Cancel all stale running workflow runs (default: idle > 30 minutes)',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: cancelStaleRunsResponseSchema } },
+      description: 'OK',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -877,7 +901,7 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 404 | 422 | 500,
+    status: 400 | 404 | 409 | 422 | 500,
     message: string,
     detail?: string
   ): Response {
@@ -2014,6 +2038,24 @@ export function registerApiRoutes(
     }
   });
 
+  // POST /api/workflows/runs/cancel-stale - Cancel all stale running workflow runs
+  registerOpenApiRoute(cancelStaleWorkflowRunsRoute, async c => {
+    try {
+      const result = await workflowDb.cancelStaleWorkflowRuns(30);
+      for (const runId of result.ids) {
+        void workflowEventDb.createWorkflowEvent({
+          workflow_run_id: runId,
+          event_type: 'run_cancelled',
+          data: { reason: 'stale_run_cleanup', actor: 'api' },
+        });
+      }
+      return c.json({ cancelled: result.count, runIds: result.ids });
+    } catch (error) {
+      getLog().error({ err: error }, 'cancel_stale_workflow_runs_failed');
+      return apiError(c, 500, 'Failed to cancel stale workflow runs');
+    }
+  });
+
   // POST /api/workflows/runs/:runId/cancel - Cancel a workflow run
   registerOpenApiRoute(cancelWorkflowRunRoute, async c => {
     try {
@@ -2022,11 +2064,34 @@ export function registerApiRoutes(
       if (!run) {
         return apiError(c, 404, 'Workflow run not found');
       }
+      if (run.status === 'cancelled') {
+        return apiError(c, 409, 'Workflow run is already cancelled');
+      }
+      if (run.status === 'completed' || run.status === 'failed') {
+        return apiError(c, 422, `Cannot cancel workflow in '${run.status}' status`);
+      }
       if (run.status !== 'running' && run.status !== 'pending' && run.status !== 'paused') {
         return apiError(c, 400, `Cannot cancel workflow in '${run.status}' status`);
       }
+      const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+      const reason = body.reason ?? '';
       await workflowDb.cancelWorkflowRun(runId);
-      return c.json({ success: true, message: `Cancelled workflow: ${run.workflow_name}` });
+      void workflowEventDb.createWorkflowEvent({
+        workflow_run_id: runId,
+        event_type: 'run_cancelled',
+        data: { reason, actor: 'api' },
+      });
+      const updated = await workflowDb.getWorkflowRun(runId);
+      const updatedRun = updated ?? {
+        ...run,
+        status: 'cancelled' as const,
+        completed_at: new Date().toISOString(),
+      };
+      return c.json({
+        success: true,
+        message: `Cancelled workflow: ${run.workflow_name}`,
+        run: updatedRun,
+      });
     } catch (error) {
       getLog().error({ err: error }, 'cancel_workflow_run_api_failed');
       return apiError(c, 500, 'Failed to cancel workflow run');

@@ -179,10 +179,20 @@ export const workflowRunByWorkerResponseSchema = z
   .object({ run: workflowRunSchema })
   .openapi('WorkflowRunByWorkerResponse');
 
+/** POST /api/workflows/runs/:runId/cancel request body. */
+export const cancelWorkflowRunBodySchema = z
+  .object({ reason: z.string().optional() })
+  .openapi('CancelWorkflowRunBody');
+
 /** POST /api/workflows/runs/:runId/cancel response. */
 export const cancelWorkflowRunResponseSchema = z
-  .object({ success: z.boolean(), message: z.string() })
+  .object({ success: z.boolean(), message: z.string(), run: workflowRunSchema })
   .openapi('CancelWorkflowRunResponse');
+
+/** POST /api/workflows/runs/cancel-stale response. */
+export const cancelStaleRunsResponseSchema = z
+  .object({ cancelled: z.number(), runIds: z.array(z.string()) })
+  .openapi('CancelStaleRunsResponse');
 
 /** Generic workflow run action response (resume, abandon, delete). */
 export const workflowRunActionResponseSchema = z
