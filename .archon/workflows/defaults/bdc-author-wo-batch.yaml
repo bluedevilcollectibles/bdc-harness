@@ -35,6 +35,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
+target_repo: bluedevilcollectibles/bdc-xo
 
 # 2026-05-16 fix v2: Cauldron API ONLY accepts conversationId + message — the
 # `inputs` field in API payloads is silently dropped. Engine injects only the

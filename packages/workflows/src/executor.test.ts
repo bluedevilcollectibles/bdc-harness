@@ -30,8 +30,10 @@ mock.module('@archon/paths', () => ({
 }));
 
 // --- Mock git ---
+const mockGetRemoteUrl = mock(async (): Promise<string | null> => null);
 mock.module('@archon/git', () => ({
   getDefaultBranch: mock(async () => 'main'),
+  getRemoteUrl: mockGetRemoteUrl,
   toRepoPath: mock((p: string) => p),
 }));
 
@@ -1127,5 +1129,119 @@ describe('finally backstop', () => {
       c => typeof c[1] === 'string' && (c[1] as string).includes('exited without finalizing')
     );
     expect(backstopCall).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// target_repo pre-flight guard (Rule 28)
+// ---------------------------------------------------------------------------
+
+describe('target_repo pre-flight guard', () => {
+  beforeEach(() => {
+    mockLogFn.mockClear();
+    mockExecuteDagWorkflow.mockClear();
+    mockEmitter.registerRun.mockClear();
+    mockEmitter.unregisterRun.mockClear();
+    mockEmitter.emit.mockClear();
+    mockGetRemoteUrl.mockClear();
+    mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
+  });
+
+  it('blocks workflow when target_repo does not match origin remote', async () => {
+    mockGetRemoteUrl.mockImplementation(
+      async () => 'https://github.com/bluedevilcollectibles/bdc-harness.git'
+    );
+    const failWorkflowRunSpy = mock(async () => {});
+    const createEventSpy = mock(async () => {});
+    const store = makeStore({
+      failWorkflowRun: failWorkflowRunSpy,
+      createWorkflowEvent: createEventSpy,
+    });
+    const deps = makeDeps(store);
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(result.success).toBe(false);
+    expect((result as { error: string }).error).toContain('target_repo_mismatch');
+    expect(failWorkflowRunSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.stringContaining('target_repo_mismatch')
+    );
+    // dag_workflow_failed event must be written
+    const dagFailCall = (createEventSpy.mock.calls as unknown[][]).find(
+      c => (c[0] as { event_type: string }).event_type === 'dag_workflow_failed'
+    );
+    expect(dagFailCall).toBeDefined();
+    // dag-executor must NOT have been called
+    expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('proceeds when target_repo matches origin remote (HTTPS)', async () => {
+    mockGetRemoteUrl.mockImplementation(
+      async () => 'https://github.com/bluedevilcollectibles/bdc-xo.git'
+    );
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockExecuteDagWorkflow).toHaveBeenCalled();
+  });
+
+  it('proceeds when target_repo matches origin remote (SSH)', async () => {
+    mockGetRemoteUrl.mockImplementation(
+      async () => 'git@github.com:bluedevilcollectibles/bdc-xo.git'
+    );
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockExecuteDagWorkflow).toHaveBeenCalled();
+  });
+
+  it('skips target_repo check when field is not set', async () => {
+    // getRemoteUrl should never be called
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(), // no target_repo
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(mockGetRemoteUrl).not.toHaveBeenCalled();
+    expect(mockExecuteDagWorkflow).toHaveBeenCalled();
   });
 });

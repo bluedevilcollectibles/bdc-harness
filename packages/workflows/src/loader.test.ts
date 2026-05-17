@@ -2647,4 +2647,30 @@ nodes:
       expect(errors.map(e => e.error_type).sort()).toEqual(['dag_invalid', 'parse_error']);
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // target_repo round-trip (Rule 28)
+  // ---------------------------------------------------------------------------
+
+  describe('target_repo', () => {
+    it('parseWorkflow round-trips target_repo', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: repo-guard\ndescription: Cross-repo guard test\ntarget_repo: bluedevilcollectibles/bdc-xo\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'repo-guard.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.target_repo).toBe('bluedevilcollectibles/bdc-xo');
+    });
+
+    it('parseWorkflow without target_repo leaves field undefined', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: no-target\ndescription: No target_repo\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'no-target.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.target_repo).toBeUndefined();
+    });
+  });
 });

@@ -7,7 +7,7 @@ import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/paths';
-import { getDefaultBranch, toRepoPath } from '@archon/git';
+import { getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
 import { logWorkflowStart, logWorkflowError } from './logger';
@@ -248,6 +248,22 @@ async function applyWorkflowPolicyFile(
       };
     }),
   };
+}
+
+/**
+ * Extract owner/repo from a git remote URL.
+ * Handles HTTPS (github.com/owner/repo[.git]) and SSH (git@github.com:owner/repo[.git]).
+ * Returns lowercase owner/repo or null if the URL cannot be parsed.
+ * Rule 28 — anchor: 2026-05-16 cross-repo incident.
+ */
+function normalizeRemoteToOwnerRepo(url: string): string | null {
+  // SSH: git@github.com:owner/repo.git
+  const sshMatch = /[^:@]+@[^:]+:([^/]+\/[^/]+?)(?:\.git)?$/.exec(url);
+  if (sshMatch?.[1]) return sshMatch[1].toLowerCase();
+  // HTTPS: https://github.com/owner/repo[.git]
+  const httpsMatch = /https?:\/\/[^/]+\/([^/]+\/[^/]+?)(?:\.git)?(?:\/.*)?$/.exec(url);
+  if (httpsMatch?.[1]) return httpsMatch[1].toLowerCase();
+  return null;
 }
 
 /**
@@ -600,6 +616,49 @@ export async function executeWorkflow(
         '❌ **Workflow blocked**: Unable to verify if another workflow is running (database error). Please try again in a moment.'
       );
       return { success: false, error: 'Database error checking for active workflow' };
+    }
+  }
+
+  // Rule 28: target_repo pre-flight guard (anchor: 2026-05-16 cross-repo incident).
+  // Verifies the worktree's git origin matches the workflow's declared target_repo
+  // before any nodes run. Fails fast with a dag_workflow_failed event on mismatch.
+  if (workflow.target_repo) {
+    let actualRemote: string | null = null;
+    try {
+      actualRemote = await getRemoteUrl(toRepoPath(cwd));
+    } catch (err) {
+      getLog().warn(
+        { err, cwd, targetRepo: workflow.target_repo },
+        'workflow.target_repo_remote_check_failed'
+      );
+    }
+    const normalizedActual = actualRemote ? normalizeRemoteToOwnerRepo(actualRemote) : null;
+    const normalizedExpected = workflow.target_repo.toLowerCase();
+    if (normalizedActual !== normalizedExpected) {
+      const reason = `target_repo_mismatch: expected ${normalizedExpected}, got ${normalizedActual ?? '(no remote)'}`;
+      await deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'dag_workflow_failed',
+          data: {
+            reason: 'target_repo_mismatch',
+            expected: normalizedExpected,
+            actual: normalizedActual,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+            'workflow_event_persist_failed'
+          );
+        });
+      await deps.store.failWorkflowRun(workflowRun.id, reason);
+      await sendCriticalMessage(
+        platform,
+        conversationId,
+        `**Workflow blocked**: \`${workflow.name}\` declares \`target_repo: ${workflow.target_repo}\` but this worktree's origin points at \`${actualRemote ?? '(no remote)'}\`.\n\nSelect the correct codebase (\`${workflow.target_repo}\`) and retry.`
+      );
+      return { success: false, workflowRunId: workflowRun.id, error: reason };
     }
   }
 
