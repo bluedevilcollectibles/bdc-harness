@@ -173,11 +173,14 @@ RUN chown -R appuser:appuser /app
 # Create .codex directory for Codex authentication
 RUN mkdir -p /home/appuser/.codex && chown appuser:appuser /home/appuser/.codex
 
-# Configure git to trust Archon directories (as appuser)
-RUN gosu appuser git config --global --add safe.directory '/.archon/workspaces' && \
-    gosu appuser git config --global --add safe.directory '/.archon/workspaces/*' && \
-    gosu appuser git config --global --add safe.directory '/.archon/worktrees' && \
-    gosu appuser git config --global --add safe.directory '/.archon/worktrees/*'
+# Configure git to trust all directories for both root and appuser.
+# Uses the git-native '*' wildcard (standalone token, not a shell glob) which
+# means "trust all repos regardless of ownership" (CVE-2022-24765 safe.directory).
+# The prior specific-path entries ('/.archon/workspaces/*' etc.) do NOT recurse --
+# git only matches them as literal strings, not as filesystem globs. The wildcard
+# covers worktrees created at arbitrary depths after container startup.
+RUN git config --global --add safe.directory '*' && \
+    gosu appuser git config --global --add safe.directory '*'
 
 # Copy entrypoint script (fixes volume permissions, drops to appuser)
 # sed strips Windows CRLF in case .gitattributes eol=lf was bypassed
