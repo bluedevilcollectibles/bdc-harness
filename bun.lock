@@ -142,10 +142,6 @@
         "typescript": "^5.0.0",
       },
     },
-    "packages/personas": {
-      "name": "@archon/personas",
-      "version": "0.1.0",
-    },
     "packages/providers": {
       "name": "@archon/providers",
       "version": "0.3.10",
@@ -301,8 +297,6 @@
     "@archon/paths": ["@archon/paths@workspace:packages/paths"],
 
     "@archon/persona-context-loader": ["@archon/persona-context-loader@workspace:packages/persona-context-loader"],
-
-    "@archon/personas": ["@archon/personas@workspace:packages/personas"],
 
     "@archon/providers": ["@archon/providers@workspace:packages/providers"],
 
