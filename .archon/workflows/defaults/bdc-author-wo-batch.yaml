@@ -43,11 +43,12 @@ model: sonnet
 # in the API `message` and have bash parse it (mirrors bdc-feature-development's
 # WO_ID-from-USER_MESSAGE pattern).
 #
-# Per-batch default below = LSPRO+ShopOps+HQ UI rebuild sortie 2026-05-17.
+# Per-batch default below = Phase 4 backend cross-cutting sortie 2026-05-17.
+# 5 WOs that fill backend gaps the LSPRO UI rebuild (promotion/v2) surfaces.
 # Change to next batch path when re-firing.
 inputs:
   WO_CONCEPTS_FILE:
-    default: "docs/plans/2026-05-17-lspro-shopops-hq-rebuild-concepts.json"
+    default: "docs/plans/2026-05-17-phase4-backend-cross-cutting-concepts.json"
   PLAN_DOC_PATH:
     default: "docs/superpowers/specs/2026-05-17-lspro-shopops-hq-rebuild-PLAN-v2.md"
   CALIBRATION_DOC:
