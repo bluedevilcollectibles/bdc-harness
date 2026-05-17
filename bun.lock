@@ -131,6 +131,17 @@
         "typescript": "^5.0.0",
       },
     },
+    "packages/persona-context-loader": {
+      "name": "@archon/persona-context-loader",
+      "version": "0.3.10",
+      "dependencies": {
+        "@archon/git": "workspace:*",
+        "@archon/paths": "workspace:*",
+      },
+      "peerDependencies": {
+        "typescript": "^5.0.0",
+      },
+    },
     "packages/providers": {
       "name": "@archon/providers",
       "version": "0.3.10",
@@ -227,6 +238,7 @@
         "@archon/git": "workspace:*",
         "@archon/overseer": "workspace:*",
         "@archon/paths": "workspace:*",
+        "@archon/persona-context-loader": "workspace:*",
         "@archon/providers": "workspace:*",
         "@hono/zod-openapi": "^0.19.6",
         "zod": "^3.25.28",
@@ -283,6 +295,8 @@
     "@archon/overseer": ["@archon/overseer@workspace:packages/overseer"],
 
     "@archon/paths": ["@archon/paths@workspace:packages/paths"],
+
+    "@archon/persona-context-loader": ["@archon/persona-context-loader@workspace:packages/persona-context-loader"],
 
     "@archon/providers": ["@archon/providers@workspace:packages/providers"],
 
