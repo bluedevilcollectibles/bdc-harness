@@ -213,6 +213,29 @@ nodes:
       Validator:
       $war-council-validator.output
 
+      ## Branch Name Derivation Rules (F-6A prevention)
+      Anchor incidents 2026-05-18: agents emitted branch names that embedded the
+      current worktree thread suffix, producing double-suffixed targets like
+      "archon/thread-9772643d-thread-9772643d" or
+      "feat/WO-AUTH-RETIRE-GAS-PATH-02-thread-feat/WO-AUTH-RETIRE-GAS-PATH-02".
+      The engine ALREADY appends a unique "-thread-<hash>" suffix at push time
+      (UNIQUE_BRANCH in commit-and-push). Your job is to emit the BASE branch
+      name only.
+
+      - Derive the branch name from the WO ID ONLY. Do NOT copy the current
+        git branch name. If running on archon/thread-9772643d, do NOT emit
+        that value or any variant of it as push_target.
+      - Use prefix feat/, fix/, or wip/ followed by the WO ID in lowercase
+        with hyphens. Example: WO-FOO-BAR-01 -> feat/wo-foo-bar-01
+      - The branch MUST NOT start with archon/thread- or contain -thread-
+        anywhere.
+      - The branch MUST NOT embed the current worktree thread hash anywhere
+        in its name.
+      - Valid examples: feat/wo-auth-retire-gas-path-02, fix/wo-bugs-01, wip/wo-draft-01
+      - commit-and-push validates the emitted branch against this allowlist
+        regex: ^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$
+        and fails closed with "Malformed branch name" on mismatch.
+
       ## Required Repo Policy
       Read the git remote URL and match it against this hardcoded staging-gate list:
       - bluedevilcollectibles/lspro-react
@@ -261,6 +284,17 @@ nodes:
         echo "No feature branch target found in decide-push-target output." >&2
         exit 1
       fi
+      # F-6A: Validate BRANCH against allowlist regex BEFORE constructing UNIQUE_BRANCH.
+      # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (anchor 2026-05-18: three WOs hit
+      # double-suffix branch names like archon/thread-9772643d-thread-9772643d).
+      # The engine appends -thread-<hash> at push time, so the agent must emit a
+      # clean feat/|fix/|wip/ prefix only. archon/thread- prefix is rejected here
+      # because it would produce a double-suffix UNIQUE_BRANCH.
+      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/|archon/thread-" >&2
+        exit 1
+      fi
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
       # Engine already provides a unique archon/thread-<hash> branch per run.
       # Derive a unique remote push target from it instead of clobbering a shared name.
@@ -286,10 +320,29 @@ nodes:
           COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
         fi
         if [ "$COMMITS_AHEAD" = "0" ]; then
-          echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
-          exit 1
+          # F-7C: origin/${UNIQUE_BRANCH} may be missing because the implement
+          # loop already pushed to a different remote branch (e.g. the engine's
+          # archon/thread-<hash> ref). Search git ls-remote origin for any ref
+          # whose HEAD SHA matches local HEAD; if found, retarget UNIQUE_BRANCH
+          # to that name and proceed (push will be a no-op).
+          # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (anchor 2026-05-18:
+          # WO-HARNESS-OVERSEER-FAILURE-CLASSES-EXPANSION-01 12:03 UTC, commit
+          # 2d5f6ac0 on origin/archon/thread-9772643d but UNIQUE_BRANCH was
+          # archon/thread-9772643d-thread-9772643d).
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          RECOVERED=$(git ls-remote origin 2>/dev/null \
+            | awk -v sha="$LOCAL_HEAD" '$1 == sha {sub(/^refs\/heads\//, "", $2); print $2}' \
+            | head -1)
+          if [ -n "$RECOVERED" ]; then
+            echo "Recovered push target from remote: $RECOVERED"
+            UNIQUE_BRANCH="$RECOVERED"
+          else
+            echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
+            exit 1
+          fi
+        else
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
         fi
-        echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
       else
         # Dirty working tree: stage + validate against plan + commit
         CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
@@ -373,6 +426,19 @@ nodes:
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1
       fi
+      # F-8C: Rule 20 staging-gate repos (lspro-react, shopops-storefront, shopops)
+      # require PRs to target staging instead of the repo default branch.
+      # decide-push-target emits "staging_gate_required: true|false"; when true,
+      # this node passes --base staging to gh pr create (otherwise it omits --base
+      # and lets gh use the repo default).
+      # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (closes Rule 20 bypass hole 2026-05-18).
+      STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      STAGING_GATE="${STAGING_GATE:-0}"
+      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+        BASE_BRANCH="staging"
+      else
+        BASE_BRANCH=""
+      fi
       TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$TITLE" ]; then
         TITLE="BDC feature Work Order implementation"
@@ -397,7 +463,7 @@ nodes:
       # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
       PR_OK=false
       for attempt in 1 2 3; do
-        if gh pr create --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" 2>&1; then
+        if gh pr create --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
           PR_OK=true
           break
         fi
