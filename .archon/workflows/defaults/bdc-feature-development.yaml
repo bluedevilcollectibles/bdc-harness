@@ -261,27 +261,32 @@ nodes:
         echo "No feature branch target found in decide-push-target output." >&2
         exit 1
       fi
-      git checkout -B "$BRANCH"
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
+      # Engine already provides a unique archon/thread-<hash> branch per run.
+      # Derive a unique remote push target from it instead of clobbering a shared name.
+      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       git status --short
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
         # Already fully synced: implement loop committed + pushed to origin
-        if git rev-parse --quiet --verify "origin/$BRANCH" >/dev/null 2>&1 && \
-           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ]; then
-          echo "Backstop no-op: implement loop already committed + pushed to origin/$BRANCH (HEAD matches)."
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${UNIQUE_BRANCH}")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed to origin/${UNIQUE_BRANCH} (HEAD matches)."
+          echo "unique_branch=${UNIQUE_BRANCH}"
           exit 0
         fi
         # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: a clean working
         # tree does NOT mean the implement loop skipped work — it may have committed
         # and left the tree clean. Count COMMITS_AHEAD to distinguish true no-op
         # from pre-committed work that still needs pushing.
-        if git rev-parse --quiet --verify "origin/${BRANCH}" >/dev/null 2>&1; then
-          COMMITS_AHEAD=$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo 0)
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${UNIQUE_BRANCH}..HEAD" 2>/dev/null || echo 0)
         else
           COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
         fi
         if [ "$COMMITS_AHEAD" = "0" ]; then
-          echo "No changed files and no commits ahead of origin/${BRANCH} -- implement loop did not produce work" >&2
+          echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
           exit 1
         fi
         echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
@@ -324,9 +329,12 @@ nodes:
 
       # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
       # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
+      # so the local archon/thread-<hash> branch lands on a unique remote name
+      # (UNIQUE_BRANCH) and does not collide with other parallel runs.
       PUSH_OK=false
       for attempt in 1 2 3; do
-        if git push -u origin "$BRANCH" 2>&1; then
+        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
           PUSH_OK=true
           break
         fi
@@ -337,6 +345,7 @@ nodes:
         echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
         exit 1
       fi
+      echo "unique_branch=${UNIQUE_BRANCH}"
 
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
@@ -351,9 +360,18 @@ nodes:
       PLAN_OUTPUT=$plan.output
       IMPLEMENT_OUTPUT=$implement.output
       VALIDATOR_OUTPUT=$war-council-validator.output
+      COMMIT_PUSH_OUTPUT=$commit-and-push.output
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
+      fi
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: read the unique
+      # remote branch the commit-and-push node pushed to; gh pr create must use
+      # --head to target that branch rather than the (local) archon/thread-<hash>.
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
+        exit 1
       fi
       TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$TITLE" ]; then
@@ -379,14 +397,13 @@ nodes:
       # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
       PR_OK=false
       for attempt in 1 2 3; do
-        if gh pr create --title "$TITLE" --body-file "$BODY_FILE" 2>&1; then
+        if gh pr create --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" 2>&1; then
           PR_OK=true
           break
         fi
         # Race-condition recovery: branch already has an open PR.
-        BRANCH_NOW=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-        if [ -n "$BRANCH_NOW" ]; then
-          EXIST=$(gh pr list --head "$BRANCH_NOW" --state open \
+        if [ -n "$UNIQUE_BRANCH" ]; then
+          EXIST=$(gh pr list --head "$UNIQUE_BRANCH" --state open \
             --json url --jq '.[0].url // empty' 2>/dev/null || true)
           if [ -n "$EXIST" ]; then
             echo "PR_URL=$EXIST"
