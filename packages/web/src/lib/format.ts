@@ -30,3 +30,20 @@ export function formatDurationMs(ms: number): string {
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   return `${(ms / 60000).toFixed(1)}m`;
 }
+
+/**
+ * Format an iteration counter label for loop nodes in the DAG viz.
+ * Returns "iter X/MAX" for running (or unspecified) status, "iter X/MAX (done)" for
+ * completed / completed_with_warning, and "iter X/MAX (failed)" for failed. Status
+ * param accepts WorkflowStepStatus strings.
+ */
+export function formatIterLabel(
+  currentIteration: number,
+  maxIterations: number,
+  status?: string
+): string {
+  const base = `iter ${String(currentIteration)}/${String(maxIterations)}`;
+  if (status === 'completed' || status === 'completed_with_warning') return `${base} (done)`;
+  if (status === 'failed') return `${base} (failed)`;
+  return base;
+}

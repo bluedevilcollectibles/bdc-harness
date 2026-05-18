@@ -3,7 +3,7 @@ import { Handle, Position } from '@xyflow/react';
 import type { NodeProps, Node } from '@xyflow/react';
 import type { DagNodeData } from './DagNodeComponent';
 import type { WorkflowStepStatus } from '@/lib/types';
-import { formatDurationMs } from '@/lib/format';
+import { formatDurationMs, formatIterLabel } from '@/lib/format';
 import { formatCostUsd, costColorClass } from '@/lib/cost-utils';
 import { StatusIcon } from './StatusIcon';
 
@@ -86,6 +86,14 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
             </span>
           </>
         )}
+        {data.currentIteration !== undefined && data.maxIterations !== undefined && (
+          <>
+            <span className="text-[10px] text-text-tertiary">·</span>
+            <span className="text-[10px] text-text-tertiary shrink-0">
+              {formatIterLabel(data.currentIteration, data.maxIterations, data.status)}
+            </span>
+          </>
+        )}
         {data.duration !== undefined && (
           <span className="text-[10px] text-text-tertiary ml-auto shrink-0">
             {formatDurationMs(data.duration)}
@@ -97,11 +105,6 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
           </span>
         )}
       </div>
-      {data.currentIteration !== undefined && data.maxIterations !== undefined && (
-        <div className="text-[10px] text-text-tertiary mt-0.5">
-          {data.currentIteration}/{data.maxIterations} iterations
-        </div>
-      )}
       {data.error && (
         <div className="text-[10px] text-error mt-1 truncate" title={data.error}>
           {data.error.slice(0, 60)}
