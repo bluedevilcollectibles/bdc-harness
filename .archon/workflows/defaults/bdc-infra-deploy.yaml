@@ -282,7 +282,11 @@ nodes:
         exit 1
       fi
 
-      git checkout -B "$BRANCH"
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
+      # Engine already provides a unique archon/thread-<hash> branch per run.
+      # Derive a unique remote push target from it instead of clobbering a shared name.
+      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       git status --short
       CHANGED_FILES=$(git status --porcelain | awk '{print substr($0,4)}')
 
@@ -307,8 +311,12 @@ nodes:
 
       COMMIT_MESSAGE="infra: deploy changes via WO"
       git commit -m "$COMMIT_MESSAGE"
-      git push -u origin "$BRANCH"
-      echo "Pushed to $BRANCH"
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
+      # so the local archon/thread-<hash> branch lands on a unique remote name
+      # (UNIQUE_BRANCH) and does not collide with other parallel runs.
+      git push origin HEAD:"${UNIQUE_BRANCH}"
+      echo "unique_branch=${UNIQUE_BRANCH}"
+      echo "Pushed to ${UNIQUE_BRANCH}"
 
   - id: open-pr-if-needed
     depends_on: [commit-and-push]
@@ -320,10 +328,19 @@ nodes:
         exit 0
       fi
 
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: read the unique
+      # remote branch the commit-and-push node pushed to; gh pr create must use
+      # --head to target that branch rather than the (local) archon/thread-<hash>.
+      UNIQUE_BRANCH=$(printf '%s\n' "$commit-and-push.output" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
+        exit 1
+      fi
+
       TITLE="infra: deployment via WO"
       BODY="Infra deployment WO. See manifest in Notion for evidence."
 
-      gh pr create --title "$TITLE" --body "$BODY" || true
+      gh pr create --title "$TITLE" --body "$BODY" --head "$UNIQUE_BRANCH" || true
 
   - id: build-manifest
     depends_on: [open-pr-if-needed]
