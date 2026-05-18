@@ -292,7 +292,15 @@ nodes:
       $war-council-validator.output
 
       ## Required Repo Policy
-      Read the git remote URL and match it against this hardcoded staging-gate list:
+      Extract the target repository from the spec content. Look for any of these patterns (in priority order):
+      1. `target_repo: <owner>/<repo>` (YAML field)
+      2. `**Target repo:** \`<owner>/<repo>\`` (Markdown bold)
+      3. `Target repo: <owner>/<repo>` (plain header)
+      4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
+
+      The target repo is where the PR must be opened (NOT the worktree's git origin — Rule 29).
+
+      Match the extracted repo against this hardcoded staging-gate list:
       - bluedevilcollectibles/lspro-react
       - bluedevilcollectibles/shopops-storefront
       - bluedevilcollectibles/shopops/
@@ -301,15 +309,21 @@ nodes:
       push_target: feature-branch:<spec-derived-branch-name>
       pr_required: true
       staging_gate_required: true
+      repo: <owner>/<repo>
 
       If the repo is bdc-xo non-doctrine code or another code repo, output:
       push_target: feature-branch:<spec-derived-branch-name>
       pr_required: true
       staging_gate_required: false
+      repo: <owner>/<repo>
 
       If this is doc-only or other non-code work, output:
       out_of_scope: true
       reason: use appropriate workflow for this work class
+      repo: unknown
+
+      CRITICAL: You MUST emit a `repo:` line in every output case. If no target_repo is
+      parseable from the spec, emit `repo: unknown` and a WARNING line explaining what is missing.
 
   - id: commit-and-push
     persona: overseer
@@ -402,6 +416,13 @@ EOF
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1
       fi
+      # Rule 29: extract explicit repo from decide-push-target output.
+      REPO=$(printf '%s\n' "$decide-push-target.output" | sed -n 's/^repo: //p' | head -n 1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: decide-push-target did not emit a valid 'repo: <owner>/<repo>'." >&2
+        echo "Fix the spec to include 'target_repo:' or '**Target repo:**' and re-run." >&2
+        exit 1
+      fi
       TITLE=$(printf '%s\n' "$plan-fix.output" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$TITLE" ]; then
         TITLE="BDC bug fix Work Order"
@@ -426,7 +447,7 @@ EOF
         echo "## Root Cause Review"
         echo "$war-council-validator.output"
       } > "$BODY_FILE"
-      gh pr create --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH"
+      gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH"
 
   - id: build-manifest
     persona: major-build
