@@ -261,6 +261,11 @@ nodes:
         echo "No feature branch target found in decide-push-target output." >&2
         exit 1
       fi
+      # WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01: reactive auto-recovery.
+      # When the overseer classifies a previous attempt as a worktree collision, it
+      # injects OVERSEER_BRANCH_SUFFIX (e.g. "-thread-aab0743e") into the retry's
+      # subprocess env. No-op on normal runs (var unset → empty string suffix).
+      BRANCH="${BRANCH}${OVERSEER_BRANCH_SUFFIX:-}"
       git checkout -B "$BRANCH"
       git status --short
       DIRTY=$(git status --porcelain)

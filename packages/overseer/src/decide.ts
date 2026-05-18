@@ -12,6 +12,7 @@
  * provider failover routing, grader integration.
  */
 
+import { randomBytes } from 'node:crypto';
 import type { ErrorClass } from './classify.ts';
 
 export type Decision = 'retry' | 'skip' | 'commit_and_push_anyway' | 'escalate';
@@ -24,6 +25,12 @@ export interface DecideInput {
   hasOutput?: boolean;
   /** Node ID — some decisions are node-type aware */
   nodeId?: string;
+  /**
+   * Optional workflow run id — used to derive a deterministic branch-suffix hint for
+   * `worktree_collision` retries so parallel runs of the same legacy YAML can be
+   * disambiguated by the suffix (WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01).
+   */
+  workflowRunId?: string;
 }
 
 export interface DecisionResult {
@@ -31,6 +38,17 @@ export interface DecisionResult {
   reason: string;
   /** Suggested backoff in ms if decision is retry */
   backoffMs?: number;
+  /**
+   * Hint the executor should apply when re-executing a node.
+   *
+   * Currently used only by the `worktree_collision` retry path:
+   * - `branchSuffix` — appended to the YAML-intended branch name by injecting
+   *   `OVERSEER_BRANCH_SUFFIX` into the retried bash node's env, so a YAML that
+   *   missed Rule 17 can still recover on first retry.
+   *
+   * (WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01)
+   */
+  mutationHint?: { branchSuffix?: string };
 }
 
 /**
@@ -119,12 +137,31 @@ export function decide(input: DecideInput): DecisionResult {
 
     case 'worktree_collision':
       // Branch name already used by another worktree (parallel fire collision).
-      // Could retry with timestamped branch name, but YAML Rule 17 already mandates that.
-      // If we still hit this, it's a YAML that didn't follow Rule 17. Escalate.
+      // YAML Rule 17 SHOULD prevent this (proactive fix via thread-id branch naming);
+      // this case is the reactive safety net for any legacy or future YAML that misses it.
+      //
+      // Attempt 1: retry with a derived branch-name suffix (executor injects it via
+      // OVERSEER_BRANCH_SUFFIX env var; the bash node appends it to its intended branch).
+      // Attempt >= 2: escalate — if a unique-suffix retry also collided, the YAML has a
+      // deeper bug that requires operator attention.
+      //
+      // Anchor: WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01 (2026-05-17 sortie).
+      if (attempt < 2) {
+        const raw = input.workflowRunId
+          ? input.workflowRunId.replace(/-/g, '').slice(0, 8)
+          : randomBytes(4).toString('hex');
+        const branchSuffix = `-thread-${raw}`;
+        return {
+          decision: 'retry',
+          reason:
+            'worktree collision — retrying with unique branch suffix; YAML should use Rule 17 thread-id naming to prevent this proactively',
+          mutationHint: { branchSuffix },
+        };
+      }
       return {
         decision: 'escalate',
         reason:
-          'worktree collision — YAML should use timestamped branch per Rule 17 (legacy YAML to patch)',
+          'worktree collision persisted on retry — YAML Rule 17 violation requires operator patch',
       };
 
     case 'branch_ref_missing':

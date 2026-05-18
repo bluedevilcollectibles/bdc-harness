@@ -17,6 +17,10 @@ export const WORKFLOW_EVENT_TYPES = [
   // Mission Control renders this yellow (between green completed and red failed).
   'node_completed_with_warning',
   'node_failed',
+  // WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01: emitted when overseer
+  // classifies a bash-node failure as recoverable and the executor re-runs it with
+  // a mutation hint (currently only `worktree_collision` → branch-suffix injection).
+  'node_retry',
   'node_skipped',
   'node_skipped_prior_success',
   'loop_iteration_started',

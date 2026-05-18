@@ -106,6 +106,23 @@ interface NodeFailedEvent {
 }
 
 /**
+ * Emitted when the overseer classifies a node failure as recoverable and the executor
+ * is about to re-run that node with a mutation hint applied
+ * (WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01).
+ *
+ * Mission Control renders this between the red `node_failed` and the subsequent
+ * `node_started` so operators can see the auto-recovery transition.
+ */
+interface NodeRetryEvent {
+  type: 'node_retry';
+  runId: string;
+  nodeId: string;
+  nodeName: string;
+  /** The branch-suffix mutation the executor is applying on the retry. */
+  branchSuffix: string;
+}
+
+/**
  * WO-170: node exited 0 but emitted a STATUS=*_failed string on stdout.
  * Either the node was declared `load_bearing: true` (WO-167 doctrine) and any
  * STATUS=*_failed appeared, OR stdout matched a known silent-data-loss
@@ -181,6 +198,7 @@ export type WorkflowEmitterEvent =
   | NodeCompletedEvent
   | NodeCompletedWithWarningEvent
   | NodeFailedEvent
+  | NodeRetryEvent
   | NodeSkippedEvent
   | WorkflowArtifactEvent
   | ToolStartedEvent

@@ -54,6 +54,7 @@ import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
+import { classifyError as overseerClassifyError, decide as overseerDecide } from '@archon/overseer';
 import { evaluateCondition } from './condition-evaluator';
 import {
   logNodeStart,
@@ -2926,7 +2927,7 @@ export async function executeDagWorkflow(
 
           // 3. Bash node dispatch — no AI, no session
           if (isBashNode(node)) {
-            const output = await executeBashNode(
+            let output = await executeBashNode(
               deps,
               platform,
               conversationId,
@@ -2942,6 +2943,101 @@ export async function executeDagWorkflow(
               config.envVars,
               resolvedInputs
             );
+
+            // Overseer-driven single-retry for recoverable bash-node failures.
+            // Currently only `worktree_collision` produces a mutationHint; other
+            // error classes either escalate (no-op here) or skip (preserve current
+            // behavior since the executor doesn't yet re-run on skip).
+            // Anchor: WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01.
+            if (output.state === 'failed' && output.error) {
+              const overseerClass = overseerClassifyError({
+                message: output.error,
+                nodeId: node.id,
+                nodeType: 'bash',
+              });
+              const overseerDecision = overseerDecide({
+                errorClass: overseerClass,
+                attempt: 1,
+                nodeId: node.id,
+                workflowRunId: workflowRun.id,
+              });
+
+              if (
+                overseerDecision.decision === 'retry' &&
+                overseerDecision.mutationHint?.branchSuffix
+              ) {
+                const branchSuffix = overseerDecision.mutationHint.branchSuffix;
+                getLog().info(
+                  {
+                    module: 'overseer',
+                    runId: workflowRun.id,
+                    nodeId: node.id,
+                    errorClass: overseerClass,
+                    branchSuffix,
+                  },
+                  'overseer.bash_retry_with_mutation'
+                );
+
+                deps.store
+                  .createWorkflowEvent({
+                    workflow_run_id: workflowRun.id,
+                    event_type: 'node_retry',
+                    step_name: node.id,
+                    data: {
+                      attempt: 2,
+                      overseer_class: overseerClass,
+                      branch_suffix: branchSuffix,
+                    },
+                  })
+                  .catch((err: Error) => {
+                    getLog().error(
+                      { err, workflowRunId: workflowRun.id, eventType: 'node_retry' },
+                      'workflow_event_persist_failed'
+                    );
+                  });
+
+                getWorkflowEventEmitter().emit({
+                  type: 'node_retry',
+                  runId: workflowRun.id,
+                  nodeId: node.id,
+                  nodeName: node.id,
+                  branchSuffix,
+                });
+
+                await safeSendMessage(
+                  platform,
+                  conversationId,
+                  `Node \`${node.id}\` failed (worktree collision). Auto-recovering: retrying with branch suffix \`${branchSuffix}\`.`,
+                  { workflowId: workflowRun.id, nodeName: node.id }
+                );
+
+                if (overseerDecision.backoffMs) {
+                  await new Promise(resolve => setTimeout(resolve, overseerDecision.backoffMs));
+                }
+
+                const retryEnvVars: Record<string, string> = {
+                  ...(config.envVars ?? {}),
+                  OVERSEER_BRANCH_SUFFIX: branchSuffix,
+                };
+                output = await executeBashNode(
+                  deps,
+                  platform,
+                  conversationId,
+                  cwd,
+                  workflowRun,
+                  node,
+                  artifactsDir,
+                  logDir,
+                  baseBranch,
+                  docsDir,
+                  nodeOutputs,
+                  issueContext,
+                  retryEnvVars,
+                  resolvedInputs
+                );
+              }
+            }
+
             return { nodeId: node.id, output };
           }
 

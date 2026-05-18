@@ -1582,6 +1582,83 @@ describe('executeDagWorkflow -- bash nodes', () => {
     );
     execSpy.mockRestore();
   });
+
+  // WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01 — Test 3 (executor wiring).
+  // When the overseer classifies a bash failure as worktree_collision, the executor
+  // must re-run executeBashNode with OVERSEER_BRANCH_SUFFIX injected into the env.
+  it('worktree_collision failure triggers overseer retry with OVERSEER_BRANCH_SUFFIX env var', async () => {
+    // First call fails with the canonical "is already used by worktree" stderr;
+    // second call (the retry) succeeds. spyOn lets us capture the env arg per call.
+    let callCount = 0;
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(async () => {
+      callCount += 1;
+      if (callCount === 1) {
+        const err = new Error(
+          "Command failed: bash -c <body>\nfatal: 'feat/x' is already used by worktree at '/somewhere'"
+        ) as Error & { code?: number; stderr?: string };
+        err.code = 128;
+        err.stderr = "fatal: 'feat/x' is already used by worktree at '/somewhere'";
+        throw err;
+      }
+      return { stdout: 'ok\n', stderr: '' };
+    });
+
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    // Run id is deterministic-suffix-derivable: first 8 hex chars (dashes stripped).
+    const workflowRun = makeWorkflowRun('aab07432-aaaa-bbbb-cccc-ddddeeeeffff', {
+      workflow_name: 'overseer-retry-test',
+      conversation_id: 'conv-overseer-retry',
+      user_message: 'test',
+    });
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-overseer-retry',
+      testDir,
+      {
+        name: 'overseer-retry-test',
+        nodes: [
+          {
+            id: 'collide-then-recover',
+            bash: 'echo will-be-mocked',
+          },
+        ],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // executeBashNode dispatched twice: original + overseer retry.
+    expect(execSpy.mock.calls.length).toBe(2);
+
+    // First call must NOT have OVERSEER_BRANCH_SUFFIX in env (original attempt).
+    const firstEnv = (execSpy.mock.calls[0][2] as { env: Record<string, string> }).env;
+    expect(firstEnv.OVERSEER_BRANCH_SUFFIX).toBeUndefined();
+
+    // Second call MUST have OVERSEER_BRANCH_SUFFIX matching the canonical pattern.
+    const secondEnv = (execSpy.mock.calls[1][2] as { env: Record<string, string> }).env;
+    expect(secondEnv.OVERSEER_BRANCH_SUFFIX).toMatch(/^-thread-[a-f0-9]{8}$/);
+
+    // A node_retry workflow event must have been persisted with the branch suffix.
+    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const retryEvent = eventCalls.find(
+      (call: unknown[]) => (call[0] as { event_type: string }).event_type === 'node_retry'
+    );
+    expect(retryEvent).toBeDefined();
+    const retryData = (retryEvent![0] as { data: Record<string, unknown> }).data;
+    expect(retryData.overseer_class).toBe('worktree_collision');
+    expect(retryData.branch_suffix).toMatch(/^-thread-[a-f0-9]{8}$/);
+
+    execSpy.mockRestore();
+  });
 });
 
 describe('executeDagWorkflow -- output_format structured output', () => {

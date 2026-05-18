@@ -110,6 +110,21 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         timestamp: Date.now(),
       });
 
+    case 'node_retry':
+      // WO-HARNESS-OVERSEER-AUTORECOVER-WORKTREE-COLLISION-01: overseer classified
+      // a bash-node failure as recoverable and the executor is about to re-run it
+      // with a mutation hint. Mission Control renders this as a transient retry
+      // marker between the red `node_failed` and the subsequent `node_started`.
+      return JSON.stringify({
+        type: 'dag_node',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        name: event.nodeName,
+        status: 'retrying',
+        branchSuffix: event.branchSuffix,
+        timestamp: Date.now(),
+      });
+
     case 'node_completed_with_warning':
       // WO-170: forward the new exit-0-but-silently-failed state to the UI.
       // Status is a new 'completed_with_warning' value the web layer renders yellow.

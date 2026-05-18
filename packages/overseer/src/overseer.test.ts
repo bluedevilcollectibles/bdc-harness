@@ -159,9 +159,27 @@ describe('decide — workflow-runtime classes', () => {
     expect(r.decision).toBe('skip');
   });
 
-  test('worktree_collision → escalate (Rule 17 violation in YAML)', () => {
+  test('worktree_collision attempt 1 → retry with mutationHint.branchSuffix (auto-recover)', () => {
     const r = decide({ errorClass: 'worktree_collision', attempt: 1 });
+    expect(r.decision).toBe('retry');
+    expect(r.mutationHint?.branchSuffix).toMatch(/^-thread-[a-f0-9]{8}$/);
+  });
+
+  test('worktree_collision attempt 1 with workflowRunId → deterministic suffix derived from run id', () => {
+    // First 8 hex chars of the run id (dashes stripped) drive the suffix.
+    const r = decide({
+      errorClass: 'worktree_collision',
+      attempt: 1,
+      workflowRunId: 'aab0743e-1234-5678-9abc-def012345678',
+    });
+    expect(r.decision).toBe('retry');
+    expect(r.mutationHint?.branchSuffix).toBe('-thread-aab0743e');
+  });
+
+  test('worktree_collision attempt 2 → escalate (no infinite retry loop)', () => {
+    const r = decide({ errorClass: 'worktree_collision', attempt: 2 });
     expect(r.decision).toBe('escalate');
+    expect(r.mutationHint).toBeUndefined();
   });
 
   test('branch_ref_missing → escalate (Rule 16 violation)', () => {
