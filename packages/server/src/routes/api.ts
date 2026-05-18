@@ -83,6 +83,8 @@ import {
   commandListResponseSchema,
   workflowRunListResponseSchema,
   workflowRunDetailSchema,
+  nodeEventsQuerySchema,
+  nodeEventsResponseSchema,
   workflowRunByWorkerResponseSchema,
   cancelWorkflowRunBodySchema,
   cancelWorkflowRunResponseSchema,
@@ -773,6 +775,25 @@ const getWorkflowRunRoute = createRoute({
     200: {
       content: { 'application/json': { schema: workflowRunDetailSchema } },
       description: 'Workflow run detail',
+    },
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getNodeEventsRoute = createRoute({
+  method: 'get',
+  path: '/api/workflows/runs/{runId}/nodes/{nodeId}/events',
+  tags: ['Workflows'],
+  summary: 'Get the last N events for a single node in a workflow run',
+  request: {
+    params: z.object({ runId: z.string(), nodeId: z.string() }),
+    query: nodeEventsQuerySchema,
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: nodeEventsResponseSchema } },
+      description: 'Recent events for the node (newest first)',
     },
     404: jsonError('Not found'),
     500: jsonError('Server error'),
@@ -2550,6 +2571,40 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'get_workflow_run_failed');
       return apiError(c, 500, 'Failed to get workflow run');
+    }
+  });
+
+  // GET /api/workflows/runs/:runId/nodes/:nodeId/events - Last N events for one node
+  // Used by the NodePeekPanel in the DAG viz to show per-node activity without SSH.
+  registerOpenApiRoute(getNodeEventsRoute, async c => {
+    try {
+      const runId = c.req.param('runId') ?? '';
+      const nodeId = c.req.param('nodeId') ?? '';
+      const limitParam = c.req.query('limit');
+
+      // Default 5; clamp to [1, 20] to bound DB load.
+      let limit = 5;
+      if (limitParam !== undefined) {
+        const parsed = Number.parseInt(limitParam, 10);
+        if (!Number.isFinite(parsed) || parsed < 1) {
+          limit = 1;
+        } else if (parsed > 20) {
+          limit = 20;
+        } else {
+          limit = parsed;
+        }
+      }
+
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        return apiError(c, 404, 'Workflow run not found');
+      }
+
+      const events = await workflowEventDb.listNodeEvents(runId, nodeId, limit);
+      return c.json({ events });
+    } catch (error) {
+      getLog().error({ err: error }, 'get_node_events_failed');
+      return apiError(c, 500, 'Failed to get node events');
     }
   });
 

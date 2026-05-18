@@ -444,6 +444,24 @@ export async function getWorkflowRun(
   return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}`);
 }
 
+/**
+ * Fetch the last N events for a single node in a workflow run.
+ * Used by the NodePeekPanel to surface per-node activity without SSH'ing for JSONL.
+ * Events are returned newest first (server query is ORDER BY created_at DESC).
+ */
+export async function getNodeEvents(
+  runId: string,
+  nodeId: string,
+  limit = 5
+): Promise<WorkflowEventResponse[]> {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  const result = await fetchJSON<{ events: WorkflowEventResponse[] }>(
+    `/api/workflows/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeId)}/events?${params.toString()}`
+  );
+  return result.events;
+}
+
 export async function getWorkflowRunByWorker(
   workerPlatformId: string
 ): Promise<{ run: WorkflowRunResponse } | null> {

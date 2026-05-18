@@ -29,6 +29,7 @@ import {
   createWorkflowEvent,
   listWorkflowEvents,
   listRecentEvents,
+  listNodeEvents,
   getCompletedDagNodeOutputs,
 } from './workflow-events';
 
@@ -185,6 +186,60 @@ describe('workflow-events', () => {
 
       await expect(listRecentEvents('run-456', new Date())).rejects.toThrow(
         'Failed to list recent workflow events: connection lost'
+      );
+    });
+  });
+
+  describe('listNodeEvents', () => {
+    test('queries by (workflow_run_id, step_name) ordered DESC with LIMIT', async () => {
+      const events: WorkflowEventRow[] = [
+        { ...mockEvent, id: 'evt-2', event_type: 'node_completed' },
+        { ...mockEvent, id: 'evt-1', event_type: 'node_started' },
+      ];
+      mockQuery.mockResolvedValueOnce(createQueryResult(events));
+
+      const result = await listNodeEvents('run-456', 'plan', 5);
+
+      expect(result).toEqual(events);
+      expect(mockQuery).toHaveBeenCalledWith(
+        `SELECT * FROM remote_agent_workflow_events
+       WHERE workflow_run_id = $1 AND step_name = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+        ['run-456', 'plan', 5]
+      );
+    });
+
+    test('parses JSON string data (SQLite path)', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            ...mockEvent,
+            event_type: 'node_completed',
+            data: JSON.stringify({ node_output: 'hello world' }),
+          },
+        ])
+      );
+
+      const result = await listNodeEvents('run-456', 'plan', 5);
+
+      expect(result).toHaveLength(1);
+      expect(result[0].data).toEqual({ node_output: 'hello world' });
+    });
+
+    test('returns empty array when node has no events', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      const result = await listNodeEvents('run-456', 'never-started', 5);
+
+      expect(result).toEqual([]);
+    });
+
+    test('throws wrapped error on query failure', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('connection refused'));
+
+      await expect(listNodeEvents('run-456', 'plan', 5)).rejects.toThrow(
+        'Failed to list node events: connection refused'
       );
     });
   });
