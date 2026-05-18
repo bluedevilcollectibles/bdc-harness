@@ -246,9 +246,7 @@ nodes:
             exit 1
           fi
           git add -- "$path"
-        done <<EOF
-      $CHANGED_FILES
-EOF
+        done < <(printf '%s\n' "$CHANGED_FILES")
 
         if git diff --cached --quiet; then
           echo "No changes staged; cannot commit." >&2

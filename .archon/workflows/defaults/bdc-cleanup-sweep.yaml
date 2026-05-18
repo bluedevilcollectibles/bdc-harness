@@ -255,15 +255,13 @@ nodes:
             continue
           fi
           git add -- "$path"
-        done <<EOF
-      $CHANGED_FILES
-EOF
+        done < <(printf '%s\n' "$CHANGED_FILES")
         if git diff --cached --quiet; then
           echo "No changes staged; cannot commit." >&2
           exit 1
         fi
         WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
-        COMMIT_MESSAGE="cleanup: ${WO_ID} — sweep per locked mapping table"
+        COMMIT_MESSAGE="cleanup: ${WO_ID} sweep per locked mapping table"
         git commit -m "$COMMIT_MESSAGE"
       fi
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
