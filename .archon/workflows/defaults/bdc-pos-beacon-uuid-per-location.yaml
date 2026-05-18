@@ -92,37 +92,32 @@ nodes:
       printf -- '--- SPEC ---\n%s\n' "$SPEC_CONTENT"
 
   # -------------------------------------------------------------------------
-  # 2. FRESH BRANCH (shopops master)
+  # 2. FRESH BRANCH (clone shopops into /tmp — bash nodes always run in
+  #    bdc-harness worktree, so we must clone the target repo separately)
   # -------------------------------------------------------------------------
   - id: fresh-branch
     depends_on: [read-spec]
     bash: |
       set -euo pipefail
-      DEFAULT_BRANCH="$(git remote show origin | sed -n 's,.*HEAD branch: ,,p')"
-      # Defensive: if the default branch is already checked out in another worktree,
-      # we can't switch to it. Use a unique branch from the current HEAD instead.
-      if ! git checkout "$DEFAULT_BRANCH" 2>/dev/null; then
-        echo "default branch held by another worktree; staying on current HEAD"
-      fi
-      git fetch origin "$DEFAULT_BRANCH" --depth=50 || true
-      git reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null || true
-      BASE_BRANCH="wo/pos-beacon-uuid-per-location-01"
-      BRANCH="${BASE_BRANCH}-run-$(date +%Y%m%d%H%M%S)"
-      if git show-ref --quiet "refs/heads/$BASE_BRANCH"; then
-        if git worktree list --porcelain | grep -q "branch refs/heads/$BASE_BRANCH" && \
-           [ "$(git rev-parse --abbrev-ref HEAD)" != "$BASE_BRANCH" ]; then
-          # base branch held by another worktree; use unique
-          git checkout -b "$BRANCH"
-        else
-          BRANCH="$BASE_BRANCH"
-          git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH"
-          git reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null || true
-        fi
+      REPO="bluedevilcollectibles/shopops"
+      BRANCH="wo/pos-beacon-uuid-per-location-01"
+      CLONE_DIR="/tmp/shopops-beacon-$$"
+
+      # Clone shopops master fresh into a temp dir unique to this run
+      gh repo clone "$REPO" "$CLONE_DIR" -- --depth=50 --branch master 2>&1
+      cd "$CLONE_DIR"
+
+      # Create or reset the WO branch
+      if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+        git checkout -b "$BRANCH" "origin/$BRANCH" 2>/dev/null || git checkout "$BRANCH"
+        git reset --hard "origin/master"
       else
-        BRANCH="$BASE_BRANCH"
         git checkout -b "$BRANCH"
       fi
+
+      echo "CLONE_DIR=${CLONE_DIR}"
       echo "BRANCH=${BRANCH}"
+      echo "SHA=$(git rev-parse HEAD)"
 
   # -------------------------------------------------------------------------
   # 3. SCHEMA VERIFY — location_beacons should NOT exist yet (best-effort)
@@ -131,6 +126,8 @@ nodes:
     depends_on: [fresh-branch]
     bash: |
       # set -e intentionally omitted — best-effort (Supabase env may not be in container)
+      CLONE_DIR=$(printf '%s\n' "$fresh-branch.output" | sed -n 's/^CLONE_DIR=//p' | head -1)
+      [ -n "$CLONE_DIR" ] && cd "$CLONE_DIR"
       SUPABASE_URL="${SUPABASE_URL:-}"
       SUPABASE_SERVICE_KEY="${SUPABASE_SERVICE_KEY:-}"
       if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
@@ -194,7 +191,9 @@ nodes:
       until: COMPLETE
       max_iterations: 5
       prompt: |
-        Implement WO-POS-BEACON-UUID-PER-LOCATION-01. CWD = shopops repo root.
+        Implement WO-POS-BEACON-UUID-PER-LOCATION-01.
+        CWD = the shopops clone at $fresh-branch.output (look for CLONE_DIR= line).
+        Run: cd <CLONE_DIR> before any file operation.
 
         ## Plan
         $plan.output
@@ -245,6 +244,8 @@ nodes:
     depends_on: [implement]
     bash: |
       set -euo pipefail
+      CLONE_DIR=$(printf '%s\n' "$fresh-branch.output" | sed -n 's/^CLONE_DIR=//p' | head -1)
+      [ -n "$CLONE_DIR" ] && cd "$CLONE_DIR"
       ls shopops-api/migrations/20260513_location_beacons.sql
       grep -q "CREATE TABLE.*location_beacons" shopops-api/migrations/20260513_location_beacons.sql
       grep -q "beacon_uuid" shopops-api/migrations/20260513_location_beacons.sql
@@ -272,6 +273,8 @@ nodes:
     depends_on: [implement]
     bash: |
       set -euo pipefail
+      CLONE_DIR=$(printf '%s\n' "$fresh-branch.output" | sed -n 's/^CLONE_DIR=//p' | head -1)
+      [ -n "$CLONE_DIR" ] && cd "$CLONE_DIR"
       cd shopops-api
       bun test tests/test_location_beacons.js
 
@@ -282,6 +285,8 @@ nodes:
     depends_on: [verify-grep, verify-tests]
     bash: |
       set -euo pipefail
+      CLONE_DIR=$(printf '%s\n' "$fresh-branch.output" | sed -n 's/^CLONE_DIR=//p' | head -1)
+      [ -n "$CLONE_DIR" ] && cd "$CLONE_DIR"
       BRANCH="wo/pos-beacon-uuid-per-location-01"
       if [ "$(git rev-parse --abbrev-ref HEAD)" != "$BRANCH" ]; then
         git checkout "$BRANCH" 2>/dev/null || git checkout -b "$BRANCH"
