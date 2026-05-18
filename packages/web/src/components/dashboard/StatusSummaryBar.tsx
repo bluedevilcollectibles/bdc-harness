@@ -1,4 +1,4 @@
-import { Search } from 'lucide-react';
+import { Search, Pause } from 'lucide-react';
 import type { DashboardCounts, CodebaseResponse, HealthResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
@@ -18,6 +18,12 @@ interface StatusSummaryBarProps {
   health: HealthResponse | undefined;
   showArchived: boolean;
   onShowArchivedChange: (v: boolean) => void;
+  /** Global Claude throttle state (auto-engaged or operator-engaged). */
+  isThrottled?: boolean;
+  /** Who engaged the throttle — surfaces operator vs auto in the chip. */
+  throttleEngagedBy?: 'operator' | 'auto';
+  /** Click handler for the throttle chip (typically releases the throttle). */
+  onThrottleClick?: () => void;
 }
 
 const STATUS_CHIPS = ['running', 'paused', 'completed', 'failed', 'cancelled', 'pending'] as const;
@@ -43,6 +49,9 @@ export function StatusSummaryBar({
   health,
   showArchived,
   onShowArchivedChange,
+  isThrottled,
+  throttleEngagedBy,
+  onThrottleClick,
 }: StatusSummaryBarProps): React.ReactElement {
   return (
     <div className="rounded-lg border border-border bg-surface p-4 space-y-3">
@@ -82,6 +91,26 @@ export function StatusSummaryBar({
             </button>
           );
         })}
+        {/* Throttle indicator — appears in Row 1 only when the global Claude
+            throttle is engaged. Clickable to release; the label tells the
+            operator whether auto-engage or manual engage fired the gate. */}
+        {isThrottled && (
+          <button
+            type="button"
+            onClick={(): void => {
+              onThrottleClick?.();
+            }}
+            className="flex items-center gap-1 rounded-full px-3 py-1 text-xs font-medium border border-warning bg-warning/10 text-warning animate-pulse ml-auto"
+            title={
+              throttleEngagedBy === 'auto'
+                ? 'Claude API throttle auto-engaged near rate-limit window end. Click to release.'
+                : 'Claude API throttle engaged by operator. Click to release.'
+            }
+          >
+            <Pause className="h-3 w-3" />
+            Throttled ({throttleEngagedBy ?? 'manual'})
+          </button>
+        )}
       </div>
 
       {/* Row 2: Project dropdown, date range, search, capacity */}

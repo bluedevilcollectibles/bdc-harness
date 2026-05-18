@@ -586,6 +586,62 @@ export async function cancelWorkflowRun(id: string): Promise<void> {
 }
 
 /**
+ * Pause a running workflow run via an operator request (HTTP POST /pause).
+ * Distinct from `pauseWorkflowRun` (approval-gate pause): no ApprovalContext
+ * is required and no `metadata.approval` is written. Sets status to 'paused'
+ * only when the run is currently 'running'. Does NOT set completed_at — the
+ * run is not finished.
+ *
+ * Throws when the run is missing or not in the running state so the route
+ * handler can map to 404/422/409 status codes.
+ */
+export async function pauseWorkflowRunByOperator(id: string): Promise<void> {
+  const dialect = getDialect();
+  try {
+    const result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'paused', metadata = ${dialect.jsonMerge('metadata', 2)}
+       WHERE id = $1 AND status = 'running'`,
+      [id, JSON.stringify({ paused_by: 'operator', paused_at: new Date().toISOString() })]
+    );
+    if (result.rowCount === 0) {
+      getLog().warn({ workflowRunId: id }, 'db.workflow_run_pause_operator_no_match');
+      throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_pause_operator_failed');
+    throw new Error(`Failed to pause workflow run: ${err.message}`);
+  }
+}
+
+/**
+ * Resume a paused workflow run (sets status back to 'running').
+ * Used by both operator-paused and approval-gate flows that need to wake the
+ * run cleanly. Throws when the run is missing or not in the paused state.
+ */
+export async function resumeWorkflowRunFromPause(id: string): Promise<void> {
+  try {
+    const result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'running'
+       WHERE id = $1 AND status = 'paused'`,
+      [id]
+    );
+    if (result.rowCount === 0) {
+      getLog().warn({ workflowRunId: id }, 'db.workflow_run_resume_no_match');
+      throw new Error(`Workflow run not found or not in paused state (id: ${id})`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_resume_failed');
+    throw new Error(`Failed to resume workflow run: ${err.message}`);
+  }
+}
+
+/**
  * Pause a running workflow run for human approval.
  * Sets status to 'paused' and stores approval context in metadata.
  * Does NOT set completed_at — the run is not finished.

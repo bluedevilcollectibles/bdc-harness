@@ -30,6 +30,7 @@ interface WorkflowRunCardProps {
   run: DashboardRunResponse;
   isDocker?: boolean;
   onCancel: (runId: string) => void;
+  onPause?: (runId: string) => void;
   onResume?: (runId: string) => void;
   onAbandon?: (runId: string) => void;
   onDelete?: (runId: string) => void;
@@ -142,6 +143,7 @@ export function WorkflowRunCard({
   run,
   isDocker,
   onCancel,
+  onPause,
   onResume,
   onAbandon,
   onDelete,
@@ -372,6 +374,33 @@ export function WorkflowRunCard({
             >
               <PlayCircle className="h-3.5 w-3.5" />
               Resume
+            </button>
+          )}
+          {/* Operator-paused runs can be resumed via the dashboard (mirrors
+              approval-gate Approve/Reject for non-approval pauses). Detected by
+              metadata.paused_by === 'operator' so we don't show this button for
+              approval-gate pauses (those use Approve/Reject). */}
+          {run.status === 'paused' && run.metadata?.paused_by === 'operator' && onResume && (
+            <button
+              onClick={(): void => {
+                onResume(run.id);
+              }}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors"
+            >
+              <PlayCircle className="h-3.5 w-3.5" />
+              Resume
+            </button>
+          )}
+          {run.status === 'running' && onPause && (
+            <button
+              onClick={(): void => {
+                onPause(run.id);
+              }}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors"
+              title="Pause the run between iterations. The current iteration completes; the next SDK call queues."
+            >
+              <Pause className="h-3.5 w-3.5" />
+              Pause
             </button>
           )}
           {run.status === 'running' && onAbandon && (

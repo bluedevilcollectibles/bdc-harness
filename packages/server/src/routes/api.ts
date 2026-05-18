@@ -89,6 +89,8 @@ import {
   cancelWorkflowRunBodySchema,
   cancelWorkflowRunResponseSchema,
   cancelStaleRunsResponseSchema,
+  pauseWorkflowRunBodySchema,
+  pauseWorkflowRunResponseSchema,
   workflowRunActionResponseSchema,
   dashboardRunsResponseSchema,
   runWorkflowBodySchema,
@@ -133,7 +135,9 @@ import {
   codebaseEnvironmentsResponseSchema,
 } from './schemas/config.schemas';
 import { providerListResponseSchema } from './schemas/provider.schemas';
+import { throttleBodySchema, throttleResponseSchema } from './schemas/admin.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
+import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 
 // Read app version: use build-time constant in binary, package.json in dev
 let appVersion = 'unknown';
@@ -656,6 +660,63 @@ const cancelWorkflowRunRoute = createRoute({
     404: jsonError('Not found'),
     409: jsonError('Already cancelled'),
     422: jsonError('Cannot cancel a terminal run'),
+    500: jsonError('Server error'),
+  },
+});
+
+const pauseWorkflowRunRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/pause',
+  tags: ['Workflows'],
+  summary: 'Pause a running workflow run (operator-triggered)',
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: {
+      content: { 'application/json': { schema: pauseWorkflowRunBodySchema } },
+      required: false,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: pauseWorkflowRunResponseSchema } },
+      description: 'Paused',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
+    409: jsonError('Already paused'),
+    422: jsonError('Cannot pause a terminal run'),
+    500: jsonError('Server error'),
+  },
+});
+
+const adminThrottleRoute = createRoute({
+  method: 'post',
+  path: '/api/admin/throttle',
+  tags: ['Admin'],
+  summary: 'Engage or release the global Claude provider throttle gate',
+  request: {
+    body: { content: { 'application/json': { schema: throttleBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: throttleResponseSchema } },
+      description: 'Throttle state updated',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getAdminThrottleRoute = createRoute({
+  method: 'get',
+  path: '/api/admin/throttle',
+  tags: ['Admin'],
+  summary: 'Read the current global Claude provider throttle state',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: throttleResponseSchema } },
+      description: 'Current throttle state',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -2207,7 +2268,114 @@ export function registerApiRoutes(
     }
   });
 
+  // POST /api/workflows/runs/:runId/pause - Operator-triggered pause
+  // Distinct from approval-gate pause (Rule of Three doctrine): no
+  // ApprovalContext is required; the run flips to 'paused' and the global
+  // Claude throttle blocks the next SDK call. Current iteration completes
+  // naturally — the DAG executor between-iteration check does not stop
+  // running concurrent nodes (approval-gate semantics are preserved).
+  registerOpenApiRoute(pauseWorkflowRunRoute, async c => {
+    try {
+      const runId = c.req.param('runId') ?? '';
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        return apiError(c, 404, 'Workflow run not found');
+      }
+      if (run.status === 'paused') {
+        return apiError(c, 409, 'Workflow run is already paused');
+      }
+      if (TERMINAL_WORKFLOW_STATUSES.includes(run.status)) {
+        return apiError(c, 422, `Cannot pause workflow in '${run.status}' status`);
+      }
+      if (run.status !== 'running') {
+        return apiError(c, 400, `Cannot pause workflow in '${run.status}' status`);
+      }
+      const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+      const reason = body.reason ?? '';
+      await workflowDb.pauseWorkflowRunByOperator(runId);
+      void workflowEventDb.createWorkflowEvent({
+        workflow_run_id: runId,
+        event_type: 'run_paused',
+        data: { reason, actor: 'operator' },
+      });
+      const updated = await workflowDb.getWorkflowRun(runId);
+      const updatedRun = updated ?? {
+        ...run,
+        status: 'paused' as const,
+      };
+      return c.json({
+        success: true,
+        message: `Paused workflow: ${run.workflow_name}`,
+        run: updatedRun,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'pause_workflow_run_api_failed');
+      return apiError(c, 500, 'Failed to pause workflow run');
+    }
+  });
+
+  // GET /api/admin/throttle - Read the current global Claude provider throttle state
+  registerOpenApiRoute(getAdminThrottleRoute, async c => {
+    try {
+      const paused = claudeProviderThrottle.isThrottled();
+      const engageContext = claudeProviderThrottle.getEngageContext();
+      return c.json({
+        success: true,
+        paused,
+        message: paused
+          ? `Throttle engaged by ${engageContext?.engagedBy ?? 'unknown'}`
+          : 'Throttle is released',
+        ...(engageContext?.engagedBy ? { engagedBy: engageContext.engagedBy } : {}),
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'get_admin_throttle_api_failed');
+      return apiError(c, 500, 'Failed to read throttle state');
+    }
+  });
+
+  // POST /api/admin/throttle - Toggle the global Claude provider throttle gate
+  // When paused=true, every subsequent Claude SDK call awaits release.
+  // When paused=false, queued waiters drain FIFO.
+  // Auto-throttle (rate-limit-triggered) and operator-throttle share the same
+  // gate; setting paused=true here keeps the gate closed even if auto-release
+  // would have opened it, because engageContext.engagedBy flips to 'operator'.
+  registerOpenApiRoute(adminThrottleRoute, async c => {
+    try {
+      const body = (await c.req.json().catch(() => null)) as { paused?: unknown } | null;
+      if (!body || typeof body.paused !== 'boolean') {
+        return apiError(c, 400, 'Body must include { paused: boolean }');
+      }
+      const wasThrottled = claudeProviderThrottle.isThrottled();
+      claudeProviderThrottle.setThrottled(body.paused, { engagedBy: 'operator' });
+      const nowThrottled = claudeProviderThrottle.isThrottled();
+      const engageContext = claudeProviderThrottle.getEngageContext();
+      const message = body.paused
+        ? wasThrottled
+          ? 'Throttle was already engaged; engagement context refreshed'
+          : 'Throttle engaged — Claude SDK calls will queue'
+        : wasThrottled
+          ? 'Throttle released — queued Claude SDK calls drained'
+          : 'Throttle was already released';
+      return c.json({
+        success: true,
+        paused: nowThrottled,
+        message,
+        ...(engageContext?.engagedBy ? { engagedBy: engageContext.engagedBy } : {}),
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'admin_throttle_api_failed');
+      return apiError(c, 500, 'Failed to update throttle state');
+    }
+  });
+
   // POST /api/workflows/runs/:runId/resume - Resume a workflow run
+  //
+  // Two modes share this route:
+  //   1. Failed run     → next invocation on the same path auto-resumes (legacy behavior)
+  //   2. Operator pause → flip status back to 'running'; the DAG executor's
+  //                        between-iteration check sees 'running' and continues.
+  //                        Approval-gate paused runs are NOT touched here — use
+  //                        /approve or /reject for those.
   registerOpenApiRoute(resumeWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
     try {
@@ -2218,7 +2386,26 @@ export function registerApiRoutes(
       if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
         return apiError(c, 400, `Cannot resume workflow in '${run.status}' status`);
       }
-      // Run is already failed — the next invocation on the same path auto-resumes
+
+      // Operator-paused runs are flagged in metadata; flip them back to running.
+      // Approval-gate pauses use metadata.approval (ApprovalContext) and resume
+      // via /approve, so leave those alone here.
+      const pausedByOperator = run.status === 'paused' && run.metadata.paused_by === 'operator';
+      if (pausedByOperator) {
+        await workflowDb.resumeWorkflowRunFromPause(runId);
+        void workflowEventDb.createWorkflowEvent({
+          workflow_run_id: runId,
+          event_type: 'run_resumed',
+          data: { actor: 'operator' },
+        });
+        return c.json({
+          success: true,
+          message: `Resumed workflow: ${run.workflow_name}`,
+        });
+      }
+
+      // Failed run path (or approval-gate paused — leave as-is, /approve handles it):
+      // the next invocation on the same path auto-resumes from completed nodes.
       const pathInfo = run.working_path ? ` at \`${run.working_path}\`` : '';
       return c.json({
         success: true,

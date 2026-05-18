@@ -374,6 +374,45 @@ export async function cancelWorkflowRun(
   });
 }
 
+export async function pauseWorkflowRun(
+  runId: string,
+  reason?: string
+): Promise<{ success: boolean; message: string; run: WorkflowRunResponse }> {
+  return fetchJSON(`/api/workflows/runs/${encodeURIComponent(runId)}/pause`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason }),
+  });
+}
+
+/**
+ * Toggle the global Claude provider throttle gate.
+ * When paused=true, every subsequent Claude SDK call queues until released.
+ * Auto-engage (rate-limit-triggered) and operator-engage share the same gate.
+ */
+export async function setGlobalThrottle(paused: boolean): Promise<{
+  success: boolean;
+  paused: boolean;
+  message: string;
+  engagedBy?: 'operator' | 'auto';
+}> {
+  return fetchJSON('/api/admin/throttle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paused }),
+  });
+}
+
+/** Read the current global Claude provider throttle state. */
+export async function getGlobalThrottle(): Promise<{
+  success: boolean;
+  paused: boolean;
+  message: string;
+  engagedBy?: 'operator' | 'auto';
+}> {
+  return fetchJSON('/api/admin/throttle');
+}
+
 export async function resumeWorkflowRun(
   runId: string
 ): Promise<{ success: boolean; message: string }> {
