@@ -21,7 +21,7 @@
  */
 
 import type { Logger } from '@archon/paths';
-import { classifyError, decide, type Decision } from '@archon/overseer';
+import { classifyError, decide, runEscalation, type Decision } from '@archon/overseer';
 import type { WorkflowRun, NodeOutput } from './schemas/workflow-run.ts';
 import type { DagNode } from './schemas/dag-node.ts';
 import type { WorkflowEmitterEvent } from './event-emitter.ts';
@@ -58,6 +58,21 @@ export interface HandleNodeFailureContext {
   statusCode?: number;
   /** Optional extra data fields to attach to the persisted node_failed event */
   extraEventData?: Record<string, unknown>;
+  /**
+   * Optional war-council-validator stdout captured from a sibling node output map.
+   * Forwarded to classify/decide so the silent-dead-end classes can detect
+   * actionable validator feedback vs. a REJECT/BLOCK/FAIL verdict.
+   */
+  validatorOutput?: string;
+  /**
+   * Optional WO ID parsed from the workflow user_message. Surfaced into the
+   * escalation payload so runEscalation can post a Notion comment on the right page.
+   */
+  woId?: string;
+  /** Optional: commits-ahead-of-origin count on the thread branch (escalation context only). */
+  threadCommitsAhead?: number;
+  /** Optional: whether the unique remote branch exists at origin (classifier discriminator). */
+  hasOriginBranch?: boolean;
 }
 
 export interface HandleNodeFailureResult {
@@ -88,6 +103,9 @@ export async function handleNodeFailure(
     nodeType: ctx.nodeType,
     exitCode: ctx.exitCode,
     statusCode: ctx.statusCode,
+    validatorOutput: ctx.validatorOutput,
+    threadCommitsAhead: ctx.threadCommitsAhead,
+    hasOriginBranch: ctx.hasOriginBranch,
   });
 
   const result = decide({
@@ -95,6 +113,8 @@ export async function handleNodeFailure(
     attempt,
     hasOutput,
     nodeId: node.id,
+    validatorOutput: ctx.validatorOutput,
+    woId: ctx.woId,
   });
 
   // Observability — Mission Control "Workflow Decisions" tab will consume this when
@@ -143,6 +163,20 @@ export async function handleNodeFailure(
     nodeName: node.command ?? node.id,
     error: ctx.errorMsg,
   });
+
+  // Silent-dead-end escalation: fire 3 operator-visible signals (escalation.json
+  // on disk, builder-monitor webhook, Notion comment) for the new failure classes
+  // identified in the 2026-05-18 Wave A anchor incidents. The presence of
+  // `result.escalationContext` is the contract — only the new classes populate it,
+  // so existing v1 escalate paths (out_of_credits, auth_failed, etc.) are unaffected.
+  if (result.decision === 'escalate' && result.escalationContext) {
+    await runEscalation(workflowRun.id, result, result.escalationContext).catch((err: Error) => {
+      deps.log.error(
+        { err, workflowRunId: workflowRun.id, nodeId: node.id, errorClass },
+        'overseer.escalation_failed'
+      );
+    });
+  }
 
   // Translate decision to NodeOutput state.
   // Exhaustiveness: if Decision ever gains a value we don't handle, the `never` assignment

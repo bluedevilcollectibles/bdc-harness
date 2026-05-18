@@ -22,6 +22,11 @@ export type ErrorClass =
   | 'worktree_collision' // git: branch already used by another worktree
   | 'spec_lookup_failed' // read-spec couldn't fetch WO spec from bdc-xo
   | 'branch_ref_missing' // git: fatal: couldn't find remote ref
+  // Silent-dead-end classes (new, from 2026-05-18 Wave A anchor incidents)
+  | 'implement_loop_no_output' // commit-and-push: no diff, no validator feedback
+  | 'validator_feedback_not_applied' // commit-and-push: validator emitted actionable feedback but agent did not iterate
+  | 'validator_rejected' // war-council-validator stdout begins with REJECT/BLOCK/FAIL
+  | 'implement_loop_skipped' // commit-and-push: thread branch HEAD-only, agent never wrote to disk
   // Fallback
   | 'unknown';
 
@@ -36,6 +41,24 @@ export interface ClassifyInput {
   nodeType?: string;
   /** Exit code if from bash node */
   exitCode?: number;
+  /**
+   * Optional war-council-validator stdout captured from a sibling node output.
+   * Used to disambiguate `implement_loop_no_output` vs `validator_feedback_not_applied`,
+   * and to detect `validator_rejected` from a non-validator failure site (e.g. commit-and-push).
+   */
+  validatorOutput?: string;
+  /**
+   * Optional count of commits on the thread branch ahead of origin/main (or whatever the
+   * base branch is). Used as contextual signal in escalation payloads; not load-bearing
+   * for the current classifier branches but documented here for future per-class rules.
+   */
+  threadCommitsAhead?: number;
+  /**
+   * Optional flag indicating whether the unique remote branch already exists at origin.
+   * Distinguishes `implement_loop_no_output` (origin branch reachable, just no diff) from
+   * `implement_loop_skipped` (origin branch missing AND no commits anywhere — agent never wrote).
+   */
+  hasOriginBranch?: boolean;
 }
 
 /**
@@ -49,6 +72,45 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   const msg = (input.message ?? '').toLowerCase();
   const status = input.statusCode;
   const exit = input.exitCode;
+  const rawMessage = input.message ?? '';
+  const validatorText = input.validatorOutput ?? '';
+
+  // --- Silent-dead-end classes (BDC-specific, 2026-05-18 Wave A anchor incidents) ---
+  //
+  // Order matters: validator_rejected is checked first so a REJECT/BLOCK/FAIL signal
+  // wins over the action-verb heuristic in validator_feedback_not_applied (e.g. a
+  // validator output of "REJECT: must add X" is still a REJECT, not feedback to apply).
+
+  // REJECT/BLOCK/FAIL at the start of any line of validator output.
+  // Two entry conditions:
+  //   (a) the failing node IS the validator and its message contains the token (Test 3)
+  //   (b) a downstream node failed and we have the validator stdout in context (Test 5
+  //       variant; current bridge wiring forwards validatorOutput when available)
+  const validatorRejectPattern = /^(REJECT|BLOCK|FAIL)\b/m;
+  if (input.nodeId === 'war-council-validator' && validatorRejectPattern.test(rawMessage)) {
+    return 'validator_rejected';
+  }
+  if (input.validatorOutput !== undefined && validatorRejectPattern.test(validatorText)) {
+    return 'validator_rejected';
+  }
+
+  // commit-and-push stderr emitted when COMMITS_AHEAD = 0 (see
+  // .archon/workflows/defaults/bdc-feature-development.yaml ~line 289).
+  // Three distinct downstream classifications depend on additional context:
+  //   - validator emitted actionable remediation -> validator_feedback_not_applied
+  //   - thread branch is HEAD-only (origin branch missing + no commits anywhere) -> implement_loop_skipped
+  //   - else -> implement_loop_no_output
+  const implementLoopStderr = /implement loop did not produce work/i;
+  if (implementLoopStderr.test(rawMessage)) {
+    const actionVerbs = /\b(add|fix|include|must|should|needs?)\b/i;
+    if (input.validatorOutput && actionVerbs.test(validatorText)) {
+      return 'validator_feedback_not_applied';
+    }
+    if (input.hasOriginBranch === false && (input.threadCommitsAhead ?? 0) === 0) {
+      return 'implement_loop_skipped';
+    }
+    return 'implement_loop_no_output';
+  }
 
   // --- Workflow-runtime classes (BDC-specific, 2026-05-16) ---
 

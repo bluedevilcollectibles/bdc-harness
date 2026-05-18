@@ -1520,31 +1520,38 @@ async function executeBashNode(
       { ...formatted.logFields, nodeId: node.id, nodeType: 'bash', isTimeout },
       'dag_node_failed'
     );
-    await logNodeError(logDir, workflowRun.id, node.id, errorMsg);
 
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'node_failed',
-        step_name: node.id,
-        data: { error: errorMsg, type: 'bash' },
-      })
-      .catch((dbErr: Error) => {
-        getLog().error(
-          { err: dbErr, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-          'workflow_event_persist_failed'
-        );
-      });
+    // Route through overseer-bridge so bash-node failures get classified and the
+    // silent-dead-end classes (implement_loop_no_output, validator_feedback_not_applied,
+    // validator_rejected, implement_loop_skipped) trigger escalation side effects.
+    // Pre-WO-OVERSEER-FAILURE-CLASSES-EXPANSION-01 this site inlined the logNodeError
+    // + createWorkflowEvent + emitter.emit + return-failed pattern and missed the
+    // bash-node failure mode entirely.
+    const validatorOutput = nodeOutputs.get('war-council-validator')?.output ?? undefined;
+    const woIdMatch = workflowRun.user_message
+      ? /\bWO-[A-Z0-9-]+/.exec(workflowRun.user_message)
+      : null;
+    const woId = woIdMatch ? woIdMatch[0] : undefined;
+    const exitCode = typeof err.code === 'number' ? err.code : undefined;
 
-    emitter.emit({
-      type: 'node_failed',
-      runId: workflowRun.id,
-      nodeId: node.id,
-      nodeName: node.id,
-      error: errorMsg,
-    });
+    const failResult = await handleNodeFailure(
+      { store: deps.store, emitter, log: getLog(), logNodeError },
+      workflowRun,
+      node,
+      {
+        errorMsg,
+        logDir,
+        outputSoFar: '',
+        hasOutput: false,
+        nodeType: 'bash',
+        exitCode,
+        validatorOutput,
+        woId,
+        extraEventData: { type: 'bash', isTimeout },
+      }
+    );
 
-    return { state: 'failed', output: '', error: errorMsg };
+    return failResult.output;
   }
 }
 

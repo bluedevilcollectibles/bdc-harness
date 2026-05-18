@@ -114,6 +114,9 @@
     "packages/overseer": {
       "name": "@archon/overseer",
       "version": "0.1.0",
+      "dependencies": {
+        "@archon/paths": "workspace:*",
+      },
       "devDependencies": {
         "@types/node": "^22.10.5",
       },

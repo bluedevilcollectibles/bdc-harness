@@ -8,12 +8,16 @@
   "exports": {
     ".": "./src/index.ts",
     "./classify": "./src/classify.ts",
-    "./decide": "./src/decide.ts"
+    "./decide": "./src/decide.ts",
+    "./escalate": "./src/escalate.ts"
   },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test src/overseer.test.ts && bun test tests/",
+    "type-check": "bun x tsc --noEmit"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@archon/paths": "workspace:*"
+  },
   "devDependencies": {
     "@types/node": "^22.10.5"
   }
