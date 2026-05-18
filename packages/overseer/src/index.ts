@@ -26,3 +26,6 @@ export type { ErrorClass, ClassifyInput } from './classify';
 
 export { decide } from './decide';
 export type { Decision, DecideInput, DecisionResult } from './decide';
+
+export { runEscalation } from './escalate';
+export type { EscalationContext } from './escalate';

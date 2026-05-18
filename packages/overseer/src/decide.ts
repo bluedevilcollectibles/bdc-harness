@@ -24,6 +24,14 @@ export interface DecideInput {
   hasOutput?: boolean;
   /** Node ID — some decisions are node-type aware */
   nodeId?: string;
+  /**
+   * Optional war-council-validator stdout from a sibling node. Surfaced into
+   * `escalationContext` for the silent-dead-end classes so the operator sees the
+   * verbatim remediation list in the Notion comment / escalation.json.
+   */
+  validatorOutput?: string;
+  /** Optional WO ID parsed from the user message — surfaced into escalationContext. */
+  woId?: string;
 }
 
 export interface DecisionResult {
@@ -31,6 +39,44 @@ export interface DecisionResult {
   reason: string;
   /** Suggested backoff in ms if decision is retry */
   backoffMs?: number;
+  /**
+   * Optional structured payload for the escalation handler. Populated for the
+   * silent-dead-end classes (implement_loop_no_output, validator_feedback_not_applied,
+   * validator_rejected, implement_loop_skipped). When present AND decision==='escalate',
+   * the executor wires this through to `runEscalation` from @archon/overseer/escalate
+   * which posts a Notion comment, fires the builder-monitor webhook, and writes
+   * `<archon-home>/runs/<runId>/escalation.json`.
+   *
+   * Fields are intentionally loose so future failure classes can add their own
+   * diagnostic data without bumping the type signature.
+   */
+  escalationContext?: {
+    errorClass: ErrorClass;
+    nodeId?: string;
+    woId?: string;
+    validatorOutput?: string;
+    /** Best-effort remediation list parsed from validatorOutput (line-by-line bullets) */
+    remediation?: string[];
+    /** Free-form fields downstream may attach */
+    [key: string]: unknown;
+  };
+}
+
+/**
+ * Extract a best-effort remediation list from validator stdout. Lines starting with
+ * "-", "*", or a digit + ". " are treated as bullets; otherwise the validator output
+ * is returned as a single-entry array (so escalation.json always carries something
+ * the operator can read without re-fetching the full node log).
+ */
+function extractRemediation(validatorOutput: string | undefined): string[] | undefined {
+  if (!validatorOutput?.trim()) return undefined;
+  const lines = validatorOutput.split(/\r?\n/);
+  const bullets = lines
+    .map(l => l.trim())
+    .filter(l => /^([-*]|\d+\.)\s+/.test(l))
+    .map(l => l.replace(/^([-*]|\d+\.)\s+/, ''));
+  if (bullets.length > 0) return bullets;
+  return [validatorOutput.trim()];
 }
 
 /**
@@ -38,7 +84,7 @@ export interface DecisionResult {
  * Returns "escalate" for unknown classes (preserve old behavior — don't auto-recover unknowns).
  */
 export function decide(input: DecideInput): DecisionResult {
-  const { errorClass, attempt, hasOutput } = input;
+  const { errorClass, attempt, hasOutput, validatorOutput, woId, nodeId } = input;
 
   switch (errorClass) {
     case 'rate_limit_exceeded':
@@ -151,6 +197,69 @@ export function decide(input: DecideInput): DecisionResult {
         decision: 'escalate',
         reason:
           'spec lookup failed on retry — WO_ID may not exist on bdc-xo main, operator must check',
+      };
+
+    // --- Silent-dead-end classes (BDC-specific 2026-05-18 Wave A anchor incidents) ---
+    //
+    // All four escalate with a populated `escalationContext`. The executor wires this
+    // through to runEscalation (escalate.ts), which writes escalation.json, posts a
+    // Notion comment on the WO page, and fires the builder-monitor webhook. Notion
+    // status stays IN_PROGRESS — operator decides next step from the escalation.
+
+    case 'implement_loop_no_output':
+      return {
+        decision: 'escalate',
+        reason:
+          'commit-and-push: no changed files and no commits ahead — agent produced no work, no validator feedback to act on',
+        escalationContext: {
+          errorClass: 'implement_loop_no_output',
+          nodeId,
+          woId,
+          validatorOutput,
+          remediation: extractRemediation(validatorOutput),
+        },
+      };
+
+    case 'validator_feedback_not_applied':
+      return {
+        decision: 'escalate',
+        reason:
+          'commit-and-push: clean tree after validator emitted actionable remediation — agent did not iterate on feedback',
+        escalationContext: {
+          errorClass: 'validator_feedback_not_applied',
+          nodeId,
+          woId,
+          validatorOutput,
+          remediation: extractRemediation(validatorOutput),
+        },
+      };
+
+    case 'validator_rejected':
+      return {
+        decision: 'escalate',
+        reason:
+          'war-council-validator rejected with REJECT/BLOCK/FAIL — work cannot proceed without operator triage',
+        escalationContext: {
+          errorClass: 'validator_rejected',
+          nodeId,
+          woId,
+          validatorOutput,
+          remediation: extractRemediation(validatorOutput),
+        },
+      };
+
+    case 'implement_loop_skipped':
+      return {
+        decision: 'escalate',
+        reason:
+          'commit-and-push: thread branch HEAD-only, no commits anywhere — agent never wrote to disk',
+        escalationContext: {
+          errorClass: 'implement_loop_skipped',
+          nodeId,
+          woId,
+          validatorOutput,
+          agentNeverWrote: true,
+        },
       };
 
     case 'unknown':
