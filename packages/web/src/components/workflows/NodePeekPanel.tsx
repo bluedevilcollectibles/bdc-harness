@@ -197,7 +197,7 @@ export function NodePeekPanel({
                 Command
               </div>
               <pre className="text-xs font-mono text-text-primary bg-surface rounded p-2">
-                {(dagNode as { command?: string } | null)?.command ?? '(unknown)'}
+                {dagNode?.command ?? '(unknown)'}
               </pre>
             </section>
           )}
