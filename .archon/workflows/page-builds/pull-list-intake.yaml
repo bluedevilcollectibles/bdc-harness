@@ -40,9 +40,20 @@ nodes:
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then
-        echo "Spec not found in bdc-xo for WO_ID=${WO_ID} (tried docs/superpowers/specs/${WO_ID}.md and date-prefix glob via gh api)" >&2
-        exit 1
+        # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
       fi
+      if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$SPEC_PATH" "$WORKFLOW_ID"
       printf '%s\n' "$SPEC_CONTENT"
   - id: post-started

@@ -63,9 +63,20 @@ nodes:
       fi
 
       if [ -z "$SPEC_CONTENT" ]; then
-        echo "ERROR: Spec not found for ${WO_ID} in bdc-xo" >&2
-        exit 1
+        # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
       fi
+      if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
 
       DESIGN_DOC=$(gh api \
         "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/2026-04-16-cheers-platform-design.md?ref=main" \

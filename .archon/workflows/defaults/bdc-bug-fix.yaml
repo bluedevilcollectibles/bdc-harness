@@ -28,8 +28,25 @@ nodes:
         SPEC_PATH=$(ls docs/superpowers/specs/*${WO_ID}.md 2>/dev/null | head -n 1 || true)
       fi
       if [ -z "$SPEC_PATH" ] || [ ! -f "$SPEC_PATH" ]; then
-        echo "Spec not found for WO_ID=${WO_ID} (tried docs/superpowers/specs/${WO_ID}.md and date-prefix glob)" >&2
-        exit 1
+        # Fallback 3: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        SPEC_CONTENT=""
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+        fi
+        if [ -z "$SPEC_CONTENT" ]; then
+          echo "Spec not found for WO_ID=${WO_ID} (tried docs/superpowers/specs/${WO_ID}.md, date-prefix glob, and GitHub issue search)" >&2
+          exit 1
+        fi
+        printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:issues/%s\n\n' "$WO_ID" "$ISSUE_NUM"
+        printf '%s\n' "$SPEC_CONTENT"
+        exit 0
       fi
       printf 'WO_ID=%s\nSPEC_PATH=%s\n\n' "$WO_ID" "$SPEC_PATH"
       cat "$SPEC_PATH"

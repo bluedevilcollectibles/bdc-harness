@@ -47,7 +47,21 @@ nodes:
             --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
         fi
       fi
-      if [ -z "$SPEC" ]; then echo "ERROR: spec not found for $WO_ID" >&2; exit 1; fi
+      if [ -z "$SPEC" ]; then
+        # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
       printf 'WO_ID=%s\nWORKFLOW_ID=%s\n\n--- SPEC ---\n%s\n' "$WO_ID" "$WORKFLOW_ID" "$SPEC"
 
   - id: fresh-branch

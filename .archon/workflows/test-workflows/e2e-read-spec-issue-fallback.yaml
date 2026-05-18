@@ -1,0 +1,71 @@
+# E2E smoke test — read-spec 4th fallback (GitHub issue body)
+# WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01
+# Tests: (1) explicit issue=N in message, (2) WO_ID title search, (3) file wins over issue.
+# No AI nodes. Pure bash. Requires gh CLI with bluedevilcollectibles/bdc-xo read access.
+name: e2e-read-spec-issue-fallback
+description: |
+  Smoke test for 4th-fallback issue-body fetch in read-spec nodes.
+  Tests: explicit issue=N, WO_ID title search, file-wins-over-issue precedence.
+  No AI nodes. Bash-only. Requires gh CLI with bdc-xo read access.
+
+nodes:
+  - id: test-explicit-issue-number
+    bash: |
+      set -euo pipefail
+      WO_ID="WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01"
+      USER_MESSAGE="WO_ID=${WO_ID} issue=193"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "FAIL: could not extract issue number from USER_MESSAGE" >&2; exit 1
+      fi
+      SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+        --json body --jq .body 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "FAIL: issue #${ISSUE_NUM} body was empty or fetch failed" >&2; exit 1
+      fi
+      echo "PASS: explicit issue=N fetched ${#SPEC_CONTENT} chars from issue #${ISSUE_NUM}"
+
+  - id: test-title-search-fallback
+    bash: |
+      set -euo pipefail
+      WO_ID="WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01"
+      ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+        --search "${WO_ID} in:title" --json number,title \
+        --jq '.[0].number' 2>/dev/null || true)
+      if [ -z "$ISSUE_NUM" ] || [ "$ISSUE_NUM" = "null" ]; then
+        echo "FAIL: title search returned no issue for WO_ID=${WO_ID}" >&2; exit 1
+      fi
+      SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+        --json body --jq .body 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "FAIL: issue body empty for issue #${ISSUE_NUM}" >&2; exit 1
+      fi
+      echo "PASS: title search found issue #${ISSUE_NUM} (${#SPEC_CONTENT} chars)"
+
+  - id: test-file-wins-over-issue
+    bash: |
+      set -euo pipefail
+      TMPDIR=$(mktemp -d)
+      mkdir -p "${TMPDIR}/docs/superpowers/specs"
+      printf 'FILE_SPEC_CONTENT\n' > "${TMPDIR}/docs/superpowers/specs/WO-FAKE-FILE-WINS-TEST-01.md"
+      WO_ID="WO-FAKE-FILE-WINS-TEST-01"
+      SPEC_PATH="${TMPDIR}/docs/superpowers/specs/${WO_ID}.md"
+      if [ ! -f "$SPEC_PATH" ]; then
+        echo "FAIL: temp file not created" >&2; rm -rf "$TMPDIR"; exit 1
+      fi
+      RESULT=$(cat "$SPEC_PATH" | tr -d '\n')
+      rm -rf "$TMPDIR"
+      if [ "$RESULT" != "FILE_SPEC_CONTENT" ]; then
+        echo "FAIL: file content was '${RESULT}', expected 'FILE_SPEC_CONTENT'" >&2; exit 1
+      fi
+      echo "PASS: file-based spec wins (issue fallback never invoked when file exists)"
+
+  - id: verify-all-pass
+    depends_on: [test-explicit-issue-number, test-title-search-fallback, test-file-wins-over-issue]
+    trigger_rule: all_success
+    bash: |
+      set -euo pipefail
+      echo "ALL PASS: read-spec 4th fallback tests satisfied"
+      echo "  explicit-issue-N: $test-explicit-issue-number.output"
+      echo "  title-search: $test-title-search-fallback.output"
+      echo "  file-wins: $test-file-wins-over-issue.output"
