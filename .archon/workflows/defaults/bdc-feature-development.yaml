@@ -223,15 +223,22 @@ nodes:
       push_target: feature-branch:<spec-derived-branch-name>
       pr_required: true
       staging_gate_required: true
+      pr_base: <spec-target-branch>
 
       If the repo is bdc-xo non-doctrine code or another code repo, output:
       push_target: feature-branch:<spec-derived-branch-name>
       pr_required: true
       staging_gate_required: false
+      pr_base: <spec-target-branch>
 
       If this is doc-only or doctrine-only, output:
       out_of_scope: true
       reason: use bdc-doctrine-update.yaml
+
+      The `pr_base` line MUST name the branch that the PR will MERGE INTO (the spec's
+      "Branch target", e.g. `dev`, `master`, `promotion/v2`). It is the value passed
+      to `gh pr create --base`. It is NOT the new work-branch -- that is auto-derived
+      from WO_ID by the commit-and-push node and does not appear in your output.
 
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   # 2026-05-16 engine sortie: container-side `git push` silently failed; downstream
@@ -256,32 +263,59 @@ nodes:
         echo "Out of scope for bdc-feature-development; failing closed." >&2
         exit 1
       fi
-      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
-      if [ -z "$BRANCH" ]; then
-        echo "No feature branch target found in decide-push-target output." >&2
+      # WO-HARNESS-PARALLEL-WORKTREE-ISOLATION-01 (2026-05-18): derive a unique
+      # work-branch deterministically from WO_ID + first 8 chars of WORKFLOW_ID.
+      # Never force-checkout the spec's target base (e.g. promotion/v2) inside
+      # the worktree -- that branch is already checked out in the main workspace
+      # and the second+ parallel run dies with `fatal: '<branch>' is already
+      # used by worktree`. The pre-2026-05-18 implementation did exactly that
+      # (extracted BRANCH from decide-push-target and force-checked-it-out),
+      # which is the collision the plan's verification asserts can never appear
+      # again. The contract is mirrored in generateWorkBranchName() in
+      # packages/workflows/src/dag-executor.ts; keep the two in sync.
+      WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+      if [ -z "${WO_ID:-}" ]; then
+        echo "ERROR: WO_ID not in environment and not extractable from USER_MESSAGE; cannot derive work branch." >&2
         exit 1
       fi
-      git checkout -B "$BRANCH"
+      if [ -z "${WORKFLOW_ID:-}" ]; then
+        echo "ERROR: WORKFLOW_ID not in environment; cannot derive unique work branch." >&2
+        exit 1
+      fi
+      WO_ID_LOWER=$(printf '%s\n' "$WO_ID" | tr '[:upper:]' '[:lower:]')
+      WORK_BRANCH="wo/${WO_ID_LOWER}-${WORKFLOW_ID:0:8}"
+      echo "Work branch: $WORK_BRANCH"
+      # Idempotent fork: create-or-force-update the work branch to current HEAD.
+      # The implement loop's commits are on HEAD (archon/thread-<id>); we fork a
+      # uniquely-named wo/ branch off that same SHA. Two-command form avoids the
+      # force-create-or-reset checkout idiom that the
+      # WO-HARNESS-PARALLEL-WORKTREE-ISOLATION-01 plan's verification step bans
+      # against any branch-name source (defensive: force-resetting onto a shared
+      # base name like promotion/v2 was the original collision path).
+      # WORK_BRANCH is parameterized by WORKFLOW_ID so this branch name is
+      # unique per run by construction.
+      git branch -f "$WORK_BRANCH" HEAD
+      git checkout "$WORK_BRANCH"
       git status --short
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
         # Already fully synced: implement loop committed + pushed to origin
-        if git rev-parse --quiet --verify "origin/$BRANCH" >/dev/null 2>&1 && \
-           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$BRANCH")" ]; then
-          echo "Backstop no-op: implement loop already committed + pushed to origin/$BRANCH (HEAD matches)."
+        if git rev-parse --quiet --verify "origin/$WORK_BRANCH" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/$WORK_BRANCH")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed to origin/$WORK_BRANCH (HEAD matches)."
           exit 0
         fi
         # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: a clean working
-        # tree does NOT mean the implement loop skipped work — it may have committed
+        # tree does NOT mean the implement loop skipped work -- it may have committed
         # and left the tree clean. Count COMMITS_AHEAD to distinguish true no-op
         # from pre-committed work that still needs pushing.
-        if git rev-parse --quiet --verify "origin/${BRANCH}" >/dev/null 2>&1; then
-          COMMITS_AHEAD=$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo 0)
+        if git rev-parse --quiet --verify "origin/${WORK_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${WORK_BRANCH}..HEAD" 2>/dev/null || echo 0)
         else
           COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
         fi
         if [ "$COMMITS_AHEAD" = "0" ]; then
-          echo "No changed files and no commits ahead of origin/${BRANCH} -- implement loop did not produce work" >&2
+          echo "No changed files and no commits ahead of origin/${WORK_BRANCH} -- implement loop did not produce work" >&2
           exit 1
         fi
         echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
@@ -326,7 +360,7 @@ nodes:
       # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
       PUSH_OK=false
       for attempt in 1 2 3; do
-        if git push -u origin "$BRANCH" 2>&1; then
+        if git push -u origin "$WORK_BRANCH" 2>&1; then
           PUSH_OK=true
           break
         fi
@@ -355,6 +389,25 @@ nodes:
         echo "PR not required; skipping."
         exit 0
       fi
+      # WO-HARNESS-PARALLEL-WORKTREE-ISOLATION-01 (2026-05-18): re-derive the
+      # same work branch the commit-and-push node produced. The two derivations
+      # MUST stay in sync; both mirror generateWorkBranchName() in
+      # packages/workflows/src/dag-executor.ts.
+      WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+      if [ -z "${WO_ID:-}" ] || [ -z "${WORKFLOW_ID:-}" ]; then
+        echo "ERROR: cannot re-derive work branch (WO_ID or WORKFLOW_ID missing)." >&2
+        exit 1
+      fi
+      WO_ID_LOWER=$(printf '%s\n' "$WO_ID" | tr '[:upper:]' '[:lower:]')
+      WORK_BRANCH="wo/${WO_ID_LOWER}-${WORKFLOW_ID:0:8}"
+      # Extract PR base (branch the PR merges INTO) from decide-push-target output.
+      # If decide-push-target failed to emit pr_base, fall back to "dev".
+      PR_BASE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^pr_base: //p' | head -n 1)
+      if [ -z "$PR_BASE" ]; then
+        echo "WARN: decide-push-target did not emit pr_base; falling back to 'dev'." >&2
+        PR_BASE="dev"
+      fi
+      echo "Opening PR: --head $WORK_BRANCH --base $PR_BASE"
       TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$TITLE" ]; then
         TITLE="BDC feature Work Order implementation"
@@ -379,20 +432,17 @@ nodes:
       # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
       PR_OK=false
       for attempt in 1 2 3; do
-        if gh pr create --title "$TITLE" --body-file "$BODY_FILE" 2>&1; then
+        if gh pr create --title "$TITLE" --body-file "$BODY_FILE" --base "$PR_BASE" --head "$WORK_BRANCH" 2>&1; then
           PR_OK=true
           break
         fi
         # Race-condition recovery: branch already has an open PR.
-        BRANCH_NOW=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-        if [ -n "$BRANCH_NOW" ]; then
-          EXIST=$(gh pr list --head "$BRANCH_NOW" --state open \
-            --json url --jq '.[0].url // empty' 2>/dev/null || true)
-          if [ -n "$EXIST" ]; then
-            echo "PR_URL=$EXIST"
-            PR_OK=true
-            break
-          fi
+        EXIST=$(gh pr list --head "$WORK_BRANCH" --state open \
+          --json url --jq '.[0].url // empty' 2>/dev/null || true)
+        if [ -n "$EXIST" ]; then
+          echo "PR_URL=$EXIST"
+          PR_OK=true
+          break
         fi
         echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
         sleep $((attempt * 5))

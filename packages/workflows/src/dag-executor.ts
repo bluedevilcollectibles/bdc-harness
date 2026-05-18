@@ -207,6 +207,33 @@ export function shouldContinueStreamingForStatus(status: string | null): boolean
   return status === 'running' || status === 'paused';
 }
 
+/**
+ * Generate a unique work-branch name for a BDC Cauldron parallel run.
+ *
+ * Each fire gets its own isolated branch via the canonical pattern:
+ *   git worktree add <thread-dir> -b wo/<wo-id-lower>-<thread-id> origin/<target-base>
+ *
+ * Uniqueness is guaranteed by `threadId` (an 8-char prefix of `workflow_run_id`).
+ * Two parallel fires for the same WO_ID always have different run IDs and thus
+ * different threadIds, producing different branch names and avoiding the
+ * `fatal: '<branch>' is already used by worktree` collision that previously
+ * killed parallel sorties (anchor incident: 2026-05-17 LSPRO+ShopOps rebuild,
+ * 13/21 runs failed at commit-and-push -- WO-HARNESS-PARALLEL-WORKTREE-ISOLATION-01).
+ *
+ * This helper is the contract surface consumed by the bash node in
+ * `.archon/workflows/defaults/bdc-feature-development.yaml`; the bash node
+ * re-derives the same string using `${WO_ID,,}-${WORKFLOW_ID:0:8}`. Keep the
+ * two implementations in sync if you change the format.
+ *
+ * @param woId     - WO identifier (e.g. "WO-HARNESS-01"); lowercased internally.
+ * @param threadId - 8-char (or longer) thread/run ID; caller may pass full
+ *                   `workflow_run_id` -- only the first 8 chars are used.
+ * @returns Branch name of the form `wo/<wo-id-lower>-<8char-thread-id>`.
+ */
+export function generateWorkBranchName(woId: string, threadId: string): string {
+  return `wo/${woId.toLowerCase()}-${threadId.slice(0, 8)}`;
+}
+
 /** Throttle state for activity heartbeat writes (only used for stale/zombie detection) */
 const lastNodeActivityUpdate = new Map<string, number>();
 const ACTIVITY_HEARTBEAT_INTERVAL_MS = 60_000;

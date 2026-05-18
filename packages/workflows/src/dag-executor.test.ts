@@ -7159,6 +7159,70 @@ describe('shouldContinueStreamingForStatus', () => {
   });
 });
 
+// WO-HARNESS-PARALLEL-WORKTREE-ISOLATION-01 (2026-05-18): parallel-worktree
+// collision regression suite. Each Cauldron fire must produce a uniquely-named
+// work branch so two parallel runs against the same target base never collide
+// at `git worktree add` / `git checkout`. The contract is mirrored by the
+// commit-and-push bash node in
+// `.archon/workflows/defaults/bdc-feature-development.yaml`, which re-derives
+// the same string via `wo/${WO_ID,,}-${WORKFLOW_ID:0:8}`.
+describe('generateWorkBranchName -- parallel-worktree isolation', () => {
+  it('produces expected format wo/<lower-wo-id>-<8char-thread-id>', async () => {
+    const { generateWorkBranchName } = await import('./dag-executor');
+    expect(generateWorkBranchName('WO-FOO-01', 'abc12345')).toBe('wo/wo-foo-01-abc12345');
+  });
+
+  it('lowercases woId', async () => {
+    const { generateWorkBranchName } = await import('./dag-executor');
+    expect(generateWorkBranchName('WO-HARNESS-PARALLEL-WORKTREE-ISOLATION-01', 'abc12345')).toBe(
+      'wo/wo-harness-parallel-worktree-isolation-01-abc12345'
+    );
+  });
+
+  it('truncates threadId to first 8 chars (matches ${WORKFLOW_ID:0:8} in bash node)', async () => {
+    const { generateWorkBranchName } = await import('./dag-executor');
+    expect(generateWorkBranchName('WO-FOO-01', 'abc123456789deadbeef')).toBe(
+      'wo/wo-foo-01-abc12345'
+    );
+  });
+
+  it('parallel runs same WO_ID, different run ids -> different branches (worktree-collision prevention)', async () => {
+    // Anchor: 2026-05-17 sortie. Two parallel fires for the same WO each had
+    // different workflow_run_id values; their thread_id-derived branch suffixes
+    // must differ so `git worktree add` does not collide.
+    const { generateWorkBranchName } = await import('./dag-executor');
+    const branch1 = generateWorkBranchName('WO-FOO-01', 'abc12345');
+    const branch2 = generateWorkBranchName('WO-FOO-01', 'def67890');
+    expect(branch1).not.toBe(branch2);
+    expect(branch1).toMatch(/^wo\/wo-foo-01-/);
+    expect(branch2).toMatch(/^wo\/wo-foo-01-/);
+  });
+
+  it('same run id, different WO_IDs -> different branches', async () => {
+    const { generateWorkBranchName } = await import('./dag-executor');
+    const branch1 = generateWorkBranchName('WO-FOO-01', 'abc12345');
+    const branch2 = generateWorkBranchName('WO-BAR-02', 'abc12345');
+    expect(branch1).not.toBe(branch2);
+  });
+
+  it('mixed-case WO_IDs collapse to a single canonical lowercase branch', async () => {
+    // Defensive: the bash node lowercases WO_ID before substitution; the TS
+    // helper must agree so the two paths produce identical branch names.
+    const { generateWorkBranchName } = await import('./dag-executor');
+    expect(generateWorkBranchName('WO-Foo-01', 'abc12345')).toBe(
+      generateWorkBranchName('wo-foo-01', 'abc12345')
+    );
+  });
+
+  it('shorter-than-8-char threadId is preserved as-is (caller responsibility)', async () => {
+    // Best-effort: if the caller passes a thread id shorter than 8 chars,
+    // `.slice(0, 8)` returns the entire string. Documents the contract --
+    // callers should pass workflow_run_id, which is always longer than 8 chars.
+    const { generateWorkBranchName } = await import('./dag-executor');
+    expect(generateWorkBranchName('WO-FOO-01', 'abc')).toBe('wo/wo-foo-01-abc');
+  });
+});
+
 describe('executeDagWorkflow -- final status derivation', () => {
   // Invariant: if ANY non-skipped node has failed status, the run must be
   // marked 'failed' — never 'completed' — regardless of how many other nodes
