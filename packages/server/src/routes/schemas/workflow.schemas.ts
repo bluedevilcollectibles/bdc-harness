@@ -165,6 +165,17 @@ export const workflowEventSchema = z
   })
   .openapi('WorkflowEvent');
 
+/** GET /api/workflows/runs/:runId/nodes/:nodeId/events query params. */
+export const nodeEventsQuerySchema = z.object({
+  // String — handler parses and clamps to [1, 20]; default 5.
+  limit: z.string().optional(),
+});
+
+/** GET /api/workflows/runs/:runId/nodes/:nodeId/events response. */
+export const nodeEventsResponseSchema = z
+  .object({ events: z.array(workflowEventSchema) })
+  .openapi('NodeEventsResponse');
+
 /** GET /api/workflows/runs/:runId response. */
 export const workflowRunDetailSchema = z
   .object({

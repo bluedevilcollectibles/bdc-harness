@@ -24,6 +24,9 @@ const mockGetWorkflowRunByWorkerPlatformId = mock(
   async (_id: string) => null as null | MockWorkflowRun
 );
 const mockListWorkflowEvents = mock(async (_runId: string) => [] as MockWorkflowEvent[]);
+const mockListNodeEvents = mock(
+  async (_runId: string, _stepName: string, _limit: number) => [] as MockWorkflowEvent[]
+);
 const mockGetConversationById = mock(
   async (_id: string) =>
     null as null | { id: string; platform_conversation_id: string; platform_type: string }
@@ -199,6 +202,7 @@ const mockCreateWorkflowEvent = mock(async (_event: unknown) => {});
 
 mock.module('@archon/core/db/workflow-events', () => ({
   listWorkflowEvents: mockListWorkflowEvents,
+  listNodeEvents: mockListNodeEvents,
   createWorkflowEvent: mockCreateWorkflowEvent,
 }));
 
@@ -1009,6 +1013,106 @@ describe('GET /api/workflows/runs/:runId', () => {
 
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('Failed to get workflow run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: GET /api/workflows/runs/:runId/nodes/:nodeId/events (WO-MC-NODE-PEEK-01)
+// ---------------------------------------------------------------------------
+
+describe('GET /api/workflows/runs/:runId/nodes/:nodeId/events', () => {
+  beforeEach(() => {
+    mockGetWorkflowRun.mockReset();
+    mockListNodeEvents.mockReset();
+  });
+
+  test('returns last N events for the node, newest first', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+    const planEvents: MockWorkflowEvent[] = [
+      {
+        id: 'evt-3',
+        workflow_run_id: 'run-uuid-1',
+        event_type: 'node_completed',
+        step_index: 0,
+        step_name: 'plan',
+        data: { node_output: 'plan complete', duration_ms: 4321 },
+        created_at: NOW,
+      },
+      {
+        id: 'evt-1',
+        workflow_run_id: 'run-uuid-1',
+        event_type: 'node_started',
+        step_index: 0,
+        step_name: 'plan',
+        data: { command: 'plan' },
+        created_at: NOW,
+      },
+    ];
+    mockListNodeEvents.mockImplementationOnce(async () => planEvents);
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-1/nodes/plan/events?limit=5');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as { events: Array<{ event_type: string }> };
+    expect(body.events.length).toBe(2);
+    expect(body.events[0]?.event_type).toBe('node_completed');
+    expect(mockListNodeEvents).toHaveBeenCalledWith('run-uuid-1', 'plan', 5);
+  });
+
+  test('defaults limit to 5 when not provided', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+    mockListNodeEvents.mockImplementationOnce(async () => []);
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-1/nodes/plan/events');
+    expect(response.status).toBe(200);
+    expect(mockListNodeEvents).toHaveBeenCalledWith('run-uuid-1', 'plan', 5);
+  });
+
+  test('clamps limit to maximum of 20', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+    mockListNodeEvents.mockImplementationOnce(async () => []);
+
+    const { app } = makeApp();
+    const response = await app.request(
+      '/api/workflows/runs/run-uuid-1/nodes/plan/events?limit=1000'
+    );
+    expect(response.status).toBe(200);
+    expect(mockListNodeEvents).toHaveBeenCalledWith('run-uuid-1', 'plan', 20);
+  });
+
+  test('clamps limit to minimum of 1 for non-positive values', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+    mockListNodeEvents.mockImplementationOnce(async () => []);
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-1/nodes/plan/events?limit=0');
+    expect(response.status).toBe(200);
+    expect(mockListNodeEvents).toHaveBeenCalledWith('run-uuid-1', 'plan', 1);
+  });
+
+  test('returns 404 when run not found', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => null);
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/nope/nodes/plan/events');
+    expect(response.status).toBe(404);
+    expect(mockListNodeEvents).not.toHaveBeenCalled();
+  });
+
+  test('returns 500 when DB throws', async () => {
+    mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+    mockListNodeEvents.mockImplementationOnce(async () => {
+      throw new Error('connection refused');
+    });
+
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/runs/run-uuid-1/nodes/plan/events');
+    expect(response.status).toBe(500);
+
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Failed to get node events');
   });
 });
 

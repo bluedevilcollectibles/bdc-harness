@@ -85,6 +85,38 @@ export async function listWorkflowEvents(workflowRunId: string): Promise<Workflo
 }
 
 /**
+ * List recent events for a single node in a workflow run, newest first.
+ *
+ * Used by the node peek side panel to show the latest activity for a node.
+ * Caller can reverse the array if chronological order is required.
+ */
+export async function listNodeEvents(
+  workflowRunId: string,
+  stepName: string,
+  limit: number
+): Promise<WorkflowEventRow[]> {
+  try {
+    const result = await pool.query<WorkflowEventRow>(
+      `SELECT * FROM remote_agent_workflow_events
+       WHERE workflow_run_id = $1 AND step_name = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [workflowRunId, stepName, limit]
+    );
+    return [...result.rows].map(row => ({
+      ...row,
+      data: typeof row.data === 'string' ? JSON.parse(row.data) : row.data,
+    }));
+  } catch (error) {
+    getLog().error(
+      { err: error as Error, runId: workflowRunId, stepName },
+      'db.workflow_node_events_list_failed'
+    );
+    throw new Error(`Failed to list node events: ${(error as Error).message}`);
+  }
+}
+
+/**
  * List recent events for a workflow run since a given timestamp.
  */
 export async function listRecentEvents(

@@ -8,6 +8,7 @@ import { StepLogs } from './StepLogs';
 import { WorkflowLogs } from './WorkflowLogs';
 import { WorkflowDagViewer } from './WorkflowDagViewer';
 import { ArtifactSummary } from './ArtifactSummary';
+import { NodePeekPanel } from './NodePeekPanel';
 import { ChatInterface } from '@/components/chat/ChatInterface';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
@@ -103,6 +104,8 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   const [activeView, setActiveView] = useState<'graph' | 'logs' | 'chat'>('graph');
   // Increments on every user-initiated node click to trigger scroll in WorkflowLogs
   const [nodeScrollTrigger, setNodeScrollTrigger] = useState(0);
+  // Controls the NodePeekPanel overlay in the graph view.
+  const [peekOpen, setPeekOpen] = useState(false);
   // Track which codebaseId we've already fetched to avoid stale re-fetches during runId transitions
   const fetchedCodebaseIdRef = useRef<string | null>(null);
 
@@ -114,6 +117,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     setWorkerRunId(null);
     setActiveView('graph');
     setNodeScrollTrigger(0);
+    setPeekOpen(false);
     fetchedCodebaseIdRef.current = null;
   }, [runId]);
 
@@ -527,10 +531,17 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
 
   // Handler for user-initiated node clicks (graph or sidebar).
   // Increments scroll trigger so WorkflowLogs scrolls to the node's section.
-  const handleNodeClick = useCallback((nodeId: string): void => {
-    setSelectedDagNode(nodeId);
-    setNodeScrollTrigger(prev => prev + 1);
-  }, []);
+  // In the graph view, also opens the NodePeekPanel side drawer.
+  const handleNodeClick = useCallback(
+    (nodeId: string): void => {
+      setSelectedDagNode(nodeId);
+      setNodeScrollTrigger(prev => prev + 1);
+      if (activeView === 'graph') {
+        setPeekOpen(true);
+      }
+    },
+    [activeView]
+  );
 
   if (error) {
     return (
@@ -594,26 +605,49 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     </div>
   );
 
+  const peekNodeDef =
+    peekOpen && selectedDagNode && dagDefinitionNodes
+      ? (dagDefinitionNodes.find(n => n.id === selectedDagNode) ?? null)
+      : null;
+  const peekNodeStatus =
+    peekOpen && selectedDagNode
+      ? workflow.dagNodes.find(n => n.nodeId === selectedDagNode)?.status
+      : undefined;
+
   const renderBody = (): React.ReactElement => {
     if (isDag && activeView === 'graph') {
       return (
         <ResizablePanelGroup orientation="horizontal" className="flex-1 min-h-0">
           <ResizablePanel defaultSize={60} minSize={30}>
-            {dagDefinitionNodes ? (
-              <WorkflowDagViewer
-                dagNodes={dagDefinitionNodes}
-                liveStatus={workflow.dagNodes}
-                isRunning={isRunning}
-                currentlyExecuting={currentlyExecuting ?? undefined}
-                selectedNodeId={selectedDagNode}
-                onNodeClick={handleNodeClick}
-              />
-            ) : (
-              <div className="flex items-center justify-center h-full text-text-secondary">
-                <span className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-accent border-t-transparent mr-2" />
-                Loading graph...
-              </div>
-            )}
+            <div className="relative h-full">
+              {dagDefinitionNodes ? (
+                <WorkflowDagViewer
+                  dagNodes={dagDefinitionNodes}
+                  liveStatus={workflow.dagNodes}
+                  isRunning={isRunning}
+                  currentlyExecuting={currentlyExecuting ?? undefined}
+                  selectedNodeId={selectedDagNode}
+                  onNodeClick={handleNodeClick}
+                />
+              ) : (
+                <div className="flex items-center justify-center h-full text-text-secondary">
+                  <span className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-accent border-t-transparent mr-2" />
+                  Loading graph...
+                </div>
+              )}
+              {peekOpen && selectedDagNode && (
+                <NodePeekPanel
+                  runId={runId}
+                  nodeId={selectedDagNode}
+                  nodeDef={peekNodeDef}
+                  nodeStatus={peekNodeStatus}
+                  isRunning={isRunning}
+                  onClose={(): void => {
+                    setPeekOpen(false);
+                  }}
+                />
+              )}
+            </div>
           </ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel defaultSize={40} minSize={20}>
