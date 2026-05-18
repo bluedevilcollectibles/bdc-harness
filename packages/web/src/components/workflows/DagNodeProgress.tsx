@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { StatusIcon } from './StatusIcon';
 import { formatDurationMs } from '@/lib/format';
+import { formatCostUsd, costColorClass } from '@/lib/cost-utils';
 import type { DagNodeState } from '@/lib/types';
 
 interface DagNodeProgressProps {
@@ -56,6 +57,11 @@ function DagNodeItem({
           {node.duration !== undefined && (
             <span className="text-xs text-text-secondary shrink-0">
               {formatDurationMs(node.duration)}
+            </span>
+          )}
+          {node.costUsd !== undefined && (
+            <span className={`text-xs shrink-0 ${costColorClass(node.costUsd)}`}>
+              {formatCostUsd(node.costUsd)}
             </span>
           )}
         </div>

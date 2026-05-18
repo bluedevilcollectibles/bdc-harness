@@ -50,6 +50,8 @@ export const TRANSIENT_PATTERNS = [
   '429',
   '503',
   '502',
+  '529', // Anthropic HTTP 529 = service overloaded
+  'overloaded', // Anthropic/Minimax overload message text
   'network error',
   'socket hang up',
   'exited with code',
@@ -386,6 +388,7 @@ export function substituteWorkflowVariables(
   // Substitute basic variables
   let result = prompt
     .replace(/\$WORKFLOW_ID/g, workflowId)
+    .replace(/\$\{run\.id\}/g, workflowId)
     .replace(/\$USER_MESSAGE/g, userMessage)
     .replace(/\$ARGUMENTS/g, userMessage)
     .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
@@ -414,6 +417,24 @@ export function substituteWorkflowVariables(
     prompt: result,
     contextSubstituted: hasContextVariables && !!issueContext,
   };
+}
+
+/**
+ * Substitute `${input.name}` references in bash scripts with resolved workflow
+ * input values.
+ *
+ * Safe in bash: '.' is not a valid bash identifier character, so `${input.name}`
+ * can never be a real bash variable expansion — no false positives exist.
+ * Any reference whose name is not in resolvedInputs is left unchanged so the
+ * shell's own `bad substitution` surfaces the misconfiguration clearly.
+ */
+export function substituteInputRefs(
+  script: string,
+  resolvedInputs: Record<string, string>
+): string {
+  return script.replace(/\$\{input\.([a-zA-Z_][a-zA-Z0-9_]*)\}/g, (match, name) =>
+    name in resolvedInputs ? resolvedInputs[name] : match
+  );
 }
 
 /**
@@ -529,4 +550,60 @@ export function stripCompletionTags(content: string, until?: string): string {
  */
 export function isInlineScript(script: string): boolean {
   return script.includes('\n') || /[;(){}&|<>$`"' ]/.test(script);
+}
+
+// ─── Agent Persona Resolution ────────────────────────────────────────────────
+
+import type { AgentPersona } from './agents/registry';
+
+/**
+ * Result of resolving an agent persona for a DAG node dispatch.
+ *
+ * When an agent persona is resolved:
+ * - `model` overrides the node's model (agent wins, log a warning if different)
+ * - `systemPrompt` is prepended to the node's prompt
+ * - `tools` is set as `allowed_tools` on the dispatch options (if the agent declares tools)
+ */
+export interface AgentPersonaResolution {
+  model: string;
+  systemPrompt: string;
+  allowedTools?: string[];
+  agentName: string;
+}
+
+/**
+ * Apply an agent persona to node dispatch options.
+ *
+ * The persona's model takes precedence over the node's resolved model.
+ * If a mismatch is detected, a warning is logged.
+ * The persona's system prompt is prepended to the node prompt.
+ * The persona's tool list (if present) is applied as allowed_tools.
+ */
+export function resolveAgentPersona(
+  persona: AgentPersona,
+  currentModel: string | undefined
+): AgentPersonaResolution {
+  if (currentModel !== undefined && currentModel !== persona.model) {
+    getLog().warn(
+      { agentName: persona.name, agentModel: persona.model, nodeModel: currentModel },
+      'agent.model_mismatch_agent_wins'
+    );
+  }
+
+  const resolution: AgentPersonaResolution = {
+    model: persona.model,
+    systemPrompt: persona.systemPrompt,
+    agentName: persona.name,
+  };
+
+  if (persona.tools && persona.tools.length > 0) {
+    resolution.allowedTools = persona.tools;
+  }
+
+  getLog().info(
+    { name: persona.name, model: persona.model, tools: persona.tools ?? [] },
+    'agent.resolved'
+  );
+
+  return resolution;
 }

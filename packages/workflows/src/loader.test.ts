@@ -34,6 +34,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 import { discoverWorkflows } from './workflow-discovery';
+import { getLoaderErrors } from './loader';
 import { isBashNode, isCancelNode, isLoopNode } from './schemas';
 import * as bundledDefaults from './defaults/bundled-defaults';
 
@@ -2131,6 +2132,36 @@ nodes:
       }
     });
 
+    it('should parse loop node with until_file shorthand', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-until-file.yaml'),
+        `
+name: loop-until-file
+description: Loop with file sentinel
+nodes:
+  - id: my-loop
+    loop:
+      prompt: "Work until .archon/done.txt exists."
+      until: COMPLETE
+      max_iterations: 5
+      until_file: "done.txt"
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+      const wf = result.workflows[0].workflow;
+      expect(isLoopNode(wf.nodes[0])).toBe(true);
+      if (isLoopNode(wf.nodes[0])) {
+        expect(wf.nodes[0].loop.until_file).toBe('done.txt');
+        expect(wf.nodes[0].loop.until_bash).toBeUndefined();
+      }
+    });
+
     it('should parse minimal loop node (only required fields)', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
@@ -2155,8 +2186,9 @@ nodes:
       expect(wf.nodes).toBeDefined();
       expect(isLoopNode(wf.nodes[0])).toBe(true);
       if (isLoopNode(wf.nodes[0])) {
-        expect(wf.nodes[0].loop.fresh_context).toBe(false);
+        expect(wf.nodes[0].loop.fresh_context).toBe(true);
         expect(wf.nodes[0].loop.until_bash).toBeUndefined();
+        expect(wf.nodes[0].loop.until_file).toBeUndefined();
       }
     });
 
@@ -2415,6 +2447,41 @@ nodes:
         'interactive_loop_in_non_interactive_workflow'
       );
     });
+
+    it('should preserve agent: field on loop node and not fire ai_fields_ignored warning', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'loop-agent.yaml'),
+        `
+name: loop-agent
+description: Loop with agent persona
+nodes:
+  - id: iterate
+    agent: major-build
+    loop:
+      prompt: "Do the work."
+      until: "COMPLETE"
+      max_iterations: 5
+`
+      );
+
+      (mockLogger.warn as Mock<() => undefined>).mockClear();
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows).toHaveLength(1);
+
+      const node = result.workflows[0].workflow.nodes[0];
+      expect(isLoopNode(node)).toBe(true);
+      expect((node as { agent?: string }).agent).toBe('major-build');
+
+      const warnCalls = (mockLogger.warn as Mock<() => undefined>).mock.calls;
+      const aiFieldWarnings = warnCalls.filter(
+        call => typeof call[1] === 'string' && (call[1] as string).includes('ai_fields_ignored')
+      );
+      expect(aiFieldWarnings).toHaveLength(0);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -2510,6 +2577,100 @@ nodes:
       expect(result.errors).toHaveLength(0);
       // AI fields should produce a warning log
       expect(mockLogger.warn).toHaveBeenCalled();
+    });
+  });
+
+  describe('loader error registry', () => {
+    it('captures malformed YAML as parse_error', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(join(workflowDir, 'bad-syntax.yaml'), 'name: bad\nnodes:\n  - id: [\n');
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const errors = getLoaderErrors();
+
+      expect(result.errors).toHaveLength(1);
+      expect(errors).toHaveLength(1);
+      expect(errors[0].filename).toBe('bad-syntax.yaml');
+      expect(errors[0].error_type).toBe('parse_error');
+      expect(errors[0].message).toContain('YAML parse error');
+    });
+
+    it('captures loop missing until as dag_invalid', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(
+        join(workflowDir, 'missing-until.yaml'),
+        `
+name: missing-until
+description: Loop missing required field
+nodes:
+  - id: implement
+    loop:
+      prompt: Build it.
+      max_iterations: 3
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const errors = getLoaderErrors();
+
+      expect(result.errors).toHaveLength(1);
+      expect(errors).toHaveLength(1);
+      expect(errors[0].filename).toBe('missing-until.yaml');
+      expect(errors[0].error_type).toBe('dag_invalid');
+      expect(errors[0].message).toContain('loop.until');
+    });
+
+    it('returns all current load failures from getLoaderErrors()', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      await writeFile(join(workflowDir, 'bad-syntax.yaml'), 'name: bad\nnodes:\n  - id: [\n');
+      await writeFile(
+        join(workflowDir, 'missing-until.yaml'),
+        `
+name: missing-until
+description: Loop missing required field
+nodes:
+  - id: implement
+    loop:
+      prompt: Build it.
+      max_iterations: 3
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      const errors = getLoaderErrors();
+
+      expect(result.errors).toHaveLength(2);
+      expect(errors.map(e => e.filename).sort()).toEqual(['bad-syntax.yaml', 'missing-until.yaml']);
+      expect(errors.map(e => e.error_type).sort()).toEqual(['dag_invalid', 'parse_error']);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // target_repo round-trip (Rule 28)
+  // ---------------------------------------------------------------------------
+
+  describe('target_repo', () => {
+    it('parseWorkflow round-trips target_repo', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: repo-guard\ndescription: Cross-repo guard test\ntarget_repo: bluedevilcollectibles/bdc-xo\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'repo-guard.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.target_repo).toBe('bluedevilcollectibles/bdc-xo');
+    });
+
+    it('parseWorkflow without target_repo leaves field undefined', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: no-target\ndescription: No target_repo\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'no-target.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.target_repo).toBeUndefined();
     });
   });
 });

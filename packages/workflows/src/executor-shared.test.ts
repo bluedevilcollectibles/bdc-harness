@@ -18,6 +18,7 @@ mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
 }));
 
+import type { AgentPersona } from './agents/registry';
 import {
   substituteWorkflowVariables,
   buildPromptWithContext,
@@ -26,6 +27,8 @@ import {
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
+  classifyError,
+  resolveAgentPersona,
 } from './executor-shared';
 
 describe('substituteWorkflowVariables', () => {
@@ -563,5 +566,108 @@ describe('formatSubprocessFailure', () => {
     const { userMessage } = formatSubprocessFailure({ stderr: 'diagnostic' }, "Script node 'n1'");
     expect(userMessage).not.toContain('[exit');
     expect(userMessage).toContain('diagnostic');
+  });
+});
+
+describe('classifyError', () => {
+  it('classifies 429 as TRANSIENT', () => {
+    expect(classifyError(new Error('rate limit: 429 too many requests'))).toBe('TRANSIENT');
+  });
+
+  it('classifies 529 as TRANSIENT', () => {
+    expect(classifyError(new Error('HTTP 529 service overloaded'))).toBe('TRANSIENT');
+  });
+
+  it('classifies overloaded messages as TRANSIENT', () => {
+    expect(classifyError(new Error('Minimax: overloaded, try again later'))).toBe('TRANSIENT');
+  });
+
+  it('classifies 401 as FATAL', () => {
+    expect(classifyError(new Error('401 unauthorized'))).toBe('FATAL');
+  });
+
+  it('FATAL takes priority over TRANSIENT when both match', () => {
+    expect(classifyError(new Error('unauthorized: exited with code 1'))).toBe('FATAL');
+  });
+
+  it('classifies unknown errors as UNKNOWN', () => {
+    expect(classifyError(new Error('something completely unexpected happened'))).toBe('UNKNOWN');
+  });
+});
+
+describe('resolveAgentPersona', () => {
+  function makePersona(overrides?: Partial<AgentPersona>): AgentPersona {
+    return {
+      name: 'test-agent',
+      model: 'sonnet',
+      systemPrompt: 'You are a test agent. Do your job.',
+      ...overrides,
+    };
+  }
+
+  it('uses persona model as the resolved model', () => {
+    const persona = makePersona({ model: 'opus' });
+    const resolution = resolveAgentPersona(persona, undefined);
+    expect(resolution.model).toBe('opus');
+  });
+
+  it('persona model wins over current node model', () => {
+    const persona = makePersona({ model: 'sonnet' });
+    const resolution = resolveAgentPersona(persona, 'opus');
+    expect(resolution.model).toBe('sonnet');
+  });
+
+  it('returns the persona systemPrompt', () => {
+    const persona = makePersona({ systemPrompt: 'You are the architect.' });
+    const resolution = resolveAgentPersona(persona, undefined);
+    expect(resolution.systemPrompt).toBe('You are the architect.');
+  });
+
+  it('returns persona name in agentName field', () => {
+    const persona = makePersona({ name: 'war-council-architect' });
+    const resolution = resolveAgentPersona(persona, undefined);
+    expect(resolution.agentName).toBe('war-council-architect');
+  });
+
+  it('sets allowedTools when persona has a tools list', () => {
+    const persona = makePersona({ tools: ['Read', 'Grep', 'Glob'] });
+    const resolution = resolveAgentPersona(persona, undefined);
+    expect(resolution.allowedTools).toEqual(['Read', 'Grep', 'Glob']);
+  });
+
+  it('allowedTools is undefined when persona has no tools', () => {
+    const persona = makePersona({ tools: undefined });
+    const resolution = resolveAgentPersona(persona, undefined);
+    expect(resolution.allowedTools).toBeUndefined();
+  });
+
+  it('logs a warning when node model differs from persona model', () => {
+    mockLogFn.mockClear();
+    const persona = makePersona({ model: 'sonnet' });
+    resolveAgentPersona(persona, 'opus');
+    const warnCalls = mockLogFn.mock.calls.filter(
+      (call: unknown[]) => typeof call[1] === 'string' && (call[1] as string).includes('mismatch')
+    );
+    expect(warnCalls.length).toBeGreaterThan(0);
+  });
+
+  it('does not log a warning when node model matches persona model', () => {
+    mockLogFn.mockClear();
+    const persona = makePersona({ model: 'sonnet' });
+    resolveAgentPersona(persona, 'sonnet');
+    const warnCalls = mockLogFn.mock.calls.filter(
+      (call: unknown[]) => typeof call[1] === 'string' && (call[1] as string).includes('mismatch')
+    );
+    expect(warnCalls.length).toBe(0);
+  });
+
+  it('does not log a warning when currentModel is undefined', () => {
+    mockLogFn.mockClear();
+    const persona = makePersona({ model: 'opus' });
+    resolveAgentPersona(persona, undefined);
+    const warnCalls = mockLogFn.mock.calls.filter(
+      (call: unknown[]) => typeof call[1] === 'string' && (call[1] as string).includes('mismatch')
+    );
+    expect(warnCalls.length).toBe(0);
   });
 });

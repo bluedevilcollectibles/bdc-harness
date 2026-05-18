@@ -4,6 +4,9 @@
  * that the inner dag-executor.test.ts cannot reach.
  */
 import { describe, it, expect, mock, beforeEach } from 'bun:test';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -27,8 +30,10 @@ mock.module('@archon/paths', () => ({
 }));
 
 // --- Mock git ---
+const mockGetRemoteUrl = mock(async (): Promise<string | null> => null);
 mock.module('@archon/git', () => ({
   getDefaultBranch: mock(async () => 'main'),
+  getRemoteUrl: mockGetRemoteUrl,
   toRepoPath: mock((p: string) => p),
 }));
 
@@ -75,6 +80,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     updateWorkflowRun: mock(async () => {}),
     failWorkflowRun: mock(async () => {}),
     getWorkflowRun: mock(async () => ({ ...makeRun(), status: 'completed' as const })),
+    getWorkflowRunStatus: mock(async () => 'completed' as const),
     createWorkflowEvent: mock(async () => {}),
     findResumableRun: mock(async () => null),
     getCompletedDagNodeOutputs: mock(async () => new Map()),
@@ -131,6 +137,10 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     metadata: {},
     ...overrides,
   };
+}
+
+function getExecutedWorkflow(): WorkflowDefinition {
+  return mockExecuteDagWorkflow.mock.calls[0]?.[4] as WorkflowDefinition;
 }
 
 describe('executeWorkflow', () => {
@@ -711,6 +721,125 @@ describe('executeWorkflow', () => {
   });
 
   // -------------------------------------------------------------------------
+  // policyFile
+  // -------------------------------------------------------------------------
+
+  describe('policyFile', () => {
+    it('loads policyFile content into prompt node systemPrompt', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
+      try {
+        await writeFile(join(cwd, 'policy.md'), 'TEST POLICY CONTENT');
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            policyFile: 'policy.md',
+            nodes: [
+              { id: 'node1', prompt: 'Do something' },
+              { id: 'loop1', loop: { prompt: 'Iterate', until: 'DONE', max_iterations: 2 } },
+            ],
+          }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(true);
+        expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+        const executedWorkflow = getExecutedWorkflow();
+        expect(executedWorkflow.nodes[0]).toMatchObject({
+          systemPrompt: 'TEST POLICY CONTENT',
+        });
+        expect(executedWorkflow.nodes[1]).toMatchObject({
+          systemPrompt: 'TEST POLICY CONTENT',
+        });
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed when policyFile is missing', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
+      try {
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({ policyFile: 'missing-policy.md' }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('policyFile not found');
+        expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed when policyFile is empty', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
+      try {
+        await writeFile(join(cwd, 'empty-policy.md'), '');
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({ policyFile: 'empty-policy.md' }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('policyFile is empty');
+        expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('prepends policyFile content before an existing prompt node systemPrompt', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
+      try {
+        await writeFile(join(cwd, 'policy.md'), 'TEST POLICY CONTENT');
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            policyFile: 'policy.md',
+            nodes: [{ id: 'node1', prompt: 'Do something', systemPrompt: 'NODE-SPECIFIC' }],
+          }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(true);
+        expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+        const executedWorkflow = getExecutedWorkflow();
+        expect(executedWorkflow.nodes[0]).toMatchObject({
+          systemPrompt: 'TEST POLICY CONTENT\n\nNODE-SPECIFIC',
+        });
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // Pre-created run (uses existing row but still runs guards)
   // -------------------------------------------------------------------------
 
@@ -950,5 +1079,169 @@ describe('executeWorkflow', () => {
       expect(msg).toContain('running 1m');
       expect(msg).toContain('Wait for it to finish');
     });
+  });
+});
+
+describe('finally backstop', () => {
+  it('calls failWorkflowRun when run is still running at finally', async () => {
+    const failSpy = mock(async () => {});
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'running' as const),
+      failWorkflowRun: failSpy,
+    });
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test',
+      'db-conv-1'
+    );
+
+    const call = (failSpy.mock.calls as unknown[][]).find(
+      c => typeof c[1] === 'string' && (c[1] as string).includes('exited without finalizing')
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('does not call failWorkflowRun when run already completed', async () => {
+    const failSpy = mock(async () => {});
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'completed' as const),
+      failWorkflowRun: failSpy,
+    });
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test',
+      'db-conv-1'
+    );
+
+    const backstopCall = (failSpy.mock.calls as unknown[][]).find(
+      c => typeof c[1] === 'string' && (c[1] as string).includes('exited without finalizing')
+    );
+    expect(backstopCall).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// target_repo pre-flight guard (Rule 28)
+// ---------------------------------------------------------------------------
+
+describe('target_repo pre-flight guard', () => {
+  beforeEach(() => {
+    mockLogFn.mockClear();
+    mockExecuteDagWorkflow.mockClear();
+    mockEmitter.registerRun.mockClear();
+    mockEmitter.unregisterRun.mockClear();
+    mockEmitter.emit.mockClear();
+    mockGetRemoteUrl.mockClear();
+    mockExecuteDagWorkflow.mockImplementation(async (): Promise<string | undefined> => undefined);
+  });
+
+  it('blocks workflow when target_repo does not match origin remote', async () => {
+    mockGetRemoteUrl.mockImplementation(
+      async () => 'https://github.com/bluedevilcollectibles/bdc-harness.git'
+    );
+    const failWorkflowRunSpy = mock(async () => {});
+    const createEventSpy = mock(async () => {});
+    const store = makeStore({
+      failWorkflowRun: failWorkflowRunSpy,
+      createWorkflowEvent: createEventSpy,
+    });
+    const deps = makeDeps(store);
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(result.success).toBe(false);
+    expect((result as { error: string }).error).toContain('target_repo_mismatch');
+    expect(failWorkflowRunSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.stringContaining('target_repo_mismatch')
+    );
+    // dag_workflow_failed event must be written
+    const dagFailCall = (createEventSpy.mock.calls as unknown[][]).find(
+      c => (c[0] as { event_type: string }).event_type === 'dag_workflow_failed'
+    );
+    expect(dagFailCall).toBeDefined();
+    // dag-executor must NOT have been called
+    expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('proceeds when target_repo matches origin remote (HTTPS)', async () => {
+    mockGetRemoteUrl.mockImplementation(
+      async () => 'https://github.com/bluedevilcollectibles/bdc-xo.git'
+    );
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockExecuteDagWorkflow).toHaveBeenCalled();
+  });
+
+  it('proceeds when target_repo matches origin remote (SSH)', async () => {
+    mockGetRemoteUrl.mockImplementation(
+      async () => 'git@github.com:bluedevilcollectibles/bdc-xo.git'
+    );
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow({ target_repo: 'bluedevilcollectibles/bdc-xo' }),
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockExecuteDagWorkflow).toHaveBeenCalled();
+  });
+
+  it('skips target_repo check when field is not set', async () => {
+    // getRemoteUrl should never be called
+    const store = makeStore();
+    const deps = makeDeps(store);
+
+    await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(), // no target_repo
+      'test message',
+      'db-conv-1'
+    );
+
+    expect(mockGetRemoteUrl).not.toHaveBeenCalled();
+    expect(mockExecuteDagWorkflow).toHaveBeenCalled();
   });
 });

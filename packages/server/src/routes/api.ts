@@ -28,6 +28,7 @@ import {
   ConversationNotFoundError,
   generateAndSetTitle,
 } from '@archon/core';
+import { createWorkflowDeps } from '@archon/core/workflows';
 import { removeWorktree, toRepoPath, toWorktreePath } from '@archon/git';
 import {
   createLogger,
@@ -45,7 +46,8 @@ import {
   BUNDLED_VERSION,
 } from '@archon/paths';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
-import { parseWorkflow } from '@archon/workflows/loader';
+import { executeWorkflow } from '@archon/workflows/executor';
+import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
 import { isValidCommandName } from '@archon/workflows/command-validation';
 import { BUNDLED_WORKFLOWS, BUNDLED_COMMANDS, isBinaryBuild } from '@archon/workflows/defaults';
 import {
@@ -72,6 +74,7 @@ import { errorSchema } from './schemas/common.schemas';
 import { updateCheckResponseSchema } from './schemas/system.schemas';
 import {
   workflowListResponseSchema,
+  workflowErrorsResponseSchema,
   validateWorkflowBodySchema,
   validateWorkflowResponseSchema,
   getWorkflowResponseSchema,
@@ -80,8 +83,14 @@ import {
   commandListResponseSchema,
   workflowRunListResponseSchema,
   workflowRunDetailSchema,
+  nodeEventsQuerySchema,
+  nodeEventsResponseSchema,
   workflowRunByWorkerResponseSchema,
+  cancelWorkflowRunBodySchema,
   cancelWorkflowRunResponseSchema,
+  cancelStaleRunsResponseSchema,
+  pauseWorkflowRunBodySchema,
+  pauseWorkflowRunResponseSchema,
   workflowRunActionResponseSchema,
   dashboardRunsResponseSchema,
   runWorkflowBodySchema,
@@ -89,6 +98,11 @@ import {
   workflowRunsQuerySchema,
   approveWorkflowRunBodySchema,
   rejectWorkflowRunBodySchema,
+  archiveWorkflowRunBodySchema,
+  unarchiveWorkflowRunBodySchema,
+  bulkArchiveBodySchema,
+  bulkArchiveResponseSchema,
+  bulkDeleteFailedResponseSchema,
 } from './schemas/workflow.schemas';
 import {
   conversationListResponseSchema,
@@ -121,7 +135,9 @@ import {
   codebaseEnvironmentsResponseSchema,
 } from './schemas/config.schemas';
 import { providerListResponseSchema } from './schemas/provider.schemas';
+import { throttleBodySchema, throttleResponseSchema } from './schemas/admin.schemas';
 import { getProviderInfoList, isRegisteredProvider } from '@archon/providers';
+import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 
 // Read app version: use build-time constant in binary, package.json in dev
 let appVersion = 'unknown';
@@ -166,6 +182,22 @@ const getWorkflowsRoute = createRoute({
     200: {
       content: { 'application/json': { schema: workflowListResponseSchema } },
       description: 'OK',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getWorkflowErrorsRoute = createRoute({
+  method: 'get',
+  path: '/api/workflows/errors',
+  tags: ['Workflows'],
+  summary: 'List workflow loader validation errors',
+  request: { query: cwdQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: workflowErrorsResponseSchema } },
+      description: 'Workflow loader errors',
     },
     400: jsonError('Bad request'),
     500: jsonError('Server error'),
@@ -612,7 +644,13 @@ const cancelWorkflowRunRoute = createRoute({
   path: '/api/workflows/runs/{runId}/cancel',
   tags: ['Workflows'],
   summary: 'Cancel a workflow run',
-  request: { params: z.object({ runId: z.string() }) },
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: {
+      content: { 'application/json': { schema: cancelWorkflowRunBodySchema } },
+      required: false,
+    },
+  },
   responses: {
     200: {
       content: { 'application/json': { schema: cancelWorkflowRunResponseSchema } },
@@ -620,6 +658,79 @@ const cancelWorkflowRunRoute = createRoute({
     },
     400: jsonError('Bad request'),
     404: jsonError('Not found'),
+    409: jsonError('Already cancelled'),
+    422: jsonError('Cannot cancel a terminal run'),
+    500: jsonError('Server error'),
+  },
+});
+
+const pauseWorkflowRunRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/pause',
+  tags: ['Workflows'],
+  summary: 'Pause a running workflow run (operator-triggered)',
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: {
+      content: { 'application/json': { schema: pauseWorkflowRunBodySchema } },
+      required: false,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: pauseWorkflowRunResponseSchema } },
+      description: 'Paused',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
+    409: jsonError('Already paused'),
+    422: jsonError('Cannot pause a terminal run'),
+    500: jsonError('Server error'),
+  },
+});
+
+const adminThrottleRoute = createRoute({
+  method: 'post',
+  path: '/api/admin/throttle',
+  tags: ['Admin'],
+  summary: 'Engage or release the global Claude provider throttle gate',
+  request: {
+    body: { content: { 'application/json': { schema: throttleBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: throttleResponseSchema } },
+      description: 'Throttle state updated',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getAdminThrottleRoute = createRoute({
+  method: 'get',
+  path: '/api/admin/throttle',
+  tags: ['Admin'],
+  summary: 'Read the current global Claude provider throttle state',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: throttleResponseSchema } },
+      description: 'Current throttle state',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+const cancelStaleWorkflowRunsRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/cancel-stale',
+  tags: ['Workflows'],
+  summary: 'Cancel all stale running workflow runs (default: idle > 30 minutes)',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: cancelStaleRunsResponseSchema } },
+      description: 'OK',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -727,6 +838,105 @@ const getWorkflowRunRoute = createRoute({
       description: 'Workflow run detail',
     },
     404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getNodeEventsRoute = createRoute({
+  method: 'get',
+  path: '/api/workflows/runs/{runId}/nodes/{nodeId}/events',
+  tags: ['Workflows'],
+  summary: 'Get the last N events for a single node in a workflow run',
+  request: {
+    params: z.object({ runId: z.string(), nodeId: z.string() }),
+    query: nodeEventsQuerySchema,
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: nodeEventsResponseSchema } },
+      description: 'Recent events for the node (newest first)',
+    },
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+// Archive/unarchive/bulk-archive/bulk-delete routes — registered before {runId} routes
+// to prevent literal paths from matching as runId param values.
+
+const archiveWorkflowRunRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/archive',
+  tags: ['Workflows'],
+  summary: 'Archive a workflow run (hide from default dashboard view)',
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: { content: { 'application/json': { schema: archiveWorkflowRunBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: workflowRunActionResponseSchema } },
+      description: 'Archived',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const unarchiveWorkflowRunRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/{runId}/unarchive',
+  tags: ['Workflows'],
+  summary: 'Unarchive a workflow run (restore to default dashboard view)',
+  request: {
+    params: z.object({ runId: z.string() }),
+    body: { content: { 'application/json': { schema: unarchiveWorkflowRunBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: workflowRunActionResponseSchema } },
+      description: 'Unarchived',
+    },
+    404: jsonError('Not found'),
+    500: jsonError('Server error'),
+  },
+});
+
+const bulkArchiveWorkflowRunsRoute = createRoute({
+  method: 'post',
+  path: '/api/workflows/runs/bulk-archive',
+  tags: ['Workflows'],
+  summary: 'Bulk-archive workflow runs by status',
+  request: {
+    body: { content: { 'application/json': { schema: bulkArchiveBodySchema } } },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: bulkArchiveResponseSchema } },
+      description: 'Bulk archived',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const bulkDeleteFailedRunsRoute = createRoute({
+  method: 'delete',
+  path: '/api/workflows/runs/bulk-failed',
+  tags: ['Workflows'],
+  summary: 'Bulk-delete archived failed runs (permanent). Use dryRun=true to preview.',
+  request: {
+    query: z.object({
+      dryRun: z.string().optional(),
+      olderThan: z.string().optional(),
+    }),
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: bulkDeleteFailedResponseSchema } },
+      description: 'Bulk deleted (or dry run preview)',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -858,7 +1068,7 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 404 | 422 | 500,
+    status: 400 | 404 | 409 | 422 | 500,
     message: string,
     detail?: string
   ): Response {
@@ -1036,15 +1246,18 @@ export function registerApiRoutes(
   }
 
   /**
-   * Re-enter the orchestrator after a paused approval gate is resolved, so a
-   * web-dispatched workflow continues (approve) or runs its on_reject prompt
-   * (reject) without the user having to re-run the workflow command. The CLI's
-   * `workflowApproveCommand` / `workflowRejectCommand` already auto-resume via
-   * `workflowRunCommand({ resume: true })`; this is the web-side equivalent.
+   * Re-enter the workflow executor directly after a paused approval gate is
+   * resolved, so a web-dispatched workflow continues (approve) or runs its
+   * on_reject prompt (reject) without the user having to re-run the workflow
+   * command. The CLI's `workflowApproveCommand` / `workflowRejectCommand`
+   * already auto-resume via `workflowRunCommand({ resume: true })`; this is the
+   * web-side equivalent without going back through the natural-language
+   * orchestrator.
    *
    * Returns `true` when a resume dispatch was initiated, `false` otherwise (no
-   * parent conversation on the run, parent conversation deleted, parent was on
-   * a non-web platform, or dispatch threw). Failures are non-fatal: the gate
+   * worker conversation on the run, parent conversation deleted, parent was on
+   * a non-web platform, workflow definition missing, or executor launch threw).
+   * Failures are non-fatal: the gate
    * decision is recorded regardless; when this returns `false` the response
    * text instructs the user to re-run the workflow command.
    *
@@ -1060,6 +1273,7 @@ export function registerApiRoutes(
     action: 'approve' | 'reject'
   ): Promise<boolean> {
     if (!run.parent_conversation_id) return false;
+    if (!run.conversation_id || !run.working_path) return false;
     // Literal event names per action — greppable for ops tooling. Keeping the
     // branch explicit rather than templating avoids the earlier 3-segment
     // `api.workflow_*.dispatched` shape that broke `{domain}.{action}_{state}`.
@@ -1071,6 +1285,10 @@ export function registerApiRoutes(
               'api.workflow_approve_auto_resume_skipped_no_platform_conv' as const,
             skippedNonWebParent: 'api.workflow_approve_auto_resume_skipped_non_web_parent' as const,
             failed: 'api.workflow_approve_auto_resume_failed' as const,
+            missingWorker: 'api.workflow_approve_auto_resume_skipped_no_worker_conv' as const,
+            missingWorkflow: 'api.workflow_approve_auto_resume_skipped_missing_workflow' as const,
+            executorStarted: 'api.workflow_approve_direct_resume_started' as const,
+            executorFailed: 'api.workflow_approve_direct_resume_failed' as const,
           }
         : {
             dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
@@ -1078,9 +1296,14 @@ export function registerApiRoutes(
               'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
             skippedNonWebParent: 'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
             failed: 'api.workflow_reject_auto_resume_failed' as const,
+            missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
+            missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
+            executorStarted: 'api.workflow_reject_direct_resume_started' as const,
+            executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
           };
     try {
       const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
+      const workerConv = await conversationDb.getConversationById(run.conversation_id);
       const platformConvId = parentConv?.platform_conversation_id;
       if (!platformConvId) {
         // parentConv === null is a data-integrity signal (the parent
@@ -1111,11 +1334,74 @@ export function registerApiRoutes(
         );
         return false;
       }
-      const resumeMessage = `/workflow run ${run.workflow_name} ${run.user_message ?? ''}`.trim();
-      await dispatchToOrchestrator(platformConvId, resumeMessage);
+      const workerPlatformConvId = workerConv?.platform_conversation_id;
+      if (!workerConv || !workerPlatformConvId || workerConv.platform_type !== 'web') {
+        getLog().warn(
+          {
+            runId: run.id,
+            workerConversationId: run.conversation_id,
+            workerPlatformType: workerConv?.platform_type,
+          },
+          events.missingWorker
+        );
+        return false;
+      }
+
+      const discovery = await discoverWorkflowsWithConfig(run.working_path, loadConfig);
+      const workflow = discovery.workflows.find(
+        item => item.workflow.name === run.workflow_name
+      )?.workflow;
+      if (!workflow) {
+        getLog().warn(
+          {
+            runId: run.id,
+            workflowName: run.workflow_name,
+            workingPath: run.working_path,
+            loaderErrors: discovery.errors,
+          },
+          events.missingWorkflow
+        );
+        return false;
+      }
+
+      webAdapter.setConversationDbId(workerPlatformConvId, workerConv.id);
+      const unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformConvId, platformConvId);
+      const execution = executeWorkflow(
+        createWorkflowDeps(),
+        webAdapter,
+        workerPlatformConvId,
+        run.working_path,
+        workflow,
+        run.user_message ?? '',
+        workerConv.id,
+        run.codebase_id ?? undefined,
+        undefined,
+        undefined,
+        parentConv.id
+      );
+      void execution
+        .then(result => {
+          if (result.success && 'summary' in result && result.summary) {
+            return webAdapter.sendMessage(platformConvId, result.summary, {
+              category: 'workflow_result',
+              segment: 'new',
+              workflowResult: {
+                workflowName: run.workflow_name,
+                runId: run.id,
+              },
+            });
+          }
+          return undefined;
+        })
+        .catch(err => {
+          getLog().warn({ err: err as Error, runId: run.id }, events.executorFailed);
+        })
+        .finally(() => {
+          unsubscribeBridge();
+        });
       getLog().info(
-        { runId: run.id, workflowName: run.workflow_name, platformConvId },
-        events.dispatched
+        { runId: run.id, workflowName: run.workflow_name, platformConvId, workerPlatformConvId },
+        events.executorStarted
       );
       return true;
     } catch (err) {
@@ -1775,19 +2061,55 @@ export function registerApiRoutes(
       }
 
       if (!workingDir) {
-        return c.json({ workflows: [] });
+        return c.json({
+          workflows: [],
+          validation_errors: { count: 0, endpoint: '/api/workflows/errors' },
+        });
       }
 
       const result = await discoverWorkflowsWithConfig(workingDir, loadConfig);
+      const loaderErrors = getLoaderErrors();
       return c.json({
         workflows: result.workflows.map(ws => ({ workflow: ws.workflow, source: ws.source })),
         errors: result.errors.length > 0 ? result.errors : undefined,
+        validation_errors: { count: loaderErrors.length, endpoint: '/api/workflows/errors' },
       });
     } catch (error) {
       // Workflow discovery can fail if cwd is stale or deleted — return empty with warning
       const err = error instanceof Error ? error : new Error(String(error));
       getLog().error({ err }, 'workflow_discovery_failed');
       return apiError(c, 500, `Workflow discovery failed: ${err.message}`);
+    }
+  });
+
+  // GET /api/workflows/errors - Discover workflow loader errors
+  registerOpenApiRoute(getWorkflowErrorsRoute, async c => {
+    try {
+      const cwd = c.req.query('cwd');
+      let workingDir = cwd;
+
+      if (cwd) {
+        if (!(await validateCwd(cwd))) {
+          return apiError(c, 400, 'Invalid cwd: must match a registered codebase path');
+        }
+      } else {
+        const codebases = await codebaseDb.listCodebases();
+        if (codebases.length > 0) {
+          workingDir = codebases[0].default_cwd;
+        }
+      }
+
+      if (!workingDir) {
+        return c.json({ errors: [], count: 0 });
+      }
+
+      await discoverWorkflowsWithConfig(workingDir, loadConfig);
+      const errors = getLoaderErrors();
+      return c.json({ errors, count: errors.length });
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error(String(error));
+      getLog().error({ err }, 'workflow_errors_discovery_failed');
+      return apiError(c, 500, `Workflow error discovery failed: ${err.message}`);
     }
   });
 
@@ -1799,12 +2121,18 @@ export function registerApiRoutes(
     }
     try {
       const { conversationId, message } = getValidatedBody(c, runWorkflowBodySchema);
-      // Persist user message and register DB ID (same as message endpoint)
+      // Persist user message and register DB ID (same as message endpoint).
+      // /run callers may provide a fresh platform conversation id; create that
+      // row up front so workflow dispatch can attach a run and web persistence
+      // has a DB id for status/output messages.
       let conv: Awaited<ReturnType<typeof conversationDb.findConversationByPlatformId>> = null;
       try {
         conv = await conversationDb.findConversationByPlatformId(conversationId);
       } catch (e: unknown) {
         getLog().error({ err: e, conversationId }, 'conversation_lookup_failed');
+      }
+      if (!conv) {
+        conv = await conversationDb.getOrCreateConversation('web', conversationId);
       }
       if (conv) {
         try {
@@ -1861,6 +2189,8 @@ export function registerApiRoutes(
       const offsetRaw = Number(c.req.query('offset'));
       const offset = Number.isNaN(offsetRaw) ? 0 : Math.max(0, offsetRaw);
 
+      const includeArchived = c.req.query('includeArchived') === 'true';
+
       const result = await workflowDb.listDashboardRuns({
         status,
         codebaseId,
@@ -1869,11 +2199,30 @@ export function registerApiRoutes(
         before,
         limit,
         offset,
+        includeArchived,
       });
       return c.json(result);
     } catch (error) {
       getLog().error({ err: error }, 'list_dashboard_runs_failed');
       return apiError(c, 500, 'Failed to list dashboard runs');
+    }
+  });
+
+  // POST /api/workflows/runs/cancel-stale - Cancel all stale running workflow runs
+  registerOpenApiRoute(cancelStaleWorkflowRunsRoute, async c => {
+    try {
+      const result = await workflowDb.cancelStaleWorkflowRuns(30);
+      for (const runId of result.ids) {
+        void workflowEventDb.createWorkflowEvent({
+          workflow_run_id: runId,
+          event_type: 'run_cancelled',
+          data: { reason: 'stale_run_cleanup', actor: 'api' },
+        });
+      }
+      return c.json({ cancelled: result.count, runIds: result.ids });
+    } catch (error) {
+      getLog().error({ err: error }, 'cancel_stale_workflow_runs_failed');
+      return apiError(c, 500, 'Failed to cancel stale workflow runs');
     }
   });
 
@@ -1885,18 +2234,148 @@ export function registerApiRoutes(
       if (!run) {
         return apiError(c, 404, 'Workflow run not found');
       }
+      if (run.status === 'cancelled') {
+        return apiError(c, 409, 'Workflow run is already cancelled');
+      }
+      if (run.status === 'completed' || run.status === 'failed') {
+        return apiError(c, 422, `Cannot cancel workflow in '${run.status}' status`);
+      }
       if (run.status !== 'running' && run.status !== 'pending' && run.status !== 'paused') {
         return apiError(c, 400, `Cannot cancel workflow in '${run.status}' status`);
       }
+      const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+      const reason = body.reason ?? '';
       await workflowDb.cancelWorkflowRun(runId);
-      return c.json({ success: true, message: `Cancelled workflow: ${run.workflow_name}` });
+      void workflowEventDb.createWorkflowEvent({
+        workflow_run_id: runId,
+        event_type: 'run_cancelled',
+        data: { reason, actor: 'api' },
+      });
+      const updated = await workflowDb.getWorkflowRun(runId);
+      const updatedRun = updated ?? {
+        ...run,
+        status: 'cancelled' as const,
+        completed_at: new Date().toISOString(),
+      };
+      return c.json({
+        success: true,
+        message: `Cancelled workflow: ${run.workflow_name}`,
+        run: updatedRun,
+      });
     } catch (error) {
       getLog().error({ err: error }, 'cancel_workflow_run_api_failed');
       return apiError(c, 500, 'Failed to cancel workflow run');
     }
   });
 
+  // POST /api/workflows/runs/:runId/pause - Operator-triggered pause
+  // Distinct from approval-gate pause (Rule of Three doctrine): no
+  // ApprovalContext is required; the run flips to 'paused' and the global
+  // Claude throttle blocks the next SDK call. Current iteration completes
+  // naturally — the DAG executor between-iteration check does not stop
+  // running concurrent nodes (approval-gate semantics are preserved).
+  registerOpenApiRoute(pauseWorkflowRunRoute, async c => {
+    try {
+      const runId = c.req.param('runId') ?? '';
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        return apiError(c, 404, 'Workflow run not found');
+      }
+      if (run.status === 'paused') {
+        return apiError(c, 409, 'Workflow run is already paused');
+      }
+      if (TERMINAL_WORKFLOW_STATUSES.includes(run.status)) {
+        return apiError(c, 422, `Cannot pause workflow in '${run.status}' status`);
+      }
+      if (run.status !== 'running') {
+        return apiError(c, 400, `Cannot pause workflow in '${run.status}' status`);
+      }
+      const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
+      const reason = body.reason ?? '';
+      await workflowDb.pauseWorkflowRunByOperator(runId);
+      void workflowEventDb.createWorkflowEvent({
+        workflow_run_id: runId,
+        event_type: 'run_paused',
+        data: { reason, actor: 'operator' },
+      });
+      const updated = await workflowDb.getWorkflowRun(runId);
+      const updatedRun = updated ?? {
+        ...run,
+        status: 'paused' as const,
+      };
+      return c.json({
+        success: true,
+        message: `Paused workflow: ${run.workflow_name}`,
+        run: updatedRun,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'pause_workflow_run_api_failed');
+      return apiError(c, 500, 'Failed to pause workflow run');
+    }
+  });
+
+  // GET /api/admin/throttle - Read the current global Claude provider throttle state
+  registerOpenApiRoute(getAdminThrottleRoute, async c => {
+    try {
+      const paused = claudeProviderThrottle.isThrottled();
+      const engageContext = claudeProviderThrottle.getEngageContext();
+      return c.json({
+        success: true,
+        paused,
+        message: paused
+          ? `Throttle engaged by ${engageContext?.engagedBy ?? 'unknown'}`
+          : 'Throttle is released',
+        ...(engageContext?.engagedBy ? { engagedBy: engageContext.engagedBy } : {}),
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'get_admin_throttle_api_failed');
+      return apiError(c, 500, 'Failed to read throttle state');
+    }
+  });
+
+  // POST /api/admin/throttle - Toggle the global Claude provider throttle gate
+  // When paused=true, every subsequent Claude SDK call awaits release.
+  // When paused=false, queued waiters drain FIFO.
+  // Auto-throttle (rate-limit-triggered) and operator-throttle share the same
+  // gate; setting paused=true here keeps the gate closed even if auto-release
+  // would have opened it, because engageContext.engagedBy flips to 'operator'.
+  registerOpenApiRoute(adminThrottleRoute, async c => {
+    try {
+      const body = (await c.req.json().catch(() => null)) as { paused?: unknown } | null;
+      if (!body || typeof body.paused !== 'boolean') {
+        return apiError(c, 400, 'Body must include { paused: boolean }');
+      }
+      const wasThrottled = claudeProviderThrottle.isThrottled();
+      claudeProviderThrottle.setThrottled(body.paused, { engagedBy: 'operator' });
+      const nowThrottled = claudeProviderThrottle.isThrottled();
+      const engageContext = claudeProviderThrottle.getEngageContext();
+      const message = body.paused
+        ? wasThrottled
+          ? 'Throttle was already engaged; engagement context refreshed'
+          : 'Throttle engaged — Claude SDK calls will queue'
+        : wasThrottled
+          ? 'Throttle released — queued Claude SDK calls drained'
+          : 'Throttle was already released';
+      return c.json({
+        success: true,
+        paused: nowThrottled,
+        message,
+        ...(engageContext?.engagedBy ? { engagedBy: engageContext.engagedBy } : {}),
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'admin_throttle_api_failed');
+      return apiError(c, 500, 'Failed to update throttle state');
+    }
+  });
+
   // POST /api/workflows/runs/:runId/resume - Resume a workflow run
+  //
+  // Two modes share this route:
+  //   1. Failed run     → next invocation on the same path auto-resumes (legacy behavior)
+  //   2. Operator pause → flip status back to 'running'; the DAG executor's
+  //                        between-iteration check sees 'running' and continues.
+  //                        Approval-gate paused runs are NOT touched here — use
+  //                        /approve or /reject for those.
   registerOpenApiRoute(resumeWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
     try {
@@ -1907,7 +2386,26 @@ export function registerApiRoutes(
       if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
         return apiError(c, 400, `Cannot resume workflow in '${run.status}' status`);
       }
-      // Run is already failed — the next invocation on the same path auto-resumes
+
+      // Operator-paused runs are flagged in metadata; flip them back to running.
+      // Approval-gate pauses use metadata.approval (ApprovalContext) and resume
+      // via /approve, so leave those alone here.
+      const pausedByOperator = run.status === 'paused' && run.metadata.paused_by === 'operator';
+      if (pausedByOperator) {
+        await workflowDb.resumeWorkflowRunFromPause(runId);
+        void workflowEventDb.createWorkflowEvent({
+          workflow_run_id: runId,
+          event_type: 'run_resumed',
+          data: { actor: 'operator' },
+        });
+        return c.json({
+          success: true,
+          message: `Resumed workflow: ${run.workflow_name}`,
+        });
+      }
+
+      // Failed run path (or approval-gate paused — leave as-is, /approve handles it):
+      // the next invocation on the same path auto-resumes from completed nodes.
       const pathInfo = run.working_path ? ` at \`${run.working_path}\`` : '';
       return c.json({
         success: true,
@@ -2066,9 +2564,76 @@ export function registerApiRoutes(
     }
   });
 
+  // POST /api/workflows/runs/:runId/archive
+  registerOpenApiRoute(archiveWorkflowRunRoute, async c => {
+    const runId = c.req.param('runId') ?? '';
+    try {
+      const body = getValidatedBody(c, archiveWorkflowRunBodySchema);
+      await workflowDb.archiveWorkflowRun(runId, 'operator', body.reason);
+      const run = await workflowDb.getWorkflowRun(runId);
+      return c.json({
+        success: true,
+        message: `Archived workflow run: ${run?.workflow_name ?? runId}`,
+      });
+    } catch (error) {
+      const err = error as Error;
+      if (err.message.includes('not found')) return apiError(c, 404, err.message);
+      if (err.message.includes('cancel first')) return apiError(c, 400, err.message);
+      getLog().error({ err, runId }, 'api.workflow_run_archive_failed');
+      return apiError(c, 500, 'Failed to archive workflow run');
+    }
+  });
+
+  // POST /api/workflows/runs/:runId/unarchive
+  registerOpenApiRoute(unarchiveWorkflowRunRoute, async c => {
+    const runId = c.req.param('runId') ?? '';
+    try {
+      await workflowDb.unarchiveWorkflowRun(runId);
+      const run = await workflowDb.getWorkflowRun(runId);
+      return c.json({
+        success: true,
+        message: `Unarchived workflow run: ${run?.workflow_name ?? runId}`,
+      });
+    } catch (error) {
+      const err = error as Error;
+      if (err.message.includes('not found')) return apiError(c, 404, err.message);
+      getLog().error({ err, runId }, 'api.workflow_run_unarchive_failed');
+      return apiError(c, 500, 'Failed to unarchive workflow run');
+    }
+  });
+
+  // POST /api/workflows/runs/bulk-archive — MUST be before /{runId} routes
+  registerOpenApiRoute(bulkArchiveWorkflowRunsRoute, async c => {
+    try {
+      const body = getValidatedBody(c, bulkArchiveBodySchema);
+      const result = await workflowDb.bulkArchiveWorkflowRuns({
+        status: body.status,
+        olderThan: body.olderThan,
+      });
+      return c.json(result);
+    } catch (error) {
+      getLog().error({ err: error }, 'api.bulk_archive_runs_failed');
+      return apiError(c, 500, 'Failed to bulk archive workflow runs');
+    }
+  });
+
+  // DELETE /api/workflows/runs/bulk-failed — MUST be before /{runId} routes
+  registerOpenApiRoute(bulkDeleteFailedRunsRoute, async c => {
+    try {
+      const dryRun = c.req.query('dryRun') === 'true';
+      const olderThan = c.req.query('olderThan') ?? undefined;
+      const result = await workflowDb.bulkDeleteArchivedFailedRuns({ dryRun, olderThan });
+      return c.json({ ...result, dryRun });
+    } catch (error) {
+      getLog().error({ err: error }, 'api.bulk_delete_failed_runs_error');
+      return apiError(c, 500, 'Failed to bulk delete failed workflow runs');
+    }
+  });
+
   // DELETE /api/workflows/runs/:runId - Delete a workflow run
   registerOpenApiRoute(deleteWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
+    const force = c.req.query('force') === 'true';
     try {
       const run = await workflowDb.getWorkflowRun(runId);
       if (!run) {
@@ -2081,9 +2646,17 @@ export function registerApiRoutes(
           `Cannot delete workflow in '${run.status}' status — cancel it first`
         );
       }
-      await workflowDb.deleteWorkflowRun(runId);
+      await workflowDb.deleteWorkflowRun(runId, force);
+      getLog().info(
+        { runId, workflowName: run.workflow_name, force, action: 'delete' },
+        'workflow_run.deleted'
+      );
       return c.json({ success: true, message: `Deleted workflow run: ${run.workflow_name}` });
     } catch (error) {
+      const err = error as Error;
+      if (err.message.includes('Archive the run first')) {
+        return apiError(c, 400, err.message);
+      }
       getLog().error({ err: error, runId }, 'api.workflow_run_delete_failed');
       return apiError(c, 500, 'Failed to delete workflow run');
     }
@@ -2185,6 +2758,40 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'get_workflow_run_failed');
       return apiError(c, 500, 'Failed to get workflow run');
+    }
+  });
+
+  // GET /api/workflows/runs/:runId/nodes/:nodeId/events - Last N events for one node
+  // Used by the NodePeekPanel in the DAG viz to show per-node activity without SSH.
+  registerOpenApiRoute(getNodeEventsRoute, async c => {
+    try {
+      const runId = c.req.param('runId') ?? '';
+      const nodeId = c.req.param('nodeId') ?? '';
+      const limitParam = c.req.query('limit');
+
+      // Default 5; clamp to [1, 20] to bound DB load.
+      let limit = 5;
+      if (limitParam !== undefined) {
+        const parsed = Number.parseInt(limitParam, 10);
+        if (!Number.isFinite(parsed) || parsed < 1) {
+          limit = 1;
+        } else if (parsed > 20) {
+          limit = 20;
+        } else {
+          limit = parsed;
+        }
+      }
+
+      const run = await workflowDb.getWorkflowRun(runId);
+      if (!run) {
+        return apiError(c, 404, 'Workflow run not found');
+      }
+
+      const events = await workflowEventDb.listNodeEvents(runId, nodeId, limit);
+      return c.json({ events });
+    } catch (error) {
+      getLog().error({ err: error }, 'get_node_events_failed');
+      return apiError(c, 500, 'Failed to get node events');
     }
   });
 

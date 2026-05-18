@@ -8,12 +8,14 @@ import { StepLogs } from './StepLogs';
 import { WorkflowLogs } from './WorkflowLogs';
 import { WorkflowDagViewer } from './WorkflowDagViewer';
 import { ArtifactSummary } from './ArtifactSummary';
+import { NodePeekPanel } from './NodePeekPanel';
 import { ChatInterface } from '@/components/chat/ChatInterface';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import { getWorkflowRun, getWorkflowRunByWorker, getCodebase, getWorkflow } from '@/lib/api';
 import { ensureUtc, formatDurationMs } from '@/lib/format';
+import { formatCostUsd, costColorClass } from '@/lib/cost-utils';
 import { selectInitialNode } from '@/lib/select-initial-node';
 import type {
   WorkflowState,
@@ -56,7 +58,21 @@ interface WorkflowExecutionProps {
   runId: string;
 }
 
-function StatusBadge({ status }: { status: string }): React.ReactElement {
+function RunCostBadge({ usd }: { usd: number }): React.ReactElement {
+  return (
+    <span className={`text-xs font-medium tabular-nums ${costColorClass(usd)}`}>
+      {formatCostUsd(usd)}
+    </span>
+  );
+}
+
+function StatusBadge({
+  status,
+  hasWarning,
+}: {
+  status: string;
+  hasWarning?: boolean;
+}): React.ReactElement {
   const colors: Record<string, string> = {
     pending: 'bg-accent/20 text-accent',
     running: 'bg-accent/20 text-accent',
@@ -64,12 +80,16 @@ function StatusBadge({ status }: { status: string }): React.ReactElement {
     failed: 'bg-error/20 text-error',
     cancelled: 'bg-surface text-text-secondary',
   };
+  // WO-170: workflow-level rollup — a "completed" workflow with any
+  // completed_with_warning node renders yellow.
+  const effectiveStatus = status === 'completed' && hasWarning ? 'completed_with_warning' : status;
+  const className =
+    effectiveStatus === 'completed_with_warning'
+      ? 'bg-warning/20 text-warning'
+      : (colors[status] ?? 'bg-surface text-text-secondary');
+  const label = effectiveStatus === 'completed_with_warning' ? 'completed (warning)' : status;
   return (
-    <span
-      className={`px-2 py-0.5 rounded-full text-xs font-medium ${colors[status] ?? 'bg-surface text-text-secondary'}`}
-    >
-      {status}
-    </span>
+    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${className}`}>{label}</span>
   );
 }
 
@@ -84,6 +104,8 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   const [activeView, setActiveView] = useState<'graph' | 'logs' | 'chat'>('graph');
   // Increments on every user-initiated node click to trigger scroll in WorkflowLogs
   const [nodeScrollTrigger, setNodeScrollTrigger] = useState(0);
+  // Controls the NodePeekPanel overlay in the graph view.
+  const [peekOpen, setPeekOpen] = useState(false);
   // Track which codebaseId we've already fetched to avoid stale re-fetches during runId transitions
   const fetchedCodebaseIdRef = useRef<string | null>(null);
 
@@ -95,6 +117,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     setWorkerRunId(null);
     setActiveView('graph');
     setNodeScrollTrigger(0);
+    setPeekOpen(false);
     fetchedCodebaseIdRef.current = null;
   }, [runId]);
 
@@ -118,11 +141,14 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   ? 'running'
                   : e.event_type === 'node_completed'
                     ? 'completed'
-                    : e.event_type === 'node_failed'
-                      ? 'failed'
-                      : 'skipped';
+                    : e.event_type === 'node_completed_with_warning'
+                      ? 'completed_with_warning'
+                      : e.event_type === 'node_failed'
+                        ? 'failed'
+                        : 'skipped';
               const existing = nodeMap.get(nodeId);
-              // Keep the latest non-running status (completed/failed/skipped override running)
+              // Keep the latest non-running status (completed/failed/skipped override running).
+              // WO-170: node_completed_with_warning also overrides running.
               if (!existing || status !== 'running') {
                 nodeMap.set(nodeId, {
                   nodeId,
@@ -131,6 +157,24 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   duration: e.data.duration_ms as number | undefined,
                   error: e.data.error as string | undefined,
                   reason: e.data.reason as 'when_condition' | 'trigger_rule' | undefined,
+                  costUsd:
+                    e.event_type === 'node_completed' ||
+                    e.event_type === 'node_completed_with_warning'
+                      ? (e.data.cost_usd as number | undefined)
+                      : undefined,
+                  // WO-170: surface warning detail on REST hydrate (matches SSE path).
+                  warningStatusLine:
+                    e.event_type === 'node_completed_with_warning'
+                      ? (e.data.statusLine as string | undefined)
+                      : undefined,
+                  warningPatterns:
+                    e.event_type === 'node_completed_with_warning'
+                      ? (e.data.patterns as string[] | undefined)
+                      : undefined,
+                  warningLoadBearing:
+                    e.event_type === 'node_completed_with_warning'
+                      ? (e.data.loadBearing as boolean | undefined)
+                      : undefined,
                 });
               }
             }
@@ -353,6 +397,12 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     };
   })();
 
+  // Running total cost across all completed nodes in this run
+  const runTotalCostUsd = useMemo(
+    () => (workflow?.dagNodes ?? []).reduce((sum, n) => sum + (n.costUsd ?? 0), 0),
+    [workflow?.dagNodes]
+  );
+
   // Auto-select the first DAG node when workflow data loads and no node is selected.
   // Prefer the currently executing node (for running workflows), otherwise pick the first node.
   useEffect(() => {
@@ -387,9 +437,12 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       if (e.event_type === 'node_started') startedNodes.add(nodeId);
       if (
         e.event_type === 'node_completed' ||
+        e.event_type === 'node_completed_with_warning' ||
         e.event_type === 'node_failed' ||
         e.event_type === 'node_skipped'
       ) {
+        // WO-170: completed_with_warning is still a terminal node state for
+        // the started-but-not-completed scan.
         completedNodes.add(nodeId);
       }
     }
@@ -435,6 +488,13 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           return `[${ts}] Node started: ${e.step_name ?? 'node'}`;
         case 'node_completed':
           return `[${ts}] Node completed: ${e.step_name ?? 'node'}`;
+        case 'node_completed_with_warning': {
+          // WO-170: surface the matched STATUS line in the per-step log so
+          // John can see what failed silently without opening the tooltip.
+          const sl = e.data.statusLine as string | undefined;
+          const slStr = sl ? ` — ${sl.split('\n')[0]}` : '';
+          return `[${ts}] Node completed with warning: ${e.step_name ?? 'node'}${slStr}`;
+        }
         case 'node_failed':
           return `[${ts}] Node failed: ${e.step_name ?? 'node'}: ${(e.data.error as string | undefined) ?? 'Unknown error'}`;
         case 'node_skipped':
@@ -471,10 +531,17 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
 
   // Handler for user-initiated node clicks (graph or sidebar).
   // Increments scroll trigger so WorkflowLogs scrolls to the node's section.
-  const handleNodeClick = useCallback((nodeId: string): void => {
-    setSelectedDagNode(nodeId);
-    setNodeScrollTrigger(prev => prev + 1);
-  }, []);
+  // In the graph view, also opens the NodePeekPanel side drawer.
+  const handleNodeClick = useCallback(
+    (nodeId: string): void => {
+      setSelectedDagNode(nodeId);
+      setNodeScrollTrigger(prev => prev + 1);
+      if (activeView === 'graph') {
+        setPeekOpen(true);
+      }
+    },
+    [activeView]
+  );
 
   if (error) {
     return (
@@ -538,26 +605,49 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     </div>
   );
 
+  const peekNodeDef =
+    peekOpen && selectedDagNode && dagDefinitionNodes
+      ? (dagDefinitionNodes.find(n => n.id === selectedDagNode) ?? null)
+      : null;
+  const peekNodeStatus =
+    peekOpen && selectedDagNode
+      ? workflow.dagNodes.find(n => n.nodeId === selectedDagNode)?.status
+      : undefined;
+
   const renderBody = (): React.ReactElement => {
     if (isDag && activeView === 'graph') {
       return (
         <ResizablePanelGroup orientation="horizontal" className="flex-1 min-h-0">
           <ResizablePanel defaultSize={60} minSize={30}>
-            {dagDefinitionNodes ? (
-              <WorkflowDagViewer
-                dagNodes={dagDefinitionNodes}
-                liveStatus={workflow.dagNodes}
-                isRunning={isRunning}
-                currentlyExecuting={currentlyExecuting ?? undefined}
-                selectedNodeId={selectedDagNode}
-                onNodeClick={handleNodeClick}
-              />
-            ) : (
-              <div className="flex items-center justify-center h-full text-text-secondary">
-                <span className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-accent border-t-transparent mr-2" />
-                Loading graph...
-              </div>
-            )}
+            <div className="relative h-full">
+              {dagDefinitionNodes ? (
+                <WorkflowDagViewer
+                  dagNodes={dagDefinitionNodes}
+                  liveStatus={workflow.dagNodes}
+                  isRunning={isRunning}
+                  currentlyExecuting={currentlyExecuting ?? undefined}
+                  selectedNodeId={selectedDagNode}
+                  onNodeClick={handleNodeClick}
+                />
+              ) : (
+                <div className="flex items-center justify-center h-full text-text-secondary">
+                  <span className="inline-block h-5 w-5 animate-spin rounded-full border-2 border-accent border-t-transparent mr-2" />
+                  Loading graph...
+                </div>
+              )}
+              {peekOpen && selectedDagNode && (
+                <NodePeekPanel
+                  runId={runId}
+                  nodeId={selectedDagNode}
+                  nodeDef={peekNodeDef}
+                  nodeStatus={peekNodeStatus}
+                  isRunning={isRunning}
+                  onClose={(): void => {
+                    setPeekOpen(false);
+                  }}
+                />
+              )}
+            </div>
           </ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel defaultSize={40} minSize={20}>
@@ -607,7 +697,10 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
         </button>
         <div className="flex items-center gap-2 min-w-0">
           <h2 className="font-semibold text-text-primary truncate">{workflow.workflowName}</h2>
-          <StatusBadge status={workflow.status} />
+          <StatusBadge
+            status={workflow.status}
+            hasWarning={workflow.dagNodes.some(n => n.status === 'completed_with_warning')}
+          />
         </div>
         <div className="flex items-center gap-2 ml-auto shrink-0">
           {codebaseName && <span className="text-xs text-text-secondary">{codebaseName}</span>}
@@ -623,6 +716,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
             </button>
           )}
           <span className="text-xs text-text-secondary">{formatDurationMs(elapsed)}</span>
+          <RunCostBadge usd={runTotalCostUsd} />
         </div>
       </div>
 

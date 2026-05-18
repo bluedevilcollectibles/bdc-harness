@@ -13,6 +13,8 @@ import {
   PlayCircle,
   Ban,
   Trash2,
+  Archive,
+  ArchiveRestore,
   CheckCircle,
   AlertTriangle,
   Pause,
@@ -28,11 +30,14 @@ interface WorkflowRunCardProps {
   run: DashboardRunResponse;
   isDocker?: boolean;
   onCancel: (runId: string) => void;
+  onPause?: (runId: string) => void;
   onResume?: (runId: string) => void;
   onAbandon?: (runId: string) => void;
   onDelete?: (runId: string) => void;
   onApprove?: (runId: string) => void;
   onReject?: (runId: string, reason?: string) => void;
+  onArchive?: (runId: string, reason?: string) => void;
+  onUnarchive?: (runId: string) => void;
 }
 
 const PLATFORM_ICONS: Record<string, React.ReactElement> = {
@@ -138,11 +143,14 @@ export function WorkflowRunCard({
   run,
   isDocker,
   onCancel,
+  onPause,
   onResume,
   onAbandon,
   onDelete,
   onApprove,
   onReject,
+  onArchive,
+  onUnarchive,
 }: WorkflowRunCardProps): React.ReactElement {
   const navigate = useNavigate();
   const [elapsed, setElapsed] = useState(() => formatDuration(run.started_at, run.completed_at));
@@ -169,8 +177,15 @@ export function WorkflowRunCard({
       : run.user_message.slice(0, 80) + '…'
     : null;
 
+  const isArchived = run.archived_at != null;
+
   return (
-    <div className="rounded-lg border border-border bg-surface p-4 space-y-3">
+    <div
+      className={cn(
+        'rounded-lg border border-border bg-surface p-4 space-y-3',
+        isArchived && 'opacity-60'
+      )}
+    >
       {/* Header: status dot + name + badge + elapsed */}
       <div className="flex items-center gap-2">
         <div
@@ -184,6 +199,12 @@ export function WorkflowRunCard({
         <span className="font-medium text-sm text-text-primary truncate flex-1">
           {run.workflow_name}
         </span>
+        {isArchived && (
+          <span className="inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-medium bg-surface-elevated text-text-tertiary border border-border">
+            <Archive className="h-2.5 w-2.5" />
+            archived
+          </span>
+        )}
         <span
           className={cn(
             'inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium',
@@ -355,6 +376,33 @@ export function WorkflowRunCard({
               Resume
             </button>
           )}
+          {/* Operator-paused runs can be resumed via the dashboard (mirrors
+              approval-gate Approve/Reject for non-approval pauses). Detected by
+              metadata.paused_by === 'operator' so we don't show this button for
+              approval-gate pauses (those use Approve/Reject). */}
+          {run.status === 'paused' && run.metadata?.paused_by === 'operator' && onResume && (
+            <button
+              onClick={(): void => {
+                onResume(run.id);
+              }}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors"
+            >
+              <PlayCircle className="h-3.5 w-3.5" />
+              Resume
+            </button>
+          )}
+          {run.status === 'running' && onPause && (
+            <button
+              onClick={(): void => {
+                onPause(run.id);
+              }}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors"
+              title="Pause the run between iterations. The current iteration completes; the next SDK call queues."
+            >
+              <Pause className="h-3.5 w-3.5" />
+              Pause
+            </button>
+          )}
           {run.status === 'running' && onAbandon && (
             <ConfirmRunActionDialog
               trigger={
@@ -397,7 +445,43 @@ export function WorkflowRunCard({
               }}
             />
           )}
-          {onDelete && run.status !== 'running' && run.status !== 'pending' && (
+          {onArchive && !isArchived && run.status !== 'running' && run.status !== 'pending' && (
+            <ConfirmRunActionDialog
+              trigger={
+                <button className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-tertiary hover:bg-surface-elevated hover:text-text-secondary transition-colors">
+                  <Archive className="h-3.5 w-3.5" />
+                  Archive
+                </button>
+              }
+              title="Archive workflow run?"
+              description={
+                <>
+                  Archive <strong>{run.workflow_name}</strong>. It will be hidden from the default
+                  dashboard view but can be restored at any time.
+                </>
+              }
+              confirmLabel="Archive"
+              reasonInput={{
+                label: 'Reason (optional)',
+                placeholder: 'e.g. cancelled-duplicate-fire',
+              }}
+              onConfirm={(reason): void => {
+                onArchive(run.id, reason);
+              }}
+            />
+          )}
+          {onUnarchive && isArchived && (
+            <button
+              onClick={(): void => {
+                onUnarchive(run.id);
+              }}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-tertiary hover:bg-surface-elevated hover:text-text-secondary transition-colors"
+            >
+              <ArchiveRestore className="h-3.5 w-3.5" />
+              Unarchive
+            </button>
+          )}
+          {onDelete && isArchived && run.status !== 'running' && run.status !== 'pending' && (
             <ConfirmRunActionDialog
               trigger={
                 <button className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-tertiary hover:bg-error/10 hover:text-error transition-colors">

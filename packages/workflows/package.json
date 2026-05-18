@@ -16,15 +16,19 @@
     "./defaults": "./src/defaults/bundled-defaults.ts",
     "./validator": "./src/validator.ts",
     "./utils/tool-formatter": "./src/utils/tool-formatter.ts",
-    "./test-utils": "./src/test-utils.ts"
+    "./test-utils": "./src/test-utils.ts",
+    "./agents/registry": "./src/agents/registry.ts",
+    "./agents/tools": "./src/agents/tools.ts"
   },
   "scripts": {
-    "test": "bun test src/dag-executor.test.ts && bun test src/loader.test.ts && bun test src/logger.test.ts && bun test src/condition-evaluator.test.ts && bun test src/event-emitter.test.ts && bun test src/executor-shared.test.ts && bun test src/load-command-prompt.test.ts && bun test src/executor.test.ts && bun test src/executor-preamble.test.ts && bun test src/defaults/ src/model-validation.test.ts src/router.test.ts src/utils/ src/hooks.test.ts && bun test src/validation-parser.test.ts src/schemas.test.ts src/command-validation.test.ts && bun test src/validator.test.ts && bun test src/script-discovery.test.ts && bun test src/runtime-check.test.ts && bun test src/script-node-deps.test.ts",
+    "test": "bun test src/bdc-commit-backstop.test.ts && bun test src/bdc-push-correctness.test.ts && bun test src/dag-executor.test.ts && bun test src/overseer-bridge.test.ts && bun test src/loader.test.ts && bun test src/logger.test.ts && bun test src/condition-evaluator.test.ts && bun test src/event-emitter.test.ts && bun test src/executor-shared.test.ts && bun test src/load-command-prompt.test.ts && bun test src/executor.test.ts && bun test src/executor-preamble.test.ts && bun test src/defaults/ src/model-validation.test.ts src/router.test.ts src/utils/ src/hooks.test.ts && bun test src/validation-parser.test.ts src/schemas.test.ts src/command-validation.test.ts && bun test src/validator.test.ts && bun test src/script-discovery.test.ts && bun test src/runtime-check.test.ts && bun test src/script-node-deps.test.ts && bun test src/agents/registry.test.ts && bun test src/schemas/dag-node.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
     "@archon/git": "workspace:*",
+    "@archon/overseer": "workspace:*",
     "@archon/paths": "workspace:*",
+    "@archon/persona-context-loader": "workspace:*",
     "@archon/providers": "workspace:*",
     "@hono/zod-openapi": "^0.19.6",
     "zod": "^3.25.28"

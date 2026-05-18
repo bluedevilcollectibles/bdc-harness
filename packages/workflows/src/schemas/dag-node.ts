@@ -131,6 +131,7 @@ const AGENT_ID_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 export const dagNodeBaseSchema = z.object({
   id: z.string(),
+  description: z.string().max(120).optional(),
   depends_on: z.array(z.string()).optional(),
   when: z.string().optional(),
   trigger_rule: triggerRuleSchema.optional(),
@@ -162,6 +163,22 @@ export const dagNodeBaseSchema = z.object({
   fallbackModel: z.string().min(1).optional(),
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
+  agent: z.string().min(1, "'agent' must be a non-empty string").optional(),
+  /**
+   * WO-170 (depends on WO-167 doctrine, not yet merged): mark this node as
+   * "load-bearing" — its output (commit-and-push, registry write, etc.) is
+   * critical to overall workflow success. When true, the DAG executor scans
+   * stdout for `STATUS=*_failed` patterns even on exit-0 and emits
+   * `node_completed_with_warning` instead of `node_completed` so Mission
+   * Control can show a yellow state instead of false-green.
+   *
+   * Independent of load_bearing, a small set of always-dangerous patterns
+   * (push_failed, commit_failed, pr_create_failed, registry_write_failed,
+   * artifact_persist_failed, bundle_save_failed, spec_save_failed) trigger
+   * the warning state too — those are silent-data-loss signals regardless of
+   * how the node was authored.
+   */
+  load_bearing: z.boolean().optional(),
 });
 
 export type DagNodeBase = z.infer<typeof dagNodeBaseSchema>;
@@ -339,6 +356,7 @@ export const BASH_NODE_AI_FIELDS: readonly string[] = [
   'fallbackModel',
   'betas',
   'sandbox',
+  'agent',
 ];
 
 /** AI-specific fields that are meaningless on script nodes — same as bash nodes */
@@ -346,11 +364,11 @@ export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
 
 /**
  * AI-specific fields that are unsupported on loop nodes.
- * `model` and `provider` are excluded because the DAG executor resolves and
- * forwards them to each iteration's AI call (see dag-executor.ts:2602-2648).
+ * `model`, `provider`, and `agent` are excluded — the DAG executor resolves
+ * and forwards them to each iteration's AI call.
  */
 export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter(
-  f => f !== 'model' && f !== 'provider'
+  f => f !== 'model' && f !== 'provider' && f !== 'agent'
 );
 
 // ---------------------------------------------------------------------------
@@ -531,6 +549,7 @@ export const dagNodeSchema = dagNodeBaseSchema
     // Common base fields (sparse — only include defined values)
     const base = {
       id,
+      ...(data.description !== undefined ? { description: data.description } : {}),
       ...(data.depends_on !== undefined && data.depends_on.length > 0
         ? { depends_on: data.depends_on }
         : {}),
@@ -563,6 +582,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.fallbackModel !== undefined ? { fallbackModel: data.fallbackModel } : {}),
       ...(data.betas !== undefined ? { betas: data.betas } : {}),
       ...(data.sandbox !== undefined ? { sandbox: data.sandbox } : {}),
+      ...(data.agent !== undefined ? { agent: data.agent } : {}),
     };
 
     if (data.command !== undefined && data.command.trim().length > 0) {
@@ -599,7 +619,11 @@ export const dagNodeSchema = dagNodeBaseSchema
     }
     // loop — guaranteed by superRefine to be defined at this point
     if (!data.loop) throw new Error('unreachable: loop must be defined after superRefine');
-    return { ...base, loop: data.loop } as LoopNode;
+    return {
+      ...base,
+      ...(data.agent !== undefined ? { agent: data.agent } : {}),
+      loop: data.loop,
+    } as LoopNode;
   })
   .openapi('DagNode');
 

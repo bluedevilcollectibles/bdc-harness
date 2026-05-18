@@ -9,6 +9,8 @@ import {
   LOOP_NODE_AI_FIELDS,
   approvalOnRejectSchema,
   dagNodeSchema,
+  workflowDefinitionSchema,
+  loopNodeConfigSchema,
 } from './schemas';
 import type {
   WorkflowDefinition,
@@ -35,6 +37,99 @@ const dagWorkflow: WorkflowDefinition = {
   description: 'DAG execution',
   nodes: [commandNode, promptNode, bashNode],
 };
+
+// ---------------------------------------------------------------------------
+// workflowDefinitionSchema
+// ---------------------------------------------------------------------------
+
+describe('workflowDefinitionSchema', () => {
+  test('accepts policyFile on workflow definitions', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'policy-workflow',
+      description: 'Policy workflow',
+      policyFile: '/tmp/test-policy.md',
+      nodes: [{ id: 'node1', prompt: 'Do something' }],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.policyFile).toBe('/tmp/test-policy.md');
+    }
+  });
+
+  test('accepts inputs field with default values', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'input-workflow',
+      description: 'Workflow with inputs',
+      nodes: [{ id: 'step', bash: 'echo ${input.branch}' }],
+      inputs: {
+        branch: { default: 'feat/my-feature' },
+        issue: { default: '42' },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.inputs).toEqual({
+        branch: { default: 'feat/my-feature' },
+        issue: { default: '42' },
+      });
+    }
+  });
+
+  test('inputs field is optional — workflow without it still validates', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'no-input-workflow',
+      description: 'Workflow without inputs',
+      nodes: [{ id: 'step', bash: 'echo hello' }],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.inputs).toBeUndefined();
+    }
+  });
+
+  test('inputs with non-string default is rejected', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'bad-input-workflow',
+      description: 'Workflow with bad inputs',
+      nodes: [{ id: 'step', bash: 'echo ok' }],
+      inputs: {
+        count: { default: 42 },
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  test('accepts target_repo field (Rule 28)', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'repo-scoped-workflow',
+      description: 'Workflow with target_repo',
+      target_repo: 'bluedevilcollectibles/bdc-xo',
+      nodes: [{ id: 'n', prompt: 'Do something' }],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.target_repo).toBe('bluedevilcollectibles/bdc-xo');
+    }
+  });
+
+  test('target_repo is optional — workflow without it still validates', () => {
+    const result = workflowDefinitionSchema.safeParse({
+      name: 'no-target-repo',
+      description: 'Workflow without target_repo',
+      nodes: [{ id: 'n', bash: 'echo hi' }],
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.target_repo).toBeUndefined();
+    }
+  });
+});
 
 // ---------------------------------------------------------------------------
 // isBashNode
@@ -667,10 +762,58 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
 // LOOP_NODE_AI_FIELDS constant
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// loopNodeConfigSchema -- until_file field
+// ---------------------------------------------------------------------------
+
+describe('loopNodeConfigSchema', () => {
+  test('accepts until_file shorthand field', () => {
+    const result = loopNodeConfigSchema.safeParse({
+      prompt: 'Work.',
+      until: 'COMPLETE',
+      max_iterations: 3,
+      until_file: 'done-sentinel.txt',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.until_file).toBe('done-sentinel.txt');
+      expect(result.data.until_bash).toBeUndefined();
+    }
+  });
+
+  test('until_file and until_bash can coexist (both checked each iteration)', () => {
+    const result = loopNodeConfigSchema.safeParse({
+      prompt: 'Work.',
+      until: 'COMPLETE',
+      max_iterations: 5,
+      until_file: 'ready.txt',
+      until_bash: 'test -d output/',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.until_file).toBe('ready.txt');
+      expect(result.data.until_bash).toBe('test -d output/');
+    }
+  });
+
+  test('until_file is optional', () => {
+    const result = loopNodeConfigSchema.safeParse({
+      prompt: 'Work.',
+      until: 'COMPLETE',
+      max_iterations: 3,
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.until_file).toBeUndefined();
+    }
+  });
+});
+
 describe('LOOP_NODE_AI_FIELDS', () => {
-  test('excludes model and provider (loop nodes support them)', () => {
+  test('excludes model, provider, and agent (loop nodes support them)', () => {
     expect(LOOP_NODE_AI_FIELDS).not.toContain('model');
     expect(LOOP_NODE_AI_FIELDS).not.toContain('provider');
+    expect(LOOP_NODE_AI_FIELDS).not.toContain('agent');
   });
 
   test('contains all other AI-specific fields from BASH_NODE_AI_FIELDS', () => {
@@ -693,5 +836,62 @@ describe('LOOP_NODE_AI_FIELDS', () => {
     for (const field of expectedFields) {
       expect(LOOP_NODE_AI_FIELDS).toContain(field);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dagNodeSchema — loop node with agent field (schema transform round-trip)
+// ---------------------------------------------------------------------------
+
+describe('dagNodeSchema — loop node with agent', () => {
+  test('accepts loop node with agent: field and preserves it through transform', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'iterate',
+      agent: 'major-build',
+      loop: {
+        prompt: 'Do the work.',
+        until: 'COMPLETE',
+        max_iterations: 5,
+      },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { agent?: string }).agent).toBe('major-build');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// dagNodeSchema — description field
+// ---------------------------------------------------------------------------
+
+describe('dagNodeSchema — description field', () => {
+  test('accepts description on a bash node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'read-spec',
+      bash: 'gh api repos/foo/bar',
+      description: 'Read spec from bdc-xo via gh api',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.description).toBe('Read spec from bdc-xo via gh api');
+    }
+  });
+
+  test('description is optional — node without it still validates', () => {
+    const result = dagNodeSchema.safeParse({ id: 'x', bash: 'echo hello' });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.description).toBeUndefined();
+    }
+  });
+
+  test('rejects description longer than 120 characters', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'n',
+      bash: 'echo hi',
+      description: 'x'.repeat(121),
+    });
+    expect(result.success).toBe(false);
   });
 });

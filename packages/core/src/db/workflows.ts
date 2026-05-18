@@ -586,6 +586,62 @@ export async function cancelWorkflowRun(id: string): Promise<void> {
 }
 
 /**
+ * Pause a running workflow run via an operator request (HTTP POST /pause).
+ * Distinct from `pauseWorkflowRun` (approval-gate pause): no ApprovalContext
+ * is required and no `metadata.approval` is written. Sets status to 'paused'
+ * only when the run is currently 'running'. Does NOT set completed_at — the
+ * run is not finished.
+ *
+ * Throws when the run is missing or not in the running state so the route
+ * handler can map to 404/422/409 status codes.
+ */
+export async function pauseWorkflowRunByOperator(id: string): Promise<void> {
+  const dialect = getDialect();
+  try {
+    const result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'paused', metadata = ${dialect.jsonMerge('metadata', 2)}
+       WHERE id = $1 AND status = 'running'`,
+      [id, JSON.stringify({ paused_by: 'operator', paused_at: new Date().toISOString() })]
+    );
+    if (result.rowCount === 0) {
+      getLog().warn({ workflowRunId: id }, 'db.workflow_run_pause_operator_no_match');
+      throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_pause_operator_failed');
+    throw new Error(`Failed to pause workflow run: ${err.message}`);
+  }
+}
+
+/**
+ * Resume a paused workflow run (sets status back to 'running').
+ * Used by both operator-paused and approval-gate flows that need to wake the
+ * run cleanly. Throws when the run is missing or not in the paused state.
+ */
+export async function resumeWorkflowRunFromPause(id: string): Promise<void> {
+  try {
+    const result = await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'running'
+       WHERE id = $1 AND status = 'paused'`,
+      [id]
+    );
+    if (result.rowCount === 0) {
+      getLog().warn({ workflowRunId: id }, 'db.workflow_run_resume_no_match');
+      throw new Error(`Workflow run not found or not in paused state (id: ${id})`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_resume_failed');
+    throw new Error(`Failed to resume workflow run: ${err.message}`);
+  }
+}
+
+/**
  * Pause a running workflow run for human approval.
  * Sets status to 'paused' and stores approval context in metadata.
  * Does NOT set completed_at — the run is not finished.
@@ -641,6 +697,8 @@ export interface ListDashboardRunsOptions {
   before?: string;
   limit?: number;
   offset?: number;
+  /** When false (default), hides archived runs from results. */
+  includeArchived?: boolean;
 }
 
 /** Response envelope for paginated dashboard runs. */
@@ -690,6 +748,9 @@ function buildDashboardWhereClauses(
   if (options?.before) {
     values.push(options.before);
     whereClauses.push(`r.started_at < $${String(values.length)}`);
+  }
+  if (!options?.includeArchived) {
+    whereClauses.push('r.archived_at IS NULL');
   }
 
   return whereClauses;
@@ -932,6 +993,63 @@ export async function failOrphanedRuns(): Promise<{ count: number }> {
 }
 
 /**
+ * Cancel all 'running' workflow runs with no activity in the last `staleSinceMinutes` minutes.
+ * Returns the count and IDs of cancelled runs for event-logging by the caller.
+ */
+export async function cancelStaleWorkflowRuns(
+  staleSinceMinutes: number
+): Promise<{ count: number; ids: string[] }> {
+  if (!Number.isInteger(staleSinceMinutes) || staleSinceMinutes < 1) {
+    throw new Error(
+      `Invalid staleSinceMinutes: ${String(staleSinceMinutes)} (must be a positive integer)`
+    );
+  }
+  const dialect = getDialect();
+  const cutoff =
+    getDatabaseType() === 'postgresql'
+      ? `NOW() - INTERVAL '${String(staleSinceMinutes)} minutes'`
+      : `datetime('now', '-${String(staleSinceMinutes)} minutes')`;
+
+  // SELECT first (SQLite does not support RETURNING on UPDATE)
+  let ids: string[];
+  try {
+    const selectResult = await pool.query<{ id: string }>(
+      `SELECT id FROM remote_agent_workflow_runs
+       WHERE status = 'running'
+         AND (last_activity_at IS NULL OR last_activity_at < ${cutoff})`,
+      []
+    );
+    ids = selectResult.rows.map(r => r.id);
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, staleSinceMinutes }, 'db.workflow_runs_cancel_stale_select_failed');
+    throw new Error(`Failed to query stale workflow runs: ${err.message}`);
+  }
+
+  if (ids.length === 0) return { count: 0, ids: [] };
+
+  try {
+    const placeholders = ids.map((_, i) => `$${String(i + 1)}`).join(', ');
+    await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET status = 'cancelled', completed_at = ${dialect.now()}
+       WHERE id IN (${placeholders})`,
+      ids
+    );
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, staleSinceMinutes, count: ids.length },
+      'db.workflow_runs_cancel_stale_update_failed'
+    );
+    throw new Error(`Failed to cancel stale workflow runs: ${err.message}`);
+  }
+
+  getLog().info({ count: ids.length, staleSinceMinutes }, 'db.workflow_runs_stale_cancelled');
+  return { count: ids.length, ids };
+}
+
+/**
  * Delete terminal workflow runs older than the given number of days.
  * Returns the count of deleted runs.
  */
@@ -976,14 +1094,15 @@ export async function deleteOldWorkflowRuns(olderThanDays: number): Promise<{ co
 
 /**
  * Delete a workflow run and its associated events.
- * Only terminal runs (completed, failed, cancelled) can be deleted.
+ * Only terminal runs can be deleted. By default requires archived_at IS NOT NULL.
+ * Pass force=true to bypass the archive guard (operator-confirmed override).
  */
-export async function deleteWorkflowRun(id: string): Promise<void> {
+export async function deleteWorkflowRun(id: string, force = false): Promise<void> {
   try {
     await pool.query('BEGIN', []);
     // Guard: verify run exists and is terminal before deleting
-    const check = await pool.query<{ status: string }>(
-      'SELECT status FROM remote_agent_workflow_runs WHERE id = $1',
+    const check = await pool.query<{ status: string; archived_at: Date | null }>(
+      'SELECT status, archived_at FROM remote_agent_workflow_runs WHERE id = $1',
       [id]
     );
     if (check.rows.length === 0) {
@@ -992,6 +1111,11 @@ export async function deleteWorkflowRun(id: string): Promise<void> {
     if (!TERMINAL_WORKFLOW_STATUSES.includes(check.rows[0].status as WorkflowRunStatus)) {
       throw new WorkflowRunGuardError(
         `Cannot delete workflow run in '${check.rows[0].status}' status — cancel it first`
+      );
+    }
+    if (!force && check.rows[0].archived_at == null) {
+      throw new WorkflowRunGuardError(
+        'Archive the run first before deleting (or pass force=true to bypass)'
       );
     }
     await pool.query('DELETE FROM remote_agent_workflow_events WHERE workflow_run_id = $1', [id]);
@@ -1003,5 +1127,208 @@ export async function deleteWorkflowRun(id: string): Promise<void> {
     const err = error as Error;
     getLog().error({ err, workflowRunId: id }, 'db.workflow_run_delete_failed');
     throw new Error(`Failed to delete workflow run: ${err.message}`);
+  }
+}
+
+/**
+ * Archive a workflow run (soft-hide from default dashboard view).
+ * Running runs cannot be archived — cancel first.
+ * Idempotent: re-archiving an already-archived run is a no-op.
+ */
+export async function archiveWorkflowRun(
+  id: string,
+  archivedBy = 'operator',
+  reason?: string
+): Promise<void> {
+  const dialect = getDialect();
+  try {
+    const check = await pool.query<{ status: string; archived_at: Date | null }>(
+      'SELECT status, archived_at FROM remote_agent_workflow_runs WHERE id = $1',
+      [id]
+    );
+    if (check.rows.length === 0) {
+      throw new WorkflowRunGuardError(`Workflow run not found: ${id}`);
+    }
+    if (check.rows[0].status === 'running' || check.rows[0].status === 'pending') {
+      throw new WorkflowRunGuardError(
+        `Cannot archive workflow run in '${check.rows[0].status}' status — cancel first, then archive`
+      );
+    }
+    if (check.rows[0].archived_at != null) {
+      // Already archived — idempotent no-op
+      return;
+    }
+    await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET archived_at = ${dialect.now()}, archived_by = $1, archive_reason = $2
+       WHERE id = $3`,
+      [archivedBy, reason ?? null, id]
+    );
+    getLog().info(
+      { workflowRunId: id, archivedBy, reason, action: 'archive' },
+      'workflow_run.archived'
+    );
+  } catch (error) {
+    if (error instanceof WorkflowRunGuardError) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_archive_failed');
+    throw new Error(`Failed to archive workflow run: ${err.message}`);
+  }
+}
+
+/**
+ * Unarchive a workflow run (restore to default dashboard view).
+ * Idempotent: unarchiving an active run is a no-op.
+ */
+export async function unarchiveWorkflowRun(id: string): Promise<void> {
+  try {
+    const check = await pool.query<{ archived_at: Date | null }>(
+      'SELECT archived_at FROM remote_agent_workflow_runs WHERE id = $1',
+      [id]
+    );
+    if (check.rows.length === 0) {
+      throw new WorkflowRunGuardError(`Workflow run not found: ${id}`);
+    }
+    if (check.rows[0].archived_at == null) {
+      // Already active — idempotent no-op
+      return;
+    }
+    await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET archived_at = NULL, archived_by = NULL, archive_reason = NULL
+       WHERE id = $1`,
+      [id]
+    );
+    getLog().info({ workflowRunId: id, action: 'unarchive' }, 'workflow_run.unarchived');
+  } catch (error) {
+    if (error instanceof WorkflowRunGuardError) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_unarchive_failed');
+    throw new Error(`Failed to unarchive workflow run: ${err.message}`);
+  }
+}
+
+/** Result from bulk archive operation. */
+export interface BulkArchiveResult {
+  archivedCount: number;
+  runIds: string[];
+}
+
+/**
+ * Bulk-archive all runs matching the given status (and optional olderThan cutoff).
+ * Skips running/pending runs and already-archived runs (idempotent).
+ */
+export async function bulkArchiveWorkflowRuns(options: {
+  status: 'failed' | 'cancelled' | 'completed';
+  olderThan?: string;
+  archivedBy?: string;
+}): Promise<BulkArchiveResult> {
+  const dialect = getDialect();
+  const { status, olderThan, archivedBy = 'operator' } = options;
+
+  const values: unknown[] = [status, archivedBy];
+  let olderThanClause = '';
+  if (olderThan) {
+    values.push(olderThan);
+    olderThanClause = `AND started_at < $${String(values.length)}`;
+  }
+
+  try {
+    // Collect IDs first so we can return them
+    const selectResult = await pool.query<{ id: string }>(
+      `SELECT id FROM remote_agent_workflow_runs
+       WHERE status = $1
+         AND archived_at IS NULL
+         ${olderThanClause}`,
+      olderThan ? [status, olderThan] : [status]
+    );
+    const runIds = selectResult.rows.map(r => r.id);
+    if (runIds.length === 0) {
+      return { archivedCount: 0, runIds: [] };
+    }
+
+    const placeholders = runIds.map((_, i) => `$${String(i + 3)}`).join(', ');
+    await pool.query(
+      `UPDATE remote_agent_workflow_runs
+       SET archived_at = ${dialect.now()}, archived_by = $2, archive_reason = NULL
+       WHERE id IN (${placeholders})`,
+      [status, archivedBy, ...runIds]
+    );
+    getLog().info(
+      { archivedCount: runIds.length, status, archivedBy, action: 'bulk_archive' },
+      'workflow_run.bulk_archived'
+    );
+    return { archivedCount: runIds.length, runIds };
+  } catch (error) {
+    const err = error as Error;
+    getLog().error({ err, status }, 'db.workflow_run_bulk_archive_failed');
+    throw new Error(`Failed to bulk archive workflow runs: ${err.message}`);
+  }
+}
+
+/** Result from bulk delete operation. */
+export interface BulkDeleteResult {
+  deletedCount: number;
+  runIds: string[];
+}
+
+/**
+ * Bulk-delete archived runs with status='failed' (and optional olderThan cutoff).
+ * dryRun=true returns the list without deleting.
+ * Cascades to workflow_events via ON DELETE CASCADE.
+ * Worktree directories on disk are NOT touched.
+ */
+export async function bulkDeleteArchivedFailedRuns(options: {
+  olderThan?: string;
+  dryRun?: boolean;
+}): Promise<BulkDeleteResult> {
+  const { olderThan, dryRun = false } = options;
+
+  const values: unknown[] = [];
+  let olderThanClause = '';
+  if (olderThan) {
+    values.push(olderThan);
+    olderThanClause = `AND started_at < $${String(values.length)}`;
+  }
+
+  try {
+    const selectResult = await pool.query<{ id: string }>(
+      `SELECT id FROM remote_agent_workflow_runs
+       WHERE status = 'failed'
+         AND archived_at IS NOT NULL
+         ${olderThanClause}`,
+      values
+    );
+    const runIds = selectResult.rows.map(r => r.id);
+    if (runIds.length === 0 || dryRun) {
+      getLog().info(
+        { count: runIds.length, dryRun, action: 'bulk_delete_failed' },
+        'workflow_run.bulk_delete_failed_preview'
+      );
+      return { deletedCount: runIds.length, runIds };
+    }
+
+    const placeholders = runIds.map((_, i) => `$${String(i + 1)}`).join(', ');
+    await pool.query('BEGIN', []);
+    await pool.query(
+      `DELETE FROM remote_agent_workflow_events WHERE workflow_run_id IN (${placeholders})`,
+      runIds
+    );
+    const deleteResult = await pool.query(
+      `DELETE FROM remote_agent_workflow_runs WHERE id IN (${placeholders})`,
+      runIds
+    );
+    await pool.query('COMMIT', []);
+    const deletedCount = deleteResult.rowCount ?? runIds.length;
+    getLog().info(
+      { deletedCount, action: 'bulk_delete_failed' },
+      'workflow_run.bulk_deleted_failed'
+    );
+    return { deletedCount, runIds };
+  } catch (error) {
+    await rollback();
+    const err = error as Error;
+    getLog().error({ err }, 'db.workflow_run_bulk_delete_failed_error');
+    throw new Error(`Failed to bulk delete failed workflow runs: ${err.message}`);
   }
 }

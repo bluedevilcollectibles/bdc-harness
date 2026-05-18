@@ -1,5 +1,11 @@
 import { describe, test, expect } from 'bun:test';
-import { ensureUtc, formatDuration, formatDurationMs, formatStarted } from './format';
+import {
+  ensureUtc,
+  formatDuration,
+  formatDurationMs,
+  formatIterLabel,
+  formatStarted,
+} from './format';
 
 describe('ensureUtc', () => {
   test('returns timestamp unchanged when it already ends with Z', () => {
@@ -164,5 +170,27 @@ describe('formatDurationMs', () => {
 
   test('one decimal place for minutes', () => {
     expect(formatDurationMs(75000)).toBe('1.3m');
+  });
+});
+
+describe('formatIterLabel', () => {
+  test('running loop shows iter X/MAX with no suffix', () => {
+    expect(formatIterLabel(4, 25, 'running')).toBe('iter 4/25');
+  });
+
+  test('no status shows iter X/MAX with no suffix', () => {
+    expect(formatIterLabel(1, 10)).toBe('iter 1/10');
+  });
+
+  test('completed loop shows iter X/MAX (done)', () => {
+    expect(formatIterLabel(8, 25, 'completed')).toBe('iter 8/25 (done)');
+  });
+
+  test('completed_with_warning shows iter X/MAX (done)', () => {
+    expect(formatIterLabel(8, 25, 'completed_with_warning')).toBe('iter 8/25 (done)');
+  });
+
+  test('failed loop shows iter X/MAX (failed)', () => {
+    expect(formatIterLabel(3, 25, 'failed')).toBe('iter 3/25 (failed)');
   });
 });

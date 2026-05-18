@@ -16,6 +16,53 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockQuery,
 }));
 
+const mockRefreshIfAuthFailed = mock(async () => ({
+  refreshed: false,
+  reason: 'no_creds' as const,
+}));
+
+mock.module('../auth-refresh/index.js', () => ({
+  refreshIfAuthFailed: mockRefreshIfAuthFailed,
+  isTerminalRefreshReason: (reason: string) =>
+    reason === 'refresh_expired' || reason === 'refresh_revoked',
+  buildReauthMessage: (provider: string, reason: string) =>
+    `${provider} subscription auth expired (${reason}). Re-run ${provider} login on the harness host.`,
+  // L2 + shared module additions (WO-HARNESS-PROVIDER-PROACTIVE-AUTH-REFRESH-01).
+  // ensureFreshAuth is a no-op in tests — the reactive refresh path is what
+  // these regression tests exercise.
+  ensureFreshAuth: mock(async () => {}),
+  AUTH_PATTERNS: [
+    'credit balance',
+    'unauthorized',
+    'authentication',
+    'invalid token',
+    '401',
+    '403',
+    'not logged in',
+    'please run /login',
+    'refresh token',
+    'could not be refreshed',
+    'log out and sign in',
+  ],
+  isAuthErrorMessage: (message: string | undefined) => {
+    if (!message) return false;
+    const lower = message.toLowerCase();
+    return [
+      'credit balance',
+      'unauthorized',
+      'authentication',
+      'invalid token',
+      '401',
+      '403',
+      'not logged in',
+      'please run /login',
+      'refresh token',
+      'could not be refreshed',
+      'log out and sign in',
+    ].some(p => lower.includes(p));
+  },
+}));
+
 import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
@@ -78,6 +125,11 @@ describe('ClaudeProvider', () => {
     mockLogger.warn.mockClear();
     mockLogger.error.mockClear();
     mockLogger.debug.mockClear();
+    mockRefreshIfAuthFailed.mockClear();
+    mockRefreshIfAuthFailed.mockResolvedValue({
+      refreshed: false,
+      reason: 'no_creds' as const,
+    });
   });
 
   describe('constructor', () => {
@@ -615,7 +667,7 @@ describe('ClaudeProvider', () => {
       expect(chunks[0]).toEqual({ type: 'assistant', content: 'Recovered!' });
     }, 5_000);
 
-    test('classifies auth errors as fatal (no retry)', async () => {
+    test('classifies auth errors as fatal when refresh has no credentials', async () => {
       const error = new Error('unauthorized');
       mockQuery.mockImplementation(async function* () {
         throw error;
@@ -628,7 +680,89 @@ describe('ClaudeProvider', () => {
       };
 
       await expect(consumeGenerator()).rejects.toThrow(/Claude Code auth error/);
-      // Should NOT retry - verify single call
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      expect(mockRefreshIfAuthFailed).toHaveBeenCalledWith('claude');
+    });
+
+    test('refreshes auth errors once and retries the query', async () => {
+      let callCount = 0;
+      mockRefreshIfAuthFailed.mockResolvedValue({
+        refreshed: true,
+        provider: 'claude' as const,
+        expiresAt: Date.now() + 28_800_000,
+      });
+      mockQuery.mockImplementation(async function* () {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error('unauthorized');
+        }
+        yield {
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'Recovered after refresh' }] },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(mockRefreshIfAuthFailed).toHaveBeenCalledTimes(1);
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(chunks).toEqual([{ type: 'assistant', content: 'Recovered after refresh' }]);
+    });
+
+    // BDC fork regression (2026-05-15): the Claude binary's pre-flight token check
+    // returns "Not logged in · Please run /login" which previously classified as
+    // 'unknown' and bypassed the refresh path. AUTH_PATTERNS must catch this so the
+    // refresh branch engages. See behavior spec invariant I-2.
+    test.each([
+      ['Not logged in · Please run /login', 'binary pre-flight expired-token error'],
+      ['Please run /login Error: success', 'binary "please run /login" variant'],
+    ])('classifies binary-side auth error as auth: %s (%s)', async (errorMessage, _label) => {
+      let callCount = 0;
+      mockRefreshIfAuthFailed.mockResolvedValue({
+        refreshed: true,
+        provider: 'claude' as const,
+        expiresAt: Date.now() + 28_800_000,
+      });
+      mockQuery.mockImplementation(async function* () {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error(errorMessage);
+        }
+        yield {
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: 'Recovered after refresh' }] },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(mockRefreshIfAuthFailed).toHaveBeenCalledWith('claude');
+      expect(mockQuery).toHaveBeenCalledTimes(2);
+      expect(chunks).toEqual([{ type: 'assistant', content: 'Recovered after refresh' }]);
+    });
+
+    test('surfaces reauth guidance when the refresh token is terminally invalid', async () => {
+      mockRefreshIfAuthFailed.mockResolvedValue({
+        refreshed: false,
+        reason: 'refresh_revoked' as const,
+      });
+      mockQuery.mockImplementation(async function* () {
+        throw new Error('unauthorized');
+      });
+
+      const consumeGenerator = async () => {
+        for await (const _ of client.sendQuery('test', '/workspace')) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(/subscription auth expired/);
       expect(mockQuery).toHaveBeenCalledTimes(1);
     });
 
@@ -726,12 +860,32 @@ describe('ClaudeProvider', () => {
       expect(callArgs.options.settingSources).toEqual(['project', 'user']);
     });
 
-    test('defaults settingSources to project when not provided', async () => {
+    test('defaults settingSources to project + user when not provided', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'test-session' };
       });
 
       for await (const _ of client.sendQuery('test', '/tmp')) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual(['project', 'user']);
+    });
+
+    test("honors explicit settingSources: ['project'] to opt out of user scope", async () => {
+      // Locks in the contract: setting settingSources: ['project'] in
+      // .archon/config.yaml must NOT be silently widened to the new default.
+      // A future refactor that drops the `?? ['project', 'user']` guard would
+      // expand skill/command/agent scope for every project-only deployment.
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        assistantConfig: { settingSources: ['project'] },
+      })) {
         // consume
       }
 

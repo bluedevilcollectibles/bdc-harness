@@ -18,6 +18,13 @@ import type {
 import { parseCodexConfig } from './config';
 import { CODEX_CAPABILITIES } from './capabilities';
 import { resolveCodexBinaryPath } from './binary-resolver';
+import {
+  AUTH_PATTERNS,
+  buildReauthMessage,
+  ensureFreshAuth,
+  isTerminalRefreshReason,
+  refreshIfAuthFailed,
+} from '../auth-refresh/index.js';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -118,14 +125,9 @@ function buildModelAccessMessage(model?: string): string {
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', '429', 'overloaded'];
-const AUTH_PATTERNS = [
-  'credit balance',
-  'unauthorized',
-  'authentication',
-  'invalid token',
-  '401',
-  '403',
-];
+// AUTH_PATTERNS is shared with claude/provider.ts and orchestrator-agent.ts via
+// packages/providers/src/auth-refresh/auth-patterns.ts. Edit that file (not here)
+// to add new auth-error markers.
 const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal', 'codex exec'];
 
 function classifyCodexError(
@@ -543,6 +545,14 @@ export class CodexProvider implements IAgentProvider {
     resumeSessionId?: string,
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
+    // BDC fork: Layer 2 — proactive auth freshness check.
+    // For Codex, ensureFreshAuth first attempts a "soft refresh" via the
+    // binary's own OAuth path (OpenAI's documented approach per
+    // developers.openai.com/codex/auth/ci-cd-auth) and only falls back to a
+    // direct refresh-endpoint POST if that path doesn't advance auth.json.
+    // Behavior spec v2 invariant I-1; research doc §Design recommendation L2 + L4.
+    await ensureFreshAuth('codex');
+
     const assistantConfig = requestOptions?.assistantConfig ?? {};
     const codexConfig = parseCodexConfig(assistantConfig);
 
@@ -644,6 +654,31 @@ export class CodexProvider implements IAgentProvider {
           { err, errorClass, attempt, maxRetries: MAX_SUBPROCESS_RETRIES },
           'query_error'
         );
+
+        // BDC fork: subscription auth must self-heal; API-key fallback is forbidden.
+        if (errorClass === 'auth' && attempt === 0) {
+          try {
+            const result = await refreshIfAuthFailed('codex');
+            if (result.refreshed) {
+              getLog().info(
+                { provider: 'codex', newExpiresAt: new Date(result.expiresAt).toISOString() },
+                'token_refreshed_retrying'
+              );
+              lastError = enrichedError;
+              continue;
+            }
+            getLog().error(
+              { provider: 'codex', reason: result.reason, err: result.error },
+              'token_refresh_failed'
+            );
+            if (isTerminalRefreshReason(result.reason)) {
+              throw new Error(buildReauthMessage('codex', result.reason));
+            }
+          } catch (refreshErr) {
+            getLog().error({ provider: 'codex', err: refreshErr }, 'token_refresh_threw');
+            throw refreshErr;
+          }
+        }
 
         if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
           throw enrichedError;

@@ -23,11 +23,13 @@ COPY packages/core/package.json ./packages/core/
 COPY packages/docs-web/package.json ./packages/docs-web/
 COPY packages/git/package.json ./packages/git/
 COPY packages/isolation/package.json ./packages/isolation/
+COPY packages/overseer/package.json ./packages/overseer/
 COPY packages/paths/package.json ./packages/paths/
 COPY packages/providers/package.json ./packages/providers/
 COPY packages/server/package.json ./packages/server/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
+COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
 
 # Install ALL dependencies (including devDependencies needed for web build)
 # --linker=hoisted: Bun's default "isolated" linker stores packages in
@@ -108,13 +110,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Pre-configure the Claude Code SDK cli.js path for any consumer that runs
-# a compiled Archon binary inside (or extending) this image. In source mode
-# (the default `bun run start` ENTRYPOINT), BUNDLED_IS_BINARY is false and
-# this variable is ignored — the SDK resolves cli.js via node_modules. Kept
-# here so extenders don't need to rediscover the path.
-# Path matches the hoisted layout produced by `bun install --linker=hoisted`.
-ENV CLAUDE_BIN_PATH=/app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js
+# CLAUDE_BIN_PATH is set at container startup (docker-entrypoint.sh).
+# The entrypoint pins the glibc variant to bypass the SDK's musl-first resolver.
 
 # Create non-root user for running Claude Code
 # Claude Code refuses to run with --dangerously-skip-permissions as root for security
@@ -138,11 +135,13 @@ COPY packages/core/package.json ./packages/core/
 COPY packages/docs-web/package.json ./packages/docs-web/
 COPY packages/git/package.json ./packages/git/
 COPY packages/isolation/package.json ./packages/isolation/
+COPY packages/overseer/package.json ./packages/overseer/
 COPY packages/paths/package.json ./packages/paths/
 COPY packages/providers/package.json ./packages/providers/
 COPY packages/server/package.json ./packages/server/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
+COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
 
 # Install production dependencies only (--ignore-scripts skips husky prepare hook)
 RUN bun install --frozen-lockfile --production --ignore-scripts --linker=hoisted
@@ -153,10 +152,12 @@ COPY packages/cli/ ./packages/cli/
 COPY packages/core/ ./packages/core/
 COPY packages/git/ ./packages/git/
 COPY packages/isolation/ ./packages/isolation/
+COPY packages/overseer/ ./packages/overseer/
 COPY packages/paths/ ./packages/paths/
 COPY packages/providers/ ./packages/providers/
 COPY packages/server/ ./packages/server/
 COPY packages/workflows/ ./packages/workflows/
+COPY packages/persona-context-loader/ ./packages/persona-context-loader/
 
 # Copy pre-built web UI from build stage
 COPY --from=web-build /app/packages/web/dist/ ./packages/web/dist/
@@ -172,11 +173,14 @@ RUN chown -R appuser:appuser /app
 # Create .codex directory for Codex authentication
 RUN mkdir -p /home/appuser/.codex && chown appuser:appuser /home/appuser/.codex
 
-# Configure git to trust Archon directories (as appuser)
-RUN gosu appuser git config --global --add safe.directory '/.archon/workspaces' && \
-    gosu appuser git config --global --add safe.directory '/.archon/workspaces/*' && \
-    gosu appuser git config --global --add safe.directory '/.archon/worktrees' && \
-    gosu appuser git config --global --add safe.directory '/.archon/worktrees/*'
+# Configure git to trust all directories for both root and appuser.
+# Uses the git-native '*' wildcard (standalone token, not a shell glob) which
+# means "trust all repos regardless of ownership" (CVE-2022-24765 safe.directory).
+# The prior specific-path entries ('/.archon/workspaces/*' etc.) do NOT recurse --
+# git only matches them as literal strings, not as filesystem globs. The wildcard
+# covers worktrees created at arbitrary depths after container startup.
+RUN git config --global --add safe.directory '*' && \
+    gosu appuser git config --global --add safe.directory '*'
 
 # Copy entrypoint script (fixes volume permissions, drops to appuser)
 # sed strips Windows CRLF in case .gitattributes eol=lf was bypassed

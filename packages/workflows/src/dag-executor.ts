@@ -6,7 +6,7 @@
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
 import { readFile } from 'fs/promises';
-import { isAbsolute, resolve as resolvePath } from 'path';
+import { isAbsolute, join, resolve as resolvePath } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import type {
@@ -52,6 +52,8 @@ import {
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger } from '@archon/paths';
 import { getWorkflowEventEmitter } from './event-emitter';
+import { detectSilentFailure } from './silent-failure-detector';
+import { handleNodeFailure } from './overseer-bridge';
 import { evaluateCondition } from './condition-evaluator';
 import {
   logNodeStart,
@@ -69,18 +71,41 @@ import {
   detectCreditExhaustion,
   loadCommandPrompt,
   substituteWorkflowVariables,
+  substituteInputRefs,
   buildPromptWithContext,
   detectCompletionSignal,
   stripCompletionTags,
   isInlineScript,
   formatSubprocessFailure,
+  resolveAgentPersona,
 } from './executor-shared';
+import { loadAgentRegistry, resolveAgent } from './agents/registry';
+import type { AgentRegistry } from './agents/registry';
+import { loadContext } from '@archon/persona-context-loader';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.dag-executor');
   return cachedLog;
+}
+
+// Agent registry cache: keyed by agents directory path, populated on first use.
+// One cache entry per unique repo root — each worktree gets its own registry.
+const agentRegistryCache = new Map<string, AgentRegistry>();
+
+async function getAgentRegistry(cwd: string): Promise<AgentRegistry> {
+  const agentsDir = join(resolvePath(cwd, '.archon', 'agents'));
+  const cached = agentRegistryCache.get(agentsDir);
+  if (cached !== undefined) return cached;
+  const registry = await loadAgentRegistry(agentsDir);
+  agentRegistryCache.set(agentsDir, registry);
+  return registry;
+}
+
+/** Clear the agent registry cache — exposed for testing only. */
+export function clearAgentRegistryCache(): void {
+  agentRegistryCache.clear();
 }
 
 const MCP_FAILURE_PREFIX = 'MCP server connection failed: ';
@@ -282,41 +307,75 @@ function shellQuote(value: string): string {
  * @param escapedForBash - When true, wraps substituted values in single quotes so
  *   they are safe to embed in bash scripts passed to `bash -c`. Set true only for
  *   bash node script substitution; AI/command prompt substitution should use false.
+ *
+ * When escapedForBash is on, this function ALSO detects the
+ *   "$node.output"   (exact double-quoted substitution)
+ * anti-pattern and swallows the surrounding double quotes. shellQuote already
+ * produces safe single-quote wrapping; wrapping that in additional double quotes
+ * mis-tokenizes multi-line node output — line 2+ of the output becomes bare
+ * commands. Anchor: WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01 (bdc-xo#153) 2026-05-16.
+ * YAMLs that write `"$node.output"` are now safe to author this natural way; the
+ * older pattern of `VAR=$node.output ... "$VAR"` continues to work unchanged.
  */
 export function substituteNodeOutputRefs(
   prompt: string,
   nodeOutputs: Map<string, NodeOutput>,
   escapedForBash = false
 ): string {
-  return prompt.replace(
-    /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g,
-    (match, nodeId: string, field: string | undefined) => {
-      const nodeOutput = nodeOutputs.get(nodeId);
-      if (!nodeOutput) {
-        getLog().warn({ nodeId, match }, 'dag_node_output_ref_unknown_node');
-        return escapedForBash ? "''" : '';
-      }
-      if (!field) {
-        return escapedForBash ? shellQuote(nodeOutput.output) : nodeOutput.output;
-      }
-      try {
-        const parsed = JSON.parse(nodeOutput.output) as Record<string, unknown>;
-        const value = parsed[field];
-        if (typeof value === 'string') return escapedForBash ? shellQuote(value) : value;
-        // numbers and booleans from JSON.parse are shell-safe without quoting:
-        // JSON disallows NaN/Infinity, so String(number) contains only digits, sign, and '.'.
-        // String(boolean) is 'true' or 'false' — no shell metacharacters.
-        if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-        return escapedForBash ? "''" : ''; // objects, null, undefined, symbol, bigint → empty
-      } catch (jsonErr) {
-        getLog().warn(
-          { nodeId, field, outputPreview: nodeOutput.output.slice(0, 100), err: jsonErr as Error },
-          'dag_node_output_ref_json_parse_failed'
-        );
-        return escapedForBash ? "''" : '';
-      }
+  const pattern = escapedForBash
+    ? /(")?\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?(")?/g
+    : /\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?/g;
+
+  return prompt.replace(pattern, (match: string, ...rest: (string | undefined)[]) => {
+    let leadingQuote: string;
+    let nodeId: string;
+    let field: string | undefined;
+    let trailingQuote: string;
+    if (escapedForBash) {
+      leadingQuote = rest[0] ?? '';
+      nodeId = rest[1] ?? '';
+      field = rest[2];
+      trailingQuote = rest[3] ?? '';
+    } else {
+      leadingQuote = '';
+      nodeId = rest[0] ?? '';
+      field = rest[1];
+      trailingQuote = '';
     }
-  );
+    const swallowQuotes = leadingQuote === '"' && trailingQuote === '"';
+    const wrap = (val: string): string =>
+      escapedForBash && !swallowQuotes ? `${leadingQuote}${val}${trailingQuote}` : val;
+
+    const nodeOutput = nodeOutputs.get(nodeId);
+    if (!nodeOutput) {
+      getLog().warn({ nodeId, match }, 'dag_node_output_ref_unknown_node');
+      return escapedForBash ? wrap("''") : '';
+    }
+    if (!field) {
+      return escapedForBash ? wrap(shellQuote(nodeOutput.output)) : nodeOutput.output;
+    }
+    try {
+      const parsed = JSON.parse(nodeOutput.output) as Record<string, unknown>;
+      const value = parsed[field];
+      if (typeof value === 'string') return escapedForBash ? wrap(shellQuote(value)) : value;
+      // numbers and booleans from JSON.parse are shell-safe without quoting:
+      // JSON disallows NaN/Infinity, so String(number) contains only digits, sign, and '.'.
+      // String(boolean) is 'true' or 'false' — no shell metacharacters.
+      if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+      // arrays and objects: JSON-stringify. Bash passes substitution as a single
+      // argument, so downstream tools (jq, etc.) receive a JSON literal they can parse.
+      if (Array.isArray(value) || typeof value === 'object') {
+        return escapedForBash ? wrap(shellQuote(JSON.stringify(value))) : JSON.stringify(value);
+      }
+      return escapedForBash ? wrap("''") : ''; // null, undefined, symbol, bigint → empty
+    } catch (jsonErr) {
+      getLog().warn(
+        { nodeId, field, outputPreview: nodeOutput.output.slice(0, 100), err: jsonErr as Error },
+        'dag_node_output_ref_json_parse_failed'
+      );
+      return escapedForBash ? wrap("''") : '';
+    }
+  });
 }
 
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
@@ -338,7 +397,7 @@ async function resolveNodeProviderAndModel(
   platform: IWorkflowPlatform,
   conversationId: string,
   workflowRunId: string,
-  _cwd: string,
+  cwd: string,
   workflowLevelOptions: WorkflowLevelOptions
 ): Promise<{
   provider: string;
@@ -427,13 +486,52 @@ async function resolveNodeProviderAndModel(
     );
   }
 
+  // Resolve agent persona (if node declares agent:)
+  // The persona's model overrides the node-resolved model; its system prompt is
+  // prepended to any node-level systemPrompt; its tools list (if present) is
+  // used as allowed_tools (node-level allowed_tools take precedence if set).
+  let effectiveModel = model;
+  let effectiveSystemPrompt = node.systemPrompt;
+  let effectiveAllowedTools = node.allowed_tools;
+
+  const agentName = 'agent' in node ? (node as { agent?: string }).agent : undefined;
+  if (agentName) {
+    const registry = await getAgentRegistry(cwd);
+    const persona = resolveAgent(agentName, registry);
+    if (persona) {
+      const personaResolution = resolveAgentPersona(persona, effectiveModel);
+      effectiveModel = personaResolution.model;
+      // Prepend agent system prompt (agent role comes before node task)
+      effectiveSystemPrompt = effectiveSystemPrompt
+        ? `${personaResolution.systemPrompt}\n\n${effectiveSystemPrompt}`
+        : personaResolution.systemPrompt;
+      // Agent tools only apply when node doesn't already restrict tools
+      if (personaResolution.allowedTools && !effectiveAllowedTools) {
+        effectiveAllowedTools = personaResolution.allowedTools;
+      }
+
+      // Load persona context (wiki + oracle) and prepend to system prompt
+      if (persona.context) {
+        const contextBlock = await loadContext(persona).catch(err => {
+          getLog().warn({ agentName, err: (err as Error).message }, 'agent.context_load_failed');
+          return '';
+        });
+        if (contextBlock) {
+          effectiveSystemPrompt = effectiveSystemPrompt
+            ? `${contextBlock}\n\n${effectiveSystemPrompt}`
+            : contextBlock;
+        }
+      }
+    }
+  }
+
   // Build universal base options
   const baseOptions: SendQueryOptions = {};
-  if (model) baseOptions.model = model;
+  if (effectiveModel) baseOptions.model = effectiveModel;
   if (config.envVars && Object.keys(config.envVars).length > 0) {
     baseOptions.env = config.envVars;
   }
-  if (node.systemPrompt !== undefined) baseOptions.systemPrompt = node.systemPrompt;
+  if (effectiveSystemPrompt !== undefined) baseOptions.systemPrompt = effectiveSystemPrompt;
   if (node.maxBudgetUsd !== undefined) baseOptions.maxBudgetUsd = node.maxBudgetUsd;
   const fb = node.fallbackModel ?? workflowLevelOptions.fallbackModel;
   if (fb) baseOptions.fallbackModel = fb;
@@ -447,7 +545,7 @@ async function resolveNodeProviderAndModel(
     hooks: node.hooks,
     skills: node.skills,
     agents: node.agents,
-    allowed_tools: node.allowed_tools,
+    allowed_tools: effectiveAllowedTools,
     denied_tools: node.denied_tools,
     effort: node.effort ?? workflowLevelOptions.effort,
     thinking: node.thinking ?? workflowLevelOptions.thinking,
@@ -455,7 +553,7 @@ async function resolveNodeProviderAndModel(
     betas: node.betas ?? workflowLevelOptions.betas,
     output_format: node.output_format,
     maxBudgetUsd: node.maxBudgetUsd,
-    systemPrompt: node.systemPrompt,
+    systemPrompt: effectiveSystemPrompt,
     fallbackModel: fb,
   };
 
@@ -468,7 +566,7 @@ async function resolveNodeProviderAndModel(
     assistantConfig,
   };
 
-  return { provider, model, options };
+  return { provider, model: effectiveModel, options };
 }
 
 /** Evaluate trigger rule for a node given its upstream states */
@@ -615,28 +713,13 @@ async function executeNodeInternal(
     if (!promptResult.success) {
       const errMsg = promptResult.message;
       getLog().error({ nodeId: node.id, error: errMsg }, 'dag_node_command_load_failed');
-      await logNodeError(logDir, workflowRun.id, node.id, errMsg);
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: node.id,
-          data: { error: errMsg },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: node.command,
-        error: errMsg,
-      });
-      return { state: 'failed', output: '', error: errMsg };
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        { errorMsg: errMsg, logDir, outputSoFar: '' }
+      );
+      return failResult.output;
     }
     rawPrompt = promptResult.content;
   } else {
@@ -1036,33 +1119,25 @@ async function executeNodeInternal(
         'dag_node_cancelled_during_streaming'
       );
 
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: node.id,
-          data: { error: 'Cancelled by user', duration_ms: duration },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: node.command ?? node.id,
-        error: 'Cancelled by user',
-      });
+      const cancelMsg = 'Cancelled by user';
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: cancelMsg,
+          logDir,
+          outputSoFar: nodeOutputText,
+          hasOutput: nodeOutputText.length > 0,
+          extraEventData: { duration_ms: duration },
+        }
+      );
 
       // Clean up throttle entries
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: nodeOutputText, error: 'Cancelled by user' };
+      return failResult.output;
     }
 
     if (streamingMode === 'batch' && batchMessages.length > 0) {
@@ -1079,34 +1154,24 @@ async function executeNodeInternal(
     if (creditError) {
       const duration = Date.now() - nodeStartTime;
       getLog().warn({ nodeId: node.id, durationMs: duration }, 'dag.node_credit_exhausted');
-      await logNodeError(logDir, workflowRun.id, node.id, creditError);
 
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: node.id,
-          data: { error: creditError },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: node.command ?? node.id,
-        error: creditError,
-      });
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: creditError,
+          logDir,
+          outputSoFar: nodeOutputText,
+          hasOutput: nodeOutputText.length > 0,
+          extraEventData: { duration_ms: duration },
+        }
+      );
 
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: nodeOutputText, error: creditError };
+      return failResult.output;
     }
 
     // Empty assistant output is a failure for AI nodes — a provider stream
@@ -1122,34 +1187,24 @@ async function executeNodeInternal(
       const duration = Date.now() - nodeStartTime;
       const emptyError = `Node '${node.id}' produced no assistant output. The provider stream closed without yielding content — likely a silent provider rejection or stream interruption.`;
       getLog().error({ nodeId: node.id, durationMs: duration }, 'dag.node_empty_output');
-      await logNodeError(logDir, workflowRun.id, node.id, emptyError);
 
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'node_failed',
-          step_name: node.id,
-          data: { error: emptyError, duration_ms: duration },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-
-      emitter.emit({
-        type: 'node_failed',
-        runId: workflowRun.id,
-        nodeId: node.id,
-        nodeName: node.command ?? node.id,
-        error: emptyError,
-      });
+      const failResult = await handleNodeFailure(
+        { store: deps.store, emitter, log: getLog(), logNodeError },
+        workflowRun,
+        node,
+        {
+          errorMsg: emptyError,
+          logDir,
+          outputSoFar: '',
+          hasOutput: false,
+          extraEventData: { duration_ms: duration },
+        }
+      );
 
       lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
       lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
-      return { state: 'failed', output: '', error: emptyError };
+      return failResult.output;
     }
 
     const duration = Date.now() - nodeStartTime;
@@ -1269,7 +1324,8 @@ async function executeBashNode(
   docsDir: string,
   nodeOutputs: Map<string, NodeOutput>,
   issueContext?: string,
-  envVars?: Record<string, string>
+  envVars?: Record<string, string>,
+  resolvedInputs?: Record<string, string>
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1309,14 +1365,29 @@ async function executeBashNode(
     docsDir,
     issueContext
   );
-  const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true);
+  const nodeRefResolved = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true);
+  // Substitute ${input.X} references from workflow inputs (safe: '.' is not a valid bash
+  // identifier character, so these patterns can never collide with real bash expansions).
+  const finalScript = resolvedInputs
+    ? substituteInputRefs(nodeRefResolved, resolvedInputs)
+    : nodeRefResolved;
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
+  // Inject workflow inputs as INPUT_<NAME> env vars (belt-and-suspenders alongside template substitution).
+  const inputEnvVars: Record<string, string> = resolvedInputs
+    ? Object.fromEntries(
+        Object.entries(resolvedInputs).map(([k, v]) => [`INPUT_${k.toUpperCase()}`, v])
+      )
+    : {};
   const subprocessEnv: NodeJS.ProcessEnv = {
     ...process.env,
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
     BASE_BRANCH: baseBranch,
+    // WORKFLOW_ID and WORKTREE_PATH as actual env vars (complement the $WORKFLOW_ID template token).
+    WORKFLOW_ID: workflowRun.id,
+    WORKTREE_PATH: cwd,
+    ...inputEnvVars,
     ...(envVars ?? {}),
   };
 
@@ -1341,6 +1412,65 @@ async function executeBashNode(
     }
 
     const duration = Date.now() - nodeStartTime;
+
+    // WO-170: detect silent-failure pattern in stdout even though exit code was 0.
+    // Load-bearing nodes (per WO-167 doctrine) get any STATUS=*_failed flagged;
+    // all nodes get always-dangerous patterns (push_failed, commit_failed, ...) flagged.
+    const warning = detectSilentFailure(output, node.load_bearing === true);
+
+    if (warning) {
+      getLog().warn(
+        {
+          nodeId: node.id,
+          durationMs: duration,
+          patterns: warning.patterns,
+          loadBearing: warning.loadBearing,
+        },
+        'dag_node_completed_with_warning'
+      );
+      await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', {
+        durationMs: duration,
+      });
+
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'node_completed_with_warning',
+          step_name: node.id,
+          data: {
+            duration_ms: duration,
+            type: 'bash',
+            node_output: output,
+            warning_status_line: warning.statusLine,
+            warning_patterns: warning.patterns,
+            warning_load_bearing: warning.loadBearing,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'node_completed_with_warning' },
+            'workflow_event_persist_failed'
+          );
+        });
+
+      emitter.emit({
+        type: 'node_completed_with_warning',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        nodeName: node.id,
+        duration,
+        statusLine: warning.statusLine,
+        patterns: warning.patterns,
+        loadBearing: warning.loadBearing,
+      });
+
+      // Downstream nodes still see this node as completed — the warning is an
+      // observability signal, not a graph-control change. Failing the node
+      // here would block dependents; rolling-up at workflow level is the UI's
+      // job (see WorkflowExecution.tsx).
+      return { state: 'completed', output };
+    }
+
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<bash>', { durationMs: duration });
 
@@ -1390,31 +1520,38 @@ async function executeBashNode(
       { ...formatted.logFields, nodeId: node.id, nodeType: 'bash', isTimeout },
       'dag_node_failed'
     );
-    await logNodeError(logDir, workflowRun.id, node.id, errorMsg);
 
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'node_failed',
-        step_name: node.id,
-        data: { error: errorMsg, type: 'bash' },
-      })
-      .catch((dbErr: Error) => {
-        getLog().error(
-          { err: dbErr, workflowRunId: workflowRun.id, eventType: 'node_failed' },
-          'workflow_event_persist_failed'
-        );
-      });
+    // Route through overseer-bridge so bash-node failures get classified and the
+    // silent-dead-end classes (implement_loop_no_output, validator_feedback_not_applied,
+    // validator_rejected, implement_loop_skipped) trigger escalation side effects.
+    // Pre-WO-OVERSEER-FAILURE-CLASSES-EXPANSION-01 this site inlined the logNodeError
+    // + createWorkflowEvent + emitter.emit + return-failed pattern and missed the
+    // bash-node failure mode entirely.
+    const validatorOutput = nodeOutputs.get('war-council-validator')?.output ?? undefined;
+    const woIdMatch = workflowRun.user_message
+      ? /\bWO-[A-Z0-9-]+/.exec(workflowRun.user_message)
+      : null;
+    const woId = woIdMatch ? woIdMatch[0] : undefined;
+    const exitCode = typeof err.code === 'number' ? err.code : undefined;
 
-    emitter.emit({
-      type: 'node_failed',
-      runId: workflowRun.id,
-      nodeId: node.id,
-      nodeName: node.id,
-      error: errorMsg,
-    });
+    const failResult = await handleNodeFailure(
+      { store: deps.store, emitter, log: getLog(), logNodeError },
+      workflowRun,
+      node,
+      {
+        errorMsg,
+        logDir,
+        outputSoFar: '',
+        hasOutput: false,
+        nodeType: 'bash',
+        exitCode,
+        validatorOutput,
+        woId,
+        extraEventData: { type: 'bash', isTimeout },
+      }
+    );
 
-    return { state: 'failed', output: '', error: errorMsg };
+    return failResult.output;
   }
 }
 
@@ -1605,6 +1742,60 @@ async function executeScriptNode(
     }
 
     const duration = Date.now() - nodeStartTime;
+
+    // WO-170: same silent-failure detection on script nodes — STATUS=*_failed
+    // on stdout when exit code was 0 is a yellow-state signal.
+    const warning = detectSilentFailure(output, node.load_bearing === true);
+
+    if (warning) {
+      getLog().warn(
+        {
+          nodeId: node.id,
+          durationMs: duration,
+          patterns: warning.patterns,
+          loadBearing: warning.loadBearing,
+        },
+        'dag_node_completed_with_warning'
+      );
+      await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', {
+        durationMs: duration,
+      });
+
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'node_completed_with_warning',
+          step_name: node.id,
+          data: {
+            duration_ms: duration,
+            type: 'script',
+            node_output: output,
+            warning_status_line: warning.statusLine,
+            warning_patterns: warning.patterns,
+            warning_load_bearing: warning.loadBearing,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'node_completed_with_warning' },
+            'workflow_event_persist_failed'
+          );
+        });
+
+      emitter.emit({
+        type: 'node_completed_with_warning',
+        runId: workflowRun.id,
+        nodeId: node.id,
+        nodeName: node.id,
+        duration,
+        statusLine: warning.statusLine,
+        patterns: warning.patterns,
+        loadBearing: warning.loadBearing,
+      });
+
+      return { state: 'completed', output };
+    }
+
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, '<script>', { durationMs: duration });
 
@@ -1687,6 +1878,7 @@ async function executeScriptNode(
  * Uses the same nodeConfig + assistantConfig pattern as resolveNodeProviderAndModel.
  */
 function buildLoopNodeOptions(
+  node: LoopNode,
   provider: string,
   model: string | undefined,
   config: WorkflowConfig,
@@ -1697,6 +1889,7 @@ function buildLoopNodeOptions(
   if (config.envVars && Object.keys(config.envVars).length > 0) {
     options.env = config.envVars;
   }
+  if (node.systemPrompt !== undefined) options.systemPrompt = node.systemPrompt;
   options.assistantConfig = config.assistants[provider] ?? {};
   // Pass workflow-level options as nodeConfig so providers can apply them
   if (workflowLevelOptions) {
@@ -1769,16 +1962,39 @@ async function executeLoopNode(
   let loopFinalStopReason: string | undefined;
   let loopTotalNumTurns: number | undefined;
   const resolvedOptions = buildLoopNodeOptions(
+    node,
     workflowProvider,
     workflowModel,
     config,
     workflowLevelOptions
   );
 
+  // Resolve agent persona for loop node (if agent: is declared).
+  // Applied to every iteration — same semantics as prompt/command nodes:
+  // persona model overrides the loop-resolved model; persona system prompt is
+  // prepended to any node-level systemPrompt.
+  const loopAgentName = (node as { agent?: string }).agent;
+  if (loopAgentName) {
+    const registry = await getAgentRegistry(cwd);
+    const persona = resolveAgent(loopAgentName, registry);
+    if (persona) {
+      const personaResolution = resolveAgentPersona(persona, resolvedOptions.model);
+      resolvedOptions.model = personaResolution.model;
+      resolvedOptions.systemPrompt = resolvedOptions.systemPrompt
+        ? `${personaResolution.systemPrompt}\n\n${resolvedOptions.systemPrompt}`
+        : personaResolution.systemPrompt;
+    }
+  }
+
   // Helper to log event store errors consistently
   const logEventStoreError = (err: Error, iteration: number): void => {
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
   };
+
+  // Sticky signal detection: once the completion token appears in any iteration's
+  // output it stays true, so a resumed interactive loop or a reset fullOutput on the
+  // next iteration cannot "un-detect" a signal the agent already emitted.
+  let stickySignalDetected = false;
 
   for (let i = startIteration; i <= loop.max_iterations; i++) {
     const iterationStart = Date.now();
@@ -2105,13 +2321,18 @@ async function executeLoopNode(
     // For interactive loops, the AI emits the signal when the user explicitly approves
     // (e.g., "approved", "looks good"). The prompt instructs the AI on when to emit it.
     const signalDetected = detectCompletionSignal(fullOutput, loop.until);
+    if (signalDetected) stickySignalDetected = true;
 
-    // Check deterministic bash condition (if configured)
+    // Check deterministic bash condition (if configured).
+    // `until_file` is a shorthand that expands to a `test -f` check.
+    const effectiveUntilBash = loop.until_file
+      ? `test -f .archon/${loop.until_file}`
+      : loop.until_bash;
     let bashComplete = false;
-    if (loop.until_bash) {
+    if (effectiveUntilBash) {
       try {
         const { prompt: bashPrompt } = substituteWorkflowVariables(
-          loop.until_bash,
+          effectiveUntilBash,
           workflowRun.id,
           workflowRun.user_message,
           artifactsDir,
@@ -2140,7 +2361,7 @@ async function executeLoopNode(
     }
 
     const duration = Date.now() - iterationStart;
-    const completionDetected = signalDetected || bashComplete;
+    const completionDetected = stickySignalDetected || bashComplete;
 
     // Emit iteration completed
     getWorkflowEventEmitter().emit({
@@ -2483,7 +2704,11 @@ export async function executeDagWorkflow(
   platform: IWorkflowPlatform,
   conversationId: string,
   cwd: string,
-  workflow: { name: string; nodes: readonly DagNode[] } & WorkflowLevelOptions,
+  workflow: {
+    name: string;
+    nodes: readonly DagNode[];
+    inputs?: Record<string, { default: string }>;
+  } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
   workflowProvider: string,
   workflowModel: string | undefined,
@@ -2497,6 +2722,12 @@ export async function executeDagWorkflow(
   priorCompletedNodes?: Map<string, string>
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
+
+  // Resolve workflow inputs: extract defaults from the `inputs:` section.
+  // These are substituted into bash node scripts as ${input.name} before execution.
+  const resolvedInputs: Record<string, string> = workflow.inputs
+    ? Object.fromEntries(Object.entries(workflow.inputs).map(([k, v]) => [k, v.default]))
+    : {};
   const workflowLevelOptions = {
     effort: workflow.effort,
     thinking: workflow.thinking,
@@ -2715,7 +2946,8 @@ export async function executeDagWorkflow(
               docsDir,
               nodeOutputs,
               issueContext,
-              config.envVars
+              config.envVars,
+              resolvedInputs
             );
             return { nodeId: node.id, output };
           }

@@ -15,11 +15,74 @@ import { modelReasoningEffortSchema, webSearchModeSchema } from './schemas/workf
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { z } from '@hono/zod-openapi';
 
+export type LoaderErrorType =
+  | 'parse_error'
+  | 'dag_invalid'
+  | 'missing_required_field'
+  | 'schema_violation';
+
+export interface LoaderError {
+  readonly filename: string;
+  readonly path?: string;
+  readonly error_type: LoaderErrorType;
+  readonly message: string;
+  readonly last_attempt_at: string;
+}
+
+const loaderErrors = new Map<string, LoaderError>();
+
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.loader');
   return cachedLog;
+}
+
+export function classifyLoaderError(error: WorkflowLoadError): LoaderErrorType {
+  if (error.errorType === 'parse_error') return 'parse_error';
+
+  const message = error.error;
+  if (/missing required field|workflow must have/i.test(message)) {
+    return 'missing_required_field';
+  }
+  if (
+    /dag node validation failed|depends_on unknown|cycle detected|references unknown|mutually exclusive|loop\./i.test(
+      message
+    )
+  ) {
+    return 'dag_invalid';
+  }
+  return 'schema_violation';
+}
+
+export function clearLoaderErrors(): void {
+  loaderErrors.clear();
+}
+
+export function recordLoaderError(error: WorkflowLoadError, path?: string): LoaderError {
+  const loaderError: LoaderError = {
+    filename: error.filename,
+    ...(path !== undefined ? { path } : {}),
+    error_type: classifyLoaderError(error),
+    message: error.error,
+    last_attempt_at: new Date().toISOString(),
+  };
+
+  loaderErrors.set(path ?? error.filename, loaderError);
+  getLog().warn(
+    {
+      filename: loaderError.filename,
+      path: loaderError.path,
+      error_type: loaderError.error_type,
+      validationErrors: [loaderError.message],
+    },
+    'workflow_parse_failed'
+  );
+  return loaderError;
+}
+
+export function getLoaderErrors(): LoaderError[] {
+  return Array.from(loaderErrors.values()).sort((a, b) => a.filename.localeCompare(b.filename));
 }
 
 /**
@@ -424,6 +487,15 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.tags }, 'invalid_tags_block_ignored');
     }
 
+    // Parse optional target_repo — Rule 28 cross-repo guard.
+    // Must be a non-empty string (owner/repo). Invalid values are warned and ignored.
+    let targetRepo: string | undefined;
+    if (typeof raw.target_repo === 'string' && raw.target_repo.trim().length > 0) {
+      targetRepo = raw.target_repo.trim();
+    } else if (raw.target_repo !== undefined) {
+      getLog().warn({ filename, value: raw.target_repo }, 'invalid_target_repo_ignored');
+    }
+
     return {
       workflow: {
         name: raw.name,
@@ -438,6 +510,16 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         nodes: dagNodes,
         ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
         ...(tags !== undefined ? { tags } : {}),
+        ...(targetRepo !== undefined ? { target_repo: targetRepo } : {}),
+        // 2026-05-16 fix: inputs block was declared in workflow.schemas.ts:104 +
+        // wired in dag-executor.ts:1362-1365 + 2576-2578, but the loader silently
+        // dropped raw.inputs from the returned workflow object. Result: every
+        // workflow's inputs surfaced as null at /api/workflows and $INPUT_* env
+        // vars were never injected into bash nodes. Anchor: bdc-author-wo-batch
+        // 3 fires died at read-inputs (WO #165 follow-up to extend the API).
+        ...(raw.inputs !== undefined
+          ? { inputs: raw.inputs as Record<string, { default: string }> }
+          : {}),
       },
       error: null,
     };

@@ -6,7 +6,14 @@
 import type { components } from '@/lib/api.generated';
 
 export type WorkflowRunStatus = components['schemas']['WorkflowRunStatus'];
-export type WorkflowStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+export type WorkflowStepStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  /** WO-170: exit-0 but emitted STATUS=*_failed on stdout. Yellow in UI. */
+  | 'completed_with_warning'
+  | 'failed'
+  | 'skipped';
 export type ArtifactType = 'pr' | 'commit' | 'file_created' | 'file_modified' | 'branch';
 
 // Base SSE event
@@ -119,6 +126,11 @@ export interface DagNodeEvent extends BaseSSEEvent {
   duration?: number;
   error?: string;
   reason?: 'when_condition' | 'trigger_rule';
+  costUsd?: number;
+  /** WO-170: present when status === 'completed_with_warning'. */
+  warningStatusLine?: string;
+  warningPatterns?: string[];
+  warningLoadBearing?: boolean;
 }
 
 // Workflow tool activity (tool_started / tool_completed from executor)
@@ -250,6 +262,13 @@ export interface DagNodeState {
   currentIteration?: number;
   maxIterations?: number;
   iterations?: LoopIterationInfo[];
+  costUsd?: number;
+  /** WO-170: STATUS=*_failed line(s) detected on stdout when status === 'completed_with_warning'. */
+  warningStatusLine?: string;
+  /** WO-170: matched *_failed patterns (e.g. ['push_failed']). */
+  warningPatterns?: string[];
+  /** WO-170: true if warning was triggered by load_bearing opt-in, false if always-dangerous pattern. */
+  warningLoadBearing?: boolean;
 }
 
 export interface WorkflowArtifact {

@@ -117,5 +117,29 @@ describe('bundled-defaults', () => {
         expect(content.includes('nodes:')).toBe(true);
       }
     });
+
+    // WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01 regression guard:
+    // Ensure the false-negative pattern is gone and the corrected COMMITS_AHEAD
+    // check is present in all four affected bdc-* workflows.
+    describe('commit-and-push backstop false-negative fix', () => {
+      const AFFECTED = [
+        'bdc-feature-development',
+        'bdc-bug-fix',
+        'bdc-cleanup-sweep',
+        'bdc-doctrine-update',
+      ];
+
+      for (const name of AFFECTED) {
+        it(`${name} does not contain the false-negative "No changed files found; cannot commit." message`, () => {
+          const content = BUNDLED_WORKFLOWS[name];
+          expect(content).not.toContain('No changed files found; cannot commit.');
+        });
+
+        it(`${name} contains COMMITS_AHEAD check (the corrected backstop logic)`, () => {
+          const content = BUNDLED_WORKFLOWS[name];
+          expect(content).toContain('COMMITS_AHEAD');
+        });
+      }
+    });
   });
 });

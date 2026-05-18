@@ -1,0 +1,582 @@
+# Drafted for WO-HARNESS-RECOVER-FROM-NOTION-WORKFLOW-01 (bdc-xo#172).
+# Purpose: rescue WO spec content from Notion entries when the originating
+# author/build workflow filed the Notion pages but lost the local MD files
+# (anchor: 2026-05-16 engine sortie loss — 13 Notion pointers filed clean,
+# 26 spec/YAML/test-plan MD files vanished when push silently failed).
+#
+# Pipeline:
+#   read-page-ids  → parse comma-separated NOTION_PAGE_IDS, fail if empty
+#   fetch-pages    → for each id: Notion REST GET page + blocks, render MD
+#   write-files    → docs/work-orders/<WO-ID>.md (idempotent; skip if exists)
+#   commit-and-push (load_bearing: true) → real retry, exit !=0 on failure
+#   open-pr         (load_bearing: true) → real retry, exit !=0 on failure
+#
+# Doctrine compliance:
+#   - YAML Recipe v1 (12 sections)
+#   - WO-167 load-bearing convention: terminal git/gh ops MUST NOT swallow failure
+#   - WO-169 safe_push_with_retry pattern (3 attempts, exponential backoff,
+#     exits non-zero on final failure)
+#   - Notion REST via python3 + urllib (matches bdc-wo-grader; no MCP in YAML)
+#   - bun-only container: no node/npm/npx
+#
+# Fire:
+#   /workflow run bdc-recover-from-notion \
+#     NOTION_PAGE_IDS=abc123,def456,... \
+#     [TARGET_BRANCH=wo/recover-from-notion-<timestamp>] \
+#     [PR_TITLE="rescue: ..."]
+
+name: bdc-recover-from-notion
+
+description: |
+  Use when: A prior workflow filed N WO pages to Notion but lost the local MD
+            spec files (commit/push silently failed). Reads each Notion page
+            and writes its body to docs/work-orders/<WO-ID>.md in bdc-xo.
+  Inputs:
+    NOTION_PAGE_IDS: REQUIRED. Comma-separated list of Notion page UUIDs.
+    TARGET_BRANCH: optional. Default wo/recover-from-notion-<timestamp>.
+    PR_TITLE: optional. Default derived from page count.
+    NOTION_DB_ID: optional. Default Blue Devil WO database.
+    DRY_RUN: 'true' writes files locally but skips commit/push/PR.
+  Does: Fetches Notion pages → writes MD specs (idempotent, skips existing) →
+        commits → pushes (load-bearing, real retry) → opens PR (load-bearing).
+  Repo: bluedevilcollectibles/bdc-xo (select bdc-xo codebase when firing).
+  NOT for: authoring new specs from scratch (use bdc-author-wo-batch).
+  parallel_ok: false
+
+policyFile: harness/policies/agent-behavior.md
+provider: claude
+model: sonnet
+
+inputs:
+  NOTION_PAGE_IDS:
+    default: ""
+  TARGET_BRANCH:
+    default: ""
+  PR_TITLE:
+    default: ""
+  NOTION_DB_ID:
+    default: "a6df831c-0b52-449f-8ca4-d77be6b70d0a"
+  DRY_RUN:
+    default: "false"
+
+nodes:
+
+  # ---------------------------------------------------------------------------
+  # 1. READ-PAGE-IDS — parse + validate comma-separated input
+  # ---------------------------------------------------------------------------
+  - id: read-page-ids
+    bash: |
+      set -euo pipefail
+      # Engine injects YAML defaults as INPUT_<NAME>; legacy /workflow run uses bare names.
+      NOTION_PAGE_IDS="${INPUT_NOTION_PAGE_IDS:-${NOTION_PAGE_IDS:-}}"
+      TARGET_BRANCH="${INPUT_TARGET_BRANCH:-${TARGET_BRANCH:-}}"
+      PR_TITLE="${INPUT_PR_TITLE:-${PR_TITLE:-}}"
+      DRY_RUN="${INPUT_DRY_RUN:-${DRY_RUN:-false}}"
+
+      if [ -z "$NOTION_PAGE_IDS" ]; then
+        echo "ERROR: NOTION_PAGE_IDS is required (comma-separated Notion page UUIDs)." >&2
+        echo "       Example: NOTION_PAGE_IDS=abc12345-...,def67890-..." >&2
+        exit 1
+      fi
+
+      if [ -z "${NOTION_API_KEY:-}" ]; then
+        echo "ERROR: NOTION_API_KEY env var is required (container Notion auth)." >&2
+        exit 1
+      fi
+
+      # Derive default branch name if not provided.
+      if [ -z "$TARGET_BRANCH" ]; then
+        TARGET_BRANCH="wo/recover-from-notion-$(date +%Y%m%d%H%M%S)"
+      fi
+
+      # Normalize: strip whitespace, split on commas, count.
+      mkdir -p .archon-recover
+      printf '%s' "$NOTION_PAGE_IDS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | grep -v '^$' > .archon-recover/page-ids.txt
+      COUNT=$(wc -l < .archon-recover/page-ids.txt | tr -d ' ')
+      if [ "$COUNT" -eq 0 ]; then
+        echo "ERROR: NOTION_PAGE_IDS parsed to zero ids." >&2
+        exit 1
+      fi
+
+      printf 'NOTION_PAGE_IDS=%s\nPAGE_COUNT=%s\nTARGET_BRANCH=%s\nPR_TITLE=%s\nDRY_RUN=%s\n' \
+        "$NOTION_PAGE_IDS" "$COUNT" "$TARGET_BRANCH" "$PR_TITLE" "$DRY_RUN"
+      echo "--- page ids ---"
+      cat .archon-recover/page-ids.txt
+
+  # ---------------------------------------------------------------------------
+  # 2. FETCH-PAGES — for each page: GET /v1/pages + GET /v1/blocks (recursive),
+  #    render to MD, derive filename from page title (WO-ID convention).
+  # ---------------------------------------------------------------------------
+  - id: fetch-pages
+    depends_on: [read-page-ids]
+    bash: |
+      set -euo pipefail
+      if [ ! -s .archon-recover/page-ids.txt ]; then
+        echo "ERROR: .archon-recover/page-ids.txt missing or empty" >&2
+        exit 1
+      fi
+      if [ -z "${NOTION_API_KEY:-}" ]; then
+        echo "ERROR: NOTION_API_KEY missing" >&2
+        exit 1
+      fi
+
+      mkdir -p .archon-recover/pages
+
+      python3 <<'PY'
+      import json, os, re, sys, time, urllib.error, urllib.request
+
+      TOKEN = os.environ["NOTION_API_KEY"]
+      HEADERS = {
+          "Authorization": f"Bearer {TOKEN}",
+          "Notion-Version": "2022-06-28",
+          "Content-Type": "application/json",
+      }
+
+      def notion_get(url, attempts=3):
+          last_err = None
+          for i in range(attempts):
+              try:
+                  req = urllib.request.Request(url, headers=HEADERS, method="GET")
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      return json.loads(resp.read().decode())
+              except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+                  last_err = e
+                  time.sleep(2 ** i)
+          raise RuntimeError(f"notion_get failed after {attempts} attempts: {url} :: {last_err}")
+
+      def rt_to_text(rich):
+          return "".join(r.get("plain_text", "") for r in (rich or []))
+
+      def block_to_md(block, depth=0):
+          t = block.get("type", "")
+          data = block.get(t, {}) or {}
+          rt = data.get("rich_text", [])
+          text = rt_to_text(rt)
+          indent = "  " * depth
+          if t == "heading_1":
+              return f"# {text}"
+              # (intentional plain heading; rt already has plain text)
+          if t == "heading_2":
+              return f"## {text}"
+              # rendered for spec section parity
+          if t == "heading_3":
+              return f"### {text}"
+          if t == "paragraph":
+              return text
+          if t == "bulleted_list_item":
+              return f"{indent}- {text}"
+          if t == "numbered_list_item":
+              return f"{indent}1. {text}"
+          if t == "to_do":
+              checked = data.get("checked", False)
+              box = "[x]" if checked else "[ ]"
+              return f"{indent}- {box} {text}"
+          if t == "code":
+              lang = data.get("language", "") or ""
+              return f"```{lang}\n{text}\n```"
+          if t == "quote":
+              return f"> {text}"
+          if t == "callout":
+              return f"> {text}"
+          if t == "divider":
+              return "---"
+          if t == "child_page":
+              return f"[child page: {data.get('title','')}]"
+          # Fallback: emit type tag for unhandled blocks rather than silently dropping
+          if text:
+              return text
+          return f"[unsupported block: {t}]"
+
+      def fetch_blocks(block_id):
+          out = []
+          cursor = None
+          while True:
+              url = f"https://api.notion.com/v1/blocks/{block_id}/children?page_size=100"
+              if cursor:
+                  url += f"&start_cursor={cursor}"
+              data = notion_get(url)
+              for block in data.get("results", []):
+                  out.append(block)
+                  if block.get("has_children"):
+                      block["_children"] = fetch_blocks(block["id"])
+              if not data.get("has_more"):
+                  break
+              cursor = data.get("next_cursor")
+              if not cursor:
+                  break
+          return out
+
+      def render_blocks(blocks, depth=0):
+          lines = []
+          for b in blocks:
+              lines.append(block_to_md(b, depth))
+              if b.get("_children"):
+                  lines.append(render_blocks(b["_children"], depth + 1))
+          return "\n\n".join(s for s in lines if s != "")
+
+      def extract_title(page):
+          props = page.get("properties", {})
+          # Try Task (WO board canonical), then Name, then any title prop
+          for key in ("Task", "Name", "Title"):
+              p = props.get(key)
+              if p and p.get("type") == "title":
+                  return rt_to_text(p.get("title", []))
+          for k, v in props.items():
+              if v.get("type") == "title":
+                  return rt_to_text(v.get("title", []))
+          return ""
+
+      def extract_wo_id(page, title):
+          props = page.get("properties", {})
+          # Prefer explicit "WO ID" property
+          p = props.get("WO ID")
+          if p:
+              typ = p.get("type")
+              if typ == "rich_text":
+                  v = rt_to_text(p.get("rich_text", [])).strip()
+                  if v:
+                      return v
+              elif typ == "title":
+                  v = rt_to_text(p.get("title", [])).strip()
+                  if v:
+                      return v
+          # Fallback: parse WO-* from title
+          m = re.search(r"WO-[A-Z0-9][A-Z0-9-]*-\d+", title or "")
+          if m:
+              return m.group(0)
+          return ""
+
+      page_ids = [
+          line.strip()
+          for line in open(".archon-recover/page-ids.txt", encoding="utf-8")
+          if line.strip()
+      ]
+
+      manifest = []
+      errors = []
+      for pid in page_ids:
+          try:
+              page = notion_get(f"https://api.notion.com/v1/pages/{pid}")
+              title = extract_title(page)
+              wo_id = extract_wo_id(page, title)
+              blocks = fetch_blocks(pid)
+              body = render_blocks(blocks)
+              entry = {
+                  "page_id": pid,
+                  "title": title,
+                  "wo_id": wo_id,
+                  "body": body,
+                  "url": page.get("url", ""),
+              }
+              safe_pid = pid.replace("-", "")
+              with open(f".archon-recover/pages/{safe_pid}.json", "w", encoding="utf-8") as f:
+                  json.dump(entry, f, indent=2, ensure_ascii=False)
+              manifest.append({
+                  "page_id": pid,
+                  "wo_id": wo_id,
+                  "title": title,
+                  "url": page.get("url", ""),
+                  "bytes": len(body.encode("utf-8")),
+              })
+              print(f"FETCHED page_id={pid} wo_id={wo_id or '(unknown)'} bytes={len(body.encode('utf-8'))}")
+          except Exception as e:
+              errors.append({"page_id": pid, "error": str(e)})
+              print(f"FETCH_ERROR page_id={pid} :: {e}", file=sys.stderr)
+
+      with open(".archon-recover/manifest.json", "w", encoding="utf-8") as f:
+          json.dump({"pages": manifest, "errors": errors}, f, indent=2, ensure_ascii=False)
+
+      print(f"\nFETCH_SUMMARY total={len(page_ids)} ok={len(manifest)} err={len(errors)}")
+      if errors:
+          # Any fetch failure is load-bearing: if we lose a page silently, we lose the spec.
+          print("ERROR: one or more Notion fetches failed; aborting before write-files", file=sys.stderr)
+          sys.exit(1)
+      PY
+
+  # ---------------------------------------------------------------------------
+  # 3. WRITE-FILES — docs/work-orders/<WO-ID>.md (idempotent; skip if exists)
+  # ---------------------------------------------------------------------------
+  - id: write-files
+    depends_on: [fetch-pages]
+    bash: |
+      set -euo pipefail
+      if [ ! -f .archon-recover/manifest.json ]; then
+        echo "ERROR: manifest.json missing — fetch-pages did not run" >&2
+        exit 1
+      fi
+
+      mkdir -p docs/work-orders
+
+      python3 <<'PY'
+      import json, os, re, sys
+
+      manifest = json.load(open(".archon-recover/manifest.json", encoding="utf-8"))
+      written = []
+      skipped = []
+      orphans = []  # pages without a derivable WO ID
+
+      for entry in manifest["pages"]:
+          pid = entry["page_id"]
+          wo_id = entry.get("wo_id") or ""
+          title = entry.get("title") or ""
+          safe_pid = pid.replace("-", "")
+          page_path = f".archon-recover/pages/{safe_pid}.json"
+          if not os.path.exists(page_path):
+              print(f"WARN: page payload missing for {pid}", file=sys.stderr)
+              continue
+          page = json.load(open(page_path, encoding="utf-8"))
+          body = page.get("body", "")
+
+          if not wo_id:
+              # Cannot derive a canonical filename. Park under a recovery dir
+              # so the data is not lost; operator renames after review.
+              os.makedirs("docs/work-orders/_recovered", exist_ok=True)
+              fallback = f"docs/work-orders/_recovered/notion-{safe_pid}.md"
+              if os.path.exists(fallback):
+                  skipped.append({"path": fallback, "reason": "exists"})
+                  print(f"SKIP existing {fallback}")
+                  continue
+              with open(fallback, "w", encoding="utf-8") as f:
+                  f.write(f"# {title or pid}\n\n")
+                  f.write(f"<!-- Recovered from Notion page {pid} (URL: {page.get('url','')}) -->\n")
+                  f.write("<!-- WO ID could not be derived from properties or title; operator must rename. -->\n\n")
+                  f.write(body)
+                  f.write("\n")
+              orphans.append(fallback)
+              print(f"WROTE_ORPHAN {fallback}")
+              continue
+
+          # Canonical path
+          out = f"docs/work-orders/{wo_id}.md"
+          if os.path.exists(out):
+              skipped.append({"path": out, "reason": "exists (idempotent skip)"})
+              print(f"SKIP existing {out}")
+              continue
+          with open(out, "w", encoding="utf-8") as f:
+              f.write(f"# {wo_id}: {title or ''}\n\n".rstrip() + "\n\n")
+              f.write(f"<!-- Recovered from Notion page {pid} ({page.get('url','')}) -->\n\n")
+              f.write(body)
+              f.write("\n")
+          written.append(out)
+          print(f"WROTE {out}")
+
+      summary = {
+          "written_count": len(written),
+          "skipped_count": len(skipped),
+          "orphan_count": len(orphans),
+          "written": written,
+          "orphans": orphans,
+          "skipped": skipped,
+      }
+      with open(".archon-recover/write-summary.json", "w", encoding="utf-8") as f:
+          json.dump(summary, f, indent=2)
+
+      print(f"\nWRITE_SUMMARY written={len(written)} skipped={len(skipped)} orphan={len(orphans)}")
+      # Hard fail only if NOTHING was written AND nothing was already-on-disk;
+      # an all-skip run is a no-op (idempotent re-fire) and acceptable.
+      if len(written) == 0 and len(orphans) == 0 and len(skipped) == 0:
+          print("ERROR: write-files produced zero output", file=sys.stderr)
+          sys.exit(1)
+      PY
+
+  # ---------------------------------------------------------------------------
+  # 4. COMMIT-AND-PUSH — load_bearing: true (WO-167 / WO-169)
+  #    Real retry. Exits non-zero on final failure. NO STATUS=*_failed swallow.
+  # ---------------------------------------------------------------------------
+  - id: commit-and-push
+    depends_on: [write-files]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DRY_RUN="${INPUT_DRY_RUN:-${DRY_RUN:-false}}"
+      TARGET_BRANCH="${INPUT_TARGET_BRANCH:-${TARGET_BRANCH:-}}"
+      if [ -z "$TARGET_BRANCH" ]; then
+        # Mirror read-page-ids default; read-page-ids stdout is not env-injected.
+        TARGET_BRANCH="wo/recover-from-notion-$(date +%Y%m%d%H%M%S)"
+      fi
+
+      if [ -z "${GITHUB_TOKEN:-}" ]; then
+        echo "ERROR: GITHUB_TOKEN missing in container — push will fail." >&2
+        echo "       Auth boundary issue is the root cause of the 2026-05-16 loss." >&2
+        exit 1
+      fi
+
+      DEFAULT_BRANCH="$(git remote show origin 2>/dev/null | sed -n 's,.*HEAD branch: ,,p')"
+      DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+
+      # Check out a clean recovery branch off the default branch.
+      git fetch origin "$DEFAULT_BRANCH" --depth=50
+      if git show-ref --quiet "refs/heads/${TARGET_BRANCH}"; then
+        git checkout "$TARGET_BRANCH"
+      else
+        git checkout -b "$TARGET_BRANCH" "origin/${DEFAULT_BRANCH}"
+      fi
+
+      # Stage recovered files only; do not sweep arbitrary working-tree changes.
+      git add docs/work-orders/ 2>/dev/null || true
+
+      if git diff --cached --quiet; then
+        echo "NO_CHANGES — write-files produced no new content (all pages already on disk)."
+        echo "BRANCH=$TARGET_BRANCH"
+        echo "STATUS=no_changes_idempotent"
+        exit 0
+      fi
+
+      WRITE_COUNT=$(git diff --cached --name-only | wc -l | tr -d ' ')
+      git -c user.name="bdc-recover-from-notion" \
+          -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "rescue(wo): recover ${WRITE_COUNT} WO spec(s) from Notion
+
+      Recovered via bdc-recover-from-notion workflow (WO-HARNESS-RECOVER-FROM-NOTION-WORKFLOW-01).
+      Source of truth: Notion WO pages. Anchor: 2026-05-16 engine sortie loss.
+
+      Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+
+      if [ "$DRY_RUN" = "true" ]; then
+        echo "DRY_RUN=true — skipping push"
+        echo "BRANCH=$TARGET_BRANCH"
+        echo "STATUS=committed_dry_run"
+        exit 0
+      fi
+
+      # safe_push_with_retry — load-bearing: real exit non-zero on final failure (WO-167/169).
+      ATTEMPTS=3
+      i=1
+      while [ "$i" -le "$ATTEMPTS" ]; do
+        if git push -u origin "$TARGET_BRANCH" 2>&1; then
+          echo "PUSH_OK attempt=$i branch=$TARGET_BRANCH"
+          echo "BRANCH=$TARGET_BRANCH"
+          echo "SHA=$(git rev-parse HEAD)"
+          echo "STATUS=pushed"
+          exit 0
+        fi
+        echo "PUSH_FAIL attempt=$i — retrying after $((2 ** i))s" >&2
+        sleep $((2 ** i))
+        i=$((i + 1))
+      done
+
+      echo "ERROR: git push failed after $ATTEMPTS attempts — recovered files are local only." >&2
+      echo "       Branch $TARGET_BRANCH exists in container; operator must rescue manually." >&2
+      echo "STATUS=push_failed" >&2
+      exit 1
+
+  # ---------------------------------------------------------------------------
+  # 5. OPEN-PR — load_bearing: true (WO-167 / WO-169)
+  #    Real retry. Exits non-zero on final failure.
+  # ---------------------------------------------------------------------------
+  - id: open-pr
+    depends_on: [commit-and-push]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DRY_RUN="${INPUT_DRY_RUN:-${DRY_RUN:-false}}"
+      PR_TITLE="${INPUT_PR_TITLE:-${PR_TITLE:-}}"
+
+      if [ "$DRY_RUN" = "true" ]; then
+        echo "DRY_RUN=true — skipping PR creation"
+        echo "STATUS=skipped_dry_run"
+        exit 0
+      fi
+
+      BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+      if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
+        echo "ERROR: detached HEAD; cannot open PR." >&2
+        exit 1
+      fi
+
+      DEFAULT_BRANCH="$(git remote show origin 2>/dev/null | sed -n 's,.*HEAD branch: ,,p')"
+      DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+      REPO="$(gh repo view --json nameWithOwner --template '{{.nameWithOwner}}' 2>/dev/null || echo '')"
+      if [ -z "$REPO" ]; then
+        echo "ERROR: could not resolve current repo via gh." >&2
+        exit 1
+      fi
+
+      # Did the upstream commit-and-push actually have changes?
+      if ! git diff "origin/${DEFAULT_BRANCH}...HEAD" --quiet 2>/dev/null; then
+        :  # diffs exist — proceed
+      else
+        echo "NO_DIFF vs origin/${DEFAULT_BRANCH} — no PR needed (idempotent run)."
+        echo "STATUS=no_diff_idempotent"
+        exit 0
+      fi
+
+      # Idempotency: if PR already exists for this branch, surface URL and exit OK.
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+              --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then
+        echo "PR_URL=$EXIST"
+        echo "STATUS=pr_already_exists"
+        exit 0
+      fi
+
+      WRITE_COUNT=$(git diff "origin/${DEFAULT_BRANCH}...HEAD" --name-only | wc -l | tr -d ' ')
+      if [ -z "$PR_TITLE" ]; then
+        PR_TITLE="rescue(wo): recover ${WRITE_COUNT} WO spec(s) from Notion"
+      fi
+
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "Recovered ${WRITE_COUNT} WO spec file(s) from Notion via \`bdc-recover-from-notion\` workflow."
+        echo ""
+        echo "Anchor: WO-HARNESS-RECOVER-FROM-NOTION-WORKFLOW-01 (bdc-xo#172)."
+        echo "Root cause being rescued: prior workflow filed Notion pointer entries"
+        echo "successfully but lost MD spec files when commit-and-push failed silently."
+        echo ""
+        echo "## Validation"
+        echo "Each recovered file derived from a Notion page body. Files use"
+        echo "\`docs/work-orders/<WO-ID>.md\` layout (canonical) or"
+        echo "\`docs/work-orders/_recovered/notion-<page-id>.md\` (orphans without"
+        echo "a derivable WO ID — operator renames after review)."
+        echo ""
+        echo "## Doctrine"
+        echo "- WO-167 load-bearing convention applied: commit-and-push and open-pr"
+        echo "  nodes exit non-zero on real failure (no STATUS=*_failed swallow)."
+        echo "- WO-169 safe_push_with_retry pattern: 3 attempts, exponential backoff."
+        echo ""
+        echo "Generated by bdc-recover-from-notion workflow."
+      } > "$BODY_FILE"
+
+      # Real retry — exit non-zero on final failure.
+      ATTEMPTS=3
+      i=1
+      while [ "$i" -le "$ATTEMPTS" ]; do
+        if URL=$(gh pr create --repo "$REPO" --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+                   --title "$PR_TITLE" --body-file "$BODY_FILE" 2>&1); then
+          echo "PR_URL=$URL"
+          echo "STATUS=pr_created"
+          exit 0
+        fi
+        # Race: another caller may have created the PR between list + create.
+        EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+                --json url --jq '.[0].url // empty' 2>/dev/null || true)
+        if [ -n "$EXIST" ]; then
+          echo "PR_URL=$EXIST"
+          echo "STATUS=pr_already_exists_race"
+          exit 0
+        fi
+        echo "PR_CREATE_FAIL attempt=$i — retrying after $((2 ** i))s" >&2
+        sleep $((2 ** i))
+        i=$((i + 1))
+      done
+
+      echo "ERROR: gh pr create failed after $ATTEMPTS attempts — branch pushed but no PR." >&2
+      echo "STATUS=pr_open_failed" >&2
+      exit 1
+
+  # ---------------------------------------------------------------------------
+  # 6. FLIP-NOTION — sentinel for operator handoff. The grader workflow owns
+  #    the actual REVIEW flip on the WO that owns this rescue (WO-172).
+  # ---------------------------------------------------------------------------
+  - id: flip-notion
+    depends_on: [open-pr]
+    bash: |
+      set -euo pipefail
+      echo "FLIP_NOTION: bdc-recover-from-notion run complete."
+      PR_URL=$(gh pr view --json url --template '{{.url}}' 2>/dev/null || echo "unknown")
+      echo "PR_URL=$PR_URL"
+      echo "RECOVERED_PAGES_MANIFEST=.archon-recover/manifest.json"
+      echo "WRITE_SUMMARY=.archon-recover/write-summary.json"
+      echo "XO_TODO: operator reviews PR + renames any docs/work-orders/_recovered/notion-*.md orphans."

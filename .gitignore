@@ -120,3 +120,9 @@ packages/server/.env
 skills-lock.json
 test-results/
 .archon/ralph/
+
+# WO-168 Tier 1: host-mounted artifact directory.
+# Keep the directory tracked via .gitkeep; ignore the per-run subdirectories
+# (bundles, manifests, diff stats) generated at runtime.
+harness-artifacts/*
+!harness-artifacts/.gitkeep

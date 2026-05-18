@@ -39,6 +39,14 @@ import type {
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { resolveClaudeBinaryPath } from './binary-resolver';
+import { claudeProviderThrottle } from './throttle';
+import {
+  AUTH_PATTERNS,
+  buildReauthMessage,
+  ensureFreshAuth,
+  isTerminalRefreshReason,
+  refreshIfAuthFailed,
+} from '../auth-refresh/index.js';
 import { createLogger } from '@archon/paths';
 import { readFile } from 'fs/promises';
 import { resolve, isAbsolute } from 'path';
@@ -103,14 +111,9 @@ const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 
 const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', '429', 'overloaded'];
-const AUTH_PATTERNS = [
-  'credit balance',
-  'unauthorized',
-  'authentication',
-  'invalid token',
-  '401',
-  '403',
-];
+// AUTH_PATTERNS is shared with codex/provider.ts and orchestrator-agent.ts via
+// packages/providers/src/auth-refresh/auth-patterns.ts. Edit that file (not here)
+// to add new auth-error markers.
 const SUBPROCESS_CRASH_PATTERNS = ['exited with code', 'killed', 'signal', 'operation aborted'];
 
 function classifySubprocessError(
@@ -622,7 +625,7 @@ function buildBaseClaudeOptions(
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     systemPrompt: requestOptions?.systemPrompt ?? { type: 'preset', preset: 'claude_code' },
-    settingSources: assistantDefaults.settingSources ?? ['project'],
+    settingSources: assistantDefaults.settingSources ?? ['project', 'user'],
     hooks: buildToolCaptureHooks(toolResultQueue),
     stderr: (data: string): void => {
       const output = data.trim();
@@ -771,8 +774,18 @@ async function* streamClaudeMessages(
       }
     } else if (event.type === 'rate_limit_event') {
       const rateLimitMsg = msg as { rate_limit_info?: Record<string, unknown> };
-      getLog().warn({ rateLimitInfo: rateLimitMsg.rate_limit_info }, 'claude.rate_limit_event');
-      yield { type: 'rate_limit', rateLimitInfo: rateLimitMsg.rate_limit_info ?? {} };
+      const rateLimitInfo = rateLimitMsg.rate_limit_info ?? {};
+      getLog().warn({ rateLimitInfo }, 'claude.rate_limit_event');
+      // Auto-throttle: engage the global gate when utilization > 0.85 and the
+      // 5-hour window resets within 5 minutes. surpassedThreshold + resetsAt
+      // + utilization come from SDKRateLimitInfo. Idempotent — re-engage is a
+      // no-op while the gate is already closed.
+      try {
+        claudeProviderThrottle.checkRateLimitAndMaybeThrottle(rateLimitInfo);
+      } catch (err) {
+        getLog().error({ err, rateLimitInfo }, 'claude.auto_throttle_check_failed');
+      }
+      yield { type: 'rate_limit', rateLimitInfo };
     } else if (event.type === 'result') {
       const resultMsg = msg as {
         session_id?: string;
@@ -929,6 +942,16 @@ export class ClaudeProvider implements IAgentProvider {
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
     let lastError: Error | undefined;
+
+    // BDC fork: Layer 2 — proactive auth freshness check.
+    // Subscription OAuth tokens can expire while the container is idle. The
+    // Claude binary subprocess does its own pre-flight check on the
+    // credentials file and exits with "Not logged in" before any HTTP call,
+    // bypassing the SDK's reactive refresh path. Refresh BEFORE we spawn so
+    // the subprocess always sees a fresh access token on disk.
+    // Behavior spec v2 invariant I-1; research doc §Design recommendation L2.
+    await ensureFreshAuth('claude');
+
     const assistantDefaults = parseClaudeConfig(requestOptions?.assistantConfig ?? {});
 
     // Resolve Claude CLI path once before the retry loop. In binary mode this
@@ -969,6 +992,13 @@ export class ClaudeProvider implements IAgentProvider {
       if (requestOptions?.abortSignal?.aborted) {
         throw new Error('Query aborted');
       }
+
+      // Rate-limit gate: when auto-throttle is engaged (or operator-paused via
+      // POST /api/admin/throttle), park here until release. waitForRelease()
+      // resolves immediately when the gate is open, so the normal path pays
+      // nothing. Respects the caller's abortSignal so cancelling a workflow
+      // mid-wait does not block forever.
+      await claudeProviderThrottle.waitForRelease(requestOptions?.abortSignal);
 
       const stderrLines: string[] = [];
       const toolResultQueue: ToolResultEntry[] = [];
@@ -1034,6 +1064,31 @@ export class ClaudeProvider implements IAgentProvider {
           },
           'query_error'
         );
+
+        // BDC fork: subscription auth must self-heal; API-key fallback is forbidden.
+        if (errorClass === 'auth' && attempt === 0) {
+          try {
+            const result = await refreshIfAuthFailed('claude');
+            if (result.refreshed) {
+              getLog().info(
+                { provider: 'claude', newExpiresAt: new Date(result.expiresAt).toISOString() },
+                'token_refreshed_retrying'
+              );
+              lastError = enrichedError;
+              continue;
+            }
+            getLog().error(
+              { provider: 'claude', reason: result.reason, err: result.error },
+              'token_refresh_failed'
+            );
+            if (isTerminalRefreshReason(result.reason)) {
+              throw new Error(buildReauthMessage('claude', result.reason));
+            }
+          } catch (refreshErr) {
+            getLog().error({ provider: 'claude', err: refreshErr }, 'token_refresh_threw');
+            throw refreshErr;
+          }
+        }
 
         if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
           throw enrichedError;

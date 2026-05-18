@@ -106,6 +106,24 @@ export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
         duration: event.type === 'node_completed' ? event.duration : undefined,
         error: event.type === 'node_failed' ? event.error : undefined,
         reason: event.type === 'node_skipped' ? event.reason : undefined,
+        costUsd: event.type === 'node_completed' ? event.costUsd : undefined,
+        timestamp: Date.now(),
+      });
+
+    case 'node_completed_with_warning':
+      // WO-170: forward the new exit-0-but-silently-failed state to the UI.
+      // Status is a new 'completed_with_warning' value the web layer renders yellow.
+      return JSON.stringify({
+        type: 'dag_node',
+        runId: event.runId,
+        nodeId: event.nodeId,
+        name: event.nodeName,
+        status: 'completed_with_warning',
+        duration: event.duration,
+        costUsd: event.costUsd,
+        warningStatusLine: event.statusLine,
+        warningPatterns: event.patterns,
+        warningLoadBearing: event.loadBearing,
         timestamp: Date.now(),
       });
 

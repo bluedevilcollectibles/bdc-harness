@@ -1,0 +1,37 @@
+name: test-approve-resume
+description: |
+  Harness-only regression fixture for bdc-xo#86.
+  Verifies an interactive approval loop resumes into the next node after Approve.
+
+model: sonnet
+interactive: true
+worktree:
+  enabled: false
+
+nodes:
+  - id: implement
+    bash: |
+      echo "IMPLEMENT_OK"
+
+  - id: approve
+    depends_on: [implement]
+    loop:
+      prompt: |
+        This is a harness regression fixture.
+
+        Latest operator input: $LOOP_USER_INPUT
+
+        If the operator says "approved", output exactly:
+        <promise>APPROVED</promise>
+
+        Otherwise ask the operator to approve the fixture.
+      until: APPROVED
+      max_iterations: 2
+      interactive: true
+      gate_message: |
+        Approve to verify the API auto-resumes and reaches the pr node.
+
+  - id: pr
+    depends_on: [approve]
+    bash: |
+      echo "RESUME_SUCCESS"

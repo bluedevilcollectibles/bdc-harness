@@ -1,0 +1,574 @@
+name: bdc-feature-development
+description: |
+  Use when: Executing a BDC feature-class Work Order from an approved spec.
+  Input: WO_ID in the environment or user message, plus repo context from Overlord.
+  Does: Reads the BDC WO spec, plans surgical implementation, verifies, commits, pushes, opens PRs, and builds a Captain CI manifest.
+  NOT for: Doctrine-only updates, cleanup sweeps, infrastructure deploys, or bug-fix WOs with their own workflow.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+nodes:
+  # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
+  # Anchor: 2026-05-16 engine sortie. Container-side `git push` silently failed
+  # (no GITHUB_TOKEN); downstream `|| echo` swallow patterns let the workflow
+  # report success while no commits reached origin. Catch the auth gap up front.
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ]; then
+        WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      if [ -z "$WO_ID" ]; then
+        echo "WO_ID missing. Provide WO_ID in environment or user message." >&2
+        exit 1
+      fi
+      # Specs live in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api.
+      # Per YAML Recipe v1 §4 / Rule 5: try docs/work-orders/ then docs/superpowers/specs/ glob.
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 1: docs/superpowers/specs/${WO_ID}.md direct
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 2: date-prefix glob in docs/superpowers/specs/
+        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\n\n' "$WO_ID" "$SPEC_PATH"
+      printf '%s\n' "$SPEC_CONTENT"
+
+  - id: plan
+    persona: war-council-architect
+    depends_on: [read-spec]
+    agent: war-council-architect
+    task_class: medium_work
+    prompt: |
+      Read the BDC Work Order spec below and produce a concise implementation plan.
+
+      ## Required Output
+      Return structured Markdown with these headings:
+      - WO ID
+      - Files to modify
+      - Files to create
+      - Files explicitly out of scope
+      - Verification commands
+      - Commit message
+      - Push policy
+      - Staging gate required
+
+      ## BDC Push Policy
+      Hardcoded Rule 20 staging-gate repos:
+      - bluedevilcollectibles/lspro-react
+      - bluedevilcollectibles/shopops-storefront
+      - bluedevilcollectibles/shopops/
+
+      For those repos, use a feature branch plus PR and require the staging gate.
+      For bdc-xo non-doctrine code and any other repo, use feature branch plus PR without staging gate.
+      Doc-only and doctrine-only WOs are out of scope for this workflow.
+
+      ## Spec
+      $read-spec.output
+
+  - id: implement
+    persona: major-build
+    depends_on: [plan]
+    agent: major-build
+    task_class: medium_work
+    loop:
+      prompt: |
+        Implement the approved plan for this BDC feature Work Order.
+
+        ## Spec
+        $read-spec.output
+
+        ## Plan
+        $plan.output
+
+        ## Execution Rules
+        - Modify only the files identified as in scope by the spec.
+        - Prefer existing repo patterns and helpers.
+        - Do not reformat unrelated code.
+        - Do not deploy.
+        - Do not bypass approval gates.
+        - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
+
+        ## Commit-and-push BEFORE exit (Patch 2, 2026-05-16)
+        When your implementation is complete, BEFORE emitting the sentinel below, run:
+
+        ```bash
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        # Re-derive WO_ID locally (don't interpolate spec output — quote-safety)
+        WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+        git add -A
+        git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
+
+        Implementation per WO spec. Self-verified within implement loop.
+        Workflow-time verify-* removed 2026-05-16 (Patch 1); PR-time gates handle validation.
+
+        Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed — operator must recover from worktree"
+        ```
+
+        Why: workflow-time verify-* gates were removed (Patch 1). Even with them gone, if any
+        downstream node fails (sentinel mismatch, war-council-validator timeout, etc.), the
+        traditional commit-and-push node may be skipped. Committing + pushing HERE makes your
+        work durable regardless of what happens after this iteration ends.
+
+        Worst case: the downstream commit-and-push node runs and is a no-op because HEAD is
+        already pushed. Best case: your work is on origin even if everything else fails.
+
+        ## Completion Criteria + Sentinel Emission (Patch 3, 2026-05-16)
+        Output ALL THREE of the following standard BDC sentinels, each on its own line at the
+        very end of your output, when all spec stop conditions are met OR a true blocker is
+        identified with evidence:
+
+        COMPLETE
+        BUILD_COMPLETE
+        <promise>COMPLETE</promise>
+
+        Reason: BDC YAMLs have used different sentinel strings over time. Emitting all three
+        guarantees the loop's `until:` matcher finds one. If you found a true blocker, end
+        with a single line `BLOCKED: <one-sentence reason>` instead.
+      until: COMPLETE
+      max_iterations: 5
+      fresh_context: true
+
+  # NOTE — verify-build / verify-types / verify-tests removed 2026-05-16 (Patch 1 of Cauldron friction sweep).
+  # Rationale: those nodes consistently killed valid implementation work on pre-existing harness rot
+  # (15+ @archon/paths failures, npm-not-found before bun sweep, scope-too-wide tsc) rather than catching
+  # real WO-introduced bugs. The implement loop now self-verifies (Rule 19 of YAML Recipe v1) and commits
+  # its own work before exit (Patch 2). Downstream PR-time gates catch real bugs at human-readable layer:
+  #   - codex-review (adversarial schema/code)
+  #   - claude-review (doctrine/architecture)
+  #   - Gitleaks (secret scan)
+  #   - e2e-smoke (CI integration test)
+  #   - Captain CI manifest contract check
+  # Workflow-time verify-* was redundant with PR-time review and high-cost-low-value. See also: WO-149
+  # (verify-scope-to-changed-files) and WO-146 (npm→bun sweep) for the deeper structural fixes.
+
+  - id: war-council-validator
+    persona: captain-ci-validator
+    depends_on: [implement]
+    task_class: medium_work
+    prompt: |
+      Invoke or emulate the war-council-validator review for this Work Order.
+
+      ## Validator Agent
+      war-council-validator
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation output:
+      $implement.output
+
+      Git diff:
+      Run `git diff --stat` and `git diff --check`, then inspect the relevant changed files.
+
+      ## Required Output
+      Return either:
+      - satisfied: with evidence that the spec deliverables and stop conditions were met
+      - needs_revision: with exact file/path/behavior findings
+
+  - id: decide-push-target
+    persona: major-build
+    depends_on: [war-council-validator]
+    task_class: clerical
+    prompt: |
+      Decide the push target for this BDC feature Work Order.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Validator:
+      $war-council-validator.output
+
+      ## Branch Name Derivation Rules (F-6A prevention)
+      Anchor incidents 2026-05-18: agents emitted branch names that embedded the
+      current worktree thread suffix, producing double-suffixed targets like
+      "archon/thread-9772643d-thread-9772643d" or
+      "feat/WO-AUTH-RETIRE-GAS-PATH-02-thread-feat/WO-AUTH-RETIRE-GAS-PATH-02".
+      The engine ALREADY appends a unique "-thread-<hash>" suffix at push time
+      (UNIQUE_BRANCH in commit-and-push). Your job is to emit the BASE branch
+      name only.
+
+      - Derive the branch name from the WO ID ONLY. Do NOT copy the current
+        git branch name. If running on archon/thread-9772643d, do NOT emit
+        that value or any variant of it as push_target.
+      - Use prefix feat/, fix/, or wip/ followed by the WO ID in lowercase
+        with hyphens. Example: WO-FOO-BAR-01 -> feat/wo-foo-bar-01
+      - The branch MUST NOT start with archon/thread- or contain -thread-
+        anywhere.
+      - The branch MUST NOT embed the current worktree thread hash anywhere
+        in its name.
+      - Valid examples: feat/wo-auth-retire-gas-path-02, fix/wo-bugs-01, wip/wo-draft-01
+      - commit-and-push validates the emitted branch against this allowlist
+        regex: ^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$
+        and fails closed with "Malformed branch name" on mismatch.
+
+      ## Required Repo Policy
+      Extract the target repository from the spec content. Look for any of these patterns (in priority order):
+      1. `target_repo: <owner>/<repo>` (YAML field)
+      2. `**Target repo:** \`<owner>/<repo>\`` (Markdown bold)
+      3. `Target repo: <owner>/<repo>` (plain header)
+      4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
+
+      The target repo is where the PR must be opened (NOT the worktree's git origin — Rule 29).
+
+      Match the extracted repo against this hardcoded staging-gate list:
+      - bluedevilcollectibles/lspro-react
+      - bluedevilcollectibles/shopops-storefront
+      - bluedevilcollectibles/shopops/
+
+      If the repo matches one of those entries, output:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: true
+      repo: <owner>/<repo>
+
+      If the repo is bdc-xo non-doctrine code or another code repo, output:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: false
+      repo: <owner>/<repo>
+
+      If this is doc-only or doctrine-only, output:
+      out_of_scope: true
+      reason: use bdc-doctrine-update.yaml
+      repo: unknown
+
+      CRITICAL: You MUST emit a `repo:` line in every output case. If no target_repo is
+      parseable from the spec, emit `repo: unknown` and a WARNING line explaining what is missing.
+
+  # load_bearing: true (WO-167 doctrine, WO-169 anchor)
+  # 2026-05-16 engine sortie: container-side `git push` silently failed; downstream
+  # `|| echo "STATUS=*_failed"` swallow patterns let the workflow report success
+  # while no commits reached origin. Push retry is now real (3 attempts, exponential
+  # backoff) and node fails closed if all attempts fail.
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      # 2026-05-16 quote-fix: substituteNodeOutputRefs with escapedForBash=true wraps
+      # the output in single quotes. Wrapping the substitution in double quotes here
+      # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes — line 2+ of
+      # the agent output becomes bare commands. Assign directly to bash vars, then
+      # quote the var reference. Engine-level fix tracked in WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$plan.output
+      echo "$DECIDE_OUTPUT"
+      if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
+        echo "Out of scope for bdc-feature-development; failing closed." >&2
+        exit 1
+      fi
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      if [ -z "$BRANCH" ]; then
+        echo "No feature branch target found in decide-push-target output." >&2
+        exit 1
+      fi
+      # F-6A: Validate BRANCH against allowlist regex BEFORE constructing UNIQUE_BRANCH.
+      # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (anchor 2026-05-18: three WOs hit
+      # double-suffix branch names like archon/thread-9772643d-thread-9772643d).
+      # The engine appends -thread-<hash> at push time, so the agent must emit a
+      # clean feat/|fix/|wip/ prefix only. archon/thread- prefix is rejected here
+      # because it would produce a double-suffix UNIQUE_BRANCH.
+      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/|archon/thread-" >&2
+        exit 1
+      fi
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
+      # Engine already provides a unique archon/thread-<hash> branch per run.
+      # Derive a unique remote push target from it instead of clobbering a shared name.
+      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      git status --short
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        # Already fully synced: implement loop committed + pushed to origin
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${UNIQUE_BRANCH}")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed to origin/${UNIQUE_BRANCH} (HEAD matches)."
+          echo "unique_branch=${UNIQUE_BRANCH}"
+          exit 0
+        fi
+        # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: a clean working
+        # tree does NOT mean the implement loop skipped work — it may have committed
+        # and left the tree clean. Count COMMITS_AHEAD to distinguish true no-op
+        # from pre-committed work that still needs pushing.
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${UNIQUE_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          # F-7C: origin/${UNIQUE_BRANCH} may be missing because the implement
+          # loop already pushed to a different remote branch (e.g. the engine's
+          # archon/thread-<hash> ref). Search git ls-remote origin for any ref
+          # whose HEAD SHA matches local HEAD; if found, retarget UNIQUE_BRANCH
+          # to that name and proceed (push will be a no-op).
+          # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (anchor 2026-05-18:
+          # WO-HARNESS-OVERSEER-FAILURE-CLASSES-EXPANSION-01 12:03 UTC, commit
+          # 2d5f6ac0 on origin/archon/thread-9772643d but UNIQUE_BRANCH was
+          # archon/thread-9772643d-thread-9772643d).
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          RECOVERED=$(git ls-remote origin 2>/dev/null \
+            | awk -v sha="$LOCAL_HEAD" '$1 == sha {sub(/^refs\/heads\//, "", $2); print $2}' \
+            | head -1)
+          if [ -n "$RECOVERED" ]; then
+            echo "Recovered push target from remote: $RECOVERED"
+            UNIQUE_BRANCH="$RECOVERED"
+          else
+            echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
+            exit 1
+          fi
+        else
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
+        fi
+      else
+        # Dirty working tree: stage + validate against plan + commit
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        # Auto-tolerated files: dependency lockfiles + standard auto-regenerated
+        # artifacts managed by package managers during the implement loop.
+        # Without this allowlist, adding a dependency causes bun.lock regeneration
+        # which trips the strict-allowlist check.
+        AUTO_TOLERATED='^(bun\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.bun-tag|node_modules/)$'
+        printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
+          if [ -z "$path" ]; then
+            continue
+          fi
+          # Skip allowlist check for auto-managed files; just stage them.
+          if printf '%s\n' "$path" | grep -Eq "$AUTO_TOLERATED"; then
+            echo "Auto-tolerated change (lockfile/managed): $path"
+            git add -- "$path"
+            continue
+          fi
+          if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
+            echo "Changed file was not listed in plan output: $path" >&2
+            exit 1
+          fi
+          git add -- "$path"
+        done
+        if git diff --cached --quiet; then
+          echo "No changes staged; nothing for backstop to commit." >&2
+          exit 0
+        fi
+        COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+        if [ -z "$COMMIT_MESSAGE" ]; then
+          # Re-derive WO_ID locally — see post-started for rationale
+          WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+          COMMIT_MESSAGE="feat: ${WO_ID} implementation"
+        fi
+        git commit -m "$COMMIT_MESSAGE"
+      fi
+
+      # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
+      # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
+      # so the local archon/thread-<hash> branch lands on a unique remote name
+      # (UNIQUE_BRANCH) and does not collide with other parallel runs.
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+      echo "unique_branch=${UNIQUE_BRANCH}"
+
+  # load_bearing: true (WO-167 doctrine, WO-169 anchor)
+  - id: open-pr-if-needed
+    persona: major-build
+    depends_on: [commit-and-push]
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      # 2026-05-16 quote-fix: see commit-and-push for rationale.
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$plan.output
+      IMPLEMENT_OUTPUT=$implement.output
+      VALIDATOR_OUTPUT=$war-council-validator.output
+      COMMIT_PUSH_OUTPUT=$commit-and-push.output
+      if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
+        echo "PR not required; skipping."
+        exit 0
+      fi
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: read the unique
+      # remote branch the commit-and-push node pushed to; gh pr create must use
+      # --head to target that branch rather than the (local) archon/thread-<hash>.
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
+        exit 1
+      fi
+      # Rule 29: extract explicit repo from decide-push-target output.
+      # Never let gh default to the worktree's origin -- it may be bdc-harness
+      # even when the spec targets bdc-xo or lspro-react.
+      REPO=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^repo: //p' | head -n 1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: decide-push-target did not emit a valid 'repo: <owner>/<repo>'." >&2
+        echo "Fix the spec to include 'target_repo:' or '**Target repo:**' and re-run." >&2
+        exit 1
+      fi
+      # F-8C: Rule 20 staging-gate repos (lspro-react, shopops-storefront, shopops)
+      # require PRs to target staging instead of the repo default branch.
+      # decide-push-target emits "staging_gate_required: true|false"; when true,
+      # this node passes --base staging to gh pr create (otherwise it omits --base
+      # and lets gh use the repo default).
+      # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (closes Rule 20 bypass hole 2026-05-18).
+      STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      STAGING_GATE="${STAGING_GATE:-0}"
+      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+        BASE_BRANCH="staging"
+      else
+        BASE_BRANCH=""
+      fi
+      TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+      if [ -z "$TITLE" ]; then
+        TITLE="BDC feature Work Order implementation"
+      fi
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "$PLAN_OUTPUT"
+        echo
+        echo "## Validation"
+        echo "Workflow-time verify-* nodes were removed 2026-05-16 (Patch 1) — agent self-verifies in implement loop;"
+        echo "real validation gates run at PR time (codex-review + claude-review + Gitleaks + e2e-smoke + Captain CI)."
+        echo "See implement output below for what the builder verified locally."
+        echo
+        echo "## Implement output"
+        echo "$IMPLEMENT_OUTPUT"
+        echo
+        echo "## Validator"
+        echo "$VALIDATOR_OUTPUT"
+      } > "$BODY_FILE"
+      # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
+      # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
+      PR_OK=false
+      for attempt in 1 2 3; do
+        if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
+          PR_OK=true
+          break
+        fi
+        # Race-condition recovery: branch already has an open PR.
+        if [ -n "$UNIQUE_BRANCH" ]; then
+          EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+            --json url --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$EXIST" ]; then
+            echo "PR_URL=$EXIST"
+            PR_OK=true
+            break
+          fi
+        fi
+        echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PR_OK" = "false" ]; then
+        echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+
+  - id: build-manifest
+    persona: major-build
+    depends_on: [open-pr-if-needed]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI completion manifest for this BDC feature Work Order.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation:
+      $implement.output
+
+      Verification:
+      (Workflow-time verify-build/types/tests removed 2026-05-16 — agent self-verifies in
+      implement loop, PR-time gates handle real validation. See implement output above.)
+
+      Validator:
+      $war-council-validator.output
+
+      ## Required Manifest Fields
+      - WO ID
+      - Files created
+      - Files modified
+      - Routes added
+      - Migrations
+      - Tests
+      - Commit SHA
+      - Validation evidence by WO class
+      - PR URL, if opened
+      - Staging gate status, if required
+
+  - id: flip-notion
+    persona: xo
+    depends_on: [build-manifest]
+    task_class: clerical
+    prompt: |
+      Update the Notion Work Order page if Notion MCP is available in this runtime.
+
+      ## Required Notion Changes
+      - Claude Status: REVIEW
+      - Status: Review
+      - Add the Captain CI manifest as a page comment
+
+      ## Manifest
+      $build-manifest.output
+
+      If Notion MCP is not available inside the container, do not invent a workaround.
+      Output a TODO for XO to flip Notion manually with the manifest above.

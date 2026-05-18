@@ -1,0 +1,324 @@
+name: bdc-doctrine-update
+description: |
+  Use when: Executing a BDC doctrine-class Work Order from an approved spec.
+  Input: WO_ID in the environment or user message, plus repo context from Overlord.
+  Does: Reads the BDC WO spec, plans surgical doctrine edits, verifies via grep, commits and pushes directly to master, and builds a Captain CI manifest.
+  NOT for: Code-shipping WOs, feature development, infrastructure deploys, or bug-fix WOs with their own workflow.
+
+policyFile: harness/policies/agent-behavior.md
+model: claude-sonnet-4-5
+
+nodes:
+  - id: read-spec
+    persona: xo
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ]; then
+        WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      if [ -z "$WO_ID" ]; then
+        echo "WO_ID missing. Provide WO_ID in environment or user message." >&2
+        exit 1
+      fi
+      # Try direct path first, then date-prefixed glob (specs are commonly named YYYY-MM-DD-WO-...md)
+      # CWD is the bdc-xo repo root (Archon worktree), so paths are relative — no BDC_XO/ prefix.
+      SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+      if [ ! -f "$SPEC_PATH" ]; then
+        SPEC_PATH=$(ls docs/superpowers/specs/*${WO_ID}.md 2>/dev/null | head -n 1 || true)
+      fi
+      if [ -z "$SPEC_PATH" ] || [ ! -f "$SPEC_PATH" ]; then
+        # Fallback 3: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        SPEC_CONTENT=""
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+        fi
+        if [ -z "$SPEC_CONTENT" ]; then
+          echo "Spec not found for WO_ID=${WO_ID} (tried docs/superpowers/specs/${WO_ID}.md, date-prefix glob, and GitHub issue search)" >&2
+          exit 1
+        fi
+        printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:issues/%s\n\n' "$WO_ID" "$ISSUE_NUM"
+        printf '%s\n' "$SPEC_CONTENT"
+        exit 0
+      fi
+      printf 'WO_ID=%s\nSPEC_PATH=%s\n\n' "$WO_ID" "$SPEC_PATH"
+      cat "$SPEC_PATH"
+
+  - id: post-started
+    persona: xo
+    depends_on: [read-spec]
+    bash: |
+      set -euo pipefail
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
+      curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
+        -H "Content-Type: application/json" \
+        -d "{\"action\":\"started\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+
+  - id: plan
+    persona: war-council-architect
+    depends_on: [read-spec]
+    task_class: medium_work
+    prompt: |
+      Read the BDC doctrine Work Order spec below and produce a concise implementation plan.
+
+      ## Required Output
+      Return structured Markdown with these headings:
+      - WO ID
+      - Files to modify
+      - Files to create
+      - Files explicitly out of scope
+      - Grep verification checks (assertions to run on each modified file)
+      - Commit message
+      - Push policy
+
+      ## Doctrine WO Policy
+      Hardcoded Rule: doctrine-only WOs push directly to master. No feature branch. No PR gate.
+      This includes edits to: CLAUDE.md, skills, memory, wiki, policies, README, ATTRIBUTION.
+
+      ## CRITICAL: Path discipline (Rule 4)
+      ALL file paths in your plan MUST be RELATIVE TO REPO ROOT.
+      The CWD is the bdc-xo repo root (or whatever codebase you are firing against).
+      DO NOT prefix paths with `BDC_XO/` or any other repo name.
+      WRONG: `BDC_XO/.gitattributes`, `BDC_XO/skills/hookify/foo.md`
+      RIGHT: `.gitattributes`, `skills/hookify/foo.md`
+      This applies to: file paths in "Files to modify" / "Files to create",
+      arguments to grep / git / sed / find / file in "Grep verification checks",
+      and any path mentioned in your plan.
+
+      Also: do NOT include placeholder substrings like `<the-file-that-failed>`
+      or `<TBD>` in grep checks. Every check must be a literal, runnable command.
+
+      ## Spec
+      $read-spec.output
+
+  - id: implement
+    persona: major-build
+    depends_on: [plan]
+    task_class: medium_work
+    model: opus[1m]
+    loop:
+      prompt: |
+        Implement the approved plan for this BDC doctrine Work Order.
+
+        ## Spec
+        $read-spec.output
+
+        ## Plan
+        $plan.output
+
+        ## Execution Rules
+        - Modify only the files identified as in scope by the spec.
+        - Preserve all unrelated content; never reformat files outside the target edits.
+        - Do not deploy.
+        - Do not bypass approval gates.
+        - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
+
+        ## Completion Criteria
+        Output <promise>COMPLETE</promise> only when all spec stop conditions that can be run in this checkout have passed, or when a true blocker is identified with evidence.
+      until: COMPLETE
+      max_iterations: 3
+      fresh_context: true
+
+  - id: verify-greps
+    persona: major-build
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      echo "Running grep verification checks on doctrine edits..."
+      # Extract grep checks from plan output's "## Grep verification checks" section.
+      # Strip markdown code fences (```bash, ```) so they don't get eval'd as commands.
+      CHECKS=$(printf '%s\n' "$plan.output" \
+        | sed -n '/## Grep verification checks/,/^## /p' \
+        | sed '1d;$d' \
+        | grep -v '^[[:space:]]*$' \
+        | grep -v '^[[:space:]]*```' \
+        | grep -v '^[[:space:]]*#' \
+        || true)
+      if [ -z "$CHECKS" ]; then
+        echo "No grep checks defined in plan; skipping detailed verification."
+        exit 0
+      fi
+      # Per-check 15s timeout prevents node-level hangs from xargs-with-empty-stdin
+      # or other unbounded commands. Anchor: 2026-05-10 WO-DOCTRINE-GITATTRIBUTES-...
+      # hit a 120s workflow-node timeout because plan output contained
+      # `git ls-files BDC_XO/... | xargs file` which hangs when ls-files returns
+      # empty (CWD is bdc-xo repo root; "BDC_XO/" is a Rule 4 violation).
+      FAILED=0
+      EXECUTED=0
+      while IFS= read -r CHECK; do
+        if [ -z "$CHECK" ]; then
+          continue
+        fi
+        EXECUTED=$((EXECUTED + 1))
+        echo "Checking: $CHECK"
+        if timeout 15 bash -c "$CHECK" >/dev/null 2>&1; then
+          echo "  PASS"
+        else
+          rc=$?
+          if [ "$rc" = "124" ]; then
+            echo "  FAIL (timed out after 15s)"
+          else
+            echo "  FAIL (exit $rc)"
+          fi
+          FAILED=$((FAILED + 1))
+        fi
+      done <<EOF
+      $CHECKS
+      EOF
+      echo "verify-greps summary: $EXECUTED checks, $FAILED failed"
+      if [ "$FAILED" -gt 0 ]; then
+        echo "Grep verification failed on $FAILED of $EXECUTED check(s)." >&2
+        exit 1
+      fi
+
+  - id: decide-push-target
+    persona: major-build
+    depends_on: [verify-greps]
+    task_class: clerical
+    prompt: |
+      Confirm the push target for this BDC doctrine Work Order.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      ## Doctrine WO Policy (LOCKED)
+      All doctrine-only Work Orders push directly to master.
+      No feature branch. No staging gate. No PR.
+
+      ## Required Output
+      Return:
+      push_target: master
+      pr_required: false
+
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target]
+    bash: |
+      set -euo pipefail
+      echo "$decide-push-target.output"
+      # Verify master direct decision
+      if ! printf '%s\n' "$decide-push-target.output" | grep -q '^push_target: master'; then
+        echo "Push target was not 'master direct'; this workflow applies only to doctrine WOs." >&2
+        exit 1
+      fi
+      # Get current branch (should be main or master depending on repo default)
+      CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      echo "Currently on branch: $CURRENT_BRANCH"
+
+      git status --short
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        # Already fully synced: implement loop committed + pushed to origin
+        if git rev-parse --quiet --verify "origin/${CURRENT_BRANCH}" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${CURRENT_BRANCH}")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed to origin/${CURRENT_BRANCH} (HEAD matches)."
+          exit 0
+        fi
+        # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: clean tree != no work.
+        # Count commits ahead to distinguish pre-committed work from true no-op.
+        if git rev-parse --quiet --verify "origin/${CURRENT_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${CURRENT_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          echo "No changed files and no commits ahead of origin/${CURRENT_BRANCH} -- implement loop did not produce work" >&2
+          exit 1
+        fi
+        echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin/${CURRENT_BRANCH} -- pushing pre-committed work."
+      else
+        # Verify all changed files are in the plan
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        while IFS= read -r path; do
+          if [ -z "$path" ]; then
+            continue
+          fi
+          if ! printf '%s\n' "$plan.output" | grep -F -- "$path" >/dev/null; then
+            echo "Changed file was not listed in plan output: $path" >&2
+            exit 1
+          fi
+          git add -- "$path"
+        done < <(printf '%s\n' "$CHANGED_FILES")
+
+        if git diff --cached --quiet; then
+          echo "No changes staged; cannot commit." >&2
+          exit 1
+        fi
+
+        COMMIT_MESSAGE=$(printf '%s\n' "$plan.output" | sed -n 's/^Commit message: //p' | head -n 1)
+        if [ -z "$COMMIT_MESSAGE" ]; then
+          WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
+          COMMIT_MESSAGE="docs(doctrine): ${WO_ID}"
+        fi
+
+        git commit -m "$COMMIT_MESSAGE"
+      fi
+      git push origin "$CURRENT_BRANCH"
+
+  - id: build-manifest
+    persona: major-build
+    depends_on: [commit-and-push]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI completion manifest for this BDC doctrine Work Order.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation:
+      $implement.output
+
+      Verification:
+      $verify-greps.output
+
+      ## Required Manifest Fields
+      - WO ID
+      - Files created
+      - Files modified
+      - Grep verification results
+      - Commit SHA
+      - Push target (master direct)
+
+      ## Format
+      Return as a structured block suitable for pasting into the Notion Notes field.
+
+  - id: post-completed
+    persona: xo
+    depends_on: [build-manifest]
+    bash: |
+      set -euo pipefail
+      WO_ID=$(printf '%s\n' "$read-spec.output" | sed -n 's/^WO_ID=//p' | head -n 1)
+      DETAIL=$(printf '%s\n' "$build-manifest.output" | python -c "import json,sys; print(json.dumps(sys.stdin.read()))")
+      curl -sS -X POST "https://n8n.bluedevilcollectibles.com/webhook/builder-status" \
+        -H "Content-Type: application/json" \
+        -d "{\"action\":\"completed\",\"wo_id\":\"${WO_ID}\",\"builder\":\"Major Build\",\"detail\":${DETAIL}}"
+
+  - id: flip-notion
+    persona: xo
+    depends_on: [post-completed]
+    task_class: clerical
+    prompt: |
+      Update the Notion Work Order page if Notion MCP is available in this runtime.
+
+      ## Required Notion Changes
+      - Claude Status: REVIEW
+      - Status: Review
+      - Add the Captain CI manifest as a page comment
+
+      ## Manifest
+      $build-manifest.output
+
+      If Notion MCP is not available inside the container, do not invent a workaround.
+      Output a TODO for XO to flip Notion manually with the manifest above.

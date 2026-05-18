@@ -25,7 +25,15 @@ import { formatToolCall } from '@archon/workflows/utils/tool-formatter';
 import { classifyAndFormatError } from '../utils/error-formatter';
 import { toError } from '../utils/error';
 import { getAgentProvider, getProviderCapabilities } from '@archon/providers';
-import { getArchonWorkspacesPath } from '@archon/paths';
+import {
+  buildReauthMessage,
+  isAuthErrorMessage,
+  isTerminalRefreshReason,
+  refreshIfAuthFailed,
+} from '@archon/providers/auth-refresh';
+import type { ProviderName } from '@archon/providers/auth-refresh';
+import { AuthRefreshedRetryNeeded } from './auth-retry-sentinel';
+import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
 import { syncWorkspace, toRepoPath } from '@archon/git';
 import type { WorkspaceSyncResult } from '@archon/git';
@@ -69,6 +77,15 @@ const MAX_BATCH_ASSISTANT_CHUNKS = 20;
 /** Max total chunks (assistant + tool) to keep in batch mode */
 const MAX_BATCH_TOTAL_CHUNKS = 200;
 
+const WORKFLOW_CODEBASE_PREFIXES: readonly { prefix: string; codebaseName: string }[] = [
+  { prefix: 'bdc-shopops-', codebaseName: 'bluedevilcollectibles/shopops' },
+  { prefix: 'bdc-lspro-', codebaseName: 'bluedevilcollectibles/lspro-react' },
+  { prefix: 'bdc-storefront-', codebaseName: 'bluedevilcollectibles/shopops-storefront' },
+  { prefix: 'bdc-xo-', codebaseName: 'bluedevilcollectibles/bdc-xo' },
+  { prefix: 'bdc-harness-', codebaseName: 'bluedevilcollectibles/bdc-harness' },
+  { prefix: 'bdc-auth-', codebaseName: 'bluedevilcollectibles/lspro-react' },
+] as const;
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface WorkflowInvocation {
@@ -81,6 +98,12 @@ export interface WorkflowInvocation {
 export interface ProjectRegistration {
   projectName: string;
   projectPath: string;
+}
+
+interface BoundCodebaseResult {
+  codebase: Codebase;
+  source: 'flag' | 'prefix' | 'fallback';
+  userMessage: string;
 }
 
 export interface OrchestratorCommands {
@@ -688,7 +711,8 @@ export async function handleMessage(
 
     // 2. Check for deterministic commands
     if (message.startsWith('/')) {
-      const { command } = commandHandler.parseCommand(message);
+      const parsedCommand = commandHandler.parseCommand(message);
+      const { command } = parsedCommand;
       const deterministicCommands = [
         'help',
         'status',
@@ -722,6 +746,19 @@ export async function handleMessage(
           const result = await handleRemoveProject(message);
           await platform.sendMessage(conversationId, result);
           return;
+        }
+
+        if (command === 'workflow') {
+          const handledWorkflowRun = await handleWorkflowRunSlashCommand(
+            platform,
+            conversationId,
+            conversation,
+            parsedCommand.args,
+            isolationHints
+          );
+          if (handledWorkflowRun) {
+            return;
+          }
         }
 
         getLog().debug({ command, conversationId }, 'deterministic_command');
@@ -821,7 +858,7 @@ export async function handleMessage(
       attachedFiles,
       workflowContext
     );
-    const cwd = getArchonWorkspacesPath();
+    const cwd = await ensureArchonWorkspacesPath();
 
     // 4. Update activity and get/create session
     await db.touchConversation(conversation.id);
@@ -870,38 +907,60 @@ export async function handleMessage(
     };
 
     const mode = platform.getStreamingMode();
-    if (mode === 'stream') {
-      await handleStreamMode(
-        platform,
-        conversationId,
-        message,
-        codebases,
-        workflows,
-        aiClient,
-        fullPrompt,
-        cwd,
-        session,
-        isolationHints,
-        conversation,
-        issueContext,
-        requestOptions
-      );
-    } else {
-      await handleBatchMode(
-        platform,
-        conversationId,
-        message,
-        codebases,
-        workflows,
-        aiClient,
-        fullPrompt,
-        cwd,
-        session,
-        isolationHints,
-        conversation,
-        issueContext,
-        requestOptions
-      );
+    // BDC fork: at-most-one retry on Layer 3 AuthRefreshedRetryNeeded sentinel.
+    // The sentinel is thrown by handleStreamMode / handleBatchMode when the
+    // SDK reports an auth-class result-with-isError AND refreshIfAuthFailed
+    // succeeds. We catch ONLY that sentinel, retry the same turn once, and
+    // let any further error (including a second sentinel) propagate.
+    // Behavior spec v2 invariant I-11.
+    const runTurn = async (): Promise<void> => {
+      if (mode === 'stream') {
+        await handleStreamMode(
+          platform,
+          conversationId,
+          message,
+          codebases,
+          workflows,
+          aiClient,
+          fullPrompt,
+          cwd,
+          session,
+          isolationHints,
+          conversation,
+          issueContext,
+          requestOptions
+        );
+      } else {
+        await handleBatchMode(
+          platform,
+          conversationId,
+          message,
+          codebases,
+          workflows,
+          aiClient,
+          fullPrompt,
+          cwd,
+          session,
+          isolationHints,
+          conversation,
+          issueContext,
+          requestOptions
+        );
+      }
+    };
+
+    try {
+      await runTurn();
+    } catch (err) {
+      if (err instanceof AuthRefreshedRetryNeeded) {
+        getLog().info(
+          { conversationId, provider: aiClient.getType() },
+          'orchestrator_retry_after_auth_refresh'
+        );
+        await runTurn();
+      } else {
+        throw err;
+      }
     }
 
     getLog().debug({ conversationId }, 'orchestrator_message_completed');
@@ -996,6 +1055,45 @@ async function handleStreamMode(
         newSessionId = msg.sessionId;
       }
       if (msg.isError) {
+        // BDC fork: Layer 3 — detect auth-class errors in the SDK's
+        // result-with-isError path. The provider's try/catch around
+        // sendQuery only catches THROWN errors; the Claude SDK reports
+        // some auth failures (subprocess pre-flight short-circuit) as a
+        // normal `result` message with isError=true. Without this branch
+        // the auth failure flows past PR #48's reactive refresh and the
+        // user sees only a generic formatted error.
+        // Behavior spec v2 invariant I-11; research doc §Design rec L3.
+        if (isAuthErrorMessage(msg.errorSubtype)) {
+          const provider = aiClient.getType() as ProviderName;
+          getLog().info(
+            { conversationId, provider, errorSubtype: msg.errorSubtype },
+            'orchestrator_auth_refresh_retry'
+          );
+          const result = await refreshIfAuthFailed(provider);
+          if (result.refreshed) {
+            if (newSessionId) {
+              await tryPersistSessionId(session.id, newSessionId);
+            }
+            throw new AuthRefreshedRetryNeeded();
+          }
+          // Refresh failed — surface re-auth instructions instead of the
+          // generic formatted error so the operator knows what to do.
+          getLog().error(
+            { conversationId, provider, reason: result.reason },
+            'orchestrator_auth_refresh_failed'
+          );
+          await platform.sendMessage(
+            conversationId,
+            isTerminalRefreshReason(result.reason)
+              ? buildReauthMessage(provider, result.reason)
+              : classifyAndFormatError(new Error(msg.errorSubtype ?? 'AI result error'))
+          );
+          if (newSessionId) {
+            await tryPersistSessionId(session.id, newSessionId);
+          }
+          return;
+        }
+
         getLog().warn(
           {
             conversationId,
@@ -1140,6 +1238,37 @@ async function handleBatchMode(
         newSessionId = msg.sessionId;
       }
       if (msg.isError) {
+        // BDC fork: Layer 3 — same auth detection as streaming variant.
+        // Behavior spec v2 invariant I-11; research doc §Design rec L3.
+        if (isAuthErrorMessage(msg.errorSubtype)) {
+          const provider = aiClient.getType() as ProviderName;
+          getLog().info(
+            { conversationId, provider, errorSubtype: msg.errorSubtype },
+            'orchestrator_auth_refresh_retry'
+          );
+          const result = await refreshIfAuthFailed(provider);
+          if (result.refreshed) {
+            if (newSessionId) {
+              await tryPersistSessionId(session.id, newSessionId);
+            }
+            throw new AuthRefreshedRetryNeeded();
+          }
+          getLog().error(
+            { conversationId, provider, reason: result.reason },
+            'orchestrator_auth_refresh_failed'
+          );
+          await platform.sendMessage(
+            conversationId,
+            isTerminalRefreshReason(result.reason)
+              ? buildReauthMessage(provider, result.reason)
+              : classifyAndFormatError(new Error(msg.errorSubtype ?? 'AI result error'))
+          );
+          if (newSessionId) {
+            await tryPersistSessionId(session.id, newSessionId);
+          }
+          return;
+        }
+
         getLog().warn(
           {
             conversationId,
@@ -1436,6 +1565,306 @@ async function handleRemoveProject(message: string): Promise<string> {
   return `Project "${projectName}" removed.\nPath was: ${codebase.default_cwd}`;
 }
 
+function resolveWorkflowByName(
+  workflowName: string,
+  workflows: readonly WorkflowDefinition[]
+): WorkflowDefinition | undefined {
+  return (
+    findWorkflow(workflowName, [...workflows]) ??
+    workflows.find(w => w.name.toLowerCase() === workflowName.toLowerCase())
+  );
+}
+
+function matchesCodebaseName(codebase: Codebase, name: string): boolean {
+  const normalizedName = name.toLowerCase();
+  const codebaseName = codebase.name.toLowerCase();
+  const shortName = codebaseName.split('/').pop() ?? codebaseName;
+  return codebaseName === normalizedName || shortName === normalizedName;
+}
+
+function stripProjectFlag(userMessage: string): { userMessage: string; projectName?: string } {
+  const parts = userMessage.split(/\s+/).filter(Boolean);
+  const cleaned: string[] = [];
+  let projectName: string | undefined;
+
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
+    if (part === '--project') {
+      projectName = parts[i + 1];
+      i += 1;
+      continue;
+    }
+    if (part.startsWith('--project=')) {
+      projectName = part.slice('--project='.length);
+      continue;
+    }
+    cleaned.push(part);
+  }
+
+  return { userMessage: cleaned.join(' '), projectName };
+}
+
+export function resolveBoundCodebase({
+  workflowName,
+  userMessage,
+  codebases,
+}: {
+  workflowName: string;
+  userMessage: string;
+  codebases: readonly Codebase[];
+}): BoundCodebaseResult {
+  if (codebases.length === 0) {
+    throw new Error('No codebases registered');
+  }
+
+  const { userMessage: strippedMessage, projectName } = stripProjectFlag(userMessage);
+  if (projectName) {
+    const codebase = codebases.find(c => matchesCodebaseName(c, projectName));
+    if (codebase) {
+      return { codebase, source: 'flag', userMessage: strippedMessage };
+    }
+    getLog().warn({ workflowName, projectName }, 'workflow_codebase_project_not_found');
+    return { codebase: codebases[0], source: 'fallback', userMessage: strippedMessage };
+  }
+
+  const prefixMatch = WORKFLOW_CODEBASE_PREFIXES.find(({ prefix }) =>
+    workflowName.startsWith(prefix)
+  );
+  if (prefixMatch) {
+    const codebase = codebases.find(c => matchesCodebaseName(c, prefixMatch.codebaseName));
+    if (codebase) {
+      return { codebase, source: 'prefix', userMessage: strippedMessage };
+    }
+    getLog().warn(
+      { workflowName, expectedCodebase: prefixMatch.codebaseName },
+      'workflow_codebase_prefix_not_registered'
+    );
+  }
+
+  return { codebase: codebases[0], source: 'fallback', userMessage: strippedMessage };
+}
+
+function workflowLoadErrorForName(
+  workflowName: string,
+  errors: readonly WorkflowLoadError[]
+): WorkflowLoadError | undefined {
+  return errors.find(
+    e =>
+      e.filename.replace(/\.ya?ml$/, '') === workflowName ||
+      e.filename === `${workflowName}.yaml` ||
+      e.filename === `${workflowName}.yml`
+  );
+}
+
+async function discoverWorkflowForCodebase(
+  workflowName: string,
+  workflowCwd: string
+): Promise<
+  | { ok: true; workflow?: WorkflowDefinition; loadError?: WorkflowLoadError }
+  | { ok: false; error: Error }
+> {
+  try {
+    await syncArchonToWorktree(workflowCwd);
+  } catch (error) {
+    getLog().debug({ err: error as Error, workflowCwd }, 'workflow_sync_before_direct_run_failed');
+  }
+
+  try {
+    const discovery = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
+    const workflows = discovery.workflows.map(w => w.workflow);
+    return {
+      ok: true,
+      workflow: resolveWorkflowByName(workflowName, workflows),
+      loadError: workflowLoadErrorForName(workflowName, discovery.errors),
+    };
+  } catch (error) {
+    return { ok: false, error: error as Error };
+  }
+}
+
+/**
+ * Handle explicit /workflow run before the generic command handler resolves workflows.
+ *
+ * API-triggered workflow conversations are often created without a codebase_id. The
+ * generic command handler discovers workflows from the global workspace in that state,
+ * which can return "workflow not found" before the E2 project auto-select logic gets a
+ * chance to attach the matching codebase. Resolve against registered codebases here so
+ * /api/workflows/:name/run reliably reaches dispatchBackgroundWorkflow.
+ */
+async function handleWorkflowRunSlashCommand(
+  platform: IPlatformAdapter,
+  conversationId: string,
+  conversation: Conversation,
+  args: string[],
+  isolationHints?: HandleMessageContext['isolationHints']
+): Promise<boolean> {
+  if (args[0] !== 'run') {
+    return false;
+  }
+
+  if (conversation.codebase_id) {
+    return false;
+  }
+
+  const workflowName = args[1];
+  const userMessage = args.slice(2).join(' ');
+
+  if (!workflowName) {
+    await platform.sendMessage(
+      conversationId,
+      'Usage: /workflow run <name> [args]\n\nUse /workflow list to see available workflows.'
+    );
+    return true;
+  }
+
+  getLog().debug({ workflowName, conversationId }, 'workflow_run_slash_direct');
+
+  const codebases = await codebaseDb.listCodebases();
+  if (codebases.length === 0) {
+    await platform.sendMessage(
+      conversationId,
+      'No projects registered. Ask me to set up a project first.'
+    );
+    return true;
+  }
+
+  try {
+    const globalDiscovery = await discoverWorkflowsWithConfig(
+      getArchonWorkspacesPath(),
+      loadConfig
+    );
+    const globalWorkflows = globalDiscovery.workflows.map(w => w.workflow);
+    const globalWorkflow = resolveWorkflowByName(workflowName, globalWorkflows);
+    if (globalWorkflow) {
+      const binding = resolveBoundCodebase({ workflowName, userMessage, codebases });
+      const { codebase } = binding;
+      getLog().info(
+        { workflowName, boundCodebase: codebase.name, source: binding.source },
+        'workflow_codebase_bound'
+      );
+      await platform.sendMessage(conversationId, `Starting workflow: \`${globalWorkflow.name}\``);
+      await dispatchOrchestratorWorkflow(
+        platform,
+        conversationId,
+        conversation,
+        codebase,
+        globalWorkflow,
+        binding.userMessage,
+        isolationHints
+      );
+      return true;
+    }
+  } catch (error) {
+    getLog().warn({ err: error as Error, workflowName }, 'global_workflow_run_discovery_failed');
+  }
+
+  const matches: { codebase: Codebase; workflow: WorkflowDefinition }[] = [];
+  let firstLoadError: WorkflowLoadError | undefined;
+  let firstDiscoveryError: { codebase: Codebase; error: Error } | undefined;
+
+  for (const codebase of codebases) {
+    const workflowCwd = codebase.default_cwd;
+    const discovery = await discoverWorkflowForCodebase(workflowName, workflowCwd);
+    if (!discovery.ok) {
+      firstDiscoveryError ??= { codebase, error: discovery.error };
+      continue;
+    }
+    firstLoadError ??= discovery.loadError;
+    if (discovery.workflow) {
+      matches.push({ codebase, workflow: discovery.workflow });
+    }
+  }
+
+  if (matches.length === 1) {
+    const { workflow } = matches[0];
+    const binding = resolveBoundCodebase({
+      workflowName: workflow.name,
+      userMessage,
+      codebases: matches.map(match => match.codebase),
+    });
+    const { codebase } = binding;
+    getLog().info(
+      { workflowName: workflow.name, boundCodebase: codebase.name, source: binding.source },
+      'workflow_codebase_bound'
+    );
+    await platform.sendMessage(conversationId, `Starting workflow: \`${workflow.name}\``);
+    await dispatchOrchestratorWorkflow(
+      platform,
+      conversationId,
+      conversation,
+      codebase,
+      workflow,
+      binding.userMessage,
+      isolationHints
+    );
+    return true;
+  }
+
+  if (matches.length > 1) {
+    const binding = resolveBoundCodebase({
+      workflowName,
+      userMessage,
+      codebases: matches.map(match => match.codebase),
+    });
+    if (binding.source !== 'fallback') {
+      const match = matches.find(candidate => candidate.codebase.id === binding.codebase.id);
+      if (match) {
+        getLog().info(
+          {
+            workflowName: match.workflow.name,
+            boundCodebase: binding.codebase.name,
+            source: binding.source,
+          },
+          'workflow_codebase_bound'
+        );
+        await platform.sendMessage(conversationId, `Starting workflow: \`${match.workflow.name}\``);
+        await dispatchOrchestratorWorkflow(
+          platform,
+          conversationId,
+          conversation,
+          binding.codebase,
+          match.workflow,
+          binding.userMessage,
+          isolationHints
+        );
+        return true;
+      }
+    }
+    const projectList = matches.map(m => `- ${m.codebase.name}`).join('\n');
+    await platform.sendMessage(
+      conversationId,
+      `Which project should this workflow run on?\n\n${projectList}\n\nReply with the project name, or use: /workflow run ${workflowName} --project <name> "${userMessage}"`
+    );
+    return true;
+  }
+
+  if (firstLoadError) {
+    await platform.sendMessage(
+      conversationId,
+      `Workflow \`${workflowName}\` failed to load: ${firstLoadError.error}\n\nFix the YAML file and try again.`
+    );
+    return true;
+  }
+
+  if (firstDiscoveryError && codebases.length === 1) {
+    getLog().error(
+      { err: firstDiscoveryError.error, cwd: firstDiscoveryError.codebase.default_cwd },
+      'workflow_discovery_failed'
+    );
+    await platform.sendMessage(
+      conversationId,
+      `Failed to load workflows: ${firstDiscoveryError.error.message}\n\nCheck .archon/workflows/ for YAML syntax issues.`
+    );
+    return true;
+  }
+
+  await platform.sendMessage(
+    conversationId,
+    `Workflow \`${workflowName}\` not found.\n\nUse /workflow list to see available workflows.`
+  );
+  return true;
+}
+
 /**
  * Handle /workflow run command when project context may be missing.
  * Implements Edge Case E2 from the plan.
@@ -1484,7 +1913,12 @@ async function handleWorkflowRunCommand(
 
   if (codebases.length === 1) {
     // Auto-select the only project
-    const codebase = codebases[0];
+    const binding = resolveBoundCodebase({ workflowName: workflow.name, userMessage, codebases });
+    const { codebase } = binding;
+    getLog().info(
+      { workflowName: workflow.name, boundCodebase: codebase.name, source: binding.source },
+      'workflow_codebase_bound'
+    );
     const workflowCwd = conversation.cwd ?? codebase.default_cwd;
     try {
       await syncArchonToWorktree(workflowCwd);
@@ -1542,7 +1976,25 @@ async function handleWorkflowRunCommand(
       conversation,
       codebase,
       resolvedWorkflow,
-      userMessage,
+      binding.userMessage,
+      isolationHints
+    );
+    return;
+  }
+
+  const binding = resolveBoundCodebase({ workflowName: workflow.name, userMessage, codebases });
+  if (binding.source !== 'fallback') {
+    getLog().info(
+      { workflowName: workflow.name, boundCodebase: binding.codebase.name, source: binding.source },
+      'workflow_codebase_bound'
+    );
+    await dispatchOrchestratorWorkflow(
+      platform,
+      conversationId,
+      conversation,
+      binding.codebase,
+      workflow,
+      binding.userMessage,
       isolationHints
     );
     return;

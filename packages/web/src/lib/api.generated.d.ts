@@ -738,6 +738,62 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/workflows/errors': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** List workflow loader validation errors */
+    get: {
+      parameters: {
+        query?: {
+          cwd?: string;
+        };
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Workflow loader errors */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['WorkflowErrorsResponse'];
+          };
+        };
+        /** @description Bad request */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/workflows/{name}/run': {
     parameters: {
       query?: never;
@@ -816,6 +872,7 @@ export interface paths {
           before?: string;
           limit?: string;
           offset?: string;
+          includeArchived?: string;
         };
         header?: never;
         path?: never;
@@ -851,6 +908,51 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/workflows/runs/cancel-stale': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Cancel all stale running workflow runs (default: idle > 30 minutes) */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description OK */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['CancelStaleRunsResponse'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/workflows/runs/{runId}/cancel': {
     parameters: {
       query?: never;
@@ -870,7 +972,11 @@ export interface paths {
         };
         cookie?: never;
       };
-      requestBody?: never;
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['CancelWorkflowRunBody'];
+        };
+      };
       responses: {
         /** @description Cancelled */
         200: {
@@ -892,6 +998,24 @@ export interface paths {
         };
         /** @description Not found */
         404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Already cancelled */
+        409: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Cannot cancel a terminal run */
+        422: {
           headers: {
             [name: string]: unknown;
           };
@@ -1184,6 +1308,241 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/workflows/runs/{runId}/archive': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Archive a workflow run (hide from default dashboard view) */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          runId: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['ArchiveWorkflowRunBody'];
+        };
+      };
+      responses: {
+        /** @description Archived */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['WorkflowRunActionResponse'];
+          };
+        };
+        /** @description Bad request */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/workflows/runs/{runId}/unarchive': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Unarchive a workflow run (restore to default dashboard view) */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path: {
+          runId: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['UnarchiveWorkflowRunBody'];
+        };
+      };
+      responses: {
+        /** @description Unarchived */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['WorkflowRunActionResponse'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/workflows/runs/bulk-archive': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Bulk-archive workflow runs by status */
+    post: {
+      parameters: {
+        query?: never;
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: {
+        content: {
+          'application/json': components['schemas']['BulkArchiveBody'];
+        };
+      };
+      responses: {
+        /** @description Bulk archived */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['BulkArchiveResponse'];
+          };
+        };
+        /** @description Bad request */
+        400: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/workflows/runs/bulk-failed': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    post?: never;
+    /** Bulk-delete archived failed runs (permanent). Use dryRun=true to preview. */
+    delete: {
+      parameters: {
+        query?: {
+          dryRun?: string;
+          olderThan?: string;
+        };
+        header?: never;
+        path?: never;
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Bulk deleted (or dry run preview) */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['BulkDeleteFailedResponse'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/workflows/runs/{runId}': {
     parameters: {
       query?: never;
@@ -1365,6 +1724,65 @@ export interface paths {
           };
           content: {
             'application/json': components['schemas']['WorkflowRunByWorkerResponse'];
+          };
+        };
+        /** @description Not found */
+        404: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+        /** @description Server error */
+        500: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['Error'];
+          };
+        };
+      };
+    };
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/workflows/runs/{runId}/nodes/{nodeId}/events': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Get the last N events for a single node in a workflow run */
+    get: {
+      parameters: {
+        query?: {
+          limit?: string;
+        };
+        header?: never;
+        path: {
+          runId: string;
+          nodeId: string;
+        };
+        cookie?: never;
+      };
+      requestBody?: never;
+      responses: {
+        /** @description Recent events for the node (newest first) */
+        200: {
+          headers: {
+            [name: string]: unknown;
+          };
+          content: {
+            'application/json': components['schemas']['NodeEventsResponse'];
           };
         };
         /** @description Not found */
@@ -2028,6 +2446,7 @@ export interface components {
     };
     DagNode: {
       id: string;
+      description?: string;
       depends_on?: string[];
       when?: string;
       /** @enum {string} */
@@ -2259,6 +2678,8 @@ export interface components {
           args?: string[];
         };
       };
+      agent?: string;
+      load_bearing?: boolean;
       command?: string;
       prompt?: string;
       bash?: string;
@@ -2266,9 +2687,10 @@ export interface components {
         prompt: string;
         until: string;
         max_iterations: number;
-        /** @default false */
+        /** @default true */
         fresh_context: boolean;
         until_bash?: string;
+        until_file?: string;
         interactive?: boolean;
         gate_message?: string;
       };
@@ -2348,8 +2770,16 @@ export interface components {
       worktree?: {
         enabled?: boolean;
       };
+      policyFile?: string;
+      mutates_checkout?: boolean;
       tags?: string[];
+      target_repo?: string;
       nodes: components['schemas']['DagNode'][];
+      inputs?: {
+        [key: string]: {
+          default: string;
+        };
+      };
     };
     /** @enum {string} */
     WorkflowSource: 'project' | 'bundled' | 'global';
@@ -2359,13 +2789,34 @@ export interface components {
     };
     WorkflowLoadError: {
       filename: string;
+      path?: string;
       error: string;
       /** @enum {string} */
       errorType: 'read_error' | 'parse_error' | 'validation_error';
+      /** @enum {string} */
+      error_type?: 'parse_error' | 'dag_invalid' | 'missing_required_field' | 'schema_violation';
+      message?: string;
+      last_attempt_at?: string;
     };
     WorkflowListResponse: {
       workflows: components['schemas']['WorkflowListEntry'][];
       errors?: components['schemas']['WorkflowLoadError'][];
+      validation_errors: {
+        count: number;
+        endpoint: string;
+      };
+    };
+    WorkflowValidationError: {
+      filename: string;
+      path?: string;
+      /** @enum {string} */
+      error_type: 'parse_error' | 'dag_invalid' | 'missing_required_field' | 'schema_violation';
+      message: string;
+      last_attempt_at: string;
+    };
+    WorkflowErrorsResponse: {
+      errors: components['schemas']['WorkflowValidationError'][];
+      count: number;
     };
     RunWorkflowBody: {
       conversationId: string;
@@ -2388,6 +2839,9 @@ export interface components {
       completed_at: string | null;
       last_activity_at: string | null;
       working_path: string | null;
+      archived_at: string | null;
+      archived_by: string | null;
+      archive_reason: string | null;
     };
     DashboardWorkflowRun: components['schemas']['WorkflowRun'] & {
       codebase_name: string | null;
@@ -2415,9 +2869,17 @@ export interface components {
         paused: number;
       };
     };
+    CancelStaleRunsResponse: {
+      cancelled: number;
+      runIds: string[];
+    };
     CancelWorkflowRunResponse: {
       success: boolean;
       message: string;
+      run: components['schemas']['WorkflowRun'];
+    };
+    CancelWorkflowRunBody: {
+      reason?: string;
     };
     WorkflowRunActionResponse: {
       success: boolean;
@@ -2428,6 +2890,24 @@ export interface components {
     };
     RejectWorkflowRunBody: {
       reason?: string;
+    };
+    ArchiveWorkflowRunBody: {
+      reason?: string;
+    };
+    UnarchiveWorkflowRunBody: Record<string, never>;
+    BulkArchiveResponse: {
+      archivedCount: number;
+      runIds: string[];
+    };
+    BulkArchiveBody: {
+      /** @enum {string} */
+      status: 'failed' | 'cancelled' | 'completed';
+      olderThan?: string;
+    };
+    BulkDeleteFailedResponse: {
+      deletedCount: number;
+      runIds: string[];
+      dryRun: boolean;
     };
     WorkflowRunListResponse: {
       runs: components['schemas']['WorkflowRun'][];
@@ -2452,6 +2932,9 @@ export interface components {
         parent_platform_id?: string;
         conversation_platform_id: string | null;
       };
+      events: components['schemas']['WorkflowEvent'][];
+    };
+    NodeEventsResponse: {
       events: components['schemas']['WorkflowEvent'][];
     };
     ValidateWorkflowResponse: {

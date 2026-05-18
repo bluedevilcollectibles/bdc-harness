@@ -4,6 +4,8 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
 
+const isWindows = process.platform === 'win32';
+
 // --- Mock logger (MUST come before imports of modules under test) ---
 
 const mockLogFn = mock(() => {});
@@ -37,6 +39,7 @@ import {
   checkTriggerRule,
   substituteNodeOutputRefs,
   executeDagWorkflow,
+  clearAgentRegistryCache,
 } from './dag-executor';
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
@@ -751,9 +754,145 @@ describe('substituteNodeOutputRefs -- shell escaping', () => {
     expect(substituteNodeOutputRefs('echo $a.output', outputs, true)).toBe("echo 'hello\nworld'");
   });
 
-  it('object JSON field becomes quoted empty string when escapedForBash=true', () => {
+  it('object JSON field becomes JSON stringified when escapedForBash=true', () => {
     const outputs = new Map([['a', makeOutput('completed', JSON.stringify({ nested: { x: 1 } }))]]);
-    expect(substituteNodeOutputRefs('echo $a.output.nested', outputs, true)).toBe("echo ''");
+    expect(substituteNodeOutputRefs('echo $a.output.nested', outputs, true)).toBe(
+      'echo \'{"x":1}\''
+    );
+  });
+
+  // WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01 (bdc-xo#153): when a node output
+  // reference is wrapped in double quotes inside a bash block, the outer double
+  // quotes are swallowed during substitution because shellQuote already produces
+  // safe single-quote wrapping. Without this, multi-line output mis-tokenized
+  // bash (line 2+ of output became bare commands).
+  describe('double-quote context handling (escapedForBash=true)', () => {
+    it('swallows outer double quotes for exact "$node.output" pattern with multi-line output', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'line1\nline2\nline3')]]);
+      // Author wrote: echo "$a.output"
+      // Without the fix: produces echo "'line1\nline2\nline3'" — bash mis-tokenizes line2/line3.
+      // With the fix:  produces echo 'line1\nline2\nline3' (single-quoted, bash-safe).
+      expect(substituteNodeOutputRefs('echo "$a.output"', outputs, true)).toBe(
+        "echo 'line1\nline2\nline3'"
+      );
+    });
+
+    it('swallows outer double quotes for single-line output', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'just one line')]]);
+      expect(substituteNodeOutputRefs('echo "$a.output"', outputs, true)).toBe(
+        "echo 'just one line'"
+      );
+    });
+
+    it('handles output containing both single quotes AND double quotes', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'it\'s a "trap"')]]);
+      // shellQuote escapes ' as '\''; " stays literal inside single quotes
+      expect(substituteNodeOutputRefs('echo "$a.output"', outputs, true)).toBe(
+        "echo 'it'\\''s a \"trap\"'"
+      );
+    });
+
+    it('handles hyphenated node ids in double-quote context', () => {
+      const outputs = new Map([
+        ['decide-push-target', makeOutput('completed', 'push_target: feature-branch:foo')],
+      ]);
+      expect(
+        substituteNodeOutputRefs('printf "%s\\n" "$decide-push-target.output"', outputs, true)
+      ).toBe('printf "%s\\n" \'push_target: feature-branch:foo\'');
+    });
+
+    it('handles JSON field access inside double quotes', () => {
+      const outputs = new Map([['a', makeOutput('completed', JSON.stringify({ cmd: 'foo bar' }))]]);
+      // "$a.output.cmd" -> 'foo bar' (outer double quotes swallowed)
+      expect(substituteNodeOutputRefs('run "$a.output.cmd"', outputs, true)).toBe("run 'foo bar'");
+    });
+
+    it('leaves bare $node.output (no surrounding quotes) producing shellQuote-wrapped value', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'hello world')]]);
+      // No surrounding double quotes — current behavior preserved.
+      expect(substituteNodeOutputRefs('echo $a.output', outputs, true)).toBe("echo 'hello world'");
+    });
+
+    it('asymmetric quotes (leading only) are NOT swallowed', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'hello')]]);
+      // `"$a.output and rest` (leading " but no trailing "): only one quote captured;
+      // we put it back, falling through to standard shellQuote behavior. Author's
+      // outer string remains intact.
+      expect(substituteNodeOutputRefs('echo "$a.output and rest"', outputs, true)).toBe(
+        'echo "\'hello\' and rest"'
+      );
+    });
+
+    it('asymmetric quotes (trailing only) are NOT swallowed', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'hello')]]);
+      // `$a.output"`: trailing " captured but leading " was a different char (here, none).
+      expect(substituteNodeOutputRefs('echo $a.output" extra', outputs, true)).toBe(
+        "echo 'hello'\" extra"
+      );
+    });
+
+    it('two adjacent quoted refs each swallow their own quotes', () => {
+      const outputs = new Map([
+        ['a', makeOutput('completed', 'A1')],
+        ['b', makeOutput('completed', 'B2')],
+      ]);
+      expect(substituteNodeOutputRefs('"$a.output" then "$b.output"', outputs, true)).toBe(
+        "'A1' then 'B2'"
+      );
+    });
+
+    it('non-shell mode (escapedForBash=false) keeps current behavior even with surrounding quotes', () => {
+      const outputs = new Map([['a', makeOutput('completed', 'hello')]]);
+      // No escaping at all, no quote swallowing.
+      expect(substituteNodeOutputRefs('echo "$a.output"', outputs)).toBe('echo "hello"');
+    });
+
+    it('unknown node in double-quote context swallows the outer quotes too', () => {
+      mockLogFn.mockClear();
+      const outputs = new Map<string, NodeOutput>();
+      // "$missing.output" -> '' (outer " swallowed; empty single-quoted string)
+      expect(substituteNodeOutputRefs('echo "$missing.output"', outputs, true)).toBe("echo ''");
+    });
+  });
+
+  it('array JSON field becomes JSON stringified', () => {
+    const outputs = new Map([
+      ['a', makeOutput('completed', JSON.stringify({ items: ['todo', 'fix'] }))],
+    ]);
+    expect(substituteNodeOutputRefs('$a.output.items', outputs)).toBe('["todo","fix"]');
+  });
+
+  it('array JSON field is shell-quoted when escapedForBash=true', () => {
+    const outputs = new Map([
+      ['a', makeOutput('completed', JSON.stringify({ items: ['todo', 'fix'] }))],
+    ]);
+    expect(substituteNodeOutputRefs('echo $a.output.items', outputs, true)).toBe(
+      'echo \'["todo","fix"]\''
+    );
+  });
+
+  it('nested object in array field becomes JSON stringified', () => {
+    const outputs = new Map([
+      [
+        'a',
+        makeOutput('completed', JSON.stringify({ files: [{ name: 'a.ts', status: 'modified' }] })),
+      ],
+    ]);
+    expect(substituteNodeOutputRefs('$a.output.files', outputs)).toBe(
+      '[{"name":"a.ts","status":"modified"}]'
+    );
+  });
+
+  it('null values in arrays stringify to "null"', () => {
+    const outputs = new Map([
+      ['a', makeOutput('completed', JSON.stringify({ items: [null, 'ok'] }))],
+    ]);
+    expect(substituteNodeOutputRefs('$a.output.items', outputs)).toBe('[null,"ok"]');
+  });
+
+  it('null object field becomes JSON stringified "null"', () => {
+    const outputs = new Map([['a', makeOutput('completed', JSON.stringify({ config: null }))]]);
+    expect(substituteNodeOutputRefs('$a.output.config', outputs)).toBe('null');
   });
 
   it('dot notation on invalid JSON returns quoted empty string when escapedForBash=true', () => {
@@ -1337,6 +1476,111 @@ describe('executeDagWorkflow -- bash nodes', () => {
     // 'INJECTED' as a standalone result of injection must not appear
     const injectedMessage = messages.find((m: string) => m === 'INJECTED');
     expect(injectedMessage).toBeUndefined();
+  });
+
+  it('${input.X} tokens are substituted in bash script before exec', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'bar\n', stderr: '' });
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-input-subst-run-id');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-input-subst',
+      testDir,
+      {
+        name: 'bash-input-subst-test',
+        nodes: [{ id: 'greet', bash: 'echo ${input.foo}' }],
+        inputs: { foo: { default: 'bar' } },
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // The bash script passed to execFileAsync must have the token replaced with the value
+    expect(execSpy).toHaveBeenCalledWith('bash', ['-c', 'echo bar'], expect.anything());
+    execSpy.mockRestore();
+  });
+
+  it('WORKTREE_PATH and INPUT_* env vars are injected into bash subprocess', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-input-env-run-id');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-input-env',
+      testDir,
+      {
+        name: 'bash-input-env-test',
+        nodes: [{ id: 'step', bash: 'echo ok' }],
+        inputs: { branch: { default: 'feat/test-branch' } },
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(execSpy).toHaveBeenCalledWith(
+      'bash',
+      ['-c', 'echo ok'],
+      expect.objectContaining({
+        env: expect.objectContaining({
+          WORKTREE_PATH: testDir,
+          INPUT_BRANCH: 'feat/test-branch',
+        }),
+      })
+    );
+    execSpy.mockRestore();
+  });
+
+  it('undefined ${input.X} token is left unchanged in bash script', async () => {
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const mockDeps = createMockDeps();
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('bash-input-undef-run-id');
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-input-undef',
+      testDir,
+      {
+        name: 'bash-input-undef-test',
+        nodes: [{ id: 'step', bash: 'echo ${input.undefined_key}' }],
+        inputs: { other: { default: 'irrelevant' } },
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    // Token for 'undefined_key' must remain verbatim (not replaced with empty string or crashed)
+    expect(execSpy).toHaveBeenCalledWith(
+      'bash',
+      ['-c', 'echo ${input.undefined_key}'],
+      expect.anything()
+    );
+    execSpy.mockRestore();
   });
 });
 
@@ -3140,6 +3384,50 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       });
     });
 
+    it('passes loop node systemPrompt to the agent provider', async () => {
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: 'Did the task. <promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'loop-session-1' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-system-prompt',
+          nodes: [
+            {
+              id: 'my-loop',
+              systemPrompt: 'TEST POLICY CONTENT',
+              loop: {
+                prompt: 'Do a task. When done, output <promise>COMPLETE</promise>.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      const options = mockSendQueryDag.mock.calls[0][3] as { systemPrompt?: string };
+      expect(options.systemPrompt).toBe('TEST POLICY CONTENT');
+    });
+
     it('completes after multiple iterations', async () => {
       let callCount = 0;
       mockSendQueryDag.mockImplementation(function* () {
@@ -4332,6 +4620,128 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
         >
       ).mock.calls;
       expect(pauseCalls.length).toBe(0);
+    });
+
+    // ─── Sticky signal detection ───────────────────────────────────────────
+
+    it('sticky detection: signal in iteration 1 exits loop before max_iterations', async () => {
+      // stickySignalDetected is set true in iteration 1. The mock yields no signal in
+      // iteration 2+ to prove the loop doesn't need re-emission — but with correct
+      // detection, the loop exits after iteration 1 (stickySignalDetected || bashComplete).
+      let callCount = 0;
+      mockSendQueryDag.mockImplementation(function* () {
+        callCount++;
+        if (callCount === 1) {
+          // Iteration 1: signal on its own line → signalDetected=true → stickySignalDetected=true
+          yield { type: 'assistant', content: 'All checks passed.\nCOMPLETE' };
+        } else {
+          // Iteration 2+: deliberately no signal (validates sticky prevents max_iter failure)
+          yield { type: 'assistant', content: 'No signal in this iteration.' };
+        }
+        yield { type: 'result', sessionId: `sticky-sid-${String(callCount)}` };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-sticky',
+          nodes: [
+            {
+              id: 'my-loop',
+              loop: {
+                prompt: 'Work. Emit COMPLETE on its own line when done.',
+                until: 'COMPLETE',
+                max_iterations: 5,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Loop exits after iteration 1 — stickySignalDetected becomes true and
+      // completionDetected = stickySignalDetected || bashComplete = true.
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      expect(
+        (
+          mockDeps.store.completeWorkflowRun as Mock<
+            (id: string, metadata?: Record<string, unknown>) => Promise<void>
+          >
+        ).mock.calls.length
+      ).toBe(1);
+      expect(
+        (mockDeps.store.failWorkflowRun as Mock<(id: string, error: string) => Promise<void>>).mock
+          .calls.length
+      ).toBe(0);
+    });
+
+    it('until_file: workflow with until_file field is accepted by the schema', async () => {
+      // Structural test: verify a workflow definition containing until_file parses without error
+      // and completes when the AI emits the completion signal.
+      // Execution-level bash expansion (test -f .archon/<path>) is covered in loader.test.ts.
+      mockSendQueryDag.mockImplementation(function* () {
+        yield { type: 'assistant', content: '<promise>COMPLETE</promise>' };
+        yield { type: 'result', sessionId: 'file-sentinel-sid' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun();
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'dag-loop-until-file',
+          nodes: [
+            {
+              id: 'my-loop',
+              loop: {
+                prompt: 'Work. Write .archon/done.txt when finished.',
+                until: 'COMPLETE',
+                max_iterations: 3,
+                until_file: 'done.txt',
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      // Signal detected (XML wrapped) → stickySignalDetected=true → exits after 1 iteration.
+      // The until_bash expansion (test -f .archon/done.txt) is a secondary check; on
+      // environments without bash it gracefully degrades to bashComplete=false.
+      expect(mockSendQueryDag.mock.calls.length).toBe(1);
+      expect(
+        (
+          mockDeps.store.completeWorkflowRun as Mock<
+            (id: string, metadata?: Record<string, unknown>) => Promise<void>
+          >
+        ).mock.calls.length
+      ).toBe(1);
     });
   });
 });
@@ -6174,59 +6584,71 @@ describe('executeDagWorkflow -- script nodes', () => {
     expect(failMsg).toBeDefined();
   });
 
-  it('failure message strips the "Command failed: bun -e <body>" prefix and stays small', async () => {
-    const mockDeps = createMockDeps();
-    const platform = createMockPlatform();
-    const workflowRun = makeWorkflowRun('script-1389-run-id', {
-      workflow_name: 'script-1389',
-      conversation_id: 'conv-1389s',
-      user_message: 'test',
-    });
+  // Skipped on Windows (WO-HARNESS-DAG-EXECUTOR-TEST-LINE-6627-01, 2026-05-16):
+  // npm-installed bun resolves to `bun.cmd` on Windows; Node's execFile invokes
+  // the cmd shim which mangles or truncates multi-KB `-e <script>` arguments,
+  // so Bun exits 0 with no stdout/stderr instead of failing on the deliberate
+  // parse error. The production runtime is Linux containers where `bun` is a
+  // single binary executed directly, so this test is correct for prod but
+  // platform-fragile on Windows dev machines. Follow-up: rewrite using a named
+  // script fixture (writeFile to .archon/scripts/) instead of inline `-e`, or
+  // resolve bun.exe absolute path explicitly. See bdc-xo follow-up WO.
+  it.skipIf(isWindows)(
+    'failure message strips the "Command failed: bun -e <body>" prefix and stays small',
+    async () => {
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('script-1389-run-id', {
+        workflow_name: 'script-1389',
+        conversation_id: 'conv-1389s',
+        user_message: 'test',
+      });
 
-    // 200 × 16 chars ≈ 3.2 KB — larger than SUBPROCESS_ERROR_MAX_CHARS (2 KB),
-    // so any leak of the script body via err.message would violate the length
-    // assertion below. Bun's stderr echoes only a few lines of context.
-    const paddingAboveMax = '// padding line '.repeat(200);
-    const scriptNode: ScriptNode = {
-      id: 'fail-script-1389',
-      script: `${paddingAboveMax}\nconst x = "marker"; this is not valid javascript`,
-      runtime: 'bun',
-    };
+      // 200 × 16 chars ≈ 3.2 KB — larger than SUBPROCESS_ERROR_MAX_CHARS (2 KB),
+      // so any leak of the script body via err.message would violate the length
+      // assertion below. Bun's stderr echoes only a few lines of context.
+      const paddingAboveMax = '// padding line '.repeat(200);
+      const scriptNode: ScriptNode = {
+        id: 'fail-script-1389',
+        script: `${paddingAboveMax}\nconst x = "marker"; this is not valid javascript`,
+        runtime: 'bun',
+      };
 
-    await executeDagWorkflow(
-      mockDeps,
-      platform,
-      'conv-1389s',
-      testDir,
-      { name: 'script-1389', nodes: [scriptNode] },
-      workflowRun,
-      'claude',
-      undefined,
-      join(testDir, 'artifacts'),
-      join(testDir, 'logs'),
-      'main',
-      'docs/',
-      minimalConfig
-    );
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-1389s',
+        testDir,
+        { name: 'script-1389', nodes: [scriptNode] },
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
 
-    const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
-    const failedEvent = eventCalls.find(
-      (call: unknown[]) =>
-        (call[0] as { event_type: string }).event_type === 'node_failed' &&
-        (call[0] as { step_name: string }).step_name === 'fail-script-1389'
-    );
-    expect(failedEvent).toBeDefined();
-    const errorMsg = (failedEvent![0] as { data: { error: string } }).data.error;
-    expect(errorMsg).toContain("Script node 'fail-script-1389' failed");
-    expect(errorMsg).not.toContain('Command failed:');
-    expect(errorMsg).not.toContain('padding line padding line padding line');
-    // 2 KB diagnostic cap + label prefix + truncation marker should stay under
-    // 2.1 KB. Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
-    expect(errorMsg.length).toBeLessThan(2100);
-    // Bun emits `error: <description>\n    at [eval]:L:C` for parse failures —
-    // the location marker is the strongest signal that the diagnostic survived.
-    expect(errorMsg).toContain('[eval]');
-  });
+      const eventCalls = (mockDeps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+      const failedEvent = eventCalls.find(
+        (call: unknown[]) =>
+          (call[0] as { event_type: string }).event_type === 'node_failed' &&
+          (call[0] as { step_name: string }).step_name === 'fail-script-1389'
+      );
+      expect(failedEvent).toBeDefined();
+      const errorMsg = (failedEvent![0] as { data: { error: string } }).data.error;
+      expect(errorMsg).toContain("Script node 'fail-script-1389' failed");
+      expect(errorMsg).not.toContain('Command failed:');
+      expect(errorMsg).not.toContain('padding line padding line padding line');
+      // 2 KB diagnostic cap + label prefix + truncation marker should stay under
+      // 2.1 KB. Bumping SUBPROCESS_ERROR_MAX_CHARS would trip this.
+      expect(errorMsg.length).toBeLessThan(2100);
+      // Bun emits `error: <description>\n    at [eval]:L:C` for parse failures —
+      // the location marker is the strongest signal that the diagnostic survived.
+      expect(errorMsg).toContain('[eval]');
+    }
+  );
 
   it('timeout kills subprocess', async () => {
     const mockDeps = createMockDeps();
@@ -6892,5 +7314,148 @@ describe('executeDagWorkflow -- final status derivation', () => {
       expect.anything(),
       expect.stringContaining('b')
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agent persona dispatch tests
+// Verify that executeDagWorkflow resolves agent: fields to persona model +
+// allowed_tools, and that nodes without agent: continue using current behavior.
+// ---------------------------------------------------------------------------
+
+describe('agent persona dispatch', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `agent-dispatch-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(join(testDir, '.archon', 'agents'), { recursive: true });
+    await mkdir(join(testDir, 'artifacts'), { recursive: true });
+    await mkdir(join(testDir, 'logs'), { recursive: true });
+    clearAgentRegistryCache();
+    mockSendQueryDag.mockClear();
+  });
+
+  afterEach(async () => {
+    clearAgentRegistryCache();
+    try {
+      await rm(testDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  async function writeAgentFile(name: string, model: string, tools?: string[]): Promise<void> {
+    const toolsLine = tools ? `tools: [${tools.join(', ')}]` : '';
+    const content = `---\nname: ${name}\nmodel: ${model}\n${toolsLine}\n---\n\nYou are the ${name} agent.\n`;
+    await writeFile(join(testDir, '.archon', 'agents', `${name}.md`), content, 'utf-8');
+  }
+
+  it('prompt node with agent: applies persona allowed_tools to nodeConfig', async () => {
+    await writeAgentFile('read-only-test-agent', 'sonnet', ['Read', 'Grep']);
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-run-1');
+
+    const nodes: DagNode[] = [
+      { id: 'plan', agent: 'read-only-test-agent', prompt: 'Plan the work.' } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'agent-persona-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
+    expect(nodeConfig.allowed_tools).toEqual(['Read', 'Grep']);
+  });
+
+  it('prompt node with agent: and model: mismatch — persona model wins', async () => {
+    await writeAgentFile('sonnet-test-agent', 'sonnet');
+
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-run-2');
+
+    // Node declares model: opus but agent persona is sonnet — persona should win
+    const nodes: DagNode[] = [
+      {
+        id: 'plan',
+        agent: 'sonnet-test-agent',
+        model: 'opus',
+        prompt: 'Plan.',
+      } as unknown as DagNode,
+    ];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'mismatch-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    // Persona model (sonnet) wins over node model (opus)
+    expect(optionsArg.model).toBe('sonnet');
+  });
+
+  it('backward compat: node without agent: does not inject persona allowed_tools', async () => {
+    const mockStore = createMockStore();
+    const mockDeps = createMockDeps(mockStore);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('agent-persona-run-3');
+
+    // No agent: field — uses current behavior (no persona tool restriction)
+    const nodes: DagNode[] = [{ id: 'step', prompt: 'Do the thing.' } as DagNode];
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-agent',
+      testDir,
+      { name: 'backward-compat-test', nodes },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
+    const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
+    const nodeConfig = optionsArg.nodeConfig as Record<string, unknown>;
+    // No agent = no persona-injected allowed_tools
+    expect(nodeConfig.allowed_tools).toBeUndefined();
   });
 });

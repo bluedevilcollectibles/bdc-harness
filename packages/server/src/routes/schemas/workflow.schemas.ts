@@ -12,10 +12,31 @@ export const workflowDefinitionSchema =
 export const workflowLoadErrorSchema = z
   .object({
     filename: z.string(),
+    path: z.string().optional(),
     error: z.string(),
     errorType: z.enum(['read_error', 'parse_error', 'validation_error']),
+    error_type: z
+      .enum(['parse_error', 'dag_invalid', 'missing_required_field', 'schema_violation'])
+      .optional(),
+    message: z.string().optional(),
+    last_attempt_at: z.string().optional(),
   })
   .openapi('WorkflowLoadError');
+
+export const workflowValidationErrorSchema = z
+  .object({
+    filename: z.string(),
+    path: z.string().optional(),
+    error_type: z.enum([
+      'parse_error',
+      'dag_invalid',
+      'missing_required_field',
+      'schema_violation',
+    ]),
+    message: z.string(),
+    last_attempt_at: z.string(),
+  })
+  .openapi('WorkflowValidationError');
 
 /**
  * Workflow source — project-defined, bundled default, or home-scoped (global).
@@ -38,8 +59,19 @@ export const workflowListResponseSchema = z
   .object({
     workflows: z.array(workflowListEntrySchema),
     errors: z.array(workflowLoadErrorSchema).optional(),
+    validation_errors: z.object({
+      count: z.number(),
+      endpoint: z.string(),
+    }),
   })
   .openapi('WorkflowListResponse');
+
+export const workflowErrorsResponseSchema = z
+  .object({
+    errors: z.array(workflowValidationErrorSchema),
+    count: z.number(),
+  })
+  .openapi('WorkflowErrorsResponse');
 
 /** GET /api/workflows/:name response. */
 export const getWorkflowResponseSchema = z
@@ -109,6 +141,9 @@ export const workflowRunSchema = z
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),
     working_path: z.string().nullable(),
+    archived_at: z.string().nullable(),
+    archived_by: z.string().nullable(),
+    archive_reason: z.string().nullable(),
   })
   .openapi('WorkflowRun');
 
@@ -130,6 +165,17 @@ export const workflowEventSchema = z
   })
   .openapi('WorkflowEvent');
 
+/** GET /api/workflows/runs/:runId/nodes/:nodeId/events query params. */
+export const nodeEventsQuerySchema = z.object({
+  // String — handler parses and clamps to [1, 20]; default 5.
+  limit: z.string().optional(),
+});
+
+/** GET /api/workflows/runs/:runId/nodes/:nodeId/events response. */
+export const nodeEventsResponseSchema = z
+  .object({ events: z.array(workflowEventSchema) })
+  .openapi('NodeEventsResponse');
+
 /** GET /api/workflows/runs/:runId response. */
 export const workflowRunDetailSchema = z
   .object({
@@ -147,10 +193,34 @@ export const workflowRunByWorkerResponseSchema = z
   .object({ run: workflowRunSchema })
   .openapi('WorkflowRunByWorkerResponse');
 
+/** POST /api/workflows/runs/:runId/cancel request body. */
+export const cancelWorkflowRunBodySchema = z
+  .object({ reason: z.string().optional() })
+  .openapi('CancelWorkflowRunBody');
+
 /** POST /api/workflows/runs/:runId/cancel response. */
 export const cancelWorkflowRunResponseSchema = z
-  .object({ success: z.boolean(), message: z.string() })
+  .object({ success: z.boolean(), message: z.string(), run: workflowRunSchema })
   .openapi('CancelWorkflowRunResponse');
+
+/** POST /api/workflows/runs/cancel-stale response. */
+export const cancelStaleRunsResponseSchema = z
+  .object({ cancelled: z.number(), runIds: z.array(z.string()) })
+  .openapi('CancelStaleRunsResponse');
+
+/** POST /api/workflows/runs/:runId/pause request body. */
+export const pauseWorkflowRunBodySchema = z
+  .object({ reason: z.string().optional() })
+  .openapi('PauseWorkflowRunBody');
+
+/**
+ * POST /api/workflows/runs/:runId/pause response.
+ * Mirrors cancelWorkflowRunResponseSchema so the operator sees the updated row
+ * back after a successful pause.
+ */
+export const pauseWorkflowRunResponseSchema = z
+  .object({ success: z.boolean(), message: z.string(), run: workflowRunSchema })
+  .openapi('PauseWorkflowRunResponse');
 
 /** Generic workflow run action response (resume, abandon, delete). */
 export const workflowRunActionResponseSchema = z
@@ -218,7 +288,38 @@ export const dashboardRunsQuerySchema = z.object({
   before: z.string().optional(),
   limit: z.string().optional(),
   offset: z.string().optional(),
+  includeArchived: z.string().optional(),
 });
+
+// =========================================================================
+// Archive / bulk-delete schemas
+// =========================================================================
+
+/** POST /api/workflows/runs/:runId/archive request body. */
+export const archiveWorkflowRunBodySchema = z
+  .object({ reason: z.string().optional() })
+  .openapi('ArchiveWorkflowRunBody');
+
+/** POST /api/workflows/runs/:runId/unarchive request body (empty). */
+export const unarchiveWorkflowRunBodySchema = z.object({}).openapi('UnarchiveWorkflowRunBody');
+
+/** POST /api/workflows/runs/bulk-archive request body. */
+export const bulkArchiveBodySchema = z
+  .object({
+    status: z.enum(['failed', 'cancelled', 'completed']),
+    olderThan: z.string().optional(),
+  })
+  .openapi('BulkArchiveBody');
+
+/** POST /api/workflows/runs/bulk-archive response. */
+export const bulkArchiveResponseSchema = z
+  .object({ archivedCount: z.number(), runIds: z.array(z.string()) })
+  .openapi('BulkArchiveResponse');
+
+/** DELETE /api/workflows/runs/bulk-failed response. */
+export const bulkDeleteFailedResponseSchema = z
+  .object({ deletedCount: z.number(), runIds: z.array(z.string()), dryRun: z.boolean() })
+  .openapi('BulkDeleteFailedResponse');
 
 /** GET /api/workflows/runs query params. */
 export const workflowRunsQuerySchema = z.object({

@@ -8,11 +8,14 @@ interface WorkflowRunGroupProps {
   runs: DashboardRunResponse[];
   isDocker?: boolean;
   onCancel: (runId: string) => void;
+  onPause?: (runId: string) => void;
   onResume?: (runId: string) => void;
   onAbandon?: (runId: string) => void;
   onDelete?: (runId: string) => void;
   onApprove?: (runId: string) => void;
   onReject?: (runId: string, reason?: string) => void;
+  onArchive?: (runId: string, reason?: string) => void;
+  onUnarchive?: (runId: string) => void;
 }
 
 export function WorkflowRunGroup({
@@ -20,11 +23,14 @@ export function WorkflowRunGroup({
   runs,
   isDocker,
   onCancel,
+  onPause,
   onResume,
   onAbandon,
   onDelete,
   onApprove,
   onReject,
+  onArchive,
+  onUnarchive,
 }: WorkflowRunGroupProps): React.ReactElement {
   const navigate = useNavigate();
 
@@ -55,11 +61,14 @@ export function WorkflowRunGroup({
             run={run}
             isDocker={isDocker}
             onCancel={onCancel}
+            onPause={onPause}
             onResume={onResume}
             onAbandon={onAbandon}
             onDelete={onDelete}
             onApprove={onApprove}
             onReject={onReject}
+            onArchive={onArchive}
+            onUnarchive={onUnarchive}
           />
         ))}
       </div>

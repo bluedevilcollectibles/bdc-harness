@@ -19,6 +19,22 @@
 #     ARCHON_DATA=/opt/archon-data    # Any absolute path on the host
 #   Default: Docker-managed volume (archon_data)
 #
+# User home (Claude/Codex/Pi config, gitconfig, shell history):
+#   /home/appuser is persisted by default to the archon_user_home named volume so
+#   user-installed Claude Code skills/commands/agents/hooks, Codex/Pi auth state,
+#   and ~/.gitconfig survive container rebuilds. To use a host path instead:
+#     ARCHON_USER_HOME=/opt/archon-user-home    # Any absolute path on the host
+#   Default: Docker-managed volume (archon_user_home)
+#
+# Harness artifacts (load-bearing workflow output — host-persistent, WO-168 Tier 1):
+#   /host-artifacts is a host bind mount where load-bearing workflow nodes save
+#   git bundles + raw artifacts BEFORE remote push, so work survives container
+#   prune / push failure / worktree cleanup. Anchor: 2026-05-16 engine sortie
+#   lost 13 specs when worktree pruned after silent push failure.
+#   Default: ./harness-artifacts (host path relative to compose file).
+#   Override: HARNESS_ARTIFACTS=/opt/harness-artifacts in .env if needed.
+#   Recovery procedure: docs/recovery/host-artifact-recovery.md
+#
 # Cloud (HTTPS):
 #   1. Set DOMAIN=archon.example.com in .env
 #   2. Point DNS A record to your server
@@ -35,10 +51,27 @@ services:
     env_file: .env
     environment:
       ARCHON_DOCKER: "true"
+      # WO-HARNESS-CONTAINER-GITHUB-AUTH-BOUNDARY-01 (#171):
+      # Workflows (sync-workflows, author-wo-batch, persona-schema, engine
+      # sortie) push branches/PRs to GitHub from inside the container. The
+      # token must be visible to bash subprocesses AND to both the legacy
+      # GH_TOKEN credential-helper check in docker-entrypoint.sh and the
+      # current `gh` CLI which reads GITHUB_TOKEN. Map both names to the
+      # same host value so neither path silently no-ops.
+      # NEVER store the literal token here. Value comes from .env (which is
+      # gitignored) or the host shell env. See docs/operations/container-github-auth.md.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GH_TOKEN: ${GH_TOKEN:-${GITHUB_TOKEN:-}}
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     volumes:
       - ${ARCHON_DATA:-archon_data}:/.archon
+      - ${ARCHON_USER_HOME:-archon_user_home}:/home/appuser
+      # WO-168 Tier 1: host-persistent artifact mount. Load-bearing workflow
+      # nodes (bdc-author-wo-batch commit-and-push, etc.) write a git bundle +
+      # raw artifacts here BEFORE attempting remote push, so worktree prune /
+      # push failure does not destroy work. See docs/recovery/host-artifact-recovery.md.
+      - ${HARNESS_ARTIFACTS:-./harness-artifacts}:/host-artifacts
     networks:
       - archon-network
     restart: unless-stopped
@@ -122,6 +155,7 @@ services:
 
 volumes:
   archon_data:
+  archon_user_home:
   postgres_data:
   caddy_data:
   caddy_config:

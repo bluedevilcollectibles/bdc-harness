@@ -1,13 +1,13 @@
 /**
  * Workflow Executor - runs DAG-based workflows
  */
-import { mkdir } from 'fs/promises';
-import { join } from 'path';
+import { mkdir, readFile } from 'fs/promises';
+import { join, resolve } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/paths';
-import { getDefaultBranch, toRepoPath } from '@archon/git';
+import { getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
 import { logWorkflowStart, logWorkflowError } from './logger';
@@ -100,7 +100,7 @@ async function safeSendMessage(
       unknownErrorTracker.count++;
       if (unknownErrorTracker.count >= UNKNOWN_ERROR_THRESHOLD) {
         throw new Error(
-          `${String(UNKNOWN_ERROR_THRESHOLD)} consecutive unrecognized errors - aborting workflow: ${err.message}`
+          `${UNKNOWN_ERROR_THRESHOLD} consecutive unrecognized errors - aborting workflow: ${err.message}`
         );
       }
     }
@@ -210,6 +210,62 @@ async function resolveProjectPaths(
   };
 }
 
+async function applyWorkflowPolicyFile(
+  workflow: WorkflowDefinition,
+  cwd: string
+): Promise<WorkflowDefinition> {
+  if (!workflow.policyFile) {
+    return workflow;
+  }
+
+  const policyPath = resolve(cwd, workflow.policyFile);
+  let policyContent: string;
+  try {
+    policyContent = await readFile(policyPath, 'utf-8');
+  } catch {
+    throw new Error(`policyFile not found: ${workflow.policyFile} (resolved to ${policyPath})`);
+  }
+
+  if (!policyContent.trim()) {
+    throw new Error(`policyFile is empty: ${workflow.policyFile}`);
+  }
+
+  return {
+    ...workflow,
+    nodes: workflow.nodes.map(node => {
+      const isAiPromptNode =
+        ('prompt' in node && node.prompt !== undefined) ||
+        ('loop' in node && node.loop !== undefined);
+      if (!isAiPromptNode) {
+        return node;
+      }
+
+      return {
+        ...node,
+        systemPrompt: node.systemPrompt
+          ? `${policyContent}\n\n${node.systemPrompt}`
+          : policyContent,
+      };
+    }),
+  };
+}
+
+/**
+ * Extract owner/repo from a git remote URL.
+ * Handles HTTPS (github.com/owner/repo[.git]) and SSH (git@github.com:owner/repo[.git]).
+ * Returns lowercase owner/repo or null if the URL cannot be parsed.
+ * Rule 28 — anchor: 2026-05-16 cross-repo incident.
+ */
+function normalizeRemoteToOwnerRepo(url: string): string | null {
+  // SSH: git@github.com:owner/repo.git
+  const sshMatch = /[^:@]+@[^:]+:([^/]+\/[^/]+?)(?:\.git)?$/.exec(url);
+  if (sshMatch?.[1]) return sshMatch[1].toLowerCase();
+  // HTTPS: https://github.com/owner/repo[.git]
+  const httpsMatch = /https?:\/\/[^/]+\/([^/]+\/[^/]+?)(?:\.git)?(?:\/.*)?$/.exec(url);
+  if (httpsMatch?.[1]) return httpsMatch[1].toLowerCase();
+  return null;
+}
+
 /**
  * Execute a complete DAG-based workflow.
  *
@@ -290,7 +346,8 @@ export async function executeWorkflow(
     );
   }
   const assistantDefaults = config.assistants[resolvedProvider];
-  const resolvedModel = workflow.model ?? (assistantDefaults?.model as string | undefined);
+  const resolvedModel =
+    workflow.model ?? (assistantDefaults?.model as string | undefined) ?? 'claude-sonnet-4-5';
 
   getLog().info(
     {
@@ -562,6 +619,49 @@ export async function executeWorkflow(
     }
   }
 
+  // Rule 28: target_repo pre-flight guard (anchor: 2026-05-16 cross-repo incident).
+  // Verifies the worktree's git origin matches the workflow's declared target_repo
+  // before any nodes run. Fails fast with a dag_workflow_failed event on mismatch.
+  if (workflow.target_repo) {
+    let actualRemote: string | null = null;
+    try {
+      actualRemote = await getRemoteUrl(toRepoPath(cwd));
+    } catch (err) {
+      getLog().warn(
+        { err, cwd, targetRepo: workflow.target_repo },
+        'workflow.target_repo_remote_check_failed'
+      );
+    }
+    const normalizedActual = actualRemote ? normalizeRemoteToOwnerRepo(actualRemote) : null;
+    const normalizedExpected = workflow.target_repo.toLowerCase();
+    if (normalizedActual !== normalizedExpected) {
+      const reason = `target_repo_mismatch: expected ${normalizedExpected}, got ${normalizedActual ?? '(no remote)'}`;
+      await deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'dag_workflow_failed',
+          data: {
+            reason: 'target_repo_mismatch',
+            expected: normalizedExpected,
+            actual: normalizedActual,
+          },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+            'workflow_event_persist_failed'
+          );
+        });
+      await deps.store.failWorkflowRun(workflowRun.id, reason);
+      await sendCriticalMessage(
+        platform,
+        conversationId,
+        `**Workflow blocked**: \`${workflow.name}\` declares \`target_repo: ${workflow.target_repo}\` but this worktree's origin points at \`${actualRemote ?? '(no remote)'}\`.\n\nSelect the correct codebase (\`${workflow.target_repo}\`) and retry.`
+      );
+      return { success: false, workflowRunId: workflowRun.id, error: reason };
+    }
+  }
+
   // Resolve external artifact and log directories
   const { artifactsDir, logDir } = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId);
 
@@ -597,16 +697,19 @@ export async function executeWorkflow(
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error
   try {
+    // BDC patch: load policyFile if specified and inject as systemPrompt for all prompt nodes.
+    const executableWorkflow = await applyWorkflowPolicyFile(workflow, cwd);
+
     getLog().info(
       {
-        workflowName: workflow.name,
+        workflowName: executableWorkflow.name,
         workflowRunId: workflowRun.id,
         hasIssueContext: !!issueContext,
         issueContextLength: issueContext?.length ?? 0,
       },
       'workflow_starting'
     );
-    await logWorkflowStart(logDir, workflowRun.id, workflow.name, userMessage);
+    await logWorkflowStart(logDir, workflowRun.id, executableWorkflow.name, userMessage);
 
     // Register run with emitter and emit workflow_started
     const emitter = getWorkflowEventEmitter();
@@ -615,7 +718,7 @@ export async function executeWorkflow(
     emitter.emit({
       type: 'workflow_started',
       runId: workflowRun.id,
-      workflowName: workflow.name,
+      workflowName: executableWorkflow.name,
       conversationId: conversationDbId,
     });
 
@@ -623,8 +726,8 @@ export async function executeWorkflow(
     // description (authored by the user in their YAML) + platform + version.
     // Opt out via ARCHON_TELEMETRY_DISABLED=1 or DO_NOT_TRACK=1.
     captureWorkflowInvoked({
-      workflowName: workflow.name,
-      workflowDescription: workflow.description,
+      workflowName: executableWorkflow.name,
+      workflowDescription: executableWorkflow.description,
       platform: platform.getPlatformType(),
       archonVersion: BUNDLED_VERSION,
     });
@@ -632,7 +735,7 @@ export async function executeWorkflow(
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'workflow_started',
-        data: { workflowName: workflow.name },
+        data: { workflowName: executableWorkflow.name },
       })
       .catch((err: Error) => {
         getLog().error(
@@ -701,7 +804,7 @@ export async function executeWorkflow(
 
     // Add workflow start message (step details omitted from text notification)
     // Strip routing metadata from description (Use when:, Handles:, NOT for:, Capability:, Triggers:)
-    const cleanDescription = (workflow.description ?? '')
+    const cleanDescription = (executableWorkflow.description ?? '')
       .split('\n')
       .filter(
         line =>
@@ -709,8 +812,8 @@ export async function executeWorkflow(
       )
       .join('\n')
       .trim();
-    const descriptionText = cleanDescription || workflow.name;
-    startupMessage += `🚀 **Starting workflow**: \`${workflow.name}\`\n\n> ${descriptionText}`;
+    const descriptionText = cleanDescription || executableWorkflow.name;
+    startupMessage += `🚀 **Starting workflow**: \`${executableWorkflow.name}\`\n\n> ${descriptionText}`;
 
     // Send consolidated message - use critical send with limited retries (1 retry max)
     // to avoid blocking workflow execution while still catching transient failures
@@ -736,7 +839,7 @@ export async function executeWorkflow(
       platform,
       conversationId,
       cwd,
-      workflow,
+      executableWorkflow,
       workflowRun,
       resolvedProvider,
       resolvedModel,
@@ -827,5 +930,24 @@ export async function executeWorkflow(
     }
     // Return failure result instead of re-throwing
     return { success: false, workflowRunId: workflowRun.id, error: err.message };
+  } finally {
+    // Defensive backstop: if the workflow run is still 'running' after all
+    // normal and exceptional code paths, flip it to 'failed' to prevent zombie
+    // accumulation. Guards against any future code path that exits without
+    // calling failWorkflowRun (e.g. a generator cleanup that exits without
+    // throwing). Only fires when the process stays alive long enough to run
+    // this finally — see #1561 for the originating zombie-state incident.
+    if (workflowRun) {
+      const runId = workflowRun.id;
+      const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
+      if (backstopStatus === 'running') {
+        getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
+        await deps.store
+          .failWorkflowRun(runId, 'Workflow exited without finalizing — see logs')
+          .catch((err: unknown) => {
+            getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
+          });
+      }
+    }
   }
 }

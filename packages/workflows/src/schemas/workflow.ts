@@ -68,6 +68,8 @@ export const workflowBaseSchema = z.object({
   betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
   sandbox: sandboxSettingsSchema.optional(),
   worktree: workflowWorktreePolicySchema.optional(),
+  /** Path to file whose content is loaded as systemPrompt for all prompt nodes. BDC patch. */
+  policyFile: z.string().optional(),
   /**
    * When `false`, the engine skips the path-exclusive lock for this workflow,
    * allowing N concurrent runs on the same live checkout. The author asserts
@@ -76,6 +78,14 @@ export const workflowBaseSchema = z.object({
    */
   mutates_checkout: z.boolean().optional(),
   tags: z.array(z.string().min(1)).optional(),
+  /**
+   * Rule 28: When set, the executor verifies `git remote get-url origin` in the
+   * worktree matches this owner/repo before starting any nodes. Mismatches fail
+   * immediately with a `dag_workflow_failed` event (reason: target_repo_mismatch).
+   * Format: "owner/repo" (e.g. "bluedevilcollectibles/bdc-xo").
+   * Anchor: 2026-05-16 cross-repo incident (26 files pushed to wrong remote).
+   */
+  target_repo: z.string().optional(),
 });
 
 export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
@@ -90,6 +100,16 @@ export type WorkflowBase = z.infer<typeof workflowBaseSchema>;
  */
 export const workflowDefinitionSchema = workflowBaseSchema.extend({
   nodes: z.array(dagNodeSchema),
+  /**
+   * Workflow-level input declarations with default values.
+   * In bash nodes, reference as `${input.name}` — the executor substitutes these
+   * before passing the script to the shell (`.` is not valid in bash identifiers,
+   * so no collision with real bash parameter expansion exists).
+   * In prompt nodes, reference as `${input.name}` — the AI sees the literal token
+   * inside its system prompt, so prompt-level input interpolation is intentionally
+   * left to the AI rather than the executor.
+   */
+  inputs: z.record(z.string(), z.object({ default: z.string() })).optional(),
 });
 
 /** Workflow definition with fully typed nodes (DagNode[]) derived from the schema. */
@@ -149,8 +169,16 @@ export interface WorkflowWithSource {
  */
 export interface WorkflowLoadError {
   readonly filename: string;
+  readonly path?: string;
   readonly error: string;
   readonly errorType: 'read_error' | 'parse_error' | 'validation_error';
+  readonly error_type?:
+    | 'parse_error'
+    | 'dag_invalid'
+    | 'missing_required_field'
+    | 'schema_violation';
+  readonly message?: string;
+  readonly last_attempt_at?: string;
 }
 
 /**
