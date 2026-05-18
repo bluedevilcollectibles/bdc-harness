@@ -1,0 +1,483 @@
+name: bdc-scout-whatnot-show-discovery
+description: |
+  Use when: Executing WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01.
+  Repo: bluedevilcollectibles/scout-service (branch: main)
+  Does: Uses Playwright to discover active and scheduled WhatNot show identifiers.
+  Stores stable show IDs and non-secret metadata (no cookies, no auth tokens).
+  Feeds discovered active show IDs to the WhatNot listener for livestream detection.
+  Reads existing scout-service/src/ files before planning.
+  Commits, pushes, opens a PR, and builds a Captain CI manifest.
+  NOT for: Session auth (separate WO), inventory sync (separate WO), or any shopops-api work.
+  scout-service is Node.js (ES modules), NOT a React project.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+nodes:
+  # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01"
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          --search "${WO_ID} in:title" --json number,title \
+          --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID} (tried docs/work-orders/, docs/superpowers/specs/ glob, and GitHub issue search)" >&2
+        exit 1
+      fi
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\n\n' "$WO_ID" "$SPEC_PATH"
+      printf '%s\n' "$SPEC_CONTENT"
+
+  - id: read-source-files
+    persona: major-build
+    depends_on: [read-spec]
+    task_class: medium_work
+    prompt: |
+      Read the existing scout-service source files before planning. This WO is in the
+      bluedevilcollectibles/scout-service repo. CWD is the scout-service worktree root.
+      scout-service is Node.js (ES modules) -- NOT React or TypeScript.
+
+      ## Discovery commands to run
+      ```bash
+      find . -name 'whatnot-listener*' -o -name 'locg-scraper*' -o -name 'scheduler*' 2>/dev/null | grep -v node_modules | head -20
+      find . -name 'session-manager*' 2>/dev/null | grep -v node_modules | head -5
+      cat package.json 2>/dev/null | head -40
+      # Check if playwright is a dependency
+      grep -i playwright package.json 2>/dev/null || echo "playwright not found in package.json"
+      ```
+
+      Then read:
+      - src/whatnot-listener.js (to understand how active livestream IDs are currently fed in)
+      - src/scheduler.js (to understand how recurring tasks are registered)
+      - src/session-manager.js (to understand how Playwright sessions are reused)
+
+      ## Required Output
+      Return a summary covering:
+      - Exact file paths found (relative to CWD)
+      - How whatnot-listener.js currently receives or discovers active show IDs
+        (hardcoded, env var, polled from an API, or none -- be explicit)
+      - How the scheduler registers recurring tasks (cron pattern, interval, or manual trigger)
+      - Whether Playwright is already a dependency (version if found)
+      - How session-manager.js stores and reuses Playwright browser state (cookies, storageState)
+      - What WhatNot pages/selectors would expose show IDs (seller hub shows page, seller profile, etc.)
+        -- describe what the existing Playwright code navigates to, if anything
+      - Storage mechanism for discovered IDs (file, in-memory, or database)
+
+      ## WO Spec
+      $read-spec.output
+
+  - id: plan
+    persona: war-council-architect
+    depends_on: [read-source-files]
+    agent: war-council-architect
+    task_class: medium_work
+    prompt: |
+      Read the BDC Work Order spec and source file audit below, then produce a concise
+      implementation plan for WhatNot show discovery in scout-service.
+
+      ## Required Output
+      Return structured Markdown with these headings:
+      - WO ID
+      - Files to modify (exact relative paths)
+      - Files to create (including the show-discovery module)
+      - Files explicitly out of scope
+      - Discovery approach:
+        - WhatNot page URL(s) to navigate to (seller hub shows, public profile, or API)
+        - DOM selectors or API response fields that expose show IDs
+        - How to distinguish active vs scheduled shows
+      - Storage design (where stable show IDs are persisted -- file path or in-memory map)
+      - Feed mechanism (how discovered active IDs reach whatnot-listener.js)
+      - Secret safety rules (MUST NOT store cookies, tokens, or passwords in the show ID store)
+      - Scheduling hook (how discovery runs -- cron via scheduler.js, or manual trigger)
+      - Verification commands (bun or node test command)
+      - Commit message
+      - Push policy (scout-service is NOT in the Rule 20 staging-gate list)
+      - Staging gate required: false
+
+      If the WhatNot page structure is unknown at planning time, the plan MUST include a
+      Playwright investigation step that runs first to discover selectors before writing
+      production code. Do NOT hardcode selectors without evidence.
+
+      ## BDC Push Policy
+      scout-service is NOT a Rule 20 staging-gate repo. Feature branch plus PR, no staging gate.
+
+      ## Spec
+      $read-spec.output
+
+      ## Source Audit
+      $read-source-files.output
+
+  - id: implement
+    persona: major-build
+    depends_on: [plan]
+    agent: major-build
+    task_class: medium_work
+    loop:
+      prompt: |
+        Implement the approved plan for WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01.
+        scout-service is Node.js (ES modules). Do NOT use TypeScript, JSX, or React patterns.
+
+        ## Spec
+        $read-spec.output
+
+        ## Source Audit
+        $read-source-files.output
+
+        ## Plan
+        $plan.output
+
+        ## Execution Rules
+        - Modify only the files identified as in scope by the spec and plan.
+        - Node.js ES modules: use import/export, async/await. No require().
+        - The show ID storage file/map MUST contain ONLY non-secret metadata:
+            show IDs, titles, scheduled times, status (active/scheduled).
+          It MUST NOT contain cookies, auth tokens, passwords, or session data.
+        - If Playwright selectors need to be discovered (plan says "investigation step first"):
+            run the investigation using the existing session-manager.js session,
+            document what you find in a comment, then write production code against those selectors.
+        - The feed mechanism to whatnot-listener.js must not require a restart of the listener
+          to pick up new show IDs (use a shared module, file-watch, or in-process export).
+        - Do not reformat unrelated code.
+        - Do not deploy.
+        - Do not bypass approval gates.
+        - Stop and report a blocker if:
+            (a) WhatNot requires login to see show IDs and no session is available, OR
+            (b) The WhatNot DOM structure cannot be determined without a live browser session
+                and the plan does not account for this.
+
+        ## Commit-and-push BEFORE exit (Patch 2, 2026-05-16)
+        When your implementation is complete, BEFORE emitting the sentinel, run:
+
+        ```bash
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        WO_ID="WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01"
+        git add -A
+        git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
+
+        Playwright-based WhatNot show discovery. Stores stable show IDs and
+        non-secret metadata. Feeds active IDs to whatnot-listener.
+
+        Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed -- operator must recover from worktree"
+        ```
+
+        ## Completion Criteria + Sentinel Emission
+        Output ALL THREE sentinels on their own lines at the very end when all spec stop
+        conditions are met OR a true blocker is identified with evidence:
+
+        COMPLETE
+        BUILD_COMPLETE
+        <promise>COMPLETE</promise>
+
+        If a true blocker is found, end with: BLOCKED: <one-sentence reason>
+      until: COMPLETE
+      max_iterations: 3
+      fresh_context: true
+
+  - id: war-council-validator
+    persona: captain-ci-validator
+    depends_on: [implement]
+    task_class: medium_work
+    prompt: |
+      Invoke or emulate the war-council-validator review for WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation output:
+      $implement.output
+
+      Git diff:
+      Run `git diff --stat` and `git diff --check`, then inspect:
+      - The new show-discovery module
+      - Any modified whatnot-listener.js or scheduler.js
+      - The show ID storage file or in-memory structure
+
+      ## Critical Checks
+      1. Does the show ID storage contain ONLY non-secret metadata
+         (show IDs, titles, times, status -- no cookies/tokens/passwords)?
+      2. Is there a clear, testable feed mechanism from discovery output to
+         whatnot-listener.js active IDs?
+      3. Is there evidence of actual selector discovery or documented DOM anchors,
+         rather than invented selectors that may not exist on WhatNot?
+
+      ## Required Output
+      Return either:
+      - satisfied: with evidence on all three critical checks
+      - needs_revision: with exact file/line/selector findings
+
+  - id: decide-push-target
+    persona: major-build
+    depends_on: [war-council-validator]
+    task_class: clerical
+    prompt: |
+      Decide the push target for WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01.
+
+      ## Branch Name Derivation Rules
+      Derive from the WO ID ONLY. Do NOT copy the current git branch name.
+      WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01 -> feat/wo-scout-whatnot-show-discovery-01
+      The branch MUST NOT start with archon/thread- or contain -thread- anywhere.
+
+      ## Repo Policy
+      Target repo: bluedevilcollectibles/scout-service
+      This repo is NOT in the Rule 20 staging-gate list.
+
+      Output:
+      push_target: feature-branch:feat/wo-scout-whatnot-show-discovery-01
+      pr_required: true
+      staging_gate_required: false
+      repo: bluedevilcollectibles/scout-service
+
+      CRITICAL: emit a `repo:` line in every output case.
+
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$plan.output
+      echo "$DECIDE_OUTPUT"
+      if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
+        echo "Out of scope for bdc-scout-whatnot-show-discovery; failing closed." >&2
+        exit 1
+      fi
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      if [ -z "$BRANCH" ]; then
+        echo "No feature branch target found in decide-push-target output." >&2
+        exit 1
+      fi
+      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/" >&2
+        exit 1
+      fi
+      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      git status --short
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${UNIQUE_BRANCH}")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed (HEAD matches)."
+          echo "unique_branch=${UNIQUE_BRANCH}"
+          exit 0
+        fi
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${UNIQUE_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          RECOVERED=$(git ls-remote origin 2>/dev/null \
+            | awk -v sha="$LOCAL_HEAD" '$1 == sha {sub(/^refs\/heads\//, "", $2); print $2}' \
+            | head -1)
+          if [ -n "$RECOVERED" ]; then
+            echo "Recovered push target from remote: $RECOVERED"
+            UNIQUE_BRANCH="$RECOVERED"
+          else
+            echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
+            exit 1
+          fi
+        else
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
+        fi
+      else
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        AUTO_TOLERATED='^(bun\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.bun-tag|node_modules/)$'
+        printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
+          if [ -z "$path" ]; then continue; fi
+          if printf '%s\n' "$path" | grep -Eq "$AUTO_TOLERATED"; then
+            echo "Auto-tolerated change (lockfile/managed): $path"
+            git add -- "$path"
+            continue
+          fi
+          if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
+            echo "Changed file was not listed in plan output: $path" >&2
+            exit 1
+          fi
+          git add -- "$path"
+        done
+        if git diff --cached --quiet; then
+          echo "No changes staged; nothing for backstop to commit." >&2
+          exit 0
+        fi
+        COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+        if [ -z "$COMMIT_MESSAGE" ]; then
+          COMMIT_MESSAGE="feat: WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01 implementation"
+        fi
+        git commit -m "$COMMIT_MESSAGE"
+      fi
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+      echo "unique_branch=${UNIQUE_BRANCH}"
+
+  - id: open-pr-if-needed
+    persona: major-build
+    depends_on: [commit-and-push]
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$plan.output
+      IMPLEMENT_OUTPUT=$implement.output
+      VALIDATOR_OUTPUT=$war-council-validator.output
+      COMMIT_PUSH_OUTPUT=$commit-and-push.output
+      if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
+        echo "PR not required; skipping."
+        exit 0
+      fi
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
+        exit 1
+      fi
+      REPO=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^repo: //p' | head -n 1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: decide-push-target did not emit a valid 'repo: <owner>/<repo>'." >&2
+        exit 1
+      fi
+      TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+      if [ -z "$TITLE" ]; then
+        TITLE="feat: WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01 -- Playwright WhatNot show discovery + active ID feed"
+      fi
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "$PLAN_OUTPUT"
+        echo
+        echo "## Validation"
+        echo "Agent self-verifies in implement loop; PR-time gates handle final validation."
+        echo "Secret safety: show ID store contains only non-secret metadata (IDs, titles, times, status)."
+        echo
+        echo "## Implement output"
+        echo "$IMPLEMENT_OUTPUT"
+        echo
+        echo "## Validator"
+        echo "$VALIDATOR_OUTPUT"
+      } > "$BODY_FILE"
+      PR_OK=false
+      for attempt in 1 2 3; do
+        if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" 2>&1; then
+          PR_OK=true
+          break
+        fi
+        if [ -n "$UNIQUE_BRANCH" ]; then
+          EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+            --json url --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$EXIST" ]; then
+            echo "PR_URL=$EXIST"
+            PR_OK=true
+            break
+          fi
+        fi
+        echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PR_OK" = "false" ]; then
+        echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+
+  - id: build-manifest
+    persona: major-build
+    depends_on: [open-pr-if-needed]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI completion manifest for WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation:
+      $implement.output
+
+      Validator:
+      $war-council-validator.output
+
+      ## Required Manifest Fields
+      - WO: WO-SCOUT-WHATNOT-SHOW-DISCOVERY-01
+      - Builder: major-build (Cauldron)
+      - Files modified (exact paths)
+      - Files created (show-discovery module, storage file location)
+      - Feed mechanism summary (how active IDs reach whatnot-listener)
+      - Tests (count passing / count total with bun or node command)
+      - PRs (repo PR URL)
+      - Merge ancestors (repo main HEAD, manifest commit, behind_by)
+      - Grep assertions:
+          (a) rerunnable grep proving no secret fields (cookie/token/password) in show ID store
+          (b) rerunnable grep proving active ID feed in whatnot-listener.js
+      - Runtime verification (docker exec scout-service node -e "import('./src/whatnot-show-discovery.js').then(m => console.log('loaded'))" or equivalent)
+      - Vercel deployment: N/A (scout-service is not on Vercel)
+      - VALIDATION: PASS
+
+  - id: flip-notion
+    persona: xo
+    depends_on: [build-manifest]
+    task_class: clerical
+    prompt: |
+      Update the Notion Work Order page if Notion MCP is available in this runtime.
+
+      ## Required Notion Changes
+      - Claude Status: REVIEW
+      - Status: Review
+      - Add the Captain CI manifest as a page comment
+
+      ## Manifest
+      $build-manifest.output
+
+      If Notion MCP is not available inside the container, do not invent a workaround.
+      Output a TODO for XO to flip Notion manually with the manifest above.

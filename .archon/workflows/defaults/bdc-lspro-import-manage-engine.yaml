@@ -1,0 +1,452 @@
+name: bdc-lspro-import-manage-engine
+description: |
+  Use when: Executing WO-LSPRO-IMPORT-MANAGE-ENGINE-01.
+  Repo: bluedevilcollectibles/lspro-react (branch: promotion/v2)
+  Does: Wires MANAGE mode in ImportPage.tsx to importCenter.ts listShipments(),
+  adds the shopops-api DELETE route for shipment deletion, verifies the integration,
+  commits, pushes, opens a PR targeting staging (Rule 20 gate), and builds a Captain CI manifest.
+  NOT for: Other import modes, unrelated ImportPage features, or doctrine updates.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+nodes:
+  # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="WO-LSPRO-IMPORT-MANAGE-ENGINE-01"
+      # Specs live in bdc-xo. Cross-repo fetch via gh api.
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback: date-prefix glob in docs/superpowers/specs/
+        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback: GitHub issue body
+        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          --search "${WO_ID} in:title" --json number,title \
+          --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID} (tried docs/work-orders/, docs/superpowers/specs/ glob, and GitHub issue search)" >&2
+        exit 1
+      fi
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\n\n' "$WO_ID" "$SPEC_PATH"
+      printf '%s\n' "$SPEC_CONTENT"
+
+  - id: read-source-files
+    persona: major-build
+    depends_on: [read-spec]
+    task_class: medium_work
+    prompt: |
+      Read the source files relevant to this WO before planning. This WO is in the
+      bluedevilcollectibles/lspro-react repo. The CWD is the lspro-react worktree root.
+
+      ## Files to read
+      - src/components/ImportPage.tsx (or the nearest match -- find with: find src -name 'ImportPage*')
+      - src/services/importCenter.ts (or find src -name 'importCenter*')
+      - Any existing MANAGE-mode handling in those files
+
+      ## Required Output
+      Return a summary covering:
+      - Exact file paths found (relative to CWD)
+      - Current MANAGE mode code path (or confirmation it is missing/stubbed)
+      - Current listShipments() signature in importCenter.ts
+      - Any related DELETE handler stubs or TODOs
+      - shopops-api route file where the DELETE /shipments endpoint should be added
+        (check for route files via: find . -path '*/routes/*' -name '*.ts' | head -20)
+
+      ## WO Spec
+      $read-spec.output
+
+  - id: plan
+    persona: war-council-architect
+    depends_on: [read-source-files]
+    agent: war-council-architect
+    task_class: medium_work
+    prompt: |
+      Read the BDC Work Order spec and source file audit below, then produce a concise
+      implementation plan for wiring MANAGE mode in ImportPage.tsx.
+
+      ## Required Output
+      Return structured Markdown with these headings:
+      - WO ID
+      - Files to modify (exact relative paths)
+      - Files to create
+      - Files explicitly out of scope
+      - Verification commands
+      - Commit message
+      - Push policy (lspro-react is a Rule 20 staging-gate repo)
+      - Staging gate required: true
+
+      ## BDC Push Policy
+      lspro-react is a Rule 20 staging-gate repo:
+      - Use a feature branch plus PR targeting staging branch.
+      - staging_gate_required: true
+
+      ## Spec
+      $read-spec.output
+
+      ## Source Audit
+      $read-source-files.output
+
+  - id: implement
+    persona: major-build
+    depends_on: [plan]
+    agent: major-build
+    task_class: medium_work
+    loop:
+      prompt: |
+        Implement the approved plan for WO-LSPRO-IMPORT-MANAGE-ENGINE-01.
+
+        ## Spec
+        $read-spec.output
+
+        ## Source Audit
+        $read-source-files.output
+
+        ## Plan
+        $plan.output
+
+        ## Execution Rules
+        - Modify only the files identified as in scope by the spec and plan.
+        - Prefer existing repo patterns (React hooks, importCenter service calls, etc.).
+        - Do not reformat unrelated code.
+        - Do not deploy.
+        - Do not bypass approval gates.
+        - lspro-react: TypeScript/React. shopops-api changes use Node.js ES modules.
+        - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
+
+        ## Commit-and-push BEFORE exit (Patch 2, 2026-05-16)
+        When your implementation is complete, BEFORE emitting the sentinel, run:
+
+        ```bash
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        WO_ID="WO-LSPRO-IMPORT-MANAGE-ENGINE-01"
+        git add -A
+        git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
+
+        Wire MANAGE mode in ImportPage.tsx to importCenter.ts listShipments().
+        Add shopops-api DELETE route for shipment deletion.
+
+        Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed -- operator must recover from worktree"
+        ```
+
+        ## Completion Criteria + Sentinel Emission
+        Output ALL THREE sentinels on their own lines at the very end when all spec stop
+        conditions are met OR a true blocker is identified with evidence:
+
+        COMPLETE
+        BUILD_COMPLETE
+        <promise>COMPLETE</promise>
+
+        If a true blocker is found, end with: BLOCKED: <one-sentence reason>
+      until: COMPLETE
+      max_iterations: 3
+      fresh_context: true
+
+  - id: war-council-validator
+    persona: captain-ci-validator
+    depends_on: [implement]
+    task_class: medium_work
+    prompt: |
+      Invoke or emulate the war-council-validator review for WO-LSPRO-IMPORT-MANAGE-ENGINE-01.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation output:
+      $implement.output
+
+      Git diff:
+      Run `git diff --stat` and `git diff --check`, then inspect ImportPage.tsx and
+      any shopops-api route file changed.
+
+      ## Required Output
+      Return either:
+      - satisfied: with evidence that MANAGE mode is wired to listShipments() and
+        the DELETE route exists in shopops-api
+      - needs_revision: with exact file/path/behavior findings
+
+  - id: decide-push-target
+    persona: major-build
+    depends_on: [war-council-validator]
+    task_class: clerical
+    prompt: |
+      Decide the push target for WO-LSPRO-IMPORT-MANAGE-ENGINE-01.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Validator:
+      $war-council-validator.output
+
+      ## Branch Name Derivation Rules
+      Derive from the WO ID ONLY. Do NOT copy the current git branch name.
+      Use prefix feat/ followed by the WO ID in lowercase with hyphens:
+      WO-LSPRO-IMPORT-MANAGE-ENGINE-01 -> feat/wo-lspro-import-manage-engine-01
+      The branch MUST NOT start with archon/thread- or contain -thread- anywhere.
+
+      ## Repo Policy
+      Target repo: bluedevilcollectibles/lspro-react
+      This repo is in the Rule 20 staging-gate list.
+
+      Output:
+      push_target: feature-branch:feat/wo-lspro-import-manage-engine-01
+      pr_required: true
+      staging_gate_required: true
+      repo: bluedevilcollectibles/lspro-react
+
+      CRITICAL: emit a `repo:` line in every output case.
+
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$plan.output
+      echo "$DECIDE_OUTPUT"
+      if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
+        echo "Out of scope for bdc-lspro-import-manage-engine; failing closed." >&2
+        exit 1
+      fi
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      if [ -z "$BRANCH" ]; then
+        echo "No feature branch target found in decide-push-target output." >&2
+        exit 1
+      fi
+      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/" >&2
+        exit 1
+      fi
+      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      git status --short
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${UNIQUE_BRANCH}")" ]; then
+          echo "Backstop no-op: implement loop already committed + pushed to origin/${UNIQUE_BRANCH} (HEAD matches)."
+          echo "unique_branch=${UNIQUE_BRANCH}"
+          exit 0
+        fi
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${UNIQUE_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          RECOVERED=$(git ls-remote origin 2>/dev/null \
+            | awk -v sha="$LOCAL_HEAD" '$1 == sha {sub(/^refs\/heads\//, "", $2); print $2}' \
+            | head -1)
+          if [ -n "$RECOVERED" ]; then
+            echo "Recovered push target from remote: $RECOVERED"
+            UNIQUE_BRANCH="$RECOVERED"
+          else
+            echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
+            exit 1
+          fi
+        else
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
+        fi
+      else
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        AUTO_TOLERATED='^(bun\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.bun-tag|node_modules/)$'
+        printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
+          if [ -z "$path" ]; then continue; fi
+          if printf '%s\n' "$path" | grep -Eq "$AUTO_TOLERATED"; then
+            echo "Auto-tolerated change (lockfile/managed): $path"
+            git add -- "$path"
+            continue
+          fi
+          if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
+            echo "Changed file was not listed in plan output: $path" >&2
+            exit 1
+          fi
+          git add -- "$path"
+        done
+        if git diff --cached --quiet; then
+          echo "No changes staged; nothing for backstop to commit." >&2
+          exit 0
+        fi
+        COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+        if [ -z "$COMMIT_MESSAGE" ]; then
+          COMMIT_MESSAGE="feat: WO-LSPRO-IMPORT-MANAGE-ENGINE-01 implementation"
+        fi
+        git commit -m "$COMMIT_MESSAGE"
+      fi
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+      echo "unique_branch=${UNIQUE_BRANCH}"
+
+  - id: open-pr-if-needed
+    persona: major-build
+    depends_on: [commit-and-push]
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$plan.output
+      IMPLEMENT_OUTPUT=$implement.output
+      VALIDATOR_OUTPUT=$war-council-validator.output
+      COMMIT_PUSH_OUTPUT=$commit-and-push.output
+      if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
+        echo "PR not required; skipping."
+        exit 0
+      fi
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
+        exit 1
+      fi
+      REPO=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^repo: //p' | head -n 1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: decide-push-target did not emit a valid 'repo: <owner>/<repo>'." >&2
+        exit 1
+      fi
+      # Rule 20: lspro-react requires PRs targeting staging branch.
+      STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      STAGING_GATE="${STAGING_GATE:-0}"
+      if [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+        BASE_BRANCH="staging"
+      else
+        BASE_BRANCH=""
+      fi
+      TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+      if [ -z "$TITLE" ]; then
+        TITLE="feat: WO-LSPRO-IMPORT-MANAGE-ENGINE-01 -- Wire MANAGE mode in ImportPage.tsx"
+      fi
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "$PLAN_OUTPUT"
+        echo
+        echo "## Validation"
+        echo "Agent self-verifies in implement loop; PR-time gates (codex-review, claude-review, Gitleaks, e2e-smoke, Captain CI) provide final validation."
+        echo
+        echo "## Implement output"
+        echo "$IMPLEMENT_OUTPUT"
+        echo
+        echo "## Validator"
+        echo "$VALIDATOR_OUTPUT"
+      } > "$BODY_FILE"
+      PR_OK=false
+      for attempt in 1 2 3; do
+        if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
+          PR_OK=true
+          break
+        fi
+        if [ -n "$UNIQUE_BRANCH" ]; then
+          EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+            --json url --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$EXIST" ]; then
+            echo "PR_URL=$EXIST"
+            PR_OK=true
+            break
+          fi
+        fi
+        echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PR_OK" = "false" ]; then
+        echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+
+  - id: build-manifest
+    persona: major-build
+    depends_on: [open-pr-if-needed]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI completion manifest for WO-LSPRO-IMPORT-MANAGE-ENGINE-01.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan:
+      $plan.output
+
+      Implementation:
+      $implement.output
+
+      Validator:
+      $war-council-validator.output
+
+      ## Required Manifest Fields
+      - WO: WO-LSPRO-IMPORT-MANAGE-ENGINE-01
+      - Builder: major-build (Cauldron)
+      - Files modified (exact paths)
+      - Files created
+      - Tests (count passing / count total with command)
+      - PRs (repo PR URL)
+      - Merge ancestors (repo main HEAD, manifest commit, behind_by)
+      - Grep assertions (rerunnable grep commands proving MANAGE mode wiring)
+      - Runtime verification (N/A for lspro-react -- Vercel pipeline handles)
+      - Vercel deployment (staging URL, state, commit)
+      - VALIDATION: PASS
+
+  - id: flip-notion
+    persona: xo
+    depends_on: [build-manifest]
+    task_class: clerical
+    prompt: |
+      Update the Notion Work Order page if Notion MCP is available in this runtime.
+
+      ## Required Notion Changes
+      - Claude Status: REVIEW
+      - Status: Review
+      - Add the Captain CI manifest as a page comment
+
+      ## Manifest
+      $build-manifest.output
+
+      If Notion MCP is not available inside the container, do not invent a workaround.
+      Output a TODO for XO to flip Notion manually with the manifest above.
