@@ -4,6 +4,7 @@ import { MessageSquare } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import { DagNodeProgress } from './DagNodeProgress';
+import { NodePeekPanel } from './NodePeekPanel';
 import { StepLogs } from './StepLogs';
 import { WorkflowLogs } from './WorkflowLogs';
 import { WorkflowDagViewer } from './WorkflowDagViewer';
@@ -97,6 +98,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   const queryClient = useQueryClient();
   const liveWorkflow = useWorkflowStore(s => s.workflows.get(runId));
   const [selectedDagNode, setSelectedDagNode] = useState<string | null>(null);
+  const [peekNodeId, setPeekNodeId] = useState<string | null>(null);
   const [codebaseName, setCodebaseName] = useState<string | null>(null);
   const [codebaseCwd, setCodebaseCwd] = useState<string | null>(null);
   const [workerRunId, setWorkerRunId] = useState<string | null>(null);
@@ -109,6 +111,7 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   // Reset local state when navigating to a different workflow run
   useEffect(() => {
     setSelectedDagNode(null);
+    setPeekNodeId(null);
     setCodebaseName(null);
     setCodebaseCwd(null);
     setWorkerRunId(null);
@@ -527,8 +530,10 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
 
   // Handler for user-initiated node clicks (graph or sidebar).
   // Increments scroll trigger so WorkflowLogs scrolls to the node's section.
+  // WO-MC-NODE-PEEK-01: also opens the NodePeekPanel in the right rail.
   const handleNodeClick = useCallback((nodeId: string): void => {
     setSelectedDagNode(nodeId);
+    setPeekNodeId(nodeId);
     setNodeScrollTrigger(prev => prev + 1);
   }, []);
 
@@ -617,7 +622,20 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           </ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel defaultSize={40} minSize={20}>
-            {logsPanel}
+            {peekNodeId !== null && dagDefinitionNodes ? (
+              <NodePeekPanel
+                nodeId={peekNodeId}
+                dagNode={dagDefinitionNodes.find(n => n.id === peekNodeId) ?? null}
+                events={queryData?.events ?? []}
+                dagNodeState={workflow.dagNodes.find(n => n.nodeId === peekNodeId)}
+                isRunning={isRunning}
+                onClose={(): void => {
+                  setPeekNodeId(null);
+                }}
+              />
+            ) : (
+              logsPanel
+            )}
           </ResizablePanel>
         </ResizablePanelGroup>
       );
