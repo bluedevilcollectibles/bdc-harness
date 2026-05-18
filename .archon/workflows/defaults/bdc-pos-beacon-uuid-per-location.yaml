@@ -39,6 +39,8 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 model: sonnet
+codebases:
+  - bluedevilcollectibles/shopops
 
 nodes:
 
