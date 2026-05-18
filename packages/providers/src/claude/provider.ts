@@ -39,6 +39,7 @@ import type {
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { resolveClaudeBinaryPath } from './binary-resolver';
+import { claudeProviderThrottle } from './throttle';
 import {
   AUTH_PATTERNS,
   buildReauthMessage,
@@ -773,8 +774,18 @@ async function* streamClaudeMessages(
       }
     } else if (event.type === 'rate_limit_event') {
       const rateLimitMsg = msg as { rate_limit_info?: Record<string, unknown> };
-      getLog().warn({ rateLimitInfo: rateLimitMsg.rate_limit_info }, 'claude.rate_limit_event');
-      yield { type: 'rate_limit', rateLimitInfo: rateLimitMsg.rate_limit_info ?? {} };
+      const rateLimitInfo = rateLimitMsg.rate_limit_info ?? {};
+      getLog().warn({ rateLimitInfo }, 'claude.rate_limit_event');
+      // Auto-throttle: engage the global gate when utilization > 0.85 and the
+      // 5-hour window resets within 5 minutes. surpassedThreshold + resetsAt
+      // + utilization come from SDKRateLimitInfo. Idempotent — re-engage is a
+      // no-op while the gate is already closed.
+      try {
+        claudeProviderThrottle.checkRateLimitAndMaybeThrottle(rateLimitInfo);
+      } catch (err) {
+        getLog().error({ err, rateLimitInfo }, 'claude.auto_throttle_check_failed');
+      }
+      yield { type: 'rate_limit', rateLimitInfo };
     } else if (event.type === 'result') {
       const resultMsg = msg as {
         session_id?: string;
@@ -981,6 +992,13 @@ export class ClaudeProvider implements IAgentProvider {
       if (requestOptions?.abortSignal?.aborted) {
         throw new Error('Query aborted');
       }
+
+      // Rate-limit gate: when auto-throttle is engaged (or operator-paused via
+      // POST /api/admin/throttle), park here until release. waitForRelease()
+      // resolves immediately when the gate is open, so the normal path pays
+      // nothing. Respects the caller's abortSignal so cancelling a workflow
+      // mid-wait does not block forever.
+      await claudeProviderThrottle.waitForRelease(requestOptions?.abortSignal);
 
       const stderrLines: string[] = [];
       const toolResultQueue: ToolResultEntry[] = [];

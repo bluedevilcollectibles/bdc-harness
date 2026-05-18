@@ -197,6 +197,20 @@ export const cancelStaleRunsResponseSchema = z
   .object({ cancelled: z.number(), runIds: z.array(z.string()) })
   .openapi('CancelStaleRunsResponse');
 
+/** POST /api/workflows/runs/:runId/pause request body. */
+export const pauseWorkflowRunBodySchema = z
+  .object({ reason: z.string().optional() })
+  .openapi('PauseWorkflowRunBody');
+
+/**
+ * POST /api/workflows/runs/:runId/pause response.
+ * Mirrors cancelWorkflowRunResponseSchema so the operator sees the updated row
+ * back after a successful pause.
+ */
+export const pauseWorkflowRunResponseSchema = z
+  .object({ success: z.boolean(), message: z.string(), run: workflowRunSchema })
+  .openapi('PauseWorkflowRunResponse');
+
 /** Generic workflow run action response (resume, abandon, delete). */
 export const workflowRunActionResponseSchema = z
   .object({ success: z.boolean(), message: z.string() })

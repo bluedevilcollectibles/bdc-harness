@@ -8,6 +8,7 @@ interface WorkflowRunGroupProps {
   runs: DashboardRunResponse[];
   isDocker?: boolean;
   onCancel: (runId: string) => void;
+  onPause?: (runId: string) => void;
   onResume?: (runId: string) => void;
   onAbandon?: (runId: string) => void;
   onDelete?: (runId: string) => void;
@@ -22,6 +23,7 @@ export function WorkflowRunGroup({
   runs,
   isDocker,
   onCancel,
+  onPause,
   onResume,
   onAbandon,
   onDelete,
@@ -59,6 +61,7 @@ export function WorkflowRunGroup({
             run={run}
             isDocker={isDocker}
             onCancel={onCancel}
+            onPause={onPause}
             onResume={onResume}
             onAbandon={onAbandon}
             onDelete={onDelete}

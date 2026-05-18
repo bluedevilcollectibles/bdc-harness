@@ -5,6 +5,7 @@ import { Workflow } from 'lucide-react';
 import {
   listDashboardRuns,
   cancelWorkflowRun,
+  pauseWorkflowRun,
   resumeWorkflowRun,
   abandonWorkflowRun,
   deleteWorkflowRun,
@@ -16,6 +17,8 @@ import {
   bulkDeleteArchivedFailedRuns,
   listCodebases,
   getHealth,
+  setGlobalThrottle,
+  getGlobalThrottle,
   type DashboardCounts,
   type DashboardRunResponse,
 } from '@/lib/api';
@@ -227,6 +230,15 @@ export function DashboardPage(): React.ReactElement {
     refetchInterval: 30_000,
   });
 
+  // Poll global Claude throttle state — surfaces auto-engaged throttles in the
+  // StatusSummaryBar so operators see the gate state without checking logs.
+  const { data: throttleState } = useQuery({
+    queryKey: ['adminThrottle'],
+    queryFn: getGlobalThrottle,
+    staleTime: 5_000,
+    refetchInterval: 15_000,
+  });
+
   // Split into active and history (from server-filtered results)
   const activeRuns = useMemo(
     () =>
@@ -302,8 +314,22 @@ export function DashboardPage(): React.ReactElement {
     }
   }
 
+  /** Toggle throttle from the StatusSummaryBar indicator (click = release). */
+  async function handleToggleThrottle(): Promise<void> {
+    try {
+      setActionError(null);
+      const next = !(throttleState?.paused ?? false);
+      await setGlobalThrottle(next);
+      void queryClient.invalidateQueries({ queryKey: ['adminThrottle'] });
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update throttle');
+    }
+  }
+
   const handleCancel = (runId: string): Promise<void> =>
     runAction(cancelWorkflowRun, runId, 'Failed to cancel workflow');
+  const handlePause = (runId: string): Promise<void> =>
+    runAction(pauseWorkflowRun, runId, 'Failed to pause workflow');
   const handleResume = (runId: string): Promise<void> =>
     runAction(resumeWorkflowRun, runId, 'Failed to resume workflow');
   const handleAbandon = (runId: string): Promise<void> =>
@@ -392,6 +418,11 @@ export function DashboardPage(): React.ReactElement {
           health={health}
           showArchived={showArchived}
           onShowArchivedChange={setShowArchived}
+          isThrottled={throttleState?.paused ?? false}
+          throttleEngagedBy={throttleState?.engagedBy}
+          onThrottleClick={(): void => {
+            void handleToggleThrottle();
+          }}
         />
 
         {archiveNotice && (
@@ -438,6 +469,7 @@ export function DashboardPage(): React.ReactElement {
                           run={run}
                           isDocker={health?.is_docker}
                           onCancel={handleCancel}
+                          onPause={handlePause}
                           onResume={handleResume}
                           onAbandon={handleAbandon}
                           onDelete={handleDelete}
@@ -457,6 +489,7 @@ export function DashboardPage(): React.ReactElement {
                       runs={group.runs}
                       isDocker={health?.is_docker}
                       onCancel={handleCancel}
+                      onPause={handlePause}
                       onResume={handleResume}
                       onAbandon={handleAbandon}
                       onDelete={handleDelete}
