@@ -1,0 +1,486 @@
+name: bdc-storefront-fail-closed-contract
+description: |
+  Coordinated build for WO-STOREFRONT-API-MODE-FAIL-CLOSED-01 +
+  WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01.
+
+  These two WOs share a single contract surface (lib/storefront-api.ts +
+  middleware.ts) and must be built together by one agent to avoid two
+  independent agents inventing different fail-closed behavior.
+
+  CONTRACT: In STOREFRONT_DATA_SOURCE=api mode, any live projection/catalog/
+  portal fetch failure must produce an explicit unavailable/error state and
+  must NOT return seed/demo data or empty-success data. Seed fallback is
+  allowed only in explicit seed/demo/local mode (STOREFRONT_DATA_SOURCE=seed).
+
+  Fires against: bluedevilcollectibles/shopops-storefront (staging gate required)
+  WO IDs: WO-STOREFRONT-API-MODE-FAIL-CLOSED-01, WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+nodes:
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-specs
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      fetch_spec() {
+        local WO_ID="$1"
+        local SPEC=""
+        SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+          --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        if [ -z "$SPEC" ]; then
+          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+            --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+        if [ -z "$SPEC" ]; then
+          echo "WARN: spec not found for $WO_ID -- using Notion page body" >&2
+          SPEC=$(gh api "repos/bluedevilcollectibles/bdc-xo/issues" \
+            --method GET -f state=open -f labels="" 2>/dev/null | \
+            jq -r --arg id "$WO_ID" '.[] | select(.title | contains($id)) | .body' 2>/dev/null | head -c 8000 || true)
+        fi
+        printf '%s\n' "$SPEC"
+      }
+
+      echo "=== WO-STOREFRONT-API-MODE-FAIL-CLOSED-01 ==="
+      fetch_spec "WO-STOREFRONT-API-MODE-FAIL-CLOSED-01"
+      echo ""
+      echo "=== WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01 ==="
+      fetch_spec "WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01"
+
+  - id: define-contract
+    persona: war-council-architect
+    depends_on: [read-specs]
+    agent: war-council-architect
+    task_class: medium_work
+    prompt: |
+      Read the two BDC Work Order specs below and produce a single unified
+      implementation contract. These WOs share the same contract surface and
+      MUST be implemented by one agent in one pass.
+
+      ## The Contract (non-negotiable — embed verbatim in plan output)
+
+      In STOREFRONT_DATA_SOURCE=api mode:
+      - Any live projection/catalog/portal fetch failure MUST produce an explicit
+        unavailable/error state (visible error UI or HTTP 503).
+      - A failed API response MUST NOT return seed/demo data.
+      - A failed API response MUST NOT return empty-success data
+        (e.g. { ok: true, items: [] } on network failure).
+      - Seed fallback is allowed ONLY in explicit seed/demo/local mode
+        (STOREFRONT_DATA_SOURCE=seed or STOREFRONT_DATA_SOURCE=demo).
+
+      ## Verification commands (embed in plan output)
+
+      ```bash
+      # With STOREFRONT_DATA_SOURCE=api and unreachable SHOPOPS_API_URL:
+      # catalog page must show error/maintenance state, not empty product grid
+      STOREFRONT_DATA_SOURCE=api SHOPOPS_API_URL=https://unreachable.example.com \
+        curl -s http://localhost:3403/shops/bdc/catalog | grep -i "unavailable\|error\|maintenance"
+
+      # portal orders/statements/pull-list must show error state, not demo data
+      STOREFRONT_DATA_SOURCE=api SHOPOPS_API_URL=https://unreachable.example.com \
+        curl -s -b "portal_token=<valid_jwt>" http://localhost:3403/shops/bdc/portal/orders \
+        | grep -v "Cryodon\|SpawnCollector"
+
+      # With STOREFRONT_DATA_SOURCE=seed: seed data must render (local dev intact)
+      STOREFRONT_DATA_SOURCE=seed curl -s http://localhost:3403/shops/bdc/catalog \
+        | grep -i "items\|products"
+      ```
+
+      ## Required regression tests (implement loop must write these)
+
+      1. api mode blocks seed fallback globally — fetchCatalog/fetchOrders/fetchStatements/fetchPullList
+         return error/null in api mode on failure, never seed JSON.
+      2. Portal orders/statements/pull-list do not import or render seed data in api mode.
+      3. Failed API responses surface a visible unavailable state (error UI rendered).
+      4. local/demo/seed mode still works intentionally (seed JSON loads, no regression).
+
+      ## File scope (read these before planning)
+
+      Primary:
+      - lib/storefront-api.ts — fetchCatalog (line ~134), fetchOrders (~244),
+        fetchStatements (~337), fetchPullList (~362)
+      - middleware.ts — tenant config fetch failure (~71-72, ~115-117)
+
+      Secondary (error UI):
+      - app/shops/[shopSlug]/catalog/page.tsx
+      - app/shops/[shopSlug]/portal/orders/page.tsx
+      - app/shops/[shopSlug]/portal/statements/page.tsx
+      - app/shops/[shopSlug]/portal/pull-list/page.tsx
+
+      Tests:
+      - __tests__/ or tests/ — write new regression tests per the 4 requirements above
+
+      Out of scope:
+      - WO-STOREFRONT-LOGGED-IN-HEADER-CHIP-01 (separate WO, separate build)
+      - Any ShopOps API changes — storefront only
+      - Authentication flow changes
+
+      ## Required Plan Output Format
+      - WO IDs: (both)
+      - Contract: (embed the contract block verbatim)
+      - Files to modify: (list)
+      - Files to create: (list)
+      - Files explicitly out of scope: (list)
+      - Verification commands: (embed the curl block verbatim)
+      - Regression tests required: (list the 4 test requirements)
+      - Commit message: (single message covering both WOs)
+      - Push policy: feature-branch to staging (Rule 20 gate)
+      - Target repo: bluedevilcollectibles/shopops-storefront
+
+      ## Specs
+      $read-specs.output
+
+  - id: implement
+    persona: major-build
+    depends_on: [define-contract]
+    agent: major-build
+    task_class: medium_work
+    loop:
+      prompt: |
+        Implement the unified fail-closed contract for these two BDC storefront WOs.
+
+        ## The Contract (non-negotiable)
+        In STOREFRONT_DATA_SOURCE=api mode:
+        - Any live projection/catalog/portal fetch failure MUST produce an explicit
+          unavailable/error state (visible error UI or HTTP 503).
+        - MUST NOT return seed/demo data on failure.
+        - MUST NOT return empty-success data on failure (no { ok: true, items: [] } on network error).
+        - Seed fallback allowed ONLY in explicit seed/demo/local mode.
+
+        ## Specs
+        $read-specs.output
+
+        ## Contract + Plan
+        $define-contract.output
+
+        ## Execution Rules
+        - Read lib/storefront-api.ts and middleware.ts fully before editing.
+        - Modify only files in scope from the plan.
+        - Do not change authentication flow, portal JWT logic, or ShopOps API.
+        - Do not paper over the contract with feature flags — the contract is always-on in api mode.
+        - Write the 4 regression tests. They must assert real behavior:
+            1. fetchCatalog/fetchOrders/fetchStatements/fetchPullList return error/null in api mode on failure.
+            2. Portal pages do not render seed data in api mode.
+            3. Failed API responses render a visible unavailable state.
+            4. Seed mode still loads seed data correctly.
+        - Do not reformat unrelated code.
+        - Do not deploy.
+
+        ## Commit-and-push BEFORE exit
+        When implementation is complete, BEFORE emitting the sentinel:
+
+        ```bash
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        git add -A
+        git diff --cached --quiet || git commit -m "fix(storefront): api-mode fail-closed contract
+
+        WO-STOREFRONT-API-MODE-FAIL-CLOSED-01 + WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01
+
+        In api mode: fetch failures produce explicit error state, never seed/empty-success.
+        Seed fallback restricted to explicit seed/demo mode only.
+        Adds 4 regression tests covering the full contract surface.
+
+        Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed"
+        ```
+
+        ## Completion Criteria + Sentinel
+        Output ALL THREE sentinels when all stop conditions are met OR a true blocker found:
+
+        COMPLETE
+        BUILD_COMPLETE
+        <promise>COMPLETE</promise>
+
+        If blocker: `BLOCKED: <one-sentence reason>`
+      until: COMPLETE
+      max_iterations: 5
+      fresh_context: true
+
+  - id: war-council-validator
+    persona: captain-ci-validator
+    depends_on: [implement]
+    task_class: medium_work
+    prompt: |
+      Validate the implementation of the fail-closed contract for:
+      - WO-STOREFRONT-API-MODE-FAIL-CLOSED-01
+      - WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01
+
+      ## Contract to validate against
+      In STOREFRONT_DATA_SOURCE=api mode:
+      1. Fetch failures produce explicit error state — not seed data, not empty-success.
+      2. lib/storefront-api.ts fetchCatalog, fetchOrders, fetchStatements, fetchPullList
+         all enforce this in api mode.
+      3. middleware.ts enforces 503 or error when api mode + tenant config unreachable.
+      4. Portal pages render a visible unavailable state when fetch returns null/error.
+      5. Seed mode still works (regression-safe).
+      6. 4 regression tests exist and assert real behavior.
+
+      Check for:
+      - Any remaining `{ ok: true, items: [] }` return on network failure in api mode.
+      - Any remaining seed JSON import used as a fallback in api mode.
+      - Any portal page that silently renders empty instead of an error state.
+      - Tests that always pass without asserting correctness (fake passes).
+
+      ## Inputs
+      Specs:
+      $read-specs.output
+
+      Contract + Plan:
+      $define-contract.output
+
+      Implementation output:
+      $implement.output
+
+      Git diff:
+      Run `git diff --stat` and inspect changed files.
+
+      ## Required Output
+      - satisfied: with evidence for each of the 6 contract points above
+      - OR needs_revision: with exact file/line/behavior findings
+
+  - id: decide-push-target
+    persona: major-build
+    depends_on: [war-council-validator]
+    task_class: clerical
+    prompt: |
+      Decide the push target for this coordinated storefront WO pair.
+
+      Target repo: bluedevilcollectibles/shopops-storefront
+      This repo is in the Rule 20 staging-gate list.
+
+      Output exactly:
+      push_target: feature-branch:fix/wo-storefront-fail-closed-contract
+      pr_required: true
+      staging_gate_required: true
+      repo: bluedevilcollectibles/shopops-storefront
+
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$define-contract.output
+      echo "$DECIDE_OUTPUT"
+      if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
+        echo "Out of scope; failing closed." >&2
+        exit 1
+      fi
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
+      if [ -z "$BRANCH" ]; then
+        echo "No feature branch target found." >&2
+        exit 1
+      fi
+      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        echo "Malformed branch name: $BRANCH" >&2
+        exit 1
+      fi
+      THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      git status --short
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1 && \
+           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${UNIQUE_BRANCH}")" ]; then
+          echo "Backstop no-op: implement loop already pushed."
+          echo "unique_branch=${UNIQUE_BRANCH}"
+          exit 0
+        fi
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${UNIQUE_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          RECOVERED=$(git ls-remote origin 2>/dev/null \
+            | awk -v sha="$LOCAL_HEAD" '$1 == sha {sub(/^refs\/heads\//, "", $2); print $2}' \
+            | head -1)
+          if [ -n "$RECOVERED" ]; then
+            echo "Recovered push target: $RECOVERED"
+            UNIQUE_BRANCH="$RECOVERED"
+          else
+            echo "No changed files and no commits ahead of origin -- implement loop did not produce work." >&2
+            exit 1
+          fi
+        else
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead -- pushing."
+        fi
+      else
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        AUTO_TOLERATED='^(bun\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.bun-tag|node_modules/)$'
+        printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
+          [ -z "$path" ] && continue
+          if printf '%s\n' "$path" | grep -Eq "$AUTO_TOLERATED"; then
+            git add -- "$path"
+            continue
+          fi
+          if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
+            echo "Changed file not in plan: $path" >&2
+            exit 1
+          fi
+          git add -- "$path"
+        done
+        if git diff --cached --quiet; then
+          echo "Nothing staged." >&2
+          exit 0
+        fi
+        git commit -m "fix(storefront): api-mode fail-closed contract (backstop commit)
+
+WO-STOREFRONT-API-MODE-FAIL-CLOSED-01 + WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01
+
+Co-Authored-By: Claude (Cauldron major-build) <noreply@anthropic.com>"
+      fi
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts." >&2
+        exit 1
+      fi
+      echo "unique_branch=${UNIQUE_BRANCH}"
+
+  - id: open-pr-if-needed
+    persona: major-build
+    depends_on: [commit-and-push]
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DECIDE_OUTPUT=$decide-push-target.output
+      PLAN_OUTPUT=$define-contract.output
+      IMPLEMENT_OUTPUT=$implement.output
+      VALIDATOR_OUTPUT=$war-council-validator.output
+      COMMIT_PUSH_OUTPUT=$commit-and-push.output
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "UNIQUE_BRANCH not found." >&2
+        exit 1
+      fi
+      REPO="bluedevilcollectibles/shopops-storefront"
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "Coordinated build: WO-STOREFRONT-API-MODE-FAIL-CLOSED-01 + WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01"
+        echo ""
+        echo "## Contract"
+        echo "In STOREFRONT_DATA_SOURCE=api mode:"
+        echo "- Fetch failures produce explicit error state (visible UI or 503)"
+        echo "- Never returns seed/demo data on failure"
+        echo "- Never returns empty-success on failure ({ ok: true, items: [] } on network error)"
+        echo "- Seed fallback allowed only in explicit seed/demo mode"
+        echo ""
+        echo "## Lane B evidence"
+        echo "- lib/storefront-api.ts:134 — fetchCatalog returned empty-success on failure"
+        echo "- lib/storefront-api.ts:244,337,362 — fetchOrders/Statements/PullList fell back to seed JSON"
+        echo "- middleware.ts:71-72,115-117 — tenant config failure was silently ignored"
+        echo ""
+        echo "## Verification"
+        echo '```bash'
+        echo 'STOREFRONT_DATA_SOURCE=api SHOPOPS_API_URL=https://unreachable.example.com \'
+        echo '  curl -s http://localhost:3403/shops/bdc/catalog | grep -i "unavailable\|error\|maintenance"'
+        echo '```'
+        echo ""
+        echo "## Plan"
+        echo "$PLAN_OUTPUT"
+        echo ""
+        echo "## Implement output"
+        echo "$IMPLEMENT_OUTPUT"
+        echo ""
+        echo "## Validator"
+        echo "$VALIDATOR_OUTPUT"
+      } > "$BODY_FILE"
+      PR_OK=false
+      for attempt in 1 2 3; do
+        if gh pr create \
+          --repo "$REPO" \
+          --title "fix(storefront): api-mode fail-closed contract [WO-STOREFRONT-API-MODE-FAIL-CLOSED-01 + WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01]" \
+          --body-file "$BODY_FILE" \
+          --head "$UNIQUE_BRANCH" \
+          --base staging 2>&1; then
+          PR_OK=true
+          break
+        fi
+        EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+          --json url --jq '.[0].url // empty' 2>/dev/null || true)
+        if [ -n "$EXIST" ]; then
+          echo "PR_URL=$EXIST"
+          PR_OK=true
+          break
+        fi
+        echo "WARN: pr create attempt $attempt failed; retrying..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PR_OK" = "false" ]; then
+        echo "ERROR: gh pr create failed after 3 attempts." >&2
+        exit 1
+      fi
+
+  - id: build-manifest
+    persona: major-build
+    depends_on: [open-pr-if-needed]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI completion manifest for this coordinated storefront build.
+
+      WO IDs: WO-STOREFRONT-API-MODE-FAIL-CLOSED-01, WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01
+
+      ## Inputs
+      Contract + Plan: $define-contract.output
+      Implementation: $implement.output
+      Validator: $war-council-validator.output
+
+      ## Required Manifest Fields
+      - WO IDs: (both)
+      - Files modified
+      - Files created
+      - Tests added (must list each of the 4 regression tests)
+      - Commit SHA
+      - PR URL (to staging branch)
+      - Grep assertions:
+          grep -r 'Cryodon\|SpawnCollector' app/ — expected: 0
+          grep -n 'ok: true, items: \[\]' lib/storefront-api.ts — expected: 0 in api-mode branch
+      - Runtime verification: N/A (staging gate required, not yet deployed)
+      - Vercel deployment: N/A until staging PR merges and John promotes
+      - VALIDATION: PASS or FAIL with reason
+
+  - id: flip-notion
+    persona: xo
+    depends_on: [build-manifest]
+    task_class: clerical
+    prompt: |
+      Update both Notion Work Order pages if Notion MCP is available.
+
+      ## WO pages to update
+      - WO-STOREFRONT-API-MODE-FAIL-CLOSED-01 (Notion ID: 367ef4c9-ce00-8143-8207-d4638aff0e4b)
+      - WO-STOREFRONT-PORTAL-SEED-FALLBACK-GUARD-01 (Notion ID: 367ef4c9-ce00-810c-b375-c840b963ffc7)
+
+      ## Required changes on each page
+      - Claude Status: REVIEW
+      - Status: Review
+      - Add the Captain CI manifest as a page comment
+
+      ## Manifest
+      $build-manifest.output
+
+      If Notion MCP is not available, output a TODO for XO to flip both pages manually.
