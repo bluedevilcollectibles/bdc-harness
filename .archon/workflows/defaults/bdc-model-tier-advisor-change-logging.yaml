@@ -15,160 +15,157 @@ inputs:
     default: WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01
 
 nodes:
+
   - id: preflight
-    type: bash
-    command: |
+    bash: |
       set -euo pipefail
       echo "=== preflight ==="
       python --version
-      cd /workspace
       git status --short
       git log --oneline -3
-      # Verify key source files exist before touching anything
       test -f src/model_tier_advisor/session_state.py && echo "session_state.py OK"
       test -f src/model_tier_advisor/logger.py && echo "logger.py OK"
       test -f src/model_tier_advisor/report.py && echo "report.py OK"
       test -f src/model_tier_advisor/hook.py && echo "hook.py OK"
       test -f docs/LOGGING_CONTRACT.md && echo "LOGGING_CONTRACT.md OK"
-      # Baseline test count before changes
       python -m pytest tests/ -v --tb=short 2>&1 | tail -20
       echo "preflight PASS"
 
-  - id: implement
-    type: loop
-    model: sonnet
+  - id: read-spec
     depends_on: [preflight]
-    prompt: |
-      You are implementing WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01.
-      The spec is at: work-orders/WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01.md
-      Read it before touching any file.
+    bash: |
+      set -euo pipefail
+      cat work-orders/WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01.md
+      cat docs/LOGGING_CONTRACT.md
 
-      ## What to build
+  - id: implement
+    depends_on: [read-spec]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 6
+      prompt: |
+        You are implementing WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01 in the model-tier-advisor repo.
+        The spec and logging contract are in $read-spec.output. Read them before touching any file.
 
-      ### 1. src/model_tier_advisor/session_state.py — add these functions:
+        ## What to build
 
-      detect_transition(session_id, new_model, log_path) -> dict | None
-        - Read the last 50 lines of events.jsonl (the advisory log)
-        - Find the most recent event with event_type == "advisory" that has a known model
-        - If new_model (lowercased) differs from that event's current_model (lowercased):
-            return {"from_model": <prior>, "to_model": new_model,
-                    "linked_event_id": <that advisory's event_id>,
-                    "matched_recommendation": new_model == <that advisory's recommended_model (lowercased)>}
-        - If no change, or no prior advisory found: return None
-        - NEVER raise — catch all exceptions and return None
+        ### 1. src/model_tier_advisor/session_state.py -- add:
 
-      _emit_transition_event(session_id, new_model, config) -> None
-        - Call detect_transition(); if None, return immediately (no event)
-        - Build an outcome_update event via make_outcome_event() from logger.py
-        - user_action = "followed" if matched_recommendation else "switched_model"
-        - outcome = "cost_savings_opportunity" if user_action == "followed" else "pending"
-        - Call append_event(outcome_event, config["log_path"])
-        - NEVER raise — wrap in try/except
+        detect_transition(session_id, new_model, log_path) -> dict | None
+          - Read the last 50 lines of the events.jsonl log at log_path
+          - Find the most recent event with event_type == "advisory" that has a known model
+          - If new_model (lowercased) differs from that event's current_model (lowercased):
+              return {"from_model": <prior current_model>, "to_model": new_model,
+                      "linked_event_id": <that advisory's event_id>,
+                      "matched_recommendation": new_model == <that advisory's recommended_model (lowercased)>}
+          - If no change, or no prior advisory found: return None
+          - NEVER raise -- catch all exceptions and return None
 
-      ### 2. src/model_tier_advisor/logger.py — add:
+        _emit_transition_event(session_id, new_model, config) -> None
+          - Call detect_transition(); if None, return immediately (no event written)
+          - Build an outcome_update event via make_outcome_event() from logger.py
+          - user_action = "followed" if matched_recommendation else "switched_model"
+          - outcome = "cost_savings_opportunity" if user_action == "followed" else "pending"
+          - Call append_event(outcome_event, config["log_path"])
+          - NEVER raise -- wrap entire body in try/except
 
-      make_outcome_event(linked_event_id, user_action, from_model, to_model, outcome, notes="") -> dict
-        - Builds an outcome_update record matching docs/LOGGING_CONTRACT.md §4
-        - Fields: event_id, event_type="outcome_update", timestamp (ISO8601 UTC),
-          linked_event_id, user_action, outcome, estimated_wasted_commits_avoided,
-          notes (passed through redact() from redact.py)
-        - estimated_wasted_commits_avoided = 1 if user_action == "followed" else 0
-        - Use secrets.token_hex(3) for event_id suffix (same as make_event)
-        - NEVER include raw prompt text, tokens, or secrets in any field
+        ### 2. src/model_tier_advisor/logger.py -- add:
 
-      ### 3. src/model_tier_advisor/hook.py — extend SessionStart branch:
+        make_outcome_event(linked_event_id, user_action, from_model, to_model, outcome, notes="") -> dict
+          - Builds an outcome_update record matching docs/LOGGING_CONTRACT.md section 4
+          - Fields: event_id (evt_<timestamp>_<6hex>), event_type="outcome_update",
+            timestamp (ISO8601 UTC), linked_event_id, user_action, outcome,
+            estimated_wasted_commits_avoided, notes (passed through redact() from redact.py)
+          - estimated_wasted_commits_avoided = 1 if user_action == "followed" else 0
+          - NEVER include raw prompt text, tokens, or secrets in any field
 
-      After `remember_model(sid, model, config["log_path"])` at line ~188, add:
-        _emit_transition_event(sid, model, config)
-      Import _emit_transition_event from session_state.
+        ### 3. src/model_tier_advisor/hook.py -- extend SessionStart branch:
 
-      ### 4. src/model_tier_advisor/report.py — extend:
+        Find the SessionStart branch in run(). After remember_model(...) is called, add:
+          _emit_transition_event(sid, model, config)
+        Add the import at the top of the file.
 
-      In summarize(events):
-        - Count outcome_update events: events where event_type == "outcome_update"
-        - Count tier_changes: all outcome_update events
-        - Count followed_transitions: outcome_update events where user_action == "followed"
-        - Update wasted_commits_avoided_estimate: sum estimated_wasted_commits_avoided
-          from outcome_update events with user_action == "followed" AND linked_event_id present
-          (this replaces the current logic that reads user_action == "followed" on advisory events
-          which was never populated)
-        - Add "tier_changes" and "followed_transitions" keys to the returned dict
+        ### 4. src/model_tier_advisor/report.py -- extend:
 
-      In format_report(summary, ...):
-        - Add "Tier changes detected: N" line after the Downshift line
-        - Update "Estimated wasted commits avoided" to use the new calculation
+        In summarize(events):
+          - Count outcome_update events (event_type == "outcome_update")
+          - tier_changes = total outcome_update count
+          - followed_transitions = outcome_update events where user_action == "followed"
+          - wasted_commits_avoided_estimate = sum of estimated_wasted_commits_avoided
+            from outcome_update events where user_action == "followed" AND linked_event_id present
+            (this replaces the old logic that read user_action == "followed" on advisory events
+            which was never populated)
+          - Add "tier_changes" and "followed_transitions" keys to the returned dict
 
-      ### 5. tests/test_transition.py — NEW FILE, 5 tests:
+        In format_report(summary, ...):
+          - Add "Tier changes detected: N" line (after the existing Downshift line)
+          - Update "Estimated wasted commits avoided" to use the new calculation
 
-      test_followed_transition:
-        - Seed events.jsonl with one advisory (recommended_model="opus", current_model="sonnet", outcome="pending")
-        - Call _emit_transition_event with new_model="opus"
-        - Assert an outcome_update event was appended with user_action="followed", linked_event_id matches
+        ### 5. tests/test_transition.py -- NEW FILE, 5 tests:
 
-      test_no_transition_same_model:
-        - Seed events.jsonl with one advisory (current_model="sonnet")
-        - Call _emit_transition_event with new_model="sonnet"
-        - Assert NO outcome_update was appended (line count unchanged)
+        test_followed_transition:
+          Seed events.jsonl with one advisory (recommended_model="opus", current_model="sonnet").
+          Call _emit_transition_event with new_model="opus".
+          Assert outcome_update appended with user_action="followed", linked_event_id matches.
 
-      test_independent_switch_not_credited:
-        - Seed events.jsonl with advisory (recommended_model="opus", current_model="sonnet")
-        - Call _emit_transition_event with new_model="haiku" (not the recommendation)
-        - Assert outcome_update appended with user_action="switched_model" (NOT "followed")
-        - Assert estimated_wasted_commits_avoided == 0 in that event
+        test_no_transition_same_model:
+          Seed events.jsonl with one advisory (current_model="sonnet").
+          Call _emit_transition_event with new_model="sonnet".
+          Assert NO outcome_update appended (line count unchanged).
 
-      test_empty_log_no_crash:
-        - events.jsonl is empty or contains "not-json"
-        - Call _emit_transition_event — must not raise, must exit cleanly
-        - Hook main() must return exit 0
+        test_independent_switch_not_credited:
+          Seed events.jsonl with advisory (recommended_model="opus", current_model="sonnet").
+          Call _emit_transition_event with new_model="haiku".
+          Assert outcome_update appended with user_action="switched_model" (NOT "followed").
+          Assert estimated_wasted_commits_avoided == 0 in that event.
 
-      test_transition_event_no_secrets:
-        - Seed events.jsonl with one advisory
-        - Call _emit_transition_event with new_model="opus"
-        - Read the written outcome_update event
-        - Assert no field contains a JWT token pattern (r'ey[A-Za-z0-9_-]{10,}')
-        - Assert no field contains a 64-char hex string (potential secret)
+        test_empty_log_no_crash:
+          events.jsonl is empty or contains "not-json".
+          Call _emit_transition_event -- must not raise.
+          Assert no outcome_update event appended.
 
-      ### 6. tests/test_report.py — extend (add to existing file):
+        test_transition_event_no_secrets:
+          Seed events.jsonl with one advisory. Call _emit_transition_event with new_model="opus".
+          Read the written outcome_update event.
+          Assert no field contains a JWT token pattern (r'ey[A-Za-z0-9_-]{10,}').
+          Assert no field contains a 64-char hex string (potential secret).
 
-      test_report_with_outcome_events:
-        - Seed events.jsonl with 3 advisory events + 2 outcome_update events
-          (user_action="followed", linked_event_id set, estimated_wasted_commits_avoided=1 each)
-        - Run report.summarize()
-        - Assert followed_transitions == 2
-        - Assert tier_changes == 2
-        - Assert wasted_commits_avoided_estimate == 2
+        ### 6. tests/test_report.py -- extend (add to existing file):
 
-      ## Hard constraints (never violate):
-      - NEVER add auto-switching logic
-      - NEVER add auto-compact logic
-      - NEVER add network calls
-      - NEVER log raw prompt text, tokens, API keys, or secrets
-      - hook.py main() must ALWAYS exit 0 (wrap everything in try/except)
-      - All new functions must have their own try/except — never propagate exceptions to caller
+        test_report_with_outcome_events:
+          Seed events.jsonl with 3 advisory events + 2 outcome_update events
+          (user_action="followed", linked_event_id set, estimated_wasted_commits_avoided=1 each).
+          Run report.summarize().
+          Assert followed_transitions == 2, tier_changes == 2, wasted_commits_avoided_estimate == 2.
 
-      ## Completion manifest required:
-      When done, output a manifest block:
-        Files modified: [list]
-        Files created: [list]
-        Tests: N/N (command)
-        Grep assertions: [grep commands proving no auto-switch/no secrets]
+        ## Hard constraints (never violate):
+        - NEVER add auto-switching logic
+        - NEVER add auto-compact logic
+        - NEVER add network calls
+        - NEVER log raw prompt text, tokens, API keys, or secrets
+        - hook.py main() must ALWAYS exit 0 (it already wraps in try/except -- preserve that)
+        - All new functions must have their own try/except -- never propagate exceptions to caller
+        - user_action values must come only from the enum in LOGGING_CONTRACT.md section 6:
+          unknown, ignored, switched_model, compacted, fresh_session, stayed_current, manual_override
+          (plus "followed" which is the observed-action equivalent of following the advisory)
+
+        Output <promise>COMPLETE</promise> when all 6 files are written and you have verified
+        the changes compile (python -c "import model_tier_advisor.session_state" etc.).
 
   - id: test
-    type: bash
     depends_on: [implement]
-    command: |
+    bash: |
       set -euo pipefail
       echo "=== running full test suite ==="
       python -m pytest tests/ -v --tb=short 2>&1
       echo "=== test PASS ==="
 
   - id: fixture-report-check
-    type: bash
     depends_on: [test]
-    command: |
+    bash: |
       set -euo pipefail
       echo "=== fixture report check ==="
-      # Write a fixture events.jsonl with 1 advisory + 1 followed outcome_update
       python -c "
       import json, secrets
       from datetime import datetime, timezone
@@ -176,7 +173,7 @@ nodes:
 
       log = Path('/tmp/fixture_events.jsonl')
       ts = datetime.now(timezone.utc).isoformat()
-      eid = f'evt_fixture_{secrets.token_hex(3)}'
+      eid = 'evt_fixture_' + secrets.token_hex(3)
       advisory = {
         'event_id': eid, 'event_type': 'advisory', 'timestamp': ts,
         'current_model': 'sonnet', 'recommended_model': 'opus',
@@ -187,63 +184,55 @@ nodes:
         'repo': 'test', 'branch': 'main'
       }
       outcome = {
-        'event_id': f'evt_outcome_{secrets.token_hex(3)}', 'event_type': 'outcome_update',
+        'event_id': 'evt_outcome_' + secrets.token_hex(3), 'event_type': 'outcome_update',
         'timestamp': ts, 'linked_event_id': eid,
         'user_action': 'followed', 'outcome': 'cost_savings_opportunity',
         'estimated_wasted_commits_avoided': 1, 'notes': ''
       }
       log.write_text(json.dumps(advisory) + '\n' + json.dumps(outcome) + '\n')
-      print('fixture written to', log)
+      print('fixture written to', str(log))
       "
-      # Run report against fixture
-      python -m model_tier_advisor.report --window all 2>&1 || \
-        MODEL_TIER_LOG=/tmp/fixture_events.jsonl python -c "
-      import json
+      python -c "
+      import sys
       from pathlib import Path
       from model_tier_advisor import report
       events, skipped = report.read_events('/tmp/fixture_events.jsonl')
       s = report.summarize(events)
       print(report.format_report(s, window_label='fixture', skipped=skipped))
-      assert s.get('tier_changes', 0) >= 1, f'tier_changes should be >= 1, got {s}'
-      assert s.get('wasted_commits_avoided_estimate', 0) >= 1, f'wasted_commits_avoided should be >= 1, got {s}'
+      assert s.get('tier_changes', 0) >= 1, 'tier_changes should be >= 1, got: ' + str(s)
+      assert s.get('wasted_commits_avoided_estimate', 0) >= 1, 'wasted_commits_avoided should be >= 1, got: ' + str(s)
       print('fixture-report-check PASS')
       "
       echo "=== fixture-report-check PASS ==="
 
   - id: grep-assertions
-    type: bash
     depends_on: [fixture-report-check]
-    command: |
+    bash: |
       set -euo pipefail
       echo "=== grep assertions ==="
-      # No auto-switching
-      if grep -rn "auto.switch\|auto_switch\|switch_model\|set_model" src/model_tier_advisor/ --include="*.py" | grep -v "test_\|\.pyc"; then
+      if grep -rn "auto.switch\|auto_switch\|set_model" src/model_tier_advisor/ --include="*.py" | grep -v "test_"; then
         echo "ERROR: auto-switch pattern found in source" >&2; exit 1
       fi
       echo "no auto-switch: PASS"
-      # SHOPOPS_PORTAL_JWT_SECRET pattern (no secret values in source)
       if grep -rn "ey[A-Za-z0-9_-]\{20,\}" src/model_tier_advisor/ --include="*.py"; then
         echo "ERROR: JWT token pattern found in source" >&2; exit 1
       fi
       echo "no token values: PASS"
-      # outcome_update exists
-      grep -c "outcome_update" src/model_tier_advisor/logger.py
-      echo "outcome_update in logger: PASS"
-      # detect_transition exists
-      grep -c "detect_transition" src/model_tier_advisor/session_state.py
-      echo "detect_transition in session_state: PASS"
-      # tier_changes in report
-      grep -c "tier_changes" src/model_tier_advisor/report.py
-      echo "tier_changes in report: PASS"
+      grep -c "outcome_update" src/model_tier_advisor/logger.py && echo "outcome_update in logger: PASS"
+      grep -c "detect_transition" src/model_tier_advisor/session_state.py && echo "detect_transition in session_state: PASS"
+      grep -c "tier_changes" src/model_tier_advisor/report.py && echo "tier_changes in report: PASS"
       echo "=== grep assertions PASS ==="
 
   - id: commit-and-push
-    type: bash
     depends_on: [grep-assertions]
-    command: |
+    bash: |
       set -euo pipefail
       git config user.email "cauldron@bluedevilcollectibles.com"
       git config user.name "Cauldron"
+      DEFAULT_BRANCH="$(git remote show origin | sed -n 's,.*HEAD branch: ,,p')"
+      git fetch origin "$DEFAULT_BRANCH" --depth=50 || true
+      BRANCH="wo/model-tier-advisor-change-logging-01-run-$(date +%Y%m%d%H%M%S)"
+      git checkout -b "$BRANCH"
       git add src/model_tier_advisor/session_state.py \
                src/model_tier_advisor/logger.py \
                src/model_tier_advisor/report.py \
@@ -251,14 +240,59 @@ nodes:
                tests/test_transition.py \
                tests/test_report.py
       git diff --cached --stat
-      git commit -m "feat(logging): add tier-change detection and outcome-update logging (WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01)"
-      git push origin HEAD
+      git commit -m "feat(logging): tier-change detection and outcome-update logging (WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01)"
+      git push -u origin "$BRANCH"
+      echo "SHA=$(git rev-parse HEAD)"
+      echo "BRANCH=${BRANCH}"
       echo "commit-and-push PASS"
 
-stop:
-  criteria:
-    - All 5 tests in test_transition.py pass.
-    - All pre-existing tests pass (no regression).
-    - Report shows non-zero tier_changes and wasted_commits_avoided on fixture.
-    - grep confirms no auto-switch logic, no token values in source.
-    - Commit pushed to origin.
+  - id: open-pr
+    depends_on: [commit-and-push]
+    bash: |
+      set -euo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      REPO="bluedevilcollectibles/model-tier-advisor"
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+        --json url --template '{{range .}}{{.url}}{{end}}' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then echo "PR=$EXIST"; exit 0; fi
+      for i in 1 2 3; do
+        if URL=$(gh pr create --repo "$REPO" --base main --head "$BRANCH" \
+            --title "feat(logging): tier-change detection and outcome-update logging" \
+            --body "WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01. Advisory only. No auto-switching. No network calls. All 5 transition tests pass." 2>&1); then
+          echo "PR=$URL"; exit 0
+        fi
+        sleep 5
+      done
+      echo "open-pr failed" >&2; exit 1
+
+  - id: flip-notion
+    depends_on: [open-pr]
+    task_class: clerical
+    prompt: |
+      Flip WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01 to REVIEW in Notion.
+
+      Build the manifest and post it to the WO Notes field, then update both status fields.
+
+      Manifest template:
+      WO: WO-MODEL-TIER-ADVISOR-CHANGE-LOGGING-01
+      Builder: Devils Cauldron (bdc-model-tier-advisor-change-logging)
+      Files modified: src/model_tier_advisor/session_state.py, src/model_tier_advisor/logger.py, src/model_tier_advisor/report.py, src/model_tier_advisor/hook.py
+      Files created: tests/test_transition.py
+      Tests: (from $test.output -- count passing / total)
+      PRs: (from $open-pr.output PR URL)
+      Merge ancestors: model-tier-advisor main HEAD (from $commit-and-push.output SHA), behind_by: 0
+      Grep assertions: grep -c outcome_update src/model_tier_advisor/logger.py returns >= 1; grep -c detect_transition src/model_tier_advisor/session_state.py returns >= 1; grep -c tier_changes src/model_tier_advisor/report.py returns >= 1; no auto-switch pattern found
+      Runtime verification: pytest tests/ -v -- all tests pass (from $test.output)
+      Vercel deployment: N/A -- local Python package, no Vercel deploy
+      VALIDATION: PASS
+
+      Set:
+       - Claude Status -> REVIEW
+       - Status -> Review
+       - Notes -> manifest above
+
+      Inputs:
+      $test.output
+      $open-pr.output
+      $commit-and-push.output
+      $grep-assertions.output
