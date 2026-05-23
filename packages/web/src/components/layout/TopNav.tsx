@@ -37,7 +37,7 @@ export function TopNav(): React.ReactElement {
         <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary">
           <span className="text-sm font-semibold text-primary-foreground">A</span>
         </div>
-        <span className="text-sm font-semibold text-text-primary">Archon</span>
+        <span className="text-sm font-semibold text-text-primary">Cauldron</span>
       </Link>
 
       {tabs.map(({ to, end, icon: Icon, label }) => (

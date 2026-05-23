@@ -776,6 +776,91 @@ describe('GET /api/workflows/runs', () => {
     mockListWorkflowRuns.mockReset();
   });
 
+  test('requires operator token when ARCHON_OPERATOR_TOKEN is configured', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    mockListWorkflowRuns.mockImplementationOnce(async () => [MOCK_RUNNING_RUN]);
+    try {
+      const { app } = makeApp();
+      const response = await app.request('/api/workflows/runs');
+
+      expect(response.status).toBe(401);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toContain('operator token');
+      expect(mockListWorkflowRuns).not.toHaveBeenCalled();
+    } finally {
+      if (previousToken === undefined) {
+        delete process.env.ARCHON_OPERATOR_TOKEN;
+      } else {
+        process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      }
+    }
+  });
+
+  test('accepts a valid bearer operator token for private workflow runs', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    mockListWorkflowRuns.mockImplementationOnce(async () => [MOCK_RUNNING_RUN]);
+    try {
+      const { app } = makeApp();
+      const response = await app.request('/api/workflows/runs', {
+        headers: { Authorization: 'Bearer test-operator-token' },
+      });
+
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { runs: Array<{ id: string }> };
+      expect(body.runs[0]?.id).toBe('run-uuid-1');
+    } finally {
+      if (previousToken === undefined) {
+        delete process.env.ARCHON_OPERATOR_TOKEN;
+      } else {
+        process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      }
+    }
+  });
+
+  test('public workflow runs endpoint returns sanitized fields without a token', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    mockListWorkflowRuns.mockImplementationOnce(async () => [
+      {
+        ...MOCK_RUNNING_RUN,
+        metadata: { cost_usd: 12.34, prompt: 'private prompt' },
+        user_message: 'ship the secret thing',
+        working_path: 'C:/Users/pcmed/private/worktree',
+      },
+    ]);
+    try {
+      const { app } = makeApp();
+      const response = await app.request('/api/public/workflows/runs');
+
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { runs: Array<Record<string, unknown>> };
+      expect(body.runs).toEqual([
+        {
+          status: 'running',
+          started_at: MOCK_RUNNING_RUN.started_at,
+          completed_at: null,
+          last_activity_at: MOCK_RUNNING_RUN.last_activity_at,
+        },
+      ]);
+      expect(JSON.stringify(body)).not.toContain('run-uuid-1');
+      expect(JSON.stringify(body)).not.toContain('conv-uuid-1');
+      expect(JSON.stringify(body)).not.toContain('cb-uuid-1');
+      expect(JSON.stringify(body)).not.toContain('private prompt');
+      expect(JSON.stringify(body)).not.toContain('deploy');
+      expect(JSON.stringify(body)).not.toContain('ship the secret thing');
+      expect(JSON.stringify(body)).not.toContain('private/worktree');
+      expect(JSON.stringify(body)).not.toContain('cost_usd');
+    } finally {
+      if (previousToken === undefined) {
+        delete process.env.ARCHON_OPERATOR_TOKEN;
+      } else {
+        process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      }
+    }
+  });
+
   test('returns empty runs array when no runs exist', async () => {
     mockListWorkflowRuns.mockImplementationOnce(async () => []);
 

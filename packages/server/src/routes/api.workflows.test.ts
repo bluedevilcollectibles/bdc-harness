@@ -111,6 +111,85 @@ mock.module('@archon/core/db/codebases', () => ({
 import { registerApiRoutes } from './api';
 
 describe('GET /api/workflows', () => {
+  test('requires operator token when ARCHON_OPERATOR_TOKEN is configured', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      const response = await app.request('/api/workflows');
+
+      expect(response.status).toBe(401);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toContain('operator token');
+    } finally {
+      if (previousToken === undefined) {
+        delete process.env.ARCHON_OPERATOR_TOKEN;
+      } else {
+        process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      }
+    }
+  });
+
+  test('accepts allowed Cloudflare Access email on configured operator host', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    const previousHosts = process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+    const previousEmails = process.env.ARCHON_OPERATOR_EMAILS;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    process.env.ARCHON_OPERATOR_ACCESS_HOSTS = 'ops.cauldron.thinmansoftware.com';
+    process.env.ARCHON_OPERATOR_EMAILS = 'john@example.com';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      const response = await app.request('/api/workflows', {
+        headers: {
+          Host: 'ops.cauldron.thinmansoftware.com',
+          'Cf-Access-Authenticated-User-Email': 'John@Example.com',
+        },
+      });
+
+      expect(response.status).toBe(200);
+    } finally {
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      if (previousHosts === undefined) delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+      else process.env.ARCHON_OPERATOR_ACCESS_HOSTS = previousHosts;
+      if (previousEmails === undefined) delete process.env.ARCHON_OPERATOR_EMAILS;
+      else process.env.ARCHON_OPERATOR_EMAILS = previousEmails;
+    }
+  });
+
+  test('rejects spoofed Cloudflare Access email on non-operator host', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    const previousHosts = process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+    const previousEmails = process.env.ARCHON_OPERATOR_EMAILS;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    process.env.ARCHON_OPERATOR_ACCESS_HOSTS = 'ops.cauldron.thinmansoftware.com';
+    process.env.ARCHON_OPERATOR_EMAILS = 'john@example.com';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      const response = await app.request('/api/workflows', {
+        headers: {
+          Host: 'cauldron.thinmansoftware.com',
+          'Cf-Access-Authenticated-User-Email': 'john@example.com',
+        },
+      });
+
+      expect(response.status).toBe(401);
+    } finally {
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      if (previousHosts === undefined) delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+      else process.env.ARCHON_OPERATOR_ACCESS_HOSTS = previousHosts;
+      if (previousEmails === undefined) delete process.env.ARCHON_OPERATOR_EMAILS;
+      else process.env.ARCHON_OPERATOR_EMAILS = previousEmails;
+    }
+  });
+
   test('returns a flat workflows array from discoverWorkflows result', async () => {
     const app = createTestApp();
     registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);

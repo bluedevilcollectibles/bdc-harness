@@ -232,6 +232,13 @@ export interface WorkflowRunResponse {
   archive_reason: string | null;
 }
 
+export interface PublicWorkflowRunResponse {
+  status: WorkflowRunStatus;
+  started_at: string;
+  completed_at: string | null;
+  last_activity_at: string | null;
+}
+
 export interface WorkflowEventResponse {
   id: string;
   workflow_run_id: string;
@@ -473,6 +480,15 @@ export async function listWorkflowRuns(options?: {
   const qs = params.toString();
   const result = await fetchJSON<{ runs: WorkflowRunResponse[] }>(
     `/api/workflows/runs${qs ? `?${qs}` : ''}`
+  );
+  return result.runs;
+}
+
+export async function listPublicWorkflowRuns(limit = 20): Promise<PublicWorkflowRunResponse[]> {
+  const params = new URLSearchParams();
+  params.set('limit', String(limit));
+  const result = await fetchJSON<{ runs: PublicWorkflowRunResponse[] }>(
+    `/api/public/workflows/runs?${params.toString()}`
   );
   return result.runs;
 }
