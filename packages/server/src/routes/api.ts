@@ -1068,7 +1068,7 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 404 | 409 | 422 | 500,
+    status: 400 | 401 | 403 | 404 | 409 | 422 | 500 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -1090,7 +1090,102 @@ export function registerApiRoutes(
 
   // CORS for Web UI — allow-all is fine for a single-developer tool.
   // Override with WEB_UI_ORIGIN env var to restrict if exposing publicly.
+  function operatorAuthDisabled(): boolean {
+    return process.env.ARCHON_OPERATOR_AUTH_DISABLED === 'true';
+  }
+
+  function privateApiRequiresOperatorToken(): boolean {
+    return Boolean(process.env.ARCHON_OPERATOR_TOKEN) || process.env.NODE_ENV === 'production';
+  }
+
+  function isPublicApiPath(pathname: string): boolean {
+    return (
+      pathname === '/api/health' ||
+      pathname === '/api/openapi.json' ||
+      pathname.startsWith('/api/public/')
+    );
+  }
+
+  function getPresentedOperatorToken(c: Context): string | undefined {
+    const bearer = c.req
+      .header('authorization')
+      ?.match(/^Bearer\s+(.+)$/i)?.[1]
+      ?.trim();
+    return bearer || c.req.header('x-archon-operator-token')?.trim();
+  }
+
+  function envList(name: string): string[] {
+    return (process.env[name] ?? '')
+      .split(',')
+      .map(value => value.trim().toLowerCase())
+      .filter(Boolean);
+  }
+
+  function hostWithoutPort(host: string | undefined): string {
+    return (host ?? '').split(':')[0]?.toLowerCase() ?? '';
+  }
+
+  function isAllowedAccessEmail(c: Context): boolean {
+    const operatorHosts = envList('ARCHON_OPERATOR_ACCESS_HOSTS');
+    const operatorEmails = envList('ARCHON_OPERATOR_EMAILS');
+    if (operatorHosts.length === 0 || operatorEmails.length === 0) return false;
+
+    const host = hostWithoutPort(c.req.header('host'));
+    if (!operatorHosts.includes(host)) return false;
+
+    const email = c.req.header('cf-access-authenticated-user-email')?.trim().toLowerCase();
+    return Boolean(email && operatorEmails.includes(email));
+  }
+
+  function publicTimestamp(value: Date | string | null): string | null {
+    if (value === null) return null;
+    return value instanceof Date ? value.toISOString() : value;
+  }
+
+  function sanitizeWorkflowRunForPublic(run: WorkflowRun): {
+    status: WorkflowRun['status'];
+    started_at: string;
+    completed_at: string | null;
+    last_activity_at: string | null;
+  } {
+    return {
+      status: run.status,
+      started_at: publicTimestamp(run.started_at) ?? '',
+      completed_at: publicTimestamp(run.completed_at),
+      last_activity_at: publicTimestamp(run.last_activity_at),
+    };
+  }
+
   app.use('/api/*', cors({ origin: process.env.WEB_UI_ORIGIN || '*' }));
+
+  app.use('/api/*', async (c, next) => {
+    if (c.req.method === 'OPTIONS' || operatorAuthDisabled() || isPublicApiPath(c.req.path)) {
+      return next();
+    }
+
+    if (!privateApiRequiresOperatorToken()) {
+      return next();
+    }
+
+    if (isAllowedAccessEmail(c)) {
+      return next();
+    }
+
+    const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
+    if (!expectedToken) {
+      return apiError(
+        c,
+        503,
+        'Operator token is required but ARCHON_OPERATOR_TOKEN is not configured'
+      );
+    }
+
+    if (getPresentedOperatorToken(c) !== expectedToken) {
+      return apiError(c, 401, 'Missing or invalid operator token');
+    }
+
+    return next();
+  });
 
   // Shared lock/dispatch/error handling for message and workflow endpoints
   /** Maximum allowed upload size per file (10 MB) */
@@ -2040,6 +2135,19 @@ export function registerApiRoutes(
   // =========================================================================
   // Workflow endpoints
   // =========================================================================
+
+  // GET /api/public/workflows/runs - Portfolio-safe workflow run summary.
+  app.get('/api/public/workflows/runs', async c => {
+    try {
+      const rawLimit = Number.parseInt(c.req.query('limit') ?? '20', 10);
+      const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 50)) : 20;
+      const runs = await workflowDb.listWorkflowRuns({ limit });
+      return c.json({ runs: runs.map(sanitizeWorkflowRunForPublic) });
+    } catch (error) {
+      getLog().error({ err: error }, 'public_workflow_runs_failed');
+      return apiError(c, 500, 'Failed to list public workflow runs');
+    }
+  });
 
   // GET /api/workflows - Discover available workflows
   registerOpenApiRoute(getWorkflowsRoute, async c => {

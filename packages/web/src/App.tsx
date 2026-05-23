@@ -11,6 +11,7 @@ import { WorkflowsPage } from '@/routes/WorkflowsPage';
 import { WorkflowExecutionPage } from '@/routes/WorkflowExecutionPage';
 import { WorkflowBuilderPage } from '@/routes/WorkflowBuilderPage';
 import { SettingsPage } from '@/routes/SettingsPage';
+import { PublicCauldronPage } from '@/routes/PublicCauldronPage';
 
 interface ErrorBoundaryState {
   hasError: boolean;
@@ -61,24 +62,33 @@ class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryStat
 }
 
 export function App(): React.ReactElement {
+  const isPublicShowcaseHost = window.location.hostname === 'cauldron.thinmansoftware.com';
+
   return (
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>
         <ProjectProvider>
           <BrowserRouter>
-            <Routes>
-              <Route element={<Layout />}>
-                <Route path="/" element={<Navigate to="/chat" replace />} />
-                <Route path="/chat" element={<ChatPage />} />
-                <Route path="/chat/*" element={<ChatPage />} />
-                <Route path="/dashboard" element={<DashboardPage />} />
-                <Route path="/workflows" element={<WorkflowsPage />} />
-                <Route path="/workflows/builder" element={<WorkflowBuilderPage />} />
-                <Route path="/workflows/runs/:runId" element={<WorkflowExecutionPage />} />
-                <Route path="/workflows/runs" element={<Navigate to="/workflows" replace />} />
-                <Route path="/settings" element={<SettingsPage />} />
-              </Route>
-            </Routes>
+            {isPublicShowcaseHost ? (
+              <Routes>
+                <Route path="/" element={<PublicCauldronPage />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Routes>
+            ) : (
+              <Routes>
+                <Route path="/" element={<PublicCauldronPage />} />
+                <Route element={<Layout />}>
+                  <Route path="/chat" element={<ChatPage />} />
+                  <Route path="/chat/*" element={<ChatPage />} />
+                  <Route path="/dashboard" element={<DashboardPage />} />
+                  <Route path="/workflows" element={<WorkflowsPage />} />
+                  <Route path="/workflows/builder" element={<WorkflowBuilderPage />} />
+                  <Route path="/workflows/runs/:runId" element={<WorkflowExecutionPage />} />
+                  <Route path="/workflows/runs" element={<Navigate to="/workflows" replace />} />
+                  <Route path="/settings" element={<SettingsPage />} />
+                </Route>
+              </Routes>
+            )}
           </BrowserRouter>
         </ProjectProvider>
       </QueryClientProvider>
