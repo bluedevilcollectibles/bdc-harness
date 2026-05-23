@@ -233,10 +233,16 @@ export interface WorkflowRunResponse {
 }
 
 export interface PublicWorkflowRunResponse {
+  workflow_label: string;
   status: WorkflowRunStatus;
   started_at: string;
   completed_at: string | null;
   last_activity_at: string | null;
+  nodes: {
+    label: string;
+    status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+    updated_at: string;
+  }[];
 }
 
 export interface WorkflowEventResponse {

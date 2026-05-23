@@ -1142,17 +1142,100 @@ export function registerApiRoutes(
     return value instanceof Date ? value.toISOString() : value;
   }
 
-  function sanitizeWorkflowRunForPublic(run: WorkflowRun): {
+  type PublicWorkflowNodeStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+
+  interface PublicWorkflowNode {
+    label: string;
+    status: PublicWorkflowNodeStatus;
+    updated_at: string;
+  }
+
+  function publicTitleFromIdentifier(identifier: string | null | undefined): string {
+    const raw = (identifier ?? '').trim();
+    if (!raw) return 'Cauldron Workflow';
+
+    const words = raw
+      .replace(/[\\/]+/g, ' ')
+      .replace(/[^a-zA-Z0-9 _.-]+/g, ' ')
+      .split(/[-_.\s]+/)
+      .filter(Boolean)
+      .filter(word => !['bdc', 'archon', 'cauldron'].includes(word.toLowerCase()))
+      .filter(word => !/^wo$/i.test(word))
+      .filter(word => !/^[0-9a-f]{8,}$/i.test(word))
+      .slice(0, 8);
+
+    if (words.length === 0) return 'Cauldron Workflow';
+
+    return words
+      .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+      .join(' ')
+      .slice(0, 80);
+  }
+
+  function publicNodeStatusForEvent(eventType: string): PublicWorkflowNodeStatus | null {
+    switch (eventType) {
+      case 'node_started':
+      case 'step_started':
+        return 'running';
+      case 'node_completed':
+      case 'node_completed_with_warning':
+      case 'step_completed':
+        return 'completed';
+      case 'node_failed':
+      case 'step_failed':
+        return 'failed';
+      case 'node_skipped':
+      case 'step_skipped':
+        return 'skipped';
+      default:
+        return null;
+    }
+  }
+
+  function sanitizeWorkflowNodesForPublic(
+    events: Awaited<ReturnType<typeof workflowEventDb.listWorkflowEvents>>
+  ): PublicWorkflowNode[] {
+    const nodes = new Map<string, PublicWorkflowNode>();
+
+    for (const event of events) {
+      if (!event.step_name) continue;
+      const status = publicNodeStatusForEvent(event.event_type);
+      if (!status) continue;
+
+      const label = publicTitleFromIdentifier(event.step_name);
+      nodes.set(event.step_name, {
+        label,
+        status,
+        updated_at: publicTimestamp(event.created_at) ?? '',
+      });
+    }
+
+    return [...nodes.values()].slice(0, 8);
+  }
+
+  async function sanitizeWorkflowRunForPublic(run: WorkflowRun): Promise<{
+    workflow_label: string;
     status: WorkflowRun['status'];
     started_at: string;
     completed_at: string | null;
     last_activity_at: string | null;
-  } {
+    nodes: PublicWorkflowNode[];
+  }> {
+    let nodes: PublicWorkflowNode[] = [];
+    try {
+      const events = await workflowEventDb.listWorkflowEvents(run.id);
+      nodes = sanitizeWorkflowNodesForPublic(events);
+    } catch (error) {
+      getLog().warn({ err: error, runStatus: run.status }, 'public_workflow_nodes_unavailable');
+    }
+
     return {
+      workflow_label: publicTitleFromIdentifier(run.workflow_name),
       status: run.status,
       started_at: publicTimestamp(run.started_at) ?? '',
       completed_at: publicTimestamp(run.completed_at),
       last_activity_at: publicTimestamp(run.last_activity_at),
+      nodes,
     };
   }
 
@@ -2142,7 +2225,8 @@ export function registerApiRoutes(
       const rawLimit = Number.parseInt(c.req.query('limit') ?? '20', 10);
       const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 50)) : 20;
       const runs = await workflowDb.listWorkflowRuns({ limit });
-      return c.json({ runs: runs.map(sanitizeWorkflowRunForPublic) });
+      const publicRuns = await Promise.all(runs.map(sanitizeWorkflowRunForPublic));
+      return c.json({ runs: publicRuns });
     } catch (error) {
       getLog().error({ err: error }, 'public_workflow_runs_failed');
       return apiError(c, 500, 'Failed to list public workflow runs');
