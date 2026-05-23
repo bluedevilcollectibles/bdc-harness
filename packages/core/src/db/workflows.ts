@@ -887,6 +887,7 @@ export async function listWorkflowRuns(options?: {
   status?: WorkflowRunStatus | WorkflowRunStatus[];
   limit?: number;
   codebaseId?: string;
+  includeArchived?: boolean;
 }): Promise<WorkflowRun[]> {
   const whereClauses: string[] = [];
   const values: unknown[] = [];
@@ -909,6 +910,9 @@ export async function listWorkflowRuns(options?: {
     whereClauses.push(
       `conversation_id IN (SELECT id FROM remote_agent_conversations WHERE codebase_id = $${String(values.length)})`
     );
+  }
+  if (!options?.includeArchived) {
+    whereClauses.push('archived_at IS NULL');
   }
 
   const limit = options?.limit ?? 50;

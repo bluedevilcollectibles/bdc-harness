@@ -631,6 +631,15 @@ describe('workflows database', () => {
   });
 
   describe('listWorkflowRuns', () => {
+    test('excludes archived runs by default', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await listWorkflowRuns();
+
+      const [query] = mockQuery.mock.calls[0] as [string, unknown[]];
+      expect(query).toContain('archived_at IS NULL');
+    });
+
     test('filters by single status string', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([]));
 
