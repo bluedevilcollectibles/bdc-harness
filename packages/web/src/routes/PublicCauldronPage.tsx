@@ -1,6 +1,15 @@
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Activity, Flame, LockKeyhole, ShieldCheck, Workflow } from 'lucide-react';
+import {
+  Activity,
+  CheckCircle2,
+  Flame,
+  LockKeyhole,
+  PlayCircle,
+  ShieldCheck,
+  Workflow,
+  XCircle,
+} from 'lucide-react';
 import { listPublicWorkflowRuns, type PublicWorkflowRunResponse } from '@/lib/api';
 import { ensureUtc } from '@/lib/format';
 import type { WorkflowRunStatus } from '@/lib/types';
@@ -23,6 +32,14 @@ const statusClass: Record<WorkflowRunStatus, string> = {
   cancelled: 'border-text-tertiary/30 bg-surface-elevated text-text-secondary',
 };
 
+const nodeStatusClass: Record<PublicWorkflowRunResponse['nodes'][number]['status'], string> = {
+  pending: 'border-warning/30 bg-warning/10 text-warning',
+  running: 'border-primary/30 bg-primary/10 text-primary',
+  completed: 'border-success/30 bg-success/10 text-success',
+  failed: 'border-error/30 bg-error/10 text-error',
+  skipped: 'border-text-tertiary/30 bg-surface-elevated text-text-tertiary',
+};
+
 function formatDate(value: string | null): string {
   if (!value) return 'Not finished';
   return new Intl.DateTimeFormat(undefined, {
@@ -33,23 +50,50 @@ function formatDate(value: string | null): string {
   }).format(new Date(ensureUtc(value)));
 }
 
+function NodeIcon({
+  status,
+}: {
+  status: PublicWorkflowRunResponse['nodes'][number]['status'];
+}): React.ReactElement {
+  if (status === 'completed') return <CheckCircle2 className="h-3.5 w-3.5" />;
+  if (status === 'failed') return <XCircle className="h-3.5 w-3.5" />;
+  return <PlayCircle className="h-3.5 w-3.5" />;
+}
+
 function PublicRunRow({ run }: { run: PublicWorkflowRunResponse }): React.ReactElement {
   return (
-    <li className="grid gap-3 border-b border-border px-4 py-4 last:border-b-0 sm:grid-cols-[1fr_auto_auto] sm:items-center">
-      <div className="min-w-0">
-        <p className="truncate text-sm font-medium text-text-primary">Cauldron workflow</p>
-        <p className="mt-1 text-xs text-text-tertiary">
-          Started {formatDate(run.started_at)} · Updated {formatDate(run.last_activity_at)}
+    <li className="border-b border-border px-4 py-4 last:border-b-0">
+      <div className="grid gap-3 sm:grid-cols-[1fr_auto_auto] sm:items-center">
+        <div className="min-w-0">
+          <p className="truncate text-sm font-medium text-text-primary">{run.workflow_label}</p>
+          <p className="mt-1 text-xs text-text-tertiary">
+            Started {formatDate(run.started_at)} - Updated {formatDate(run.last_activity_at)}
+          </p>
+        </div>
+        <span
+          className={`w-fit rounded-full border px-2.5 py-1 text-xs font-medium ${statusClass[run.status]}`}
+        >
+          {statusLabel[run.status]}
+        </span>
+        <p className="text-xs text-text-tertiary sm:text-right">
+          Finished {formatDate(run.completed_at)}
         </p>
       </div>
-      <span
-        className={`w-fit rounded-full border px-2.5 py-1 text-xs font-medium ${statusClass[run.status]}`}
-      >
-        {statusLabel[run.status]}
-      </span>
-      <p className="text-xs text-text-tertiary sm:text-right">
-        Finished {formatDate(run.completed_at)}
-      </p>
+      {run.nodes.length > 0 ? (
+        <ol className="mt-3 flex flex-wrap gap-2">
+          {run.nodes.map((node, index) => (
+            <li
+              key={`${node.label}-${node.updated_at}-${index}`}
+              className={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${nodeStatusClass[node.status]}`}
+            >
+              <NodeIcon status={node.status} />
+              <span className="truncate">{node.label}</span>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="mt-3 text-xs text-text-tertiary">Waiting for node telemetry.</p>
+      )}
     </li>
   );
 }
@@ -130,15 +174,17 @@ export function PublicCauldronPage(): React.ReactElement {
         <div className="rounded-lg border border-border bg-surface shadow-2xl shadow-black/20">
           <div className="flex items-center justify-between border-b border-border px-4 py-3">
             <div>
-              <h2 className="text-sm font-semibold">Recent public run status</h2>
-              <p className="mt-1 text-xs text-text-tertiary">Sanitized metadata only</p>
+              <h2 className="text-sm font-semibold">Recent public workflow progress</h2>
+              <p className="mt-1 text-xs text-text-tertiary">
+                Sanitized workflow and node progress
+              </p>
             </div>
             <span className="rounded-full border border-border px-2.5 py-1 text-xs text-text-tertiary">
               live
             </span>
           </div>
           {isLoading ? (
-            <p className="px-4 py-10 text-sm text-text-secondary">Loading workflow status…</p>
+            <p className="px-4 py-10 text-sm text-text-secondary">Loading workflow status...</p>
           ) : isError ? (
             <p className="px-4 py-10 text-sm text-error">Unable to load public run status.</p>
           ) : runs.length === 0 ? (

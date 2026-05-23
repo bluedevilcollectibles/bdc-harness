@@ -774,6 +774,7 @@ describe('POST /api/workflows/runs/:runId/approve', () => {
 describe('GET /api/workflows/runs', () => {
   beforeEach(() => {
     mockListWorkflowRuns.mockReset();
+    mockListWorkflowEvents.mockReset();
   });
 
   test('requires operator token when ARCHON_OPERATOR_TOKEN is configured', async () => {
@@ -819,15 +820,49 @@ describe('GET /api/workflows/runs', () => {
     }
   });
 
-  test('public workflow runs endpoint returns sanitized fields without a token', async () => {
+  test('public workflow runs endpoint returns sanitized workflow and node progress without a token', async () => {
     const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
     process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
     mockListWorkflowRuns.mockImplementationOnce(async () => [
       {
         ...MOCK_RUNNING_RUN,
+        workflow_name: 'bdc-feature-development',
         metadata: { cost_usd: 12.34, prompt: 'private prompt' },
         user_message: 'ship the secret thing',
         working_path: 'C:/Users/pcmed/private/worktree',
+      },
+    ]);
+    mockListWorkflowEvents.mockImplementationOnce(async () => [
+      {
+        id: 'evt-secret-1',
+        workflow_run_id: 'run-uuid-1',
+        event_type: 'node_started',
+        step_index: 0,
+        step_name: 'read-spec',
+        data: {
+          prompt: 'private node prompt',
+          node_output: 'private node output',
+          working_path: 'C:/Users/pcmed/private/worktree',
+        },
+        created_at: NOW,
+      },
+      {
+        id: 'evt-secret-2',
+        workflow_run_id: 'run-uuid-1',
+        event_type: 'node_completed',
+        step_index: 0,
+        step_name: 'read-spec',
+        data: { costUsd: 99, node_output: 'private node output' },
+        created_at: NOW,
+      },
+      {
+        id: 'evt-secret-3',
+        workflow_run_id: 'run-uuid-1',
+        event_type: 'node_started',
+        step_index: 1,
+        step_name: 'implement-fix',
+        data: { tool_input: { file_path: 'C:/Users/pcmed/private/source.ts' } },
+        created_at: NOW,
       },
     ]);
     try {
@@ -838,20 +873,39 @@ describe('GET /api/workflows/runs', () => {
       const body = (await response.json()) as { runs: Array<Record<string, unknown>> };
       expect(body.runs).toEqual([
         {
+          workflow_label: 'Feature Development',
           status: 'running',
           started_at: MOCK_RUNNING_RUN.started_at,
           completed_at: null,
           last_activity_at: MOCK_RUNNING_RUN.last_activity_at,
+          nodes: [
+            {
+              label: 'Read Spec',
+              status: 'completed',
+              updated_at: NOW,
+            },
+            {
+              label: 'Implement Fix',
+              status: 'running',
+              updated_at: NOW,
+            },
+          ],
         },
       ]);
       expect(JSON.stringify(body)).not.toContain('run-uuid-1');
       expect(JSON.stringify(body)).not.toContain('conv-uuid-1');
       expect(JSON.stringify(body)).not.toContain('cb-uuid-1');
+      expect(JSON.stringify(body)).not.toContain('evt-secret');
+      expect(JSON.stringify(body)).not.toContain('workflow_run_id');
       expect(JSON.stringify(body)).not.toContain('private prompt');
+      expect(JSON.stringify(body)).not.toContain('private node prompt');
+      expect(JSON.stringify(body)).not.toContain('private node output');
       expect(JSON.stringify(body)).not.toContain('deploy');
       expect(JSON.stringify(body)).not.toContain('ship the secret thing');
       expect(JSON.stringify(body)).not.toContain('private/worktree');
       expect(JSON.stringify(body)).not.toContain('cost_usd');
+      expect(JSON.stringify(body)).not.toContain('costUsd');
+      expect(JSON.stringify(body)).not.toContain('tool_input');
     } finally {
       if (previousToken === undefined) {
         delete process.env.ARCHON_OPERATOR_TOKEN;
