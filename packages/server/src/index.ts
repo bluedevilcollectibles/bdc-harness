@@ -609,7 +609,21 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     }
 
     app.use('/assets/*', serveStatic({ root: webDistPath }));
+    app.use('/brand/*', serveStatic({ root: webDistPath }));
     app.use('/favicon.png', serveStatic({ root: webDistPath, path: 'favicon.png' }));
+    app.use('/favicon-32.png', serveStatic({ root: webDistPath, path: 'favicon-32.png' }));
+    app.use(
+      '/apple-touch-icon.png',
+      serveStatic({ root: webDistPath, path: 'apple-touch-icon.png' })
+    );
+    app.use(
+      '/cauldron-icon-192.png',
+      serveStatic({ root: webDistPath, path: 'cauldron-icon-192.png' })
+    );
+    app.use(
+      '/cauldron-icon-512.png',
+      serveStatic({ root: webDistPath, path: 'cauldron-icon-512.png' })
+    );
     // SPA fallback - serve index.html for unmatched routes (after all API routes)
     app.get('*', serveStatic({ root: webDistPath, path: 'index.html' }));
   }
