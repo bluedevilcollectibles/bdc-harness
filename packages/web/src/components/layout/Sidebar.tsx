@@ -178,7 +178,7 @@ export function Sidebar(): React.ReactElement {
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary">
             <span className="text-sm font-semibold text-primary-foreground">A</span>
           </div>
-          <span className="text-base font-semibold text-text-primary">Archon</span>
+          <span className="text-base font-semibold text-text-primary">Cauldron</span>
         </Link>
       </div>
 
