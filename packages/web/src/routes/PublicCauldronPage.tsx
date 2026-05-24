@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import {
   Activity,
   CheckCircle2,
+  HelpCircle,
   Flame,
   LockKeyhole,
   PlayCircle,
@@ -13,6 +14,7 @@ import {
 import { listPublicWorkflowRuns, type PublicWorkflowRunResponse } from '@/lib/api';
 import { ensureUtc } from '@/lib/format';
 import type { WorkflowRunStatus } from '@/lib/types';
+import { getWorkflowStepHelp } from '@/lib/workflow-step-descriptions';
 import codeCauldronHero from '@/assets/code-cauldron-hero.png';
 
 const statusLabel: Record<WorkflowRunStatus, string> = {
@@ -61,6 +63,39 @@ function NodeIcon({
   return <PlayCircle className="h-3.5 w-3.5" />;
 }
 
+function PublicNodePill({
+  node,
+  tooltipId,
+}: {
+  node: PublicWorkflowRunResponse['nodes'][number];
+  tooltipId: string;
+}): React.ReactElement {
+  const help = getWorkflowStepHelp({
+    nodeId: node.label,
+    label: node.label,
+  });
+
+  return (
+    <li
+      className={`group relative inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${nodeStatusClass[node.status]}`}
+      title={`${help.title}: ${help.body}`}
+      aria-describedby={tooltipId}
+    >
+      <NodeIcon status={node.status} />
+      <span className="truncate">{node.label}</span>
+      <HelpCircle className="h-3 w-3 shrink-0 opacity-70" aria-hidden="true" />
+      <span
+        id={tooltipId}
+        role="tooltip"
+        className="pointer-events-none absolute left-1/2 top-full z-50 mt-2 hidden w-64 -translate-x-1/2 rounded-md border border-border bg-surface px-3 py-2 text-left text-text-secondary shadow-xl group-hover:block group-focus-within:block"
+      >
+        <span className="block text-[11px] font-semibold text-text-primary">{help.title}</span>
+        <span className="mt-1 block text-[11px] leading-5">{help.body}</span>
+      </span>
+    </li>
+  );
+}
+
 function PublicRunRow({ run }: { run: PublicWorkflowRunResponse }): React.ReactElement {
   return (
     <li className="border-b border-border px-4 py-4 last:border-b-0">
@@ -83,13 +118,11 @@ function PublicRunRow({ run }: { run: PublicWorkflowRunResponse }): React.ReactE
       {run.nodes.length > 0 ? (
         <ol className="mt-3 flex flex-wrap gap-2">
           {run.nodes.map((node, index) => (
-            <li
+            <PublicNodePill
               key={`${node.label}-${node.updated_at}-${index}`}
-              className={`inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${nodeStatusClass[node.status]}`}
-            >
-              <NodeIcon status={node.status} />
-              <span className="truncate">{node.label}</span>
-            </li>
+              node={node}
+              tooltipId={`public-node-help-${run.started_at.replace(/[^a-zA-Z0-9]/g, '-')}-${index}`}
+            />
           ))}
         </ol>
       ) : (

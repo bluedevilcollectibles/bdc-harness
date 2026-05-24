@@ -67,11 +67,14 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
     isWarning && data.warningStatusLine
       ? `Silent failure detected${data.warningLoadBearing ? ' (load-bearing node)' : ' (always-dangerous pattern)'}\n${data.warningStatusLine}`
       : undefined;
+  const tooltipTitle = `${help.title}: ${help.body}${
+    data.agentPersona ? `\nPersona: ${data.agentPersona}` : ''
+  }${warningTitle ? `\n\n${warningTitle}` : ''}`;
 
   return (
     <div
       className={`group relative rounded-lg border border-border px-3 py-2 min-w-[140px] transition-all duration-300 ${style}${data.selected ? ' ring-2 ring-accent-bright' : ''}`}
-      title={warningTitle}
+      title={tooltipTitle}
       aria-label={`${help.title}. ${help.body}`}
     >
       <Handle type="target" position={Position.Top} className="!bg-border !w-2 !h-2" />
