@@ -482,7 +482,11 @@ export async function validateWorkflowResources(
     }
 
     // --- Agent persona: check .archon/agents/<name>.md exists and is valid ---
-    const agentName = 'agent' in node ? (node as { agent?: string }).agent : undefined;
+    // `persona:` is the human-facing alias for `agent:` — both resolve identically.
+    // If both are set, schema parse (dagNodeSchema) already enforced they agree.
+    const nodeAgentRef = node as { agent?: string; persona?: string };
+    const agentName = nodeAgentRef.agent ?? nodeAgentRef.persona;
+    const agentField = nodeAgentRef.agent !== undefined ? 'agent' : 'persona';
     if (agentName) {
       const agentFilePath = join(cwd, '.archon', 'agents', `${agentName}.md`);
       const agentExists = await fileExists(agentFilePath);
@@ -490,9 +494,9 @@ export async function validateWorkflowResources(
         issues.push({
           level: 'error',
           nodeId: node.id,
-          field: 'agent',
+          field: agentField,
           message: `Agent '${agentName}' not found: .archon/agents/${agentName}.md does not exist`,
-          hint: `Create .archon/agents/${agentName}.md with name, model, and system prompt frontmatter`,
+          hint: `Create .archon/agents/${agentName}.md with name, model, and system prompt frontmatter (referenced via '${agentField}:')`,
         });
       } else {
         // Validate the agent file itself (catches model/tool errors at workflow-load time)
@@ -503,7 +507,7 @@ export async function validateWorkflowResources(
           issues.push({
             level: 'error',
             nodeId: node.id,
-            field: 'agent',
+            field: agentField,
             message: `Agent file '${agentName}' failed validation: ${err.message}`,
             hint: 'Fix the agent file frontmatter (name, model, tools) and ensure the body is non-empty',
           });
