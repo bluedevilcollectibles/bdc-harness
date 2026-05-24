@@ -169,17 +169,17 @@ export function PublicCauldronPage(): React.ReactElement {
               <p className="mt-1 text-xs text-text-tertiary">Private fields exposed</p>
             </div>
           </div>
-        </div>
 
-        <div className="flex flex-col gap-4">
-          <div className="overflow-hidden rounded-lg border border-primary/25 bg-surface shadow-2xl shadow-primary/10">
+          <div className="mt-7 overflow-hidden rounded-lg border border-primary/25 bg-surface shadow-2xl shadow-primary/10">
             <img
               src="/brand/code-cauldron-hero.png"
               alt="Code Cauldron visual showing work orders, repo maps, rules, personas, tests, and approvals brewing into PR evidence."
               className="aspect-[1491/1055] w-full object-cover"
             />
           </div>
+        </div>
 
+        <div className="flex flex-col gap-4">
           <div className="rounded-lg border border-border bg-surface shadow-2xl shadow-black/20">
             <div className="flex items-center justify-between border-b border-border px-4 py-3">
               <div>
