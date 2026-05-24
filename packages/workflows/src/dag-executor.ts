@@ -486,7 +486,9 @@ async function resolveNodeProviderAndModel(
     );
   }
 
-  // Resolve agent persona (if node declares agent:)
+  // Resolve agent persona (if node declares `agent:` or `persona:`).
+  // `persona:` is the human-facing alias for `agent:` — both resolve identically.
+  // If both are set they must agree (enforced at parse time by dagNodeSchema).
   // The persona's model overrides the node-resolved model; its system prompt is
   // prepended to any node-level systemPrompt; its tools list (if present) is
   // used as allowed_tools (node-level allowed_tools take precedence if set).
@@ -494,7 +496,8 @@ async function resolveNodeProviderAndModel(
   let effectiveSystemPrompt = node.systemPrompt;
   let effectiveAllowedTools = node.allowed_tools;
 
-  const agentName = 'agent' in node ? (node as { agent?: string }).agent : undefined;
+  const nodeAgentRef = node as { agent?: string; persona?: string };
+  const agentName = nodeAgentRef.agent ?? nodeAgentRef.persona;
   if (agentName) {
     const registry = await getAgentRegistry(cwd);
     const persona = resolveAgent(agentName, registry);
@@ -1969,11 +1972,16 @@ async function executeLoopNode(
     workflowLevelOptions
   );
 
-  // Resolve agent persona for loop node (if agent: is declared).
+  // Resolve agent persona for loop node (if `agent:` or `persona:` is declared).
+  // `persona:` is the human-facing alias for `agent:` — both resolve identically.
   // Applied to every iteration — same semantics as prompt/command nodes:
   // persona model overrides the loop-resolved model; persona system prompt is
   // prepended to any node-level systemPrompt.
-  const loopAgentName = (node as { agent?: string }).agent;
+  // Note: the loop path does NOT call loadContext (wiki + oracle) today;
+  // that pre-existing gap is tracked separately and is out of scope for the
+  // persona-alias WO (preserve current loop behavior identically).
+  const loopAgentRef = node as { agent?: string; persona?: string };
+  const loopAgentName = loopAgentRef.agent ?? loopAgentRef.persona;
   if (loopAgentName) {
     const registry = await getAgentRegistry(cwd);
     const persona = resolveAgent(loopAgentName, registry);

@@ -165,6 +165,19 @@ export const dagNodeBaseSchema = z.object({
   sandbox: sandboxSettingsSchema.optional(),
   agent: z.string().min(1, "'agent' must be a non-empty string").optional(),
   /**
+   * Human-facing alias for `agent:` — resolved identically by the executor and
+   * validator (see WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01).
+   *
+   * If both `agent:` and `persona:` are set on the same node they MUST agree;
+   * conflicting values are rejected at parse time by superRefine (fail-closed,
+   * no silent precedence). Either field alone resolves to the same persona;
+   * setting both is permitted only to make a node self-documenting.
+   *
+   * Loader emits `*_node_ai_fields_ignored` warnings if `persona:` appears on
+   * a non-AI node (bash, script, approval, cancel) — same treatment as `agent:`.
+   */
+  persona: z.string().min(1, "'persona' must be a non-empty string").optional(),
+  /**
    * WO-170 (depends on WO-167 doctrine, not yet merged): mark this node as
    * "load-bearing" — its output (commit-and-push, registry write, etc.) is
    * critical to overall workflow success. When true, the DAG executor scans
@@ -357,6 +370,7 @@ export const BASH_NODE_AI_FIELDS: readonly string[] = [
   'betas',
   'sandbox',
   'agent',
+  'persona',
 ];
 
 /** AI-specific fields that are meaningless on script nodes — same as bash nodes */
@@ -364,11 +378,12 @@ export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
 
 /**
  * AI-specific fields that are unsupported on loop nodes.
- * `model`, `provider`, and `agent` are excluded — the DAG executor resolves
- * and forwards them to each iteration's AI call.
+ * `model`, `provider`, `agent`, and `persona` are excluded — the DAG executor
+ * resolves and forwards them to each iteration's AI call. `persona` is the
+ * human-facing alias for `agent` (see dagNodeBaseSchema).
  */
 export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter(
-  f => f !== 'model' && f !== 'provider' && f !== 'agent'
+  f => f !== 'model' && f !== 'provider' && f !== 'agent' && f !== 'persona'
 );
 
 // ---------------------------------------------------------------------------
@@ -542,6 +557,16 @@ export const dagNodeSchema = dagNodeBaseSchema
         path: ['idle_timeout'],
       });
     }
+
+    // persona/agent conflict: both fields allowed only if they agree.
+    // Fail-closed: no silent precedence (see WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01).
+    if (data.persona !== undefined && data.agent !== undefined && data.persona !== data.agent) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `'persona' ('${data.persona}') and 'agent' ('${data.agent}') must agree — they resolve to the same persona. Set only one, or set both to the same value.`,
+        path: ['persona'],
+      });
+    }
   })
   .transform((data): DagNode => {
     const id = data.id.trim();
@@ -583,6 +608,7 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.betas !== undefined ? { betas: data.betas } : {}),
       ...(data.sandbox !== undefined ? { sandbox: data.sandbox } : {}),
       ...(data.agent !== undefined ? { agent: data.agent } : {}),
+      ...(data.persona !== undefined ? { persona: data.persona } : {}),
     };
 
     if (data.command !== undefined && data.command.trim().length > 0) {
@@ -622,6 +648,7 @@ export const dagNodeSchema = dagNodeBaseSchema
     return {
       ...base,
       ...(data.agent !== undefined ? { agent: data.agent } : {}),
+      ...(data.persona !== undefined ? { persona: data.persona } : {}),
       loop: data.loop,
     } as LoopNode;
   })
