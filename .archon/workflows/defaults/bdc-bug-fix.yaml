@@ -138,7 +138,7 @@ nodes:
       Hardcoded Rule 20 staging-gate repos:
       - bluedevilcollectibles/lspro-react
       - bluedevilcollectibles/shopops-storefront
-      - bluedevilcollectibles/shopops/
+      - bluedevilcollectibles/shopops
 
       For those repos, use a feature branch plus PR and require the staging gate.
       For other code repos, use feature branch plus PR without staging gate.
@@ -320,7 +320,7 @@ nodes:
       Match the extracted repo against this hardcoded staging-gate list:
       - bluedevilcollectibles/lspro-react
       - bluedevilcollectibles/shopops-storefront
-      - bluedevilcollectibles/shopops/
+      - bluedevilcollectibles/shopops
 
       If the repo matches one of those entries, output:
       push_target: feature-branch:<spec-derived-branch-name>

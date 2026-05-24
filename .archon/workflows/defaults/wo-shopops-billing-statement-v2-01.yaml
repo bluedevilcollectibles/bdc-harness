@@ -27,24 +27,24 @@
 #      If missing: Archon Dashboard -> Projects -> "+ Add Project"
 #        Name: bluedevilcollectibles/shopops
 #        Repository URL: https://github.com/bluedevilcollectibles/shopops
-#        Default branch: master
+#        Default branch: staging
 #   2. WO spec exists on bdc-xo main:
 #      gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/WO-SHOPOPS-BILLING-STATEMENT-V2-01.md?ref=main" --jq .name
 #      Expected: "WO-SHOPOPS-BILLING-STATEMENT-V2-01.md"
 #   3. GITHUB_TOKEN in Archon executor has push scope to bluedevilcollectibles/shopops.
-#   4. shopops master branch exists: git ls-remote --heads <url> master
-#   5. Rule 19 reminder: after PR merges to master, operator MUST rebuild + restart shopops-api container:
+#   4. shopops staging branch exists: git ls-remote --heads <url> staging
+#   5. Rule 19 reminder: after John promotes the staged PR, operator MUST rebuild + restart shopops-api container:
 #      ssh hetzner-prod "cd /opt/bdc/shopops && docker compose pull && docker compose up -d shopops-api"
 #      Then run the docker exec grep assertions from the manifest to prove source is live.
 #
 # Deploy:
-#   bash BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-SHOPOPS-BILLING-STATEMENT-V2-01.yaml
+#   bash BDC_XO/scripts/archon-bridge/sync-workflows.sh wo-shopops-billing-statement-v2-01.yaml
 #   After sync, verify: curl -s https://archon.bluedevilcollectibles.com/api/workflows | python -c \
 #     "import sys,json; print([w['workflow']['name'] for w in json.load(sys.stdin)['workflows']])"
 #   Expected: 'bdc-shopops-billing-statement-v2-01' in output.
 #
 # REVIEW BEFORE DEPLOY — human verifies: grep assertions match actual file paths, test
-# command matches shopops-api runner (node tests/run_all.js), Notion page ID correct,
+# command matches shopops-api runner (cd shopops-api && node tests/run_all.js), Notion page ID correct,
 # Rule 19 docker exec paths match deployed container layout.
 
 name: bdc-shopops-billing-statement-v2-01
@@ -61,11 +61,11 @@ description: |
       as NEW named exports alongside the existing assertBillingSource (DO NOT replace).
     - Extends lib/billing/errors.js with BillingCutoverError + PaymentChannelInvalidError.
     - Mounts /statements/v2 router in index.js BEFORE existing /statements mounts.
-    - Runs: node tests/run_all.js (all tests pass).
-    - Commits, pushes feature branch, opens PR to master.
+    - Runs: cd shopops-api && node tests/run_all.js (all tests pass).
+    - Commits, pushes feature branch, opens PR to staging.
     - Provides Rule 19 docker exec grep evidence in manifest.
     - Flips Notion WO-SHOPOPS-BILLING-STATEMENT-V2-01 to REVIEW with manifest in Notes.
-  Repo: bluedevilcollectibles/shopops (master branch — NOT staging; shopops uses master).
+  Repo: bluedevilcollectibles/shopops (staging branch — Rule 20 staging-gate repo).
   WO class: CODE (single-repo, schema migration + new routes).
   Gate: ShopOps Recovery Checklist — Gate 8 (BDC weekly billing path).
   parallel_ok: false
@@ -95,7 +95,7 @@ nodes:
       fi
       echo "preflight-github-auth PASS"
       echo "TARGET_REPO=bluedevilcollectibles/shopops"
-      echo "TARGET_BRANCH=master"
+      echo "TARGET_BRANCH=staging"
 
   # ─── Node 2: Read spec (cross-repo via gh api from bdc-xo) ──────────────────
   # Rule 4: paths relative to bdc-xo repo root (no BDC_XO/ prefix).
@@ -155,20 +155,20 @@ nodes:
       printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nWORKFLOW_ID=%s\n\n' "$WO_ID" "$SPEC_PATH" "$WORKFLOW_ID"
       printf -- '--- SPEC ---\n%s\n' "$SPEC_CONTENT"
 
-  # ─── Node 3: Fresh branch from master ───────────────────────────────────────
-  # shopops uses master (not main). Always branch fresh from master HEAD.
+  # ─── Node 3: Fresh branch from staging ──────────────────────────────────────
+  # Rule 20 staging-gate repos branch fresh from staging HEAD.
   - id: fresh-branch
     depends_on: [read-spec]
     bash: |
       set -euo pipefail
-      git fetch origin master --depth=50 || true
-      git checkout master 2>/dev/null || echo "master branch held by worktree; staying on current HEAD"
-      git reset --hard origin/master 2>/dev/null || true
+      git fetch origin staging --depth=50 || true
+      git checkout staging 2>/dev/null || echo "staging branch held by worktree; staying on current HEAD"
+      git reset --hard origin/staging 2>/dev/null || true
       # Rule 2: branch suffix uses runtime date, NOT $WORKFLOW_ID (bash substitution-time).
       BRANCH="wo/shopops-billing-statement-v2-01-run-$(date +%Y%m%d%H%M%S)"
       git checkout -b "$BRANCH"
       echo "BRANCH=${BRANCH}"
-      echo "BASE=master"
+      echo "BASE=staging"
       echo "REPO=bluedevilcollectibles/shopops"
 
   # ─── Node 4: Implement (self-review loop) ───────────────────────────────────
@@ -267,7 +267,7 @@ nodes:
         - pull_list_allocations (old table) must NOT be referenced in assertBillingSourceV2.
 
         ## Tests
-        After implementation, run: node tests/run_all.js
+        After implementation, run: cd shopops-api && node tests/run_all.js
         All tests must pass. Fix any failures before emitting COMPLETE.
         Also write a test file tests/statements-v2.test.js with at least 7 tests covering:
           1. POST /statements/v2 happy path (201, billing_statements created, allocations INVOICED)
@@ -287,9 +287,9 @@ nodes:
           billing_statements new columns, statement_payments new columns, ISSUED status widen
         - routes/statements-v2.js: /statements/v2 route family (POST create, GET list,
           GET ready, GET :id, PATCH issue, PATCH reconcile, PATCH void)
-        - lib/billing/assert-billing-source.js: +assertBillingSourceV2 +assertBillingCutover
+        - shopops-api/lib/billing/assert-billing-source.js: +assertBillingSourceV2 +assertBillingCutover
           (assertBillingSource retained unchanged for routes/invoices.js compat)
-        - lib/billing/errors.js: +BillingCutoverError +PaymentChannelInvalidError
+        - shopops-api/lib/billing/errors.js: +BillingCutoverError +PaymentChannelInvalidError
         - index.js: mount /statements/v2 BEFORE /statements
 
         Co-Authored-By: Claude Sonnet (Cauldron bdc-shopops-billing-statement-v2-01) <noreply@anthropic.com>"
@@ -314,27 +314,27 @@ nodes:
       echo "=== WO-SHOPOPS-BILLING-STATEMENT-V2-01 grep assertions ==="
 
       # Stop 2: assertBillingSourceV2 present in assert-billing-source.js
-      ASSERT_COUNT=$(grep -c "assertBillingSourceV2" lib/billing/assert-billing-source.js)
+      ASSERT_COUNT=$(grep -c "assertBillingSourceV2" shopops-api/lib/billing/assert-billing-source.js)
       [ "$ASSERT_COUNT" -ge 1 ] || (echo "FAIL: assertBillingSourceV2 not found in assert-billing-source.js" >&2; exit 1)
       echo "assertBillingSourceV2 count: $ASSERT_COUNT (>= 1 required) PASS"
 
       # Stop 2: both old + new function names present (>= 2 total assertBillingSource references)
-      BOTH_COUNT=$(grep -c "assertBillingSource" lib/billing/assert-billing-source.js)
+      BOTH_COUNT=$(grep -c "assertBillingSource" shopops-api/lib/billing/assert-billing-source.js)
       [ "$BOTH_COUNT" -ge 2 ] || (echo "FAIL: assertBillingSource appears fewer than 2 times (old+new required)" >&2; exit 1)
       echo "assertBillingSource total count: $BOTH_COUNT (>= 2 required) PASS"
 
       # Stop 2: assertBillingCutover present
-      CUTOVER_COUNT=$(grep -c "assertBillingCutover" lib/billing/assert-billing-source.js)
+      CUTOVER_COUNT=$(grep -c "assertBillingCutover" shopops-api/lib/billing/assert-billing-source.js)
       [ "$CUTOVER_COUNT" -ge 1 ] || (echo "FAIL: assertBillingCutover not found" >&2; exit 1)
       echo "assertBillingCutover count: $CUTOVER_COUNT (>= 1 required) PASS"
 
       # Stop 2: BILLING_CUTOVER_GATE referenced in assert-billing-source.js
-      GATE_COUNT=$(grep -c "BILLING_CUTOVER_GATE" lib/billing/assert-billing-source.js)
+      GATE_COUNT=$(grep -c "BILLING_CUTOVER_GATE" shopops-api/lib/billing/assert-billing-source.js)
       [ "$GATE_COUNT" -ge 1 ] || (echo "FAIL: BILLING_CUTOVER_GATE not found in assert-billing-source.js" >&2; exit 1)
       echo "BILLING_CUTOVER_GATE count: $GATE_COUNT (>= 1 required) PASS"
 
       # Stop 2: assertBillingSourceV2 must NOT reference pull_list_allocations (legacy table)
-      LEGACY_COUNT=$(grep -c "pull_list_allocations" lib/billing/assert-billing-source.js || true)
+      LEGACY_COUNT=$(grep -c "pull_list_allocations" shopops-api/lib/billing/assert-billing-source.js || true)
       [ "$LEGACY_COUNT" -eq 0 ] || (echo "FAIL: pull_list_allocations found in assert-billing-source.js (forbidden in v2 path)" >&2; exit 1)
       echo "pull_list_allocations count: $LEGACY_COUNT (== 0 required) PASS"
 
@@ -372,11 +372,11 @@ nodes:
       echo "SHOW_PICKUP count: $SHOW_PICKUP (== 0 required) PASS"
 
       # errors.js — both new error classes present
-      BILLING_CUTOVER_ERR=$(grep -c "BillingCutoverError" lib/billing/errors.js)
+      BILLING_CUTOVER_ERR=$(grep -c "BillingCutoverError" shopops-api/lib/billing/errors.js)
       [ "$BILLING_CUTOVER_ERR" -ge 1 ] || (echo "FAIL: BillingCutoverError not in errors.js" >&2; exit 1)
       echo "BillingCutoverError in errors.js: $BILLING_CUTOVER_ERR (>= 1 required) PASS"
 
-      PAYMENT_CHAN_ERR=$(grep -c "PaymentChannelInvalidError" lib/billing/errors.js)
+      PAYMENT_CHAN_ERR=$(grep -c "PaymentChannelInvalidError" shopops-api/lib/billing/errors.js)
       [ "$PAYMENT_CHAN_ERR" -ge 1 ] || (echo "FAIL: PaymentChannelInvalidError not in errors.js" >&2; exit 1)
       echo "PaymentChannelInvalidError in errors.js: $PAYMENT_CHAN_ERR (>= 1 required) PASS"
 
@@ -384,7 +384,7 @@ nodes:
       echo "=== All grep assertions PASS ==="
 
   # ─── Node 6: Run tests ──────────────────────────────────────────────────────
-  # shopops-api test runner is node tests/run_all.js (per CLAUDE.md + bdc-template-shopops-api).
+  # shopops-api test runner runs from the shopops-api subdirectory.
   - id: verify-tests
     depends_on: [implement]
     bash: |
@@ -396,8 +396,9 @@ nodes:
       else
         echo "WARN: tests/statements-v2.test.js not found; implement loop may have skipped test authoring"
       fi
+      cd shopops-api
       node tests/run_all.js
-      echo "node tests/run_all.js PASS"
+      echo "cd shopops-api && node tests/run_all.js PASS"
 
   # ─── Node 7: Backstop commit-and-push ──────────────────────────────────────
   # Idempotent — if implement loop already committed + pushed, this is a no-op.
@@ -438,7 +439,7 @@ nodes:
       echo "SHA=$(git rev-parse HEAD)"
 
   # ─── Node 8: Open PR ────────────────────────────────────────────────────────
-  # PR base = master (shopops uses master, not staging for this WO per spec §10).
+  # PR base = staging for Rule 20 staging-gate repos.
   # Idempotent: checks for existing PR before attempting creation.
   - id: open-pr
     depends_on: [commit-and-push]
@@ -448,7 +449,7 @@ nodes:
       WO_ID="WO-SHOPOPS-BILLING-STATEMENT-V2-01"
       REPO="bluedevilcollectibles/shopops"
       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-      BASE="master"
+      BASE="staging"
       TITLE="feat(shopops-api): WO-SHOPOPS-BILLING-STATEMENT-V2-01 — billing statement v2 (WhatNot pull-list path)"
 
       # Idempotent: check for existing open PR
@@ -475,9 +476,9 @@ nodes:
         echo "  GET ready, GET :id, PATCH issue, PATCH reconcile, PATCH void)."
         echo ""
         echo "## Files modified"
-        echo "- \`lib/billing/assert-billing-source.js\` — +assertBillingSourceV2 +assertBillingCutover"
+        echo "- \`shopops-api/lib/billing/assert-billing-source.js\` — +assertBillingSourceV2 +assertBillingCutover"
         echo "  (assertBillingSource retained unchanged for routes/invoices.js compat)."
-        echo "- \`lib/billing/errors.js\` — +BillingCutoverError +PaymentChannelInvalidError."
+        echo "- \`shopops-api/lib/billing/errors.js\` — +BillingCutoverError +PaymentChannelInvalidError."
         echo "- \`index.js\` — mount /statements/v2 BEFORE /statements mounts."
         echo ""
         echo "## Rule 19 — Runtime verification required after merge"
@@ -537,31 +538,31 @@ nodes:
        - shopops/tests/statements-v2.test.js
 
       Files modified:
-       - shopops/lib/billing/assert-billing-source.js (+assertBillingSourceV2, +assertBillingCutover; assertBillingSource retained)
-       - shopops/lib/billing/errors.js (+BillingCutoverError, +PaymentChannelInvalidError)
+       - shopops/shopops-api/lib/billing/assert-billing-source.js (+assertBillingSourceV2, +assertBillingCutover; assertBillingSource retained)
+       - shopops/shopops-api/lib/billing/errors.js (+BillingCutoverError, +PaymentChannelInvalidError)
        - shopops/index.js (mount /statements/v2 before /statements)
 
-      Tests: [fill from verify-tests.output — format: N/N (node tests/run_all.js)]
+      Tests: [fill from verify-tests.output — format: N/N (cd shopops-api && node tests/run_all.js)]
 
       PRs: [fill from open-pr.output — format: repo/PR URL (merged: timestamp, commit: sha)]
 
       Merge ancestors:
-       - shopops master HEAD: [fill from commit-and-push.output SHA] | manifest commit: [same] | behind_by: 0
+       - shopops staging HEAD: [fill from commit-and-push.output SHA] | manifest commit: [same] | behind_by: 0
 
       Grep assertions:
-       - shopops: grep -c "assertBillingSourceV2" lib/billing/assert-billing-source.js && [ $(grep -c "assertBillingSourceV2" lib/billing/assert-billing-source.js) -ge 1 ]
-       - shopops: grep -c "assertBillingSource" lib/billing/assert-billing-source.js && [ $(grep -c "assertBillingSource" lib/billing/assert-billing-source.js) -ge 2 ]
-       - shopops: grep -c "pull_list_allocations" lib/billing/assert-billing-source.js && [ $(grep -c "pull_list_allocations" lib/billing/assert-billing-source.js 2>/dev/null || echo 0) -eq 0 ]
+       - shopops: grep -c "assertBillingSourceV2" shopops-api/lib/billing/assert-billing-source.js && [ $(grep -c "assertBillingSourceV2" shopops-api/lib/billing/assert-billing-source.js) -ge 1 ]
+       - shopops: grep -c "assertBillingSource" shopops-api/lib/billing/assert-billing-source.js && [ $(grep -c "assertBillingSource" shopops-api/lib/billing/assert-billing-source.js) -ge 2 ]
+       - shopops: grep -c "pull_list_allocations" shopops-api/lib/billing/assert-billing-source.js && [ $(grep -c "pull_list_allocations" shopops-api/lib/billing/assert-billing-source.js 2>/dev/null || echo 0) -eq 0 ]
        - shopops: grep -c "statements/v2\|statementsV2" index.js && [ $(grep -c "statements/v2\|statementsV2" index.js) -ge 2 ]
        - shopops: grep -c "pull_allocation_id" routes/statements-v2.js && [ $(grep -c "pull_allocation_id" routes/statements-v2.js) -ge 1 ]
        - shopops: grep -c "SHOW_PICKUP" routes/statements-v2.js && [ $(grep -c "SHOW_PICKUP" routes/statements-v2.js 2>/dev/null || echo 0) -eq 0 ]
        - shopops: grep -c "billing_statement_line_items" migrations/20260523_billing_statement_v2.sql && [ $(grep -c "billing_statement_line_items" migrations/20260523_billing_statement_v2.sql) -ge 1 ]
        - shopops: grep -c "ISSUED" migrations/20260523_billing_statement_v2.sql && [ $(grep -c "ISSUED" migrations/20260523_billing_statement_v2.sql) -ge 1 ]
-       - shopops: grep -c "BillingCutoverError" lib/billing/errors.js && [ $(grep -c "BillingCutoverError" lib/billing/errors.js) -ge 1 ]
-       - shopops: grep -c "PaymentChannelInvalidError" lib/billing/errors.js && [ $(grep -c "PaymentChannelInvalidError" lib/billing/errors.js) -ge 1 ]
+       - shopops: grep -c "BillingCutoverError" shopops-api/lib/billing/errors.js && [ $(grep -c "BillingCutoverError" shopops-api/lib/billing/errors.js) -ge 1 ]
+       - shopops: grep -c "PaymentChannelInvalidError" shopops-api/lib/billing/errors.js && [ $(grep -c "PaymentChannelInvalidError" shopops-api/lib/billing/errors.js) -ge 1 ]
 
       Runtime verification (Rule 19 — shopops-api uses COPY . /app, rebuild required after merge):
-       PENDING — operator must rebuild + restart shopops-api container after PR merges to master.
+       PENDING — operator must rebuild + restart shopops-api container after John promotes the staged PR.
        After rebuild, run:
          docker exec shopops-api grep -n "statements/v2" /app/index.js
            -> Expected: >= 1 match (mount line)
