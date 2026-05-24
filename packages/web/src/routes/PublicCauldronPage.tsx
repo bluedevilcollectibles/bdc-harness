@@ -43,6 +43,10 @@ const nodeStatusClass: Record<PublicWorkflowRunResponse['nodes'][number]['status
   skipped: 'border-text-tertiary/30 bg-surface-elevated text-text-tertiary',
 };
 
+function isActiveRun(status: WorkflowRunStatus): boolean {
+  return status === 'running' || status === 'pending' || status === 'paused';
+}
+
 function formatDate(value: string | null): string {
   if (!value) return 'Not finished';
   return new Intl.DateTimeFormat(undefined, {
@@ -138,17 +142,20 @@ export function PublicCauldronPage(): React.ReactElement {
     isError,
   } = useQuery({
     queryKey: ['publicWorkflowRuns'],
-    queryFn: () => listPublicWorkflowRuns(12),
+    queryFn: () => listPublicWorkflowRuns(24),
     refetchInterval: 30_000,
     retry: 1,
   });
 
   const stats = useMemo(() => {
-    const active = runs.filter(r => r.status === 'running' || r.status === 'pending').length;
+    const active = runs.filter(r => isActiveRun(r.status)).length;
     const completed = runs.filter(r => r.status === 'completed').length;
     const failed = runs.filter(r => r.status === 'failed').length;
     return { active, completed, failed };
   }, [runs]);
+
+  const activeRuns = useMemo(() => runs.filter(run => isActiveRun(run.status)), [runs]);
+  const completedRuns = useMemo(() => runs.filter(run => !isActiveRun(run.status)), [runs]);
 
   return (
     <main className="min-h-screen bg-background text-text-primary">
@@ -172,7 +179,7 @@ export function PublicCauldronPage(): React.ReactElement {
         </div>
       </header>
 
-      <section className="mx-auto grid max-w-6xl gap-8 px-5 py-10 lg:grid-cols-[1.05fr_0.95fr] lg:items-center">
+      <section className="mx-auto grid max-w-6xl gap-8 px-5 py-10 lg:grid-cols-[1.05fr_0.95fr] lg:items-start">
         <div>
           <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-success/25 bg-success/10 px-3 py-1 text-xs font-medium text-success">
             <ShieldCheck className="h-3.5 w-3.5" />
@@ -216,26 +223,55 @@ export function PublicCauldronPage(): React.ReactElement {
           <div className="rounded-lg border border-border bg-surface shadow-2xl shadow-black/20">
             <div className="flex items-center justify-between border-b border-border px-4 py-3">
               <div>
-                <h2 className="text-sm font-semibold">Recent public workflow progress</h2>
+                <h2 className="text-sm font-semibold">Running now</h2>
                 <p className="mt-1 text-xs text-text-tertiary">
-                  Sanitized workflow and node progress
+                  Active work orders and live node progress
                 </p>
               </div>
-              <span className="rounded-full border border-border px-2.5 py-1 text-xs text-text-tertiary">
-                live
+              <span className="rounded-full border border-primary/30 bg-primary/10 px-2.5 py-1 text-xs text-primary">
+                {activeRuns.length} live
               </span>
             </div>
             {isLoading ? (
               <p className="px-4 py-10 text-sm text-text-secondary">Loading workflow status...</p>
             ) : isError ? (
               <p className="px-4 py-10 text-sm text-error">Unable to load public run status.</p>
-            ) : runs.length === 0 ? (
+            ) : activeRuns.length === 0 ? (
               <p className="px-4 py-10 text-sm text-text-secondary">
-                No recent workflow runs to show.
+                No active workflow runs right now.
               </p>
             ) : (
               <ul>
-                {runs.map((run, index) => (
+                {activeRuns.map((run, index) => (
+                  <PublicRunRow key={`${run.started_at}-${run.status}-${index}`} run={run} />
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="rounded-lg border border-border bg-surface shadow-2xl shadow-black/20">
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <div>
+                <h2 className="text-sm font-semibold">Completed and past runs</h2>
+                <p className="mt-1 text-xs text-text-tertiary">
+                  Scroll for recent review-ready workflow history
+                </p>
+              </div>
+              <span className="rounded-full border border-border px-2.5 py-1 text-xs text-text-tertiary">
+                {completedRuns.length} shown
+              </span>
+            </div>
+            {isLoading ? (
+              <p className="px-4 py-8 text-sm text-text-secondary">Loading run history...</p>
+            ) : isError ? (
+              <p className="px-4 py-8 text-sm text-error">Unable to load run history.</p>
+            ) : completedRuns.length === 0 ? (
+              <p className="px-4 py-8 text-sm text-text-secondary">
+                Completed workflow history will appear here.
+              </p>
+            ) : (
+              <ul className="max-h-[520px] overflow-y-auto">
+                {completedRuns.map((run, index) => (
                   <PublicRunRow key={`${run.started_at}-${run.status}-${index}`} run={run} />
                 ))}
               </ul>
