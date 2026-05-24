@@ -78,7 +78,6 @@ function PublicNodePill({
   return (
     <li
       className={`group relative inline-flex max-w-full items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs ${nodeStatusClass[node.status]}`}
-      title={`${help.title}: ${help.body}`}
       aria-describedby={tooltipId}
     >
       <NodeIcon status={node.status} />

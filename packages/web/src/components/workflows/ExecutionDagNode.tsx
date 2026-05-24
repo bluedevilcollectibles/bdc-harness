@@ -63,18 +63,9 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
   // title attribute is sufficient for v1 — keeps the change minimal and
   // accessible to keyboard / screen-reader users.
   const isWarning = data.status === 'completed_with_warning';
-  const warningTitle =
-    isWarning && data.warningStatusLine
-      ? `Silent failure detected${data.warningLoadBearing ? ' (load-bearing node)' : ' (always-dangerous pattern)'}\n${data.warningStatusLine}`
-      : undefined;
-  const tooltipTitle = `${help.title}: ${help.body}${
-    data.agentPersona ? `\nPersona: ${data.agentPersona}` : ''
-  }${warningTitle ? `\n\n${warningTitle}` : ''}`;
-
   return (
     <div
       className={`group relative rounded-lg border border-border px-3 py-2 min-w-[140px] transition-all duration-300 ${style}${data.selected ? ' ring-2 ring-accent-bright' : ''}`}
-      title={tooltipTitle}
       aria-label={`${help.title}. ${help.body}`}
     >
       <Handle type="target" position={Position.Top} className="!bg-border !w-2 !h-2" />
@@ -123,12 +114,10 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
         </span>
       </div>
       {data.error && (
-        <div className="text-[10px] text-error mt-1 truncate" title={data.error}>
-          {data.error.slice(0, 60)}
-        </div>
+        <div className="text-[10px] text-error mt-1 truncate">{data.error.slice(0, 60)}</div>
       )}
       {isWarning && data.warningPatterns && data.warningPatterns.length > 0 && (
-        <div className="text-[10px] text-warning mt-1 truncate" title={data.warningStatusLine}>
+        <div className="text-[10px] text-warning mt-1 truncate">
           {data.warningPatterns.join(', ')}
         </div>
       )}
@@ -143,6 +132,11 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
         {data.agentPersona && (
           <p className="mt-2 border-t border-border pt-2 text-[10px] text-text-tertiary">
             Persona: {data.agentPersona}
+          </p>
+        )}
+        {isWarning && data.warningStatusLine && (
+          <p className="mt-2 border-t border-border pt-2 text-[10px] leading-4 text-warning">
+            Silent failure detected: {data.warningStatusLine}
           </p>
         )}
       </div>
