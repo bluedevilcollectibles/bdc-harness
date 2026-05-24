@@ -152,7 +152,7 @@ export function ProjectSelector({
           <AlertDialogHeader>
             <AlertDialogTitle>Remove project?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will remove <strong>{deleteTarget?.name}</strong> from Archon, delete its
+              This will remove <strong>{deleteTarget?.name}</strong> from Cauldron, delete its
               workspace directory and worktrees. This cannot be undone.
             </AlertDialogDescription>
           </AlertDialogHeader>

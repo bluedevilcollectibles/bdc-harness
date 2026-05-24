@@ -171,33 +171,43 @@ export function PublicCauldronPage(): React.ReactElement {
           </div>
         </div>
 
-        <div className="rounded-lg border border-border bg-surface shadow-2xl shadow-black/20">
-          <div className="flex items-center justify-between border-b border-border px-4 py-3">
-            <div>
-              <h2 className="text-sm font-semibold">Recent public workflow progress</h2>
-              <p className="mt-1 text-xs text-text-tertiary">
-                Sanitized workflow and node progress
-              </p>
-            </div>
-            <span className="rounded-full border border-border px-2.5 py-1 text-xs text-text-tertiary">
-              live
-            </span>
+        <div className="flex flex-col gap-4">
+          <div className="overflow-hidden rounded-lg border border-primary/25 bg-surface shadow-2xl shadow-primary/10">
+            <img
+              src="/brand/code-cauldron-hero.png"
+              alt="Code Cauldron visual showing work orders, repo maps, rules, personas, tests, and approvals brewing into PR evidence."
+              className="aspect-[1491/1055] w-full object-cover"
+            />
           </div>
-          {isLoading ? (
-            <p className="px-4 py-10 text-sm text-text-secondary">Loading workflow status...</p>
-          ) : isError ? (
-            <p className="px-4 py-10 text-sm text-error">Unable to load public run status.</p>
-          ) : runs.length === 0 ? (
-            <p className="px-4 py-10 text-sm text-text-secondary">
-              No recent workflow runs to show.
-            </p>
-          ) : (
-            <ul>
-              {runs.map((run, index) => (
-                <PublicRunRow key={`${run.started_at}-${run.status}-${index}`} run={run} />
-              ))}
-            </ul>
-          )}
+
+          <div className="rounded-lg border border-border bg-surface shadow-2xl shadow-black/20">
+            <div className="flex items-center justify-between border-b border-border px-4 py-3">
+              <div>
+                <h2 className="text-sm font-semibold">Recent public workflow progress</h2>
+                <p className="mt-1 text-xs text-text-tertiary">
+                  Sanitized workflow and node progress
+                </p>
+              </div>
+              <span className="rounded-full border border-border px-2.5 py-1 text-xs text-text-tertiary">
+                live
+              </span>
+            </div>
+            {isLoading ? (
+              <p className="px-4 py-10 text-sm text-text-secondary">Loading workflow status...</p>
+            ) : isError ? (
+              <p className="px-4 py-10 text-sm text-error">Unable to load public run status.</p>
+            ) : runs.length === 0 ? (
+              <p className="px-4 py-10 text-sm text-text-secondary">
+                No recent workflow runs to show.
+              </p>
+            ) : (
+              <ul>
+                {runs.map((run, index) => (
+                  <PublicRunRow key={`${run.started_at}-${run.status}-${index}`} run={run} />
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
       </section>
     </main>
