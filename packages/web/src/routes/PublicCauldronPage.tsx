@@ -13,6 +13,7 @@ import {
 import { listPublicWorkflowRuns, type PublicWorkflowRunResponse } from '@/lib/api';
 import { ensureUtc } from '@/lib/format';
 import type { WorkflowRunStatus } from '@/lib/types';
+import codeCauldronHero from '@/assets/code-cauldron-hero.png';
 
 const statusLabel: Record<WorkflowRunStatus, string> = {
   pending: 'Pending',
@@ -172,7 +173,7 @@ export function PublicCauldronPage(): React.ReactElement {
 
           <div className="mt-7 overflow-hidden rounded-lg border border-primary/25 bg-surface shadow-2xl shadow-primary/10">
             <img
-              src="/brand/code-cauldron-hero.png"
+              src={codeCauldronHero}
               alt="Code Cauldron visual showing work orders, repo maps, rules, personas, tests, and approvals brewing into PR evidence."
               className="aspect-[1491/1055] w-full object-cover"
             />
