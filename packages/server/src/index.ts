@@ -67,6 +67,7 @@ import { registerApiRoutes } from './routes/api';
 import {
   handleMessage,
   pool,
+  getDialect,
   ConversationLockManager,
   classifyAndFormatError,
   startCleanupScheduler,
@@ -681,6 +682,26 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
         // Flush queued telemetry events before pool closes the process.
         await shutdownTelemetry();
+
+        // Best-effort: mark in-flight runs as failed before pool closes.
+        // If this fails, shutdown still proceeds -- never block on zombie cleanup.
+        try {
+          const dialect = getDialect();
+          const result = await pool.query(
+            `UPDATE remote_agent_workflow_runs
+             SET status = 'failed',
+                 completed_at = ${dialect.now()},
+                 last_activity_at = ${dialect.now()},
+                 metadata = ${dialect.jsonMerge('metadata', 1)}
+             WHERE status IN ('running', 'pending')`,
+            ['{"shutdown_reason":"sigterm"}']
+          );
+          if (result.rowCount > 0) {
+            getLog().info({ count: result.rowCount }, 'shutdown_marked_runs_failed');
+          }
+        } catch (err) {
+          getLog().warn({ err }, 'shutdown_mark_runs_failed_error');
+        }
 
         return pool.end();
       })
