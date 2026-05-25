@@ -182,9 +182,48 @@ nodes:
   # Workflow-time verify-* was redundant with PR-time review and high-cost-low-value. See also: WO-149
   # (verify-scope-to-changed-files) and WO-146 (npm→bun sweep) for the deeper structural fixes.
 
+  # Cauldron resilience: commit + push WIP branch after implement loop exits.
+  # Best-effort only -- failure logged and silently tolerated (NOT load_bearing).
+  # If container restarts after this node but before backstop, work survives on origin.
+  # If nothing changed since last checkpoint, exits 0 silently.
+  # Anchor: 2026-05-24 run 07415e9f lost local commit when container restarted before backstop.
+  # WO-HARNESS-IMPLEMENT-CHECKPOINT-PUSH-01
+  - id: checkpoint-push
+    persona: overseer
+    depends_on: [implement]
+    bash: |
+      set -uo pipefail
+
+      WO_ID="${WO_ID:-unknown}"
+      WIP_BRANCH="wip/${WO_ID}-$(date +%Y%m%d%H%M%S)"
+
+      git add -A 2>/dev/null || true
+
+      if git diff --cached --quiet 2>/dev/null; then
+        echo "checkpoint-push: nothing staged -- no commit needed"
+        exit 0
+      fi
+
+      git commit -m "wip: checkpoint after implement loop -- ${WO_ID}
+
+      Cauldron resilience checkpoint. Not the final commit.
+      Will be superseded by backstop commit-and-push node.
+
+      Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>" \
+        2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
+
+      if git push -u origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
+        echo "checkpoint-push: WIP branch pushed -- ${WIP_BRANCH}"
+        echo "CHECKPOINT_BRANCH=${WIP_BRANCH}"
+        echo "CHECKPOINT_SHA=$(git rev-parse HEAD)"
+      else
+        echo "WARN: checkpoint push failed -- work is local only; backstop will retry" >&2
+      fi
+      exit 0
+
   - id: war-council-validator
     persona: captain-ci-validator
-    depends_on: [implement]
+    depends_on: [checkpoint-push]
     task_class: medium_work
     prompt: |
       Invoke or emulate the war-council-validator review for this Work Order.
