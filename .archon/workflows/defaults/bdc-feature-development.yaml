@@ -367,13 +367,12 @@ nodes:
       git status --short
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
-        # Already fully synced: implement loop committed + pushed to origin
-        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1 && \
-           [ "$(git rev-parse HEAD)" = "$(git rev-parse "origin/${UNIQUE_BRANCH}")" ]; then
-          echo "Backstop no-op: implement loop already committed + pushed to origin/${UNIQUE_BRANCH} (HEAD matches)."
-          echo "unique_branch=${UNIQUE_BRANCH}"
-          exit 0
-        fi
+        # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: do NOT exit 0 here on the
+        # "HEAD matches origin" heuristic. The only invariant that matters is
+        # origin/${UNIQUE_BRANCH} == local HEAD, verified by ls-remote at the END
+        # of this node (after the push loop). A clean tree that already matches
+        # origin simply makes the push a no-op + the verify a pass. Falling
+        # through (instead of exit 0) guarantees every path hits the final verify.
         # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: a clean working
         # tree does NOT mean the implement loop skipped work — it may have committed
         # and left the tree clean. Count COMMITS_AHEAD to distinguish true no-op
@@ -462,6 +461,19 @@ nodes:
         echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
         exit 1
       fi
+      # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: the ONLY success invariant.
+      # Clean-tree / commits-ahead-0 / HEAD-reachable-from-some-remote are NOT
+      # valid proxies. The canonical PR branch MUST be on origin at local HEAD
+      # before open-pr-if-needed runs, or work is lost when the worktree is cleaned
+      # (anchors: Lane A runs ac2777a3 + f6e24ac2, 2026-05-25 -- both lost the
+      # report at open-pr because the branch was never durably on origin).
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+      if [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ]; then
+        echo "FATAL: canonical branch ${UNIQUE_BRANCH} not durably pushed (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})" >&2
+        exit 1
+      fi
+      echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
       echo "unique_branch=${UNIQUE_BRANCH}"
 
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
@@ -488,6 +500,15 @@ nodes:
       UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
       if [ -z "$UNIQUE_BRANCH" ]; then
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
+        exit 1
+      fi
+      # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: precondition guard. Re-verify
+      # the canonical branch is on origin at local HEAD BEFORE attempting any PR.
+      # If commit-and-push's verify passed this should always hold; failing here
+      # means the branch was lost between nodes -- abort before wasting gh retries.
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ]; then
+        echo "FATAL: open-pr precondition failed -- ${UNIQUE_BRANCH} not on origin at HEAD (origin=${REMOTE_HEAD:-<absent>})." >&2
         exit 1
       fi
       # Rule 29: extract explicit repo from decide-push-target output.
@@ -554,7 +575,14 @@ nodes:
         sleep $((attempt * 5))
       done
       if [ "$PR_OK" = "false" ]; then
+        # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: gh pr create failed, but the
+        # canonical branch was VERIFIED on origin at HEAD above (precondition guard
+        # + commit-and-push verify). So the work is NOT lost -- the operator can open
+        # the PR manually from the pushed branch. Emit a salvage manifest line so the
+        # branch + SHA survive in the run output even though the worktree is cleaned.
+        echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=${REPO} branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
         echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} ${BASE_BRANCH:+--base ${BASE_BRANCH}}" >&2
         exit 1
       fi
 
