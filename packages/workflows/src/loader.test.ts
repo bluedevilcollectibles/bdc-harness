@@ -2673,4 +2673,35 @@ nodes:
       expect(result.workflows[0].workflow.target_repo).toBeUndefined();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // policyFile round-trip (WO-HARNESS-POLICYFILE-NOT-ENFORCED-01)
+  // ---------------------------------------------------------------------------
+  //
+  // Regression guard: parseWorkflow used to silently drop raw.policyFile from
+  // the returned workflow object even though the schema accepted it. That made
+  // the executor's applyWorkflowPolicyFile() permanently dead code for any
+  // workflow discovered via YAML — every Cauldron run loaded an empty policy.
+
+  describe('policyFile', () => {
+    it('parseWorkflow round-trips policyFile', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: policy-bound\ndescription: Workflow with policyFile declaration\npolicyFile: harness/policies/agent-behavior.md\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'policy-bound.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.policyFile).toBe('harness/policies/agent-behavior.md');
+    });
+
+    it('parseWorkflow without policyFile leaves field undefined', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: no-policy\ndescription: No policyFile\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'no-policy.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.policyFile).toBeUndefined();
+    });
+  });
 });

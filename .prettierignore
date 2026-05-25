@@ -44,3 +44,8 @@ CHANGELOG.md
 CONTRIBUTING.md
 *.yml
 *.yaml
+
+# Canonical agent-behavior policies (BDC) — preserved verbatim from bdc-xo so
+# prettier must not reformat them. Anchor: WO-HARNESS-POLICYFILE-NOT-ENFORCED-01
+# Stop Point Test 6 forbids rewriting policy content.
+harness/policies/

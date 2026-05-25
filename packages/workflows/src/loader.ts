@@ -496,6 +496,20 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       getLog().warn({ filename, value: raw.target_repo }, 'invalid_target_repo_ignored');
     }
 
+    // Parse optional policyFile — BDC Universal Agent Behavior Policy loader.
+    // The executor reads this and either loads the file from the worktree or
+    // falls back to the bundled canonical policy (BUNDLED_POLICIES). Before this
+    // block existed, the loader silently dropped raw.policyFile from the
+    // returned workflow object so workflow.policyFile was always undefined —
+    // making the executor's applyWorkflowPolicyFile() dead code for any
+    // workflow loaded via YAML discovery. Anchor: WO-HARNESS-POLICYFILE-NOT-ENFORCED-01.
+    let policyFile: string | undefined;
+    if (typeof raw.policyFile === 'string' && raw.policyFile.trim().length > 0) {
+      policyFile = raw.policyFile.trim();
+    } else if (raw.policyFile !== undefined) {
+      getLog().warn({ filename, value: raw.policyFile }, 'invalid_policy_file_ignored');
+    }
+
     return {
       workflow: {
         name: raw.name,
@@ -511,6 +525,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
         ...(tags !== undefined ? { tags } : {}),
         ...(targetRepo !== undefined ? { target_repo: targetRepo } : {}),
+        ...(policyFile !== undefined ? { policyFile } : {}),
         // 2026-05-16 fix: inputs block was declared in workflow.schemas.ts:104 +
         // wired in dag-executor.ts:1362-1365 + 2576-2578, but the loader silently
         // dropped raw.inputs from the returned workflow object. Result: every
