@@ -4,9 +4,10 @@
  * that the inner dag-executor.test.ts cannot reach.
  */
 import { describe, it, expect, mock, beforeEach } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { createHash } from 'node:crypto';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -836,6 +837,181 @@ describe('executeWorkflow', () => {
       } finally {
         await rm(cwd, { recursive: true, force: true });
       }
+    });
+
+    // -----------------------------------------------------------------------
+    // Bundled fallback (Approach B — central resolver)
+    // WO-HARNESS-POLICYFILE-NOT-ENFORCED-01
+    // -----------------------------------------------------------------------
+
+    it('falls back to BUNDLED_POLICIES when the local file is absent', async () => {
+      // No policy file written to cwd — must resolve via the bundled canonical
+      // copy embedded at bundle time from harness/policies/.
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
+      try {
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            policyFile: 'harness/policies/agent-behavior.md',
+            nodes: [
+              { id: 'node1', prompt: 'Do something' },
+              { id: 'loop1', loop: { prompt: 'Iterate', until: 'DONE', max_iterations: 2 } },
+            ],
+          }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(true);
+        expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+        const executedWorkflow = getExecutedWorkflow();
+
+        // Sentinel checks: both required by the Universal Agent Behavior Policy v1.1
+        const node0SystemPrompt = executedWorkflow.nodes[0].systemPrompt;
+        const node1SystemPrompt = executedWorkflow.nodes[1].systemPrompt;
+        expect(node0SystemPrompt).toContain('Think before building');
+        expect(node0SystemPrompt).toContain('Surgical changes only');
+        expect(node1SystemPrompt).toContain('Think before building');
+        expect(node1SystemPrompt).toContain('Surgical changes only');
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('local copy wins over bundled when both are present', async () => {
+      // When the target repo ships its own copy (only bdc-xo does today), the
+      // local file takes precedence over the bundled canonical. This preserves
+      // a documented override path for bdc-xo.
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
+      try {
+        const subdir = join(cwd, 'harness', 'policies');
+        await mkdir(subdir, { recursive: true });
+        await writeFile(
+          join(subdir, 'agent-behavior.md'),
+          'LOCAL OVERRIDE — does not contain sentinels'
+        );
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            policyFile: 'harness/policies/agent-behavior.md',
+            nodes: [{ id: 'node1', prompt: 'Do something' }],
+          }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(true);
+        const executedWorkflow = getExecutedWorkflow();
+        expect(executedWorkflow.nodes[0].systemPrompt).toBe(
+          'LOCAL OVERRIDE — does not contain sentinels'
+        );
+        // Bundled sentinels should NOT appear since local took precedence
+        expect(executedWorkflow.nodes[0].systemPrompt).not.toContain('Think before building');
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('fails loud when neither local nor bundled policy resolves', async () => {
+      // Declared policyFile path does not exist locally AND is not in
+      // BUNDLED_POLICIES — must throw with both sources named.
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
+      try {
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({ policyFile: 'harness/policies/does-not-exist.md' }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('policyFile not found');
+        expect(result.error).toContain('harness/policies/does-not-exist.md');
+        expect(result.error).toContain('bundled canonical source');
+        expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('injects policy exactly once per prompt node (idempotent)', async () => {
+      // Each prompt node receives the policy as systemPrompt prefix exactly
+      // once — no duplication within a node when the policy text contains
+      // unique markers.
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-'));
+      try {
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            policyFile: 'harness/policies/agent-behavior.md',
+            nodes: [
+              { id: 'a', prompt: 'A' },
+              { id: 'b', prompt: 'B' },
+              { id: 'c', prompt: 'C' },
+            ],
+          }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(true);
+        const executedWorkflow = getExecutedWorkflow();
+        // The phrase "Think before building" appears once in the canonical
+        // policy text. Count occurrences per node — must be exactly 1.
+        for (const node of executedWorkflow.nodes) {
+          const sentinelCount = (node.systemPrompt?.match(/Think before building/g) ?? []).length;
+          expect(sentinelCount).toBe(1);
+        }
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('bundled canonical policy passes checksum verification', async () => {
+      // The bundled copy MUST contain the canonical policy. We assert:
+      //  1. The bundled entry exists for the canonical key.
+      //  2. SHA256 produces a deterministic 64-char hex digest (not empty).
+      //  3. The content includes both locked principles' sentinels.
+      //
+      // No hard-coded hash is asserted: the canonical policy may legitimately
+      // change in bdc-xo, at which point this PR's bundled snapshot is
+      // expected to be refreshed via `bun run generate:bundled`. The
+      // sentinel + non-empty-digest combo is sufficient to detect a
+      // bundled-but-stub-empty regression.
+      const { BUNDLED_POLICIES } = await import('./defaults/bundled-defaults');
+      const canonicalKey = 'harness/policies/agent-behavior.md';
+
+      expect(Object.hasOwn(BUNDLED_POLICIES, canonicalKey)).toBe(true);
+      const bundledContent = BUNDLED_POLICIES[canonicalKey];
+      expect(typeof bundledContent).toBe('string');
+      expect(bundledContent.length).toBeGreaterThan(100);
+
+      const digest = createHash('sha256').update(bundledContent, 'utf-8').digest('hex');
+      expect(digest).toMatch(/^[a-f0-9]{64}$/);
+
+      // Sentinels — these are the Locked Principles 1 and 3 from v1.1.
+      expect(bundledContent).toContain('Think before building');
+      expect(bundledContent).toContain('Surgical changes only');
     });
   });
 

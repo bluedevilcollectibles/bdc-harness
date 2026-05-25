@@ -22,7 +22,11 @@
 
 import { BUNDLED_IS_BINARY } from '@archon/paths';
 
-export { BUNDLED_COMMANDS, BUNDLED_WORKFLOWS } from './bundled-defaults.generated';
+export {
+  BUNDLED_COMMANDS,
+  BUNDLED_WORKFLOWS,
+  BUNDLED_POLICIES,
+} from './bundled-defaults.generated';
 
 /**
  * Check if the current process is running as a compiled binary (not via Bun CLI).

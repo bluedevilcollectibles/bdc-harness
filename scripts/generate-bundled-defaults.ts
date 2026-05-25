@@ -28,6 +28,13 @@ import { join, resolve } from 'path';
 const REPO_ROOT = resolve(import.meta.dir, '..');
 const COMMANDS_DIR = join(REPO_ROOT, '.archon/commands/defaults');
 const WORKFLOWS_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
+// Policies are referenced by workflow YAMLs via the verbatim path used in
+// `policyFile:` (e.g. `harness/policies/agent-behavior.md`). The bundled
+// record keys MUST match that path exactly so `BUNDLED_POLICIES[workflow.policyFile]`
+// is a direct lookup in the executor's central resolver (Approach B —
+// WO-HARNESS-POLICYFILE-NOT-ENFORCED-01).
+const POLICIES_DIR = join(REPO_ROOT, 'harness/policies');
+const POLICIES_KEY_PREFIX = 'harness/policies';
 const OUTPUT_PATH = join(
   REPO_ROOT,
   'packages/workflows/src/defaults/bundled-defaults.generated.ts'
@@ -91,6 +98,47 @@ async function collectFiles(dir: string, extensions: readonly string[]): Promise
   return files;
 }
 
+/**
+ * Variant of collectFiles for policies: keys are `${prefix}/${filename}` (extension
+ * preserved) so the record can be looked up by the verbatim `policyFile:` path
+ * declared in workflow YAML. Unlike commands/workflows where the name is the
+ * filename stem, policies are keyed by full repo-relative path with extension.
+ *
+ * Validation: filenames must be `<kebab>.md`. Anything else is rejected so a stray
+ * `.DS_Store`, `README.md`, or accidentally uppercased file cannot poison the
+ * bundle. Empty files are rejected (same as collectFiles).
+ */
+async function collectPoliciesWithPath(dir: string, keyPrefix: string): Promise<BundledFile[]> {
+  const entries = await readdir(dir);
+  const matched = entries.filter(entry => entry.endsWith('.md')).sort((a, b) => a.localeCompare(b));
+
+  const files: BundledFile[] = [];
+  const seen = new Set<string>();
+  for (const entry of matched) {
+    // Validate the basename (without extension) as kebab-case, matching the
+    // collectFiles policy so an uppercase or weird filename can't sneak in.
+    const stem = entry.slice(0, -'.md'.length);
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(stem)) {
+      throw new Error(
+        `Bundled policy has invalid filename "${entry}" in ${dir}. ` +
+          'Names must be kebab-case (lowercase letters, digits, hyphens) and end in .md.'
+      );
+    }
+    const key = `${keyPrefix}/${entry}`;
+    if (seen.has(key)) {
+      throw new Error(`Bundled policy key collision: "${key}" appears twice in ${dir}.`);
+    }
+    seen.add(key);
+    const raw = await readFile(join(dir, entry), 'utf-8');
+    const content = raw.replace(/\r\n/g, '\n');
+    if (!content.trim()) {
+      throw new Error(`Bundled policy "${entry}" in ${dir} is empty.`);
+    }
+    files.push({ name: key, content });
+  }
+  return files;
+}
+
 function renderRecord(comment: string, exportName: string, files: BundledFile[]): string {
   const entries = files
     .map(f => `  ${JSON.stringify(f.name)}: ${JSON.stringify(f.content)},`)
@@ -103,7 +151,11 @@ function renderRecord(comment: string, exportName: string, files: BundledFile[])
   ].join('\n');
 }
 
-function renderFile(commands: BundledFile[], workflows: BundledFile[]): string {
+function renderFile(
+  commands: BundledFile[],
+  workflows: BundledFile[],
+  policies: BundledFile[]
+): string {
   const header = [
     '/**',
     ' * AUTO-GENERATED — DO NOT EDIT.',
@@ -114,6 +166,7 @@ function renderFile(commands: BundledFile[], workflows: BundledFile[]): string {
     ' * Source of truth:',
     ' *   .archon/commands/defaults/*.md',
     ' *   .archon/workflows/defaults/*.{yaml,yml}',
+    ' *   harness/policies/*.md',
     ' *',
     ' * Contents are inlined as plain string literals (JSON-escaped) so this',
     ' * module loads in both Bun and Node. Previous versions used',
@@ -128,6 +181,12 @@ function renderFile(commands: BundledFile[], workflows: BundledFile[]): string {
     '',
     renderRecord('Bundled default workflows', 'BUNDLED_WORKFLOWS', workflows),
     '',
+    renderRecord(
+      'Bundled agent-behavior policies (keyed by `policyFile:` path verbatim)',
+      'BUNDLED_POLICIES',
+      policies
+    ),
+    '',
   ].join('\n');
 }
 
@@ -135,14 +194,16 @@ async function main(): Promise<void> {
   await Promise.all([
     ensureDir(COMMANDS_DIR, 'Commands defaults'),
     ensureDir(WORKFLOWS_DIR, 'Workflows defaults'),
+    ensureDir(POLICIES_DIR, 'Agent-behavior policies'),
   ]);
 
-  const [commands, workflows] = await Promise.all([
+  const [commands, workflows, policies] = await Promise.all([
     collectFiles(COMMANDS_DIR, ['.md']),
     collectFiles(WORKFLOWS_DIR, ['.yaml', '.yml']),
+    collectPoliciesWithPath(POLICIES_DIR, POLICIES_KEY_PREFIX),
   ]);
 
-  const contents = renderFile(commands, workflows);
+  const contents = renderFile(commands, workflows, policies);
 
   if (CHECK_ONLY) {
     let existing = '';
@@ -160,14 +221,14 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     console.log(
-      `bundled-defaults.generated.ts is up to date (${commands.length} commands, ${workflows.length} workflows).`
+      `bundled-defaults.generated.ts is up to date (${commands.length} commands, ${workflows.length} workflows, ${policies.length} policies).`
     );
     return;
   }
 
   await writeFile(OUTPUT_PATH, contents, 'utf-8');
   console.log(
-    `Wrote ${OUTPUT_PATH}\n  ${commands.length} commands, ${workflows.length} workflows.`
+    `Wrote ${OUTPUT_PATH}\n  ${commands.length} commands, ${workflows.length} workflows, ${policies.length} policies.`
   );
 }
 

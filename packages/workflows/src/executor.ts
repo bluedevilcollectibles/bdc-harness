@@ -15,6 +15,7 @@ import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import { classifyError } from './executor-shared';
+import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -210,6 +211,24 @@ async function resolveProjectPaths(
   };
 }
 
+/**
+ * Resolve the policy text for a workflow's declared `policyFile`.
+ *
+ * Approach B — Central resolver. Resolution order:
+ *   1. Target worktree path (`<cwd>/<policyFile>`) — preserves backward
+ *      compatibility when the file is checked in to the target repo (only
+ *      `bdc-xo` ships it today).
+ *   2. Bundled canonical policy (`BUNDLED_POLICIES[policyFile]`) — embedded at
+ *      bundle time from `harness/policies/` in this repo. Keys are the verbatim
+ *      `policyFile:` path string (e.g. `harness/policies/agent-behavior.md`).
+ *   3. Throws — names both sources tried.
+ *
+ * Rationale: Cauldron workflows declare `policyFile: harness/policies/agent-behavior.md`
+ * but only `bdc-xo` actually ships that file. With local-only resolution every
+ * non-`bdc-xo` target (shopops, lspro-react, etc.) fails before any node runs.
+ * Bundling the canonical copy here means every target gets the same policy with
+ * no per-repo distribution churn. Anchor: WO-HARNESS-POLICYFILE-NOT-ENFORCED-01.
+ */
 async function applyWorkflowPolicyFile(
   workflow: WorkflowDefinition,
   cwd: string
@@ -220,15 +239,47 @@ async function applyWorkflowPolicyFile(
 
   const policyPath = resolve(cwd, workflow.policyFile);
   let policyContent: string;
+  let resolvedSource: 'local' | 'bundled';
+
+  let localContent: string | undefined;
   try {
-    policyContent = await readFile(policyPath, 'utf-8');
+    localContent = await readFile(policyPath, 'utf-8');
   } catch {
-    throw new Error(`policyFile not found: ${workflow.policyFile} (resolved to ${policyPath})`);
+    localContent = undefined;
+  }
+
+  if (localContent !== undefined) {
+    policyContent = localContent;
+    resolvedSource = 'local';
+  } else {
+    // Local file absent — try the bundled canonical policy. The key is the
+    // verbatim `policyFile:` path (matches the generator's POLICIES_KEY_PREFIX
+    // convention in scripts/generate-bundled-defaults.ts).
+    const bundled = BUNDLED_POLICIES[workflow.policyFile];
+    if (bundled === undefined) {
+      const available = Object.keys(BUNDLED_POLICIES).join(', ') || '(none)';
+      throw new Error(
+        `policyFile not found: ${workflow.policyFile} (tried local path ${policyPath} ` +
+          `and bundled canonical source). Available bundled policies: ${available}`
+      );
+    }
+    policyContent = bundled;
+    resolvedSource = 'bundled';
   }
 
   if (!policyContent.trim()) {
-    throw new Error(`policyFile is empty: ${workflow.policyFile}`);
+    throw new Error(`policyFile is empty: ${workflow.policyFile} (source: ${resolvedSource})`);
   }
+
+  getLog().info(
+    {
+      workflowName: workflow.name,
+      policyFile: workflow.policyFile,
+      source: resolvedSource,
+      policyLength: policyContent.length,
+    },
+    'workflow.policy_file_resolved'
+  );
 
   return {
     ...workflow,
