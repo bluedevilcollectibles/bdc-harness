@@ -1,8 +1,8 @@
 /**
  * Workflow Executor - runs DAG-based workflows
  */
-import { mkdir, readFile } from 'fs/promises';
-import { join, resolve } from 'path';
+import { mkdir } from 'fs/promises';
+import { join } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
@@ -15,6 +15,7 @@ import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers';
 import { classifyError } from './executor-shared';
+import { resolveWorkflowPolicyFile } from './policy-resolver';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -218,17 +219,21 @@ async function applyWorkflowPolicyFile(
     return workflow;
   }
 
-  const policyPath = resolve(cwd, workflow.policyFile);
-  let policyContent: string;
-  try {
-    policyContent = await readFile(policyPath, 'utf-8');
-  } catch {
-    throw new Error(`policyFile not found: ${workflow.policyFile} (resolved to ${policyPath})`);
-  }
-
-  if (!policyContent.trim()) {
-    throw new Error(`policyFile is empty: ${workflow.policyFile}`);
-  }
+  // Resolver tries the local worktree file first, then falls back to the
+  // bundled canonical policy embedded in the engine (Approach B per
+  // WO-HARNESS-POLICYFILE-NOT-ENFORCED-01). Throws loudly when neither
+  // source resolves or the resolved content is empty.
+  const resolved = await resolveWorkflowPolicyFile(workflow.policyFile, cwd);
+  getLog().info(
+    {
+      policyFile: workflow.policyFile,
+      source: resolved.source,
+      resolvedPath: resolved.resolvedPath,
+      contentLength: resolved.content.length,
+    },
+    'policy.resolved'
+  );
+  const policyContent = resolved.content;
 
   return {
     ...workflow,

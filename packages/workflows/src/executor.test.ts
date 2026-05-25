@@ -837,6 +837,99 @@ describe('executeWorkflow', () => {
         await rm(cwd, { recursive: true, force: true });
       }
     });
+
+    // -----------------------------------------------------------------------
+    // Approach B (WO-HARNESS-POLICYFILE-NOT-ENFORCED-01):
+    // bundled canonical fallback when local file is absent.
+    // -----------------------------------------------------------------------
+
+    it('falls back to bundled canonical when local agent-behavior.md is absent', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-bundled-'));
+      try {
+        // Deliberately do NOT write harness/policies/agent-behavior.md.
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            policyFile: 'harness/policies/agent-behavior.md',
+            nodes: [{ id: 'node1', prompt: 'Do something' }],
+          }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(true);
+        expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+        const executedWorkflow = getExecutedWorkflow();
+        const sp = (executedWorkflow.nodes[0] as { systemPrompt?: string }).systemPrompt ?? '';
+        // Sentinels from the canonical BDC Universal Agent Behavior Policy
+        expect(sp).toContain('Think before building');
+        expect(sp).toContain('Surgical changes only');
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('injects bundled canonical policy exactly once per prompt node', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-once-'));
+      try {
+        const deps = makeDeps();
+
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          makeWorkflow({
+            policyFile: 'harness/policies/agent-behavior.md',
+            nodes: [
+              { id: 'n1', prompt: 'first' },
+              { id: 'n2', prompt: 'second' },
+            ],
+          }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(true);
+        const executedWorkflow = getExecutedWorkflow();
+        const sp0 = (executedWorkflow.nodes[0] as { systemPrompt?: string }).systemPrompt ?? '';
+        const sp1 = (executedWorkflow.nodes[1] as { systemPrompt?: string }).systemPrompt ?? '';
+        // Count of sentinel must be 1 in each node (single injection, no duplication).
+        expect(sp0.split('Think before building').length - 1).toBe(1);
+        expect(sp1.split('Think before building').length - 1).toBe(1);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed when non-canonical policyFile path is missing locally', async () => {
+      const cwd = await mkdtemp(join(tmpdir(), 'archon-policy-noncanon-'));
+      try {
+        const deps = makeDeps();
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          cwd,
+          // Non-canonical path: no bundled fallback exists for this name,
+          // so the executor must error rather than silently no-op.
+          makeWorkflow({ policyFile: 'docs/team-policy.md' }),
+          'test',
+          'db-conv-1'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('policyFile not found');
+        expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
   });
 
   // -------------------------------------------------------------------------

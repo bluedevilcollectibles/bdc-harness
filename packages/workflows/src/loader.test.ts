@@ -2673,4 +2673,44 @@ nodes:
       expect(result.workflows[0].workflow.target_repo).toBeUndefined();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // policyFile round-trip (WO-HARNESS-POLICYFILE-NOT-ENFORCED-01)
+  //
+  // Regression guard: the loader return object previously omitted policyFile,
+  // silently stripping the field from every YAML-loaded workflow and making
+  // the executor's policy injection branch unreachable.
+  // ---------------------------------------------------------------------------
+
+  describe('policyFile', () => {
+    it('parseWorkflow round-trips policyFile', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: policy-bearer\ndescription: Workflow declaring policyFile\npolicyFile: harness/policies/agent-behavior.md\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'policy-bearer.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.policyFile).toBe('harness/policies/agent-behavior.md');
+    });
+
+    it('parseWorkflow without policyFile leaves field undefined', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: no-policy\ndescription: No policyFile declared\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'no-policy.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.policyFile).toBeUndefined();
+    });
+
+    it('parseWorkflow trims whitespace around policyFile value', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: spaced-policy\ndescription: Whitespace test\npolicyFile: "   harness/policies/agent-behavior.md   "\nnodes:\n  - id: n\n    prompt: Do something\n`;
+      await writeFile(join(workflowDir, 'spaced-policy.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(1);
+      expect(result.workflows[0].workflow.policyFile).toBe('harness/policies/agent-behavior.md');
+    });
+  });
 });
