@@ -1563,7 +1563,7 @@ describe('DELETE /api/workflows/runs/:runId', () => {
     const body = (await response.json()) as { success: boolean; message: string };
     expect(body.success).toBe(true);
     expect(body.message).toContain('Deleted');
-    expect(mockDeleteWorkflowRun).toHaveBeenCalledWith('run-uuid-2');
+    expect(mockDeleteWorkflowRun).toHaveBeenCalledWith('run-uuid-2', false);
   });
 
   test('returns 200 and deletes a failed run', async () => {
@@ -1573,7 +1573,7 @@ describe('DELETE /api/workflows/runs/:runId', () => {
       method: 'DELETE',
     });
     expect(response.status).toBe(200);
-    expect(mockDeleteWorkflowRun).toHaveBeenCalledWith('run-uuid-4');
+    expect(mockDeleteWorkflowRun).toHaveBeenCalledWith('run-uuid-4', false);
   });
 });
 
