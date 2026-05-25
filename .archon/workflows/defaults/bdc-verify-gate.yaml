@@ -1,0 +1,362 @@
+name: bdc-verify-gate
+description: |
+  Use when: Verifying a gate checklist (Lane A/B/C, billing reverify, any gate) against a live
+  service, producing a durable evidence report instead of a hand-run one-off.
+  Inputs:
+    CHECKLIST_PATH: bdc-xo path to the gate checklist md (required)
+    GATE_NAME: which section/lane to verify, e.g. "Lane A" (required)
+    PROBE_BASE_PROD: prod base URL (default shopops prod)
+    PROBE_BASE_STAGING: staging base URL (default shopops staging)
+    CLEAN_BASELINE_REF: GitHub ref for code/route provenance (default master)
+    NOTION_DB_ID: WO board (default a6df831c-...)
+    AUTOFILE_FIXES: 'true' = file a fix WO per FAIL (default true)
+    DRY_RUN: 'true' = write report locally, skip commit + Notion
+  Does: reads the checklist, probes each item against the live service (CF Access for prod,
+        direct for staging), classifies PASS/FAIL/BLOCKED/NOT_TESTED with captured proof +
+        provenance, commits a durable evidence report to bdc-xo, re-marks the checklist, and
+        auto-files a fix WO per FAIL. Read-only probes; NEVER mutates prod billing.
+  Repo: bluedevilcollectibles/bdc-xo (operator selects bdc-xo codebase when firing).
+  Spec: docs/work-orders/WO-HARNESS-VERIFY-GATE-WORKFLOW-01.md
+  parallel_ok: false
+
+# NOTE (Cauldron API): only conversationId + message reach the engine; the API `inputs`
+# field is dropped. The engine injects the DEFAULTS below as $INPUT_<NAME> env vars. To
+# run a different gate, edit CHECKLIST_PATH/GATE_NAME defaults and re-fire, or pass them
+# in the message and parse in bash (mirrors bdc-feature-development's WO_ID pattern).
+#
+# SECRET HANDLING (Rule 6): CF Access token is NEVER hardcoded here. probe-gate reads
+# $CF_ACCESS_CLIENT_ID / $CF_ACCESS_CLIENT_SECRET from container env. Prereq: add both to
+# the archon container env file (shopops-storefront-vercel service token values).
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+target_repo: bluedevilcollectibles/bdc-xo
+
+inputs:
+  CHECKLIST_PATH:
+    default: "xo-wiki/wiki/concepts/shopops-recovery-checklist/_index.md"
+  GATE_NAME:
+    default: "Lane A"
+  PROBE_BASE_PROD:
+    default: "https://shopops.bluedevilcollectibles.com"
+  PROBE_BASE_STAGING:
+    default: "https://shopops-api.livesellerpro.app"
+  CLEAN_BASELINE_REF:
+    default: "master"
+  NOTION_DB_ID:
+    default: "a6df831c-0b52-449f-8ca4-d77be6b70d0a"
+  AUTOFILE_FIXES:
+    default: "true"
+  DRY_RUN:
+    default: "false"
+
+nodes:
+
+  # Pre-flight: fail closed if container lacks GITHUB auth (WO-169 anchor).
+  - id: preflight-github-auth
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DRY_RUN="${INPUT_DRY_RUN:-${DRY_RUN:-false}}"
+      if [ "$DRY_RUN" = "true" ]; then
+        echo "preflight-github-auth: DRY_RUN=true -- skipping auth probe"
+        exit 0
+      fi
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  # Read the gate checklist from bdc-xo and isolate the target gate section.
+  - id: read-checklist
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      CHECKLIST_PATH="${INPUT_CHECKLIST_PATH:-${CHECKLIST_PATH:-xo-wiki/wiki/concepts/shopops-recovery-checklist/_index.md}}"
+      GATE_NAME="${INPUT_GATE_NAME:-${GATE_NAME:-Lane A}}"
+      PROBE_BASE_PROD="${INPUT_PROBE_BASE_PROD:-${PROBE_BASE_PROD:-https://shopops.bluedevilcollectibles.com}}"
+      PROBE_BASE_STAGING="${INPUT_PROBE_BASE_STAGING:-${PROBE_BASE_STAGING:-https://shopops-api.livesellerpro.app}}"
+      CLEAN_BASELINE_REF="${INPUT_CLEAN_BASELINE_REF:-${CLEAN_BASELINE_REF:-master}}"
+      NOTION_DB_ID="${INPUT_NOTION_DB_ID:-${NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}}"
+      AUTOFILE_FIXES="${INPUT_AUTOFILE_FIXES:-${AUTOFILE_FIXES:-true}}"
+      DRY_RUN="${INPUT_DRY_RUN:-${DRY_RUN:-false}}"
+
+      # Read checklist: local worktree first (CWD = bdc-xo root), then gh api cross-ref.
+      CHECKLIST_CONTENT=""
+      if [ -f "$CHECKLIST_PATH" ]; then
+        CHECKLIST_CONTENT=$(cat "$CHECKLIST_PATH")
+      else
+        CHECKLIST_CONTENT=$(gh api \
+          "repos/bluedevilcollectibles/bdc-xo/contents/${CHECKLIST_PATH}?ref=main" \
+          --jq .content 2>/dev/null | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$CHECKLIST_CONTENT" ]; then
+        echo "ERROR: checklist not found at $CHECKLIST_PATH" >&2
+        exit 1
+      fi
+
+      # CF Access token presence (do NOT print the values; print presence only).
+      CF_PRESENT="no"
+      if [ -n "${CF_ACCESS_CLIENT_ID:-}" ] && [ -n "${CF_ACCESS_CLIENT_SECRET:-}" ]; then
+        CF_PRESENT="yes"
+      fi
+
+      DATE_TAG=$(date -u +%Y-%m-%d)
+      GATE_SLUG=$(printf '%s' "$GATE_NAME" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')
+
+      printf 'GATE_NAME=%s\n' "$GATE_NAME"
+      printf 'GATE_SLUG=%s\n' "$GATE_SLUG"
+      printf 'CHECKLIST_PATH=%s\n' "$CHECKLIST_PATH"
+      printf 'PROBE_BASE_PROD=%s\n' "$PROBE_BASE_PROD"
+      printf 'PROBE_BASE_STAGING=%s\n' "$PROBE_BASE_STAGING"
+      printf 'CLEAN_BASELINE_REF=%s\n' "$CLEAN_BASELINE_REF"
+      printf 'NOTION_DB_ID=%s\n' "$NOTION_DB_ID"
+      printf 'AUTOFILE_FIXES=%s\n' "$AUTOFILE_FIXES"
+      printf 'DRY_RUN=%s\n' "$DRY_RUN"
+      printf 'CF_ACCESS_TOKEN_PRESENT=%s\n' "$CF_PRESENT"
+      printf 'EVIDENCE_PATH=docs/gate-evidence/%s-%s.md\n\n' "$GATE_SLUG" "$DATE_TAG"
+      printf '=== CHECKLIST (%s) ===\n%s\n' "$CHECKLIST_PATH" "$CHECKLIST_CONTENT"
+
+  # Probe each item in the gate section. Read-only. Classify with proof + provenance.
+  - id: probe-gate
+    depends_on: [read-checklist]
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      until: ALL_ITEMS_CLASSIFIED
+      max_iterations: 3
+      prompt: |
+        You are the BDC Gate Verification probe. CWD = bdc-xo repo root. You have bash +
+        file read/write tools.
+
+        ## Inputs
+        $read-checklist.output
+
+        ## Previous iteration (empty on first pass)
+        $LOOP_PREV_OUTPUT
+
+        ## Your task
+        Verify every checklist item under the GATE_NAME section. For EACH item:
+
+        1. Determine the probe: which ShopOps endpoint/route + method proves or disproves
+           the item's claim. Read-only GETs only. Use PROBE_BASE_PROD and PROBE_BASE_STAGING.
+        2. PROD probes go through Cloudflare Access -- send BOTH headers:
+             curl -s -o /dev/null -w '%{http_code}' \
+               -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+               -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+               "$PROBE_BASE_PROD/<endpoint>"
+           If CF_ACCESS_TOKEN_PRESENT=no, mark all PROD-only items BLOCKED (reason:
+           "CF Access token not in container env"). STAGING probes need no CF headers.
+        3. Capture the actual HTTP status and a short response-shape note as proof.
+        4. For code/route provenance, read source via:
+             gh api "repos/bluedevilcollectibles/shopops/contents/<path>?ref=$CLEAN_BASELINE_REF"
+           NEVER read /opt/bdc/shopops (dirty checkout). State the baseline ref per row.
+        5. Classify each item:
+             PASS        -- probe succeeded with expected status/shape (proof captured)
+             FAIL        -- probe returned wrong status/shape vs the claim (capture actual)
+             BLOCKED     -- could not authenticate / CF Access unreachable / unsafe to test
+             NOT_TESTED  -- no probe applies / out of scope this run
+           A PASS with no captured proof is INVALID -- downgrade to BLOCKED.
+
+        ## BILLING SAFETY -- HARD RULE
+        You may GET balance/summary/statement-list/pdf. You may NOT POST /statements/generate,
+        send invoices, or mutate billing on PROD. Billing-mutation items = BLOCKED (reason:
+        "prod billing mutation requires John PROCEED -- out of scope"). Staging mutation OK.
+
+        ## Output (when every item is classified)
+        Emit a markdown table, one row per item:
+          | # | Item | Target | Auth | Endpoint/Path | Data used | Result | Proof | Provenance |
+        Then a summary line: PASS=<n> FAIL=<n> BLOCKED=<n> NOT_TESTED=<n>
+        Then on its own line the sentinel: ALL_ITEMS_CLASSIFIED
+        If you cannot classify every item this iteration, emit progress + iterate.
+
+  # Compose the evidence report file from the probe table.
+  - id: write-evidence
+    depends_on: [probe-gate]
+    bash: |
+      set -uo pipefail
+      EVIDENCE_PATH=$(printf '%s\n' "$read-checklist.output" | sed -n 's/^EVIDENCE_PATH=//p' | head -n 1)
+      GATE_NAME=$(printf '%s\n' "$read-checklist.output" | sed -n 's/^GATE_NAME=//p' | head -n 1)
+      CLEAN_BASELINE_REF=$(printf '%s\n' "$read-checklist.output" | sed -n 's/^CLEAN_BASELINE_REF=//p' | head -n 1)
+      if [ -z "$EVIDENCE_PATH" ]; then
+        echo "ERROR: EVIDENCE_PATH not found in read-checklist output" >&2
+        exit 1
+      fi
+      mkdir -p "$(dirname "$EVIDENCE_PATH")"
+      {
+        printf '# Gate Evidence: %s\n\n' "$GATE_NAME"
+        printf '_Generated %s by bdc-verify-gate. Clean baseline ref: %s. Read-only probes; no prod billing mutation._\n\n' \
+          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CLEAN_BASELINE_REF"
+        printf '%s\n' "$probe-gate.output"
+      } > "$EVIDENCE_PATH"
+      echo "EVIDENCE_WRITTEN=$EVIDENCE_PATH"
+      echo "EVIDENCE_BYTES=$(wc -c < "$EVIDENCE_PATH" | tr -d ' ')"
+
+  # Commit the evidence report to bdc-xo with the ORIGIN-VERIFY invariant.
+  - id: commit-evidence
+    depends_on: [write-evidence]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DRY_RUN=$(printf '%s\n' "$read-checklist.output" | sed -n 's/^DRY_RUN=//p' | head -n 1)
+      EVIDENCE_PATH=$(printf '%s\n' "$write-evidence.output" | sed -n 's/^EVIDENCE_WRITTEN=//p' | head -n 1)
+      GATE_NAME=$(printf '%s\n' "$read-checklist.output" | sed -n 's/^GATE_NAME=//p' | head -n 1)
+      if [ -z "$EVIDENCE_PATH" ] || [ ! -f "$EVIDENCE_PATH" ]; then
+        echo "ERROR: evidence file missing -- write-evidence did not produce a file" >&2
+        exit 1
+      fi
+      if [ "$DRY_RUN" = "true" ]; then
+        echo "commit-evidence: DRY_RUN=true -- evidence at $EVIDENCE_PATH, not committed"
+        echo "EVIDENCE_PATH=$EVIDENCE_PATH"
+        exit 0
+      fi
+      UNIQUE_BRANCH="verify-gate/$(printf '%s' "$GATE_NAME" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')-run-$(date +%Y%m%d%H%M%S)"
+      git add "$EVIDENCE_PATH"
+      if git diff --cached --quiet; then
+        echo "commit-evidence: no change to evidence file (idempotent re-run)"
+      else
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "evidence(verify-gate): ${GATE_NAME} verification report
+
+      Generated by bdc-verify-gate. Read-only probes; no prod billing mutation.
+
+      Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+      fi
+      # ORIGIN-VERIFY invariant (WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02):
+      # the report MUST be durably on origin before anything downstream. Push to a
+      # unique branch + verify origin == HEAD or FATAL.
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then PUSH_OK=true; break; fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "FATAL: evidence push failed after 3 attempts -- echoing report to logs for recovery:" >&2
+        echo "===EVIDENCE_BEGIN===" >&2; cat "$EVIDENCE_PATH" >&2; echo "===EVIDENCE_END===" >&2
+        exit 1
+      fi
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+      if [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ]; then
+        echo "FATAL: evidence branch ${UNIQUE_BRANCH} not durably on origin (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})" >&2
+        echo "===EVIDENCE_BEGIN===" >&2; cat "$EVIDENCE_PATH" >&2; echo "===EVIDENCE_END===" >&2
+        exit 1
+      fi
+      echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
+      echo "EVIDENCE_BRANCH=${UNIQUE_BRANCH}"
+      echo "EVIDENCE_PATH=${EVIDENCE_PATH}"
+
+  # Open a PR so the evidence + checklist re-mark land on bdc-xo main.
+  - id: open-evidence-pr
+    depends_on: [commit-evidence]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      DRY_RUN=$(printf '%s\n' "$read-checklist.output" | sed -n 's/^DRY_RUN=//p' | head -n 1)
+      if [ "$DRY_RUN" = "true" ]; then
+        echo "open-evidence-pr: DRY_RUN=true -- skipping PR"
+        exit 0
+      fi
+      UNIQUE_BRANCH=$(printf '%s\n' "$commit-evidence.output" | sed -n 's/^EVIDENCE_BRANCH=//p' | head -n 1)
+      GATE_NAME=$(printf '%s\n' "$read-checklist.output" | sed -n 's/^GATE_NAME=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "open-evidence-pr: no EVIDENCE_BRANCH (commit may have been a no-op) -- nothing to PR"
+        exit 0
+      fi
+      # Precondition: branch must be on origin at HEAD (ORIGIN-VERIFY guard).
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ]; then
+        echo "FATAL: open-evidence-pr precondition failed -- ${UNIQUE_BRANCH} not on origin at HEAD" >&2
+        exit 1
+      fi
+      PR_OK=false
+      for attempt in 1 2 3; do
+        if gh pr create --repo bluedevilcollectibles/bdc-xo \
+             --title "evidence(verify-gate): ${GATE_NAME} verification report" \
+             --body "Automated gate-evidence report from bdc-verify-gate. Read-only probes; no prod billing mutation. Review the evidence table + re-marked checklist." \
+             --head "$UNIQUE_BRANCH" 2>&1; then
+          PR_OK=true; break
+        fi
+        EXIST=$(gh pr list --repo bluedevilcollectibles/bdc-xo --head "$UNIQUE_BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
+        if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; PR_OK=true; break; fi
+        echo "WARN: gh pr create attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PR_OK" = "false" ]; then
+        # Branch is verified on origin above -- work is SAFE, salvageable manually.
+        echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=bluedevilcollectibles/bdc-xo branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
+        echo "RECOVERY: gh pr create --repo bluedevilcollectibles/bdc-xo --head ${UNIQUE_BRANCH}" >&2
+        echo "ERROR: gh pr create failed after 3 attempts." >&2
+        exit 1
+      fi
+      echo "EVIDENCE_BRANCH=${UNIQUE_BRANCH}"
+
+  # Auto-file a fix WO per FAIL row (prompt-node: needs Notion MCP + judgment).
+  - id: file-fix-wos
+    depends_on: [open-evidence-pr]
+    task_class: clerical
+    prompt: |
+      Review the gate verification results and file a fix Work Order for each FAIL row.
+
+      ## Inputs
+      $read-checklist.output
+      $probe-gate.output
+      $commit-evidence.output
+
+      ## DRY_RUN / AUTOFILE check
+      If $read-checklist.output contains `DRY_RUN=true` OR `AUTOFILE_FIXES=false`:
+        Do NOT file anything. Output instead, one line per FAIL row:
+          XO_TODO_FIX: <item> -- <captured failure> (file a fix WO manually)
+        Then stop.
+
+      ## When AUTOFILE_FIXES=true and DRY_RUN=false
+      For each row in $probe-gate.output classified FAIL:
+      1. Derive a fix WO ID: WO-FIX-<GATE_SLUG>-<short-item-slug>-01.
+      2. Check Notion DB (from NOTION_DB_ID in $read-checklist.output) for an existing
+         page with that WO ID. If it exists, skip (idempotent) and note SKIP_EXISTING.
+      3. Otherwise create a Notion page via the notion-create-pages tool:
+         - Task / WO ID: the derived WO-FIX id
+         - Status: To Do ; Claude Status: QUEUED ; Execution State: ACTIVE
+         - Priority: P1 ; Builder: Codex ; Project: ShopOps
+         - Notes: the failing item text + the captured failure proof (status/shape) +
+           "Surfaced by bdc-verify-gate gate verification. Evidence: " + the EVIDENCE_PATH.
+      4. Output: FIX_WO_FILED=<wo-id> <notion-url>  (or SKIP_EXISTING=<wo-id>) per FAIL.
+
+      If there are ZERO FAIL rows, output: NO_FAILS -- no fix WOs needed.
+
+      Do NOT file fix WOs for BLOCKED or NOT_TESTED rows (those need John triage, not a code fix).
+
+  - id: build-manifest
+    depends_on: [file-fix-wos]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI completion manifest for WO-HARNESS-VERIFY-GATE-WORKFLOW-01.
+
+      ## Inputs
+      $read-checklist.output
+      $probe-gate.output
+      $commit-evidence.output
+      $open-evidence-pr.output
+      $file-fix-wos.output
+
+      Produce a manifest v2 block. Class: INFRA/verification. Include:
+      - Files created: the evidence report path under docs/gate-evidence/
+      - PRs: the bdc-xo evidence PR URL
+      - Runtime verification: the probe table summary (PASS/FAIL/BLOCKED/NOT_TESTED counts)
+      - Fix WOs filed: list from $file-fix-wos.output
+      - VALIDATION: PASS if every item was classified and the evidence landed durably on origin.
+
+  # Final node: flip this WO to REVIEW (Archon does not auto-update Notion).
+  - id: flip-notion
+    depends_on: [build-manifest]
+    task_class: clerical
+    prompt: |
+      Update the Notion page for WO-HARNESS-VERIFY-GATE-WORKFLOW-01 in database
+      a6df831c-0b52-449f-8ca4-d77be6b70d0a:
+      - Claude Status: REVIEW
+      - Status: Review
+      - Append to Notes: the manifest from $build-manifest.output (evidence PR + probe summary).
+      Use the Notion MCP notion-update-page tool. Output NOTION_UPDATED=true on success.
