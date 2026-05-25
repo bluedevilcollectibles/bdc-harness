@@ -1,0 +1,786 @@
+# Drafted by Major Build for WO-HARNESS-WO-AUTHOR-WORKFLOW-01 on 2026-05-25
+# Pattern source: bdc-author-wo-batch.yaml (adversarial loop, host-artifact bundle)
+#                 bdc-feature-development.yaml (preflight, fire pattern, sentinel)
+#
+# Pre-flight (4-block):
+#   1. YAML exists: this file
+#   2. Spec exists: BDC_XO/docs/work-orders/WO-HARNESS-WO-AUTHOR-WORKFLOW-01.md
+#   3. CWD scope: bdc-xo (WO specs + YAMLs live there -- select bdc-xo when firing)
+#   4. Codebase registered: bluedevilcollectibles/bdc-xo (verify in Archon DB)
+#
+# Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-wo-author.yaml
+#
+# Fire examples:
+#   /workflow run bdc-wo-author MODE=--draft-only USER_MESSAGE="Author a WO to add pull-list export to ShopOps"
+#   /workflow run bdc-wo-author MODE=--queue     USER_MESSAGE="bdc-harness#128"
+#   /workflow run bdc-wo-author MODE=--fire      USER_MESSAGE="Author WO for SIGTERM cleanup --fire it"
+#
+# Author.md / Validate.md skills: their 12-section template + 12-check gate are
+# inlined in the author-loop prompt (the same way bdc-author-wo-batch inlines
+# them). Builders firing this YAML do not need filesystem access to ~/.claude/.
+
+name: bdc-wo-author
+description: |
+  Use when: Authoring any new BDC WO. This is the canonical front door — chat,
+  GitHub issue, Notion stub, and file-drop intake all normalize into one
+  pipeline (Author.md 12-section draft -> Validate.md 12-check adversarial gate
+  -> dry-run preview -> optional approval gate -> commit-spec -> file-notion
+  -> optional fire-cauldron). Replaces informal handoff via chat/VS Code.
+  Inputs:
+    USER_MESSAGE: free-text description, or "@<repo>#<N>" for GitHub issue,
+                  or "--notion <page-id>" for Notion stub,
+                  or "--spec <repo-relative-path>" for an existing draft file.
+                  Mode flags inline: --draft-only | --queue (default) | --fire
+                  Auto-approve flag: --auto-approve, "fire it", "fire now"
+    MODE: optional explicit mode override (--draft-only|--queue|--fire); USER_MESSAGE wins
+    NOTION_DB_ID: Notion WO database (default: a6df831c-0b52-449f-8ca4-d77be6b70d0a)
+  Does: Normalizes intake, runs adversarial author-loop (max 5 iterations),
+        emits dry-run preview block (always), gates on operator approval when
+        --fire mode (unless auto-approve), commits spec to bdc-xo feature
+        branch, files Notion page (unless --draft-only), fires
+        bdc-feature-development against the target repo (--fire only).
+  Repo: bluedevilcollectibles/bdc-xo (operator selects bdc-xo codebase when firing).
+  NOT for: Doctrine-only WOs (use bdc-doctrine-update). Existing WOs already in
+        REVIEW status. Batch authoring (use bdc-author-wo-batch).
+  parallel_ok: false
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+# interactive: true forces foreground execution on web. Required because
+# approval-gate is an approval node that hangs silently otherwise (Archon
+# CLAUDE.md: "interactive: true at the workflow level forces foreground
+# execution on web (required for approval-gate workflows in the web UI)").
+interactive: true
+
+# Cauldron API silently drops the `inputs` field in /api/conversations POST
+# bodies (see bdc-author-wo-batch.yaml line 40-49 for the anchor incident).
+# Engine ONLY injects defaults declared here as $INPUT_<NAME> env vars.
+# Override by editing default + re-firing, or by inlining flags in USER_MESSAGE.
+inputs:
+  MODE:
+    default: "--queue"
+  NOTION_DB_ID:
+    default: "a6df831c-0b52-449f-8ca4-d77be6b70d0a"
+
+nodes:
+
+  # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
+  # Copied verbatim from bdc-feature-development.yaml -- commit-spec is
+  # load_bearing so we need real git push capability before any work runs.
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  # normalize-intake: single prompt node handles all four intake sources.
+  # See WO spec §8 + plan Ambiguity #2 resolution: prompt node, not bash, so
+  # that the --notion <page-id> path can use the Notion MCP tool without
+  # splitting into two nodes with fragile when: chains.
+  - id: normalize-intake
+    persona: xo
+    depends_on: [preflight-github-auth]
+    task_class: medium_work
+    prompt: |
+      You are the BDC WO Author intake normalizer. Your job is to detect the
+      intake source from USER_MESSAGE, fetch the underlying content if needed,
+      and emit a normalized description block that the downstream author-loop
+      consumes.
+
+      ## Inputs
+      USER_MESSAGE: $USER_MESSAGE
+      INPUT_MODE: $INPUT_MODE
+
+      ## Intake Detection (priority order)
+
+      1. **--spec <path>** in USER_MESSAGE: fetch via `gh api repos/bluedevilcollectibles/bdc-xo/contents/<path>?ref=main`,
+         base64-decode .content. intake_source=spec_file
+      2. **--notion <page-id>** in USER_MESSAGE: use Notion MCP `notion-fetch` against the page ID.
+         Extract title + body as the description. intake_source=notion_stub
+      3. **<owner>/<repo>#<N>** or just **<repo>#<N>** in USER_MESSAGE: fetch via
+         `gh api repos/<owner-or-default-org>/<repo>/issues/<N>` (default org:
+         bluedevilcollectibles). Use title + body. intake_source=github_issue
+      4. Otherwise: treat USER_MESSAGE itself as the description.
+         intake_source=chat_message
+
+      ## Mode Flag Extraction (USER_MESSAGE wins over INPUT_MODE default)
+
+      Scan USER_MESSAGE for: `--draft-only`, `--queue`, `--fire`. Last match wins.
+      If none present, use INPUT_MODE (default `--queue`).
+      Also scan for: `--auto-approve`, "fire it", "fire now". Set auto_approve=true if any present.
+
+      ## Target Repo Hint Extraction
+
+      Scan USER_MESSAGE and (if intake_source != chat_message) the fetched content
+      for any of: `lspro-react`, `shopops-storefront`, `shopops`, `bdc-harness`,
+      `bdc-xo`, `pricing-monolith`, `arena`. Emit the first match as target_repo_hint.
+      If none found, emit `target_repo_hint=unknown` -- the author-loop will infer
+      from the WO spec body's §10 Deploy Target.
+
+      ## WO ID Hint Extraction
+
+      If USER_MESSAGE or fetched content contains a `WO-[A-Z][A-Z0-9-]+-[0-9]+`
+      string, emit it as wo_id_hint. Otherwise emit `wo_id_hint=auto-generate`
+      and the author-loop will derive a deterministic ID from the Objective.
+
+      ## Required Output
+
+      Emit a structured block exactly in this format (no markdown fences):
+
+      ```
+      === NORMALIZE-INTAKE OUTPUT ===
+      intake_source=<chat_message|github_issue|notion_stub|spec_file>
+      mode=<--draft-only|--queue|--fire>
+      auto_approve=<true|false>
+      target_repo_hint=<repo-name-or-unknown>
+      wo_id_hint=<WO-ID-or-auto-generate>
+
+      === DESCRIPTION ===
+      <full normalized description text -- use the fetched issue/notion/spec body
+       in its entirety if applicable, or the raw USER_MESSAGE for chat intake>
+      ```
+
+      If any fetch fails (404 on issue, Notion page not accessible, etc.),
+      do NOT invent content. Output:
+
+      ```
+      INTAKE_FAILURE: <reason>
+      ```
+
+      and stop. Downstream nodes will halt.
+
+  # read-context: cross-repo fetch of prior art (existing WOs in same prefix
+  # family) so the author-loop can spot duplicates and reuse patterns.
+  - id: read-context
+    persona: xo
+    depends_on: [normalize-intake]
+    bash: |
+      set -euo pipefail
+      # Extract wo_id_hint from normalize-intake output. If present, find
+      # existing WOs that share the prefix family.
+      INTAKE_OUT=$normalize-intake.output
+      WO_HINT=$(printf '%s\n' "$INTAKE_OUT" | sed -n 's/^wo_id_hint=//p' | head -n 1)
+      TARGET_HINT=$(printf '%s\n' "$INTAKE_OUT" | sed -n 's/^target_repo_hint=//p' | head -n 1)
+
+      # Derive prefix: WO-HARNESS-FOO-BAR-01 -> HARNESS-FOO
+      PREFIX=""
+      if [ -n "$WO_HINT" ] && [ "$WO_HINT" != "auto-generate" ]; then
+        PREFIX=$(printf '%s\n' "$WO_HINT" | sed -E 's/^WO-([A-Z]+-[A-Z]+).*/\1/')
+      elif [ -n "$TARGET_HINT" ] && [ "$TARGET_HINT" != "unknown" ]; then
+        # Map target repo to typical WO prefix
+        case "$TARGET_HINT" in
+          lspro-react) PREFIX="LSPRO" ;;
+          shopops-storefront) PREFIX="STOREFRONT" ;;
+          shopops) PREFIX="SHOPOPS" ;;
+          bdc-harness) PREFIX="HARNESS" ;;
+          bdc-xo) PREFIX="XO" ;;
+          *) PREFIX="" ;;
+        esac
+      fi
+
+      # List existing WOs in same prefix family (best-effort, never block).
+      # Cross-repo: bdc-xo holds all WO specs.
+      SIBLINGS=""
+      if [ -n "$PREFIX" ]; then
+        SIBLINGS=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders?ref=main" \
+          --template '{{range .}}{{.name}}{{"\n"}}{{end}}' 2>/dev/null \
+          | grep -E "^WO-${PREFIX}-" | head -20 || true)
+      fi
+
+      echo "=== READ-CONTEXT OUTPUT ==="
+      echo "prefix_family=${PREFIX:-unknown}"
+      if [ -n "$SIBLINGS" ]; then
+        echo "existing_siblings:"
+        printf '%s\n' "$SIBLINGS" | sed 's/^/  - /'
+      else
+        echo "existing_siblings: (none found or no prefix)"
+      fi
+
+      # Read wo-recipe.md doctrine reference if available (best-effort)
+      RECIPE_HEAD=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/xo-wiki/wiki/doctrine/wo-recipe/_index.md?ref=main" \
+        --jq .content 2>/dev/null | base64 -d 2>/dev/null | head -60 || true)
+      if [ -n "$RECIPE_HEAD" ]; then
+        echo ""
+        echo "=== WO-RECIPE.MD (head) ==="
+        printf '%s\n' "$RECIPE_HEAD"
+      fi
+
+  # author-loop: adversarial AUTHOR -> REVIEW -> FIX cycle.
+  # 12-section template + 12-check Validate.md gate are inlined here so the
+  # workflow does not depend on filesystem access to ~/.claude/skills/.
+  # Pattern source: bdc-author-wo-batch.yaml lines 165-310 (3-phase prompt).
+  - id: author-loop
+    persona: major-build
+    depends_on: [read-context]
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      until: VALIDATE_PASS
+      max_iterations: 5
+      prompt: |
+        You are the BDC WO Author Pipeline, alternating between AUTHOR and
+        ADVERSARIAL REVIEWER roles. CWD = bdc-xo repo root. You have full
+        file read/write tool access.
+
+        ## Pipeline Inputs
+
+        ### Intake (normalized)
+        $normalize-intake.output
+
+        ### Prior Art Context
+        $read-context.output
+
+        ### Previous Iteration Results (empty on first iteration)
+        $LOOP_PREV_OUTPUT
+
+        ---
+
+        ## PHASE 1 -- AUTHOR
+
+        **1a. Idempotency check**: Parse wo_id_hint from intake. If it is a real
+        WO ID (not "auto-generate") AND `docs/work-orders/<wo_id>.md` already
+        exists on disk, SKIP authoring -- emit `IDEMPOTENT_SKIP: <wo_id> already
+        exists on disk` and proceed directly to PHASE 3 commit.
+
+        **1b. Derive WO_ID** (if hint was "auto-generate"):
+        - Extract a concise 2-3 word noun phrase from the Objective sentence.
+        - Pattern: `WO-<PREFIX>-<NOUN-PHRASE>-01` where PREFIX matches target
+          repo (LSPRO, STOREFRONT, SHOPOPS, HARNESS, XO, etc.).
+        - Example: "Add pull-list export to ShopOps" -> WO-SHOPOPS-PULLLIST-EXPORT-01
+        - Deterministic from Objective: running twice with same description
+          MUST produce same ID (idempotency req from spec §8 Q8).
+
+        **1c. Draft the 12-section WO spec** (wo-recipe.md template):
+        ```
+        ## 1. Objective
+        ## 2. Behavior Source of Truth   <-- must cite concrete file path or WO ID
+        ## 3. Prior Art Check
+        ## 4. System Context             <-- list dependencies or state "standalone"
+        ## 5. UI Hierarchy               <-- N/A with one-line reason if not UI
+        ## 6. Mode Behavior Matrix       <-- N/A with one-line reason if not multi-mode
+        ## 7. Backend Function Inventory <-- every function labeled EXISTING (file:line) or NEW
+        ## 8. Data Flow
+        ## 9. Database Schema References <-- N/A with one-line reason if no DB;
+                                            if DB: cite information_schema query OR migration file
+        ## 10. Deploy Target
+        ## 11. Test Scenarios            <-- >= 3 tests, each with Given/When/Then structure
+        ## 12. Stop Point                <-- CI-executable commands, Given/When/Then
+        ```
+        Add a "Grep assertions" section if the WO touches 2+ repos (Check 8A).
+        Reference `wo-recipe.md` somewhere in the body (Check 2).
+        Include 8 required questions answered somewhere in the body (Check 10):
+          1. What behavior exists AFTER this WO?
+          2. Where is the source of truth?
+          3. Who owns this system?
+          4. What existing logic is reused?
+          5. What is the exact schema? (N/A if no DB)
+          6. What MUST NEVER break? (invariants)
+          7. How does CI prove it works?
+          8. What happens if it runs twice? (idempotency)
+
+        ---
+
+        ## PHASE 2 -- ADVERSARIAL REVIEW (you are now a blocking reviewer)
+
+        Apply all 12 checks to the drafted spec:
+
+        **Check 1**: 8 always-required headers present verbatim:
+          ## 1. Objective, ## 2. Behavior Source of Truth, ## 3. Prior Art Check,
+          ## 7. Backend Function Inventory, ## 8. Data Flow, ## 10. Deploy Target,
+          ## 11. Test Scenarios, ## 12. Stop Point
+          -> BLOCK if any missing.
+
+        **Check 2**: Body contains the substring `wo-recipe.md`.
+          -> BLOCK if absent.
+
+        **Check 3**: §2 references at least one concrete artifact (file path or WO ID).
+          -> BLOCK if §2 contains only TBD, "see body", or empty text.
+
+        **Check 4**: WO ID matches `WO-[A-Z][A-Z0-9-]*-[0-9]+`; consistent across
+        filename, H1, and (planned) Notion title.
+          -> BLOCK if inconsistent.
+
+        **Check 5**: §2 cites a real path (e.g. `docs/plans/foo.md`, `WO-XYZ-01`).
+          -> BLOCK if §2 is vague without a concrete locator.
+
+        **Check 6**: Every function/route/script in §7 labeled `EXISTING (file:line)` or `NEW`.
+          -> BLOCK if any name appears without a label.
+
+        **Check 7**: §9 column/table claims cite `information_schema` query result
+        or migration file path.
+          -> BLOCK if §9 makes a column claim without citing source.
+
+        **Check 8**: §11 has >= 3 test scenarios each with Given/When/Then structure.
+          -> BLOCK if fewer than 3, or any test is purely descriptive.
+
+        **Check 8A**: If WO's files span 2+ repos -> must have `Grep assertions`
+        block with grep command per repo.
+          -> BLOCK if split-repo WO lacks grep assertions.
+
+        **Check 9**: §12 stop conditions are CI-executable commands (Given/When/Then).
+          -> BLOCK if any stop condition is vague ("staging accessible").
+
+        **Check 10**: 8 required questions addressed somewhere in body (see PHASE 1c).
+          -> BLOCK if any unanswered.
+
+        **Check 11** (HARDEST -- anti-guess hardening): Every component name, table
+        name, column name, route path in the spec traces to a source file. No
+        invented names. If §7 lists `fetchPullList`, the spec must label it
+        `EXISTING (lib/storefront-api.ts:142)` or `NEW`.
+          -> BLOCK if any specific claim is not anchored to a real source.
+
+        **Check 12**: §4 lists dependencies OR explicitly says "standalone".
+          -> BLOCK if §4 is empty and WO touches more than one subsystem.
+
+        Output per WO: `VALIDATE: PASS` (all 12) or
+        `VALIDATE: FAIL -- Check N: <gap>` for each failure.
+
+        ---
+
+        ## PHASE 3 -- FIX OR COMMIT
+
+        - **FAIL**: Revise spec to address each listed gap. Re-run all 12 checks
+          on the revision. If revised passes -> write file; if still fails ->
+          continue to next iteration.
+        - **PASS** or **IDEMPOTENT_SKIP**: Write `docs/work-orders/<WO_ID>.md` to disk.
+          Also emit a footer block (parsed by downstream dry-run-preview):
+          ```
+          === AUTHOR-LOOP RESULT ===
+          wo_id=<WO_ID>
+          spec_path=docs/work-orders/<WO_ID>.md
+          target_repo=<owner/repo from §10 Deploy Target>
+          mode=<--draft-only|--queue|--fire from intake>
+          auto_approve=<true|false from intake>
+          ```
+
+        ---
+
+        ## SENTINEL RULE
+
+        Output `<promise>VALIDATE_PASS</promise>` ONLY when:
+        - `docs/work-orders/<wo_id>.md` exists on disk (or IDEMPOTENT_SKIP fired)
+        - The AUTHOR-LOOP RESULT footer block is present in your output
+        - Final review verdict was VALIDATE: PASS (or IDEMPOTENT_SKIP)
+
+        If iteration 5 ends without passing, do NOT emit the sentinel.
+        Instead output a BATCH_FAILURE block:
+        ```
+        BATCH_FAILURE:
+          WO_ID: <id or "(unassigned)">
+          failed_checks: [list of Check N]
+          critique: <specific gaps that could not be resolved>
+        ```
+
+  # dry-run-preview: ALWAYS runs. Emits the preview block that operator sees
+  # before any Notion create or Cauldron fire. Cross-checks: existing spec on
+  # disk (idempotency), existing Notion page (idempotency), active Cauldron
+  # runs for same WO_ID (duplicate run detection per spec Scenario 3).
+  - id: dry-run-preview
+    persona: major-build
+    depends_on: [author-loop]
+    bash: |
+      set -euo pipefail
+      AUTHOR_OUT=$author-loop.output
+
+      # Parse footer block from author-loop output. Author-loop emits these
+      # under "=== AUTHOR-LOOP RESULT ===" header.
+      WO_ID=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^wo_id=//p' | head -n 1)
+      SPEC_PATH=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^spec_path=//p' | head -n 1)
+      TARGET_REPO=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^target_repo=//p' | head -n 1)
+      MODE=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^mode=//p' | head -n 1)
+      AUTO_APPROVE=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^auto_approve=//p' | head -n 1)
+
+      if [ -z "$WO_ID" ]; then
+        # Check for BATCH_FAILURE first; that is a clean exit upstream signal.
+        if printf '%s\n' "$AUTHOR_OUT" | grep -q '^BATCH_FAILURE:'; then
+          echo "DRY_RUN_PREVIEW: skipped (author-loop emitted BATCH_FAILURE)"
+          exit 0
+        fi
+        echo "ERROR: author-loop output missing wo_id footer; cannot build preview." >&2
+        exit 1
+      fi
+
+      # Cross-check 1: spec file exists on disk (it should -- author-loop wrote it)
+      SPEC_OK=0
+      [ -f "$SPEC_PATH" ] && SPEC_OK=1
+
+      # Cross-check 2: any existing Cauldron workflow run for this WO_ID?
+      # Best-effort GET against the Cauldron API. If unreachable, do NOT block --
+      # emit "duplicate_check=skipped" so the approval gate can still proceed.
+      DUPLICATE_INFO="duplicate_check=skipped (Cauldron API unreachable)"
+      if RUNS_JSON=$(curl -fsS --max-time 10 \
+          "https://archon.bluedevilcollectibles.com/api/workflows/runs?limit=20" 2>/dev/null); then
+        # jq filter: walk top-level array or .runs[], find first whose
+        # initial_message|message contains $WO_ID AND status is non-terminal.
+        # Output format: <id>|<status>|<started_at> or empty.
+        ACTIVE_RUN=$(printf '%s\n' "$RUNS_JSON" | jq -r --arg wo "$WO_ID" '
+          (if type == "array" then . else (.runs // []) end)
+          | map(select(((.initial_message // .message // "") | contains($wo))
+                       and (.status == "running" or .status == "pending" or .status == "queued")))
+          | if length > 0 then (.[0] | "\(.id // "unknown")|\(.status)|\(.started_at // "?")") else "" end
+        ' 2>/dev/null || true)
+        if [ -n "$ACTIVE_RUN" ]; then
+          DUPLICATE_INFO="DUPLICATE_RUN_DETECTED: $ACTIVE_RUN"
+        else
+          DUPLICATE_INFO="duplicate_check=clean (no active runs for $WO_ID)"
+        fi
+      fi
+
+      # Emit preview block (always shown -- operator gate before Notion/fire)
+      echo "=== DRY-RUN PREVIEW ==="
+      echo "wo_id=$WO_ID"
+      echo "spec_path=$SPEC_PATH"
+      echo "spec_on_disk=$SPEC_OK"
+      echo "target_repo=$TARGET_REPO"
+      echo "mode=$MODE"
+      echo "auto_approve=$AUTO_APPROVE"
+      echo "fire_workflow=bdc-feature-development"
+      echo "notion_db=${INPUT_NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}"
+      echo "$DUPLICATE_INFO"
+      echo ""
+      echo "Mode behavior:"
+      case "$MODE" in
+        --draft-only)
+          echo "  - Commit spec to bdc-xo feature branch + open PR"
+          echo "  - NO Notion entry created"
+          echo "  - NO Cauldron fire"
+          ;;
+        --queue)
+          echo "  - Commit spec to bdc-xo feature branch + open PR"
+          echo "  - Notion entry created (Claude Status=QUEUED)"
+          echo "  - NO Cauldron fire (operator fires separately)"
+          ;;
+        --fire)
+          echo "  - Commit spec to bdc-xo feature branch + open PR"
+          echo "  - Notion entry created (Claude Status=QUEUED)"
+          if [ "$AUTO_APPROVE" = "true" ]; then
+            echo "  - Cauldron fire IMMEDIATE (auto-approve flag detected)"
+          else
+            echo "  - Cauldron fire PENDING operator approval (next node)"
+          fi
+          ;;
+        *)
+          echo "  - WARN: unknown mode '$MODE' -- defaulting to --queue behavior"
+          ;;
+      esac
+
+  # approval-gate: only runs in --fire mode AND when auto_approve != true.
+  # In other modes, the `when:` condition skips this node and downstream
+  # nodes with trigger_rule: all_done still execute.
+  - id: approval-gate
+    persona: xo
+    depends_on: [dry-run-preview]
+    when: "$dry-run-preview.output =~ 'mode=--fire' AND $dry-run-preview.output =~ 'auto_approve=false'"
+    approval:
+      message: |
+        Review the dry-run preview above. Fire this WO through bdc-feature-development?
+
+        - "approved" / "yes" / "fire" -> proceed to fire-cauldron
+        - "no" / "reject" -> halt at --queue state (spec + Notion only)
+        - If DUPLICATE_RUN_DETECTED is in the preview, type "fire anyway" to override
+      capture_response: true
+
+  # commit-spec: ALWAYS runs (depends only on dry-run-preview, not approval-gate).
+  # Spec commits regardless of mode -- mode only controls Notion + Cauldron fire.
+  # load_bearing: true (same rationale as bdc-author-wo-batch commit-and-push).
+  # Pattern: branch name single-WO (wo/author-<WO_ID>-<timestamp>), 3-attempt
+  # push retry with exponential backoff, host-artifact bundle save BEFORE push.
+  - id: commit-spec
+    persona: overseer
+    depends_on: [dry-run-preview]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      PREVIEW=$dry-run-preview.output
+      WO_ID=$(printf '%s\n' "$PREVIEW" | sed -n 's/^wo_id=//p' | head -n 1)
+      SPEC_PATH=$(printf '%s\n' "$PREVIEW" | sed -n 's/^spec_path=//p' | head -n 1)
+
+      if [ -z "$WO_ID" ] || [ -z "$SPEC_PATH" ]; then
+        # author-loop hit BATCH_FAILURE; clean exit, no commit.
+        echo "commit-spec: no WO to commit (preview did not produce wo_id)"
+        exit 0
+      fi
+
+      if [ ! -f "$SPEC_PATH" ]; then
+        echo "ERROR: spec file $SPEC_PATH does not exist on disk -- author-loop did not write it." >&2
+        exit 1
+      fi
+
+      TIMESTAMP=$(date +%Y%m%d%H%M%S)
+      BRANCH="wo/author-${WO_ID}-${TIMESTAMP}"
+
+      # WO-168 Tier 1: save load-bearing artifacts to host-mounted volume BEFORE
+      # any remote operation. Copied from bdc-author-wo-batch.yaml.
+      save_bundle_to_host() {
+        local run_id="${WORKFLOW_RUN_ID:-${WORKFLOW_ID:-unknown-$(date +%Y%m%d%H%M%S)}}"
+        local dest="/host-artifacts/${run_id}"
+        if [ ! -d /host-artifacts ]; then
+          echo "WARN: /host-artifacts not mounted -- skipping bundle save (recovery from worktree only)" >&2
+          return 0
+        fi
+        mkdir -p "$dest" 2>/dev/null || {
+          echo "WARN: could not mkdir $dest -- skipping bundle save" >&2
+          return 0
+        }
+        if git bundle create "$dest/branch.bundle" HEAD 2>"$dest/bundle.err"; then
+          echo "  host-artifact: bundle saved $dest/branch.bundle ($(stat -c%s "$dest/branch.bundle" 2>/dev/null || echo '?') bytes)"
+        else
+          echo "WARN: git bundle create failed -- see $dest/bundle.err" >&2
+        fi
+        git diff --stat HEAD~1 HEAD > "$dest/changes.txt" 2>/dev/null \
+          || git log -1 --name-status HEAD > "$dest/changes.txt" 2>/dev/null \
+          || echo "(no diff/log available)" > "$dest/changes.txt"
+        {
+          echo "branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+          echo "sha=$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+          echo "saved_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "workflow_run_id=${run_id}"
+          echo "wo_id=${WO_ID}"
+          echo "recovery_cmd=git fetch ${dest}/branch.bundle main:rescue-${run_id}"
+        } > "$dest/MANIFEST.txt"
+        echo "  host-artifact: manifest written $dest/MANIFEST.txt"
+      }
+
+      git checkout -b "$BRANCH"
+      git add -- "$SPEC_PATH"
+
+      if git diff --cached --quiet; then
+        echo "No staged changes (spec was already committed in a prior run)"
+        echo "BRANCH=$(git rev-parse --abbrev-ref HEAD)"
+        echo "SHA=$(git rev-parse HEAD)"
+        echo "wo_id=$WO_ID"
+        echo "spec_path=$SPEC_PATH"
+        exit 0
+      fi
+
+      git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+        commit -m "feat(wo-author): ${WO_ID} -- authored via bdc-wo-author
+
+      Spec drafted via bdc-wo-author adversarial loop (Author.md 12-section template +
+      Validate.md 12-check gate). Operator reviews then promotes via Notion + Cauldron.
+
+      Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+
+      # Bundle BEFORE push so a push failure does not destroy the spec.
+      save_bundle_to_host
+
+      # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push -u origin "$BRANCH" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+      echo "BRANCH=$BRANCH"
+      echo "SHA=$(git rev-parse HEAD)"
+      echo "wo_id=$WO_ID"
+      echo "spec_path=$SPEC_PATH"
+
+  # file-notion: creates Notion page (unless --draft-only). Uses trigger_rule:
+  # all_done so the workflow still proceeds when approval-gate is skipped.
+  - id: file-notion
+    persona: xo
+    depends_on: [commit-spec]
+    when: "$dry-run-preview.output !~ 'mode=--draft-only'"
+    task_class: clerical
+    prompt: |
+      File the authored WO to Notion.
+
+      ## Inputs
+      Dry-run preview: $dry-run-preview.output
+      Commit-spec output: $commit-spec.output
+      Author-loop output (for spec body): $author-loop.output
+
+      ## Idempotency Check
+      Before creating, search Notion DB `${INPUT_NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}`
+      for an existing page with WO ID matching the wo_id from commit-spec output.
+      If found, output `IDEMPOTENT_SKIP: page already exists at <existing_url>` and
+      do NOT create a duplicate.
+
+      ## Notion Filing (when no duplicate found)
+      1. Read the spec file at `spec_path` (from commit-spec output) to extract:
+         - §1 Objective text (first 300 chars for Notes summary)
+         - Target repo from §10 Deploy Target (for Project field)
+      2. Use the Notion MCP `notion-create-pages` tool to create a page in
+         database `${INPUT_NOTION_DB_ID:-a6df831c-0b52-449f-8ca4-d77be6b70d0a}` with:
+         - Task: <wo_id>
+         - WO ID: <wo_id>
+         - Status: To Do
+         - Claude Status: QUEUED
+         - Priority: P1 (default)
+         - Builder: Major Build (default)
+         - Execution State: ACTIVE
+         - Project: <target_repo> (or "Infrastructure" if unknown)
+         - Notes: first 300 chars of §1 Objective +
+                  " WO file: BDC_XO/<spec_path>" +
+                  " Authored by bdc-wo-author."
+      3. Output `NOTION_URL=<url>` on the created page.
+
+      If Notion MCP is unavailable, output:
+        XO_TODO: File <wo_id> to Notion manually (DB ${INPUT_NOTION_DB_ID}).
+                 Status=To Do, Claude Status=QUEUED, Builder=Major Build.
+
+  # fire-cauldron: only runs in --fire mode AND only after approval-gate
+  # returned approval (or auto_approve=true skipped the gate).
+  # Per WO spec Ambiguity #4 resolution: fail-closed if ARCHON_OPERATOR_TOKEN
+  # is missing from executor env.
+  - id: fire-cauldron
+    persona: xo
+    depends_on: [commit-spec, approval-gate]
+    when: "$dry-run-preview.output =~ 'mode=--fire'"
+    trigger_rule: all_done
+    bash: |
+      set -euo pipefail
+      PREVIEW=$dry-run-preview.output
+      APPROVAL=$approval-gate.output
+
+      MODE=$(printf '%s\n' "$PREVIEW" | sed -n 's/^mode=//p' | head -n 1)
+      AUTO_APPROVE=$(printf '%s\n' "$PREVIEW" | sed -n 's/^auto_approve=//p' | head -n 1)
+      WO_ID=$(printf '%s\n' "$PREVIEW" | sed -n 's/^wo_id=//p' | head -n 1)
+      TARGET_REPO=$(printf '%s\n' "$PREVIEW" | sed -n 's/^target_repo=//p' | head -n 1)
+      DUP_LINE=$(printf '%s\n' "$PREVIEW" | grep -E '^(DUPLICATE_RUN_DETECTED|duplicate_check)' | head -n 1 || true)
+
+      # Guard 1: mode must be --fire (when: should have skipped us if not)
+      if [ "$MODE" != "--fire" ]; then
+        echo "fire-cauldron: mode=$MODE is not --fire; skipping"
+        exit 0
+      fi
+
+      # Guard 2: approval required (unless auto_approve)
+      if [ "$AUTO_APPROVE" != "true" ]; then
+        if ! printf '%s\n' "$APPROVAL" | grep -iqE 'approved|^yes|fire'; then
+          echo "fire-cauldron: approval not granted (got: $APPROVAL) -- halting at --queue state"
+          exit 0
+        fi
+        # If duplicate detected, require explicit "fire anyway" in approval
+        if printf '%s\n' "$DUP_LINE" | grep -q 'DUPLICATE_RUN_DETECTED'; then
+          if ! printf '%s\n' "$APPROVAL" | grep -iq 'fire anyway'; then
+            echo "fire-cauldron: DUPLICATE_RUN_DETECTED and operator did not type 'fire anyway' -- halting" >&2
+            exit 1
+          fi
+          echo "fire-cauldron: operator overrode duplicate run detection with 'fire anyway'"
+        fi
+      fi
+
+      # Guard 3: required inputs
+      if [ -z "$WO_ID" ] || [ -z "$TARGET_REPO" ]; then
+        echo "ERROR: missing WO_ID or TARGET_REPO from preview" >&2
+        exit 1
+      fi
+
+      # Guard 4: ARCHON_OPERATOR_TOKEN must be in executor env (Ambiguity #4).
+      if [ -z "${ARCHON_OPERATOR_TOKEN:-}" ]; then
+        echo "ERROR: ARCHON_OPERATOR_TOKEN not set in executor env." >&2
+        echo "Fire path requires authenticated Cauldron API call. Add the secret" >&2
+        echo "to the harness container env and retry." >&2
+        exit 1
+      fi
+
+      # POST to Cauldron conversations endpoint with the execution message.
+      # This pattern matches bdc-doctrine-update post-completed n8n call style
+      # for content-type + auth header.
+      RESPONSE=$(curl -fsS -X POST \
+        "https://archon.bluedevilcollectibles.com/api/conversations" \
+        -H "Content-Type: application/json" \
+        -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN}" \
+        --max-time 30 \
+        -d "{\"message\": \"Execute ${WO_ID} --project ${TARGET_REPO}\"}" \
+        2>&1)
+
+      # jq extracts whichever id field the API returned (id, conversation_id, run_id);
+      # falls back to "parse_failed" if the body is not JSON or has none of those keys.
+      RUN_ID=$(printf '%s\n' "$RESPONSE" \
+        | jq -r '.id // .conversation_id // .run_id // "unknown"' 2>/dev/null \
+        || echo "parse_failed")
+
+      echo "FIRE_OK=true"
+      echo "WO_ID=$WO_ID"
+      echo "TARGET_REPO=$TARGET_REPO"
+      echo "RUN_ID=$RUN_ID"
+      echo "RESPONSE=$RESPONSE"
+
+  # build-manifest: trigger_rule all_done so skipped file-notion/fire-cauldron
+  # in non-applicable modes do not block manifest emission.
+  - id: build-manifest
+    persona: major-build
+    depends_on: [commit-spec, file-notion, fire-cauldron]
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      Build the Captain CI completion manifest for WO-HARNESS-WO-AUTHOR-WORKFLOW-01
+      and the WO that was just authored.
+
+      ## Inputs
+      Normalize-intake: $normalize-intake.output
+      Read-context: $read-context.output
+      Author-loop: $author-loop.output
+      Dry-run preview: $dry-run-preview.output
+      Approval-gate: $approval-gate.output
+      Commit-spec: $commit-spec.output
+      File-notion: $file-notion.output
+      Fire-cauldron: $fire-cauldron.output
+
+      ## Required Manifest Fields
+      - WO: <wo_id from commit-spec, or "BATCH_FAILURE" if author-loop failed>
+      - Mode: <--draft-only | --queue | --fire>
+      - Intake source: <chat_message | github_issue | notion_stub | spec_file>
+      - Files created: docs/work-orders/<WO_ID>.md (only one file -- the spec)
+      - Files modified: none
+      - Branch: <BRANCH from commit-spec>
+      - Commit SHA: <SHA from commit-spec>
+      - Notion URL: <NOTION_URL from file-notion, or "skipped (--draft-only)">
+      - Cauldron run ID: <RUN_ID from fire-cauldron, or "skipped (not --fire)">
+      - Tests: N/A (authoring workflow -- Validate.md 12-check gate IS the test;
+               PR-time codex-review + claude-review catch slips)
+      - Grep assertions (run these against the harness YAML and authored spec):
+        - bdc-harness: count of workflow name string in this YAML -> >= 1
+        - bdc-harness: count of `^model[:][ ]sonnet$` (regex, root-level only) -> 1
+        - bdc-harness: count of `^policyFile[:]` (regex, root-level only) -> 1
+        - bdc-xo: gh api repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/<WO_ID>.md --jq .size -> > 0
+      - VALIDATION: PASS
+
+      Run summary:
+        Adversarial review iterations: <count from $author-loop.output>
+        Validate.md verdict: PASS | BATCH_FAILURE
+        Duplicate run check: <line from dry-run-preview>
+
+  # flip-notion: flips THIS WO (WO-HARNESS-WO-AUTHOR-WORKFLOW-01) to REVIEW.
+  # Note: this is the META WO -- the WO that built the workflow -- not the WO
+  # that was just authored. The authored WO goes to QUEUED via file-notion.
+  - id: flip-notion
+    persona: xo
+    depends_on: [build-manifest]
+    task_class: clerical
+    prompt: |
+      Flip the META Work Order (WO-HARNESS-WO-AUTHOR-WORKFLOW-01 -- the one that
+      built THIS workflow file) to REVIEW with manifest in Notes property.
+
+      DO NOT flip the WO that was just authored -- that one is at QUEUED (set by
+      file-notion in this same run).
+
+      Required Notion changes for WO-HARNESS-WO-AUTHOR-WORKFLOW-01:
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> $build-manifest.output verbatim
+      - claimed_by: Major Build (bdc-wo-author)
+      - claimed_at: today's date
+
+      If Notion MCP unavailable, output:
+        XO_TODO: Flip WO-HARNESS-WO-AUTHOR-WORKFLOW-01 to REVIEW; paste manifest into Notes.
+
+      Manifest:
+      $build-manifest.output
