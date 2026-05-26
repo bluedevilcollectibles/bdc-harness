@@ -62,6 +62,7 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 # Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
+ARG TERRAFORM_VERSION=1.8.5
 
 WORKDIR /app
 
@@ -74,6 +75,7 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     gosu \
     postgresql-client \
+    unzip \
     # Chromium for agent-browser E2E testing (drives browser via CDP)
     chromium \
     && rm -rf /var/lib/apt/lists/*
@@ -85,6 +87,13 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | d
     && apt-get update \
     && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Terraform for deployment-factory planning workflows.
+RUN curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+    && unzip -o /tmp/terraform.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/terraform \
+    && terraform version \
+    && rm -f /tmp/terraform.zip
 
 # Install agent-browser CLI (Vercel Labs) for E2E testing workflows
 # - Uses npm (not bun) because postinstall script downloads the native Rust binary
