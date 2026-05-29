@@ -890,7 +890,7 @@ nodes:
           runs=data if isinstance(data,list) else data.get('runs',[])
           run_id=os.environ.get('RUN_ID',''); wo_id=os.environ.get('WO_ID',''); wo_slug=os.environ.get('WO_SLUG','')
           next((print(str(r.get('codebase','') or r.get('repo','') or r.get('repository','') or '')+'|'+r.get('status','unknown')) for r in runs if str(r.get('id',''))==run_id or wo_id in (r.get('initial_message','') or r.get('message','') or '') or wo_slug in (r.get('workflow_name','') or r.get('workflowName',''))), None)
-          - 2>/dev/null || echo "")
+          " 2>/dev/null || echo "")
 
         if [ -n "$MATCH" ]; then
           BOUND_REPO=$(printf '%s\n' "$MATCH" | cut -d'|' -f1)
