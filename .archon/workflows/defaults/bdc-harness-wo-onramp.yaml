@@ -67,46 +67,121 @@ nodes:
 
       echo "preflight PASS"
 
-  # Node 2: normalize-spec
-  # Parses WO_ID and --project from USER_MESSAGE, fetches spec from bdc-xo,
-  # emits normalized block consumed by all downstream nodes.
+  # Node 2: fetch-spec (bash node — deterministic private-repo fetch)
+  # The xo persona has no Bash tool, so spec retrieval MUST be a bash node, not an
+  # agent prompt. Runs the gh api fallback chain (proven in bdc-feature-development
+  # read-spec). Writes the raw spec to $ARTIFACTS_DIR/source-spec.md. Fails non-zero
+  # if nothing is retrieved, so fetch-failure is distinguishable from parse-failure.
+  - id: fetch-spec
+    load_bearing: true
+    depends_on: [preflight]
+    bash: |
+      set -euo pipefail
+      DEST="$ARTIFACTS_DIR/source-spec.md"
+      META="$ARTIFACTS_DIR/source-spec.meta"
+
+      # Parse WO_ID from USER_MESSAGE
+      WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z][A-Z0-9-]+-[0-9]+' | head -n 1 || true)
+      if [ -z "$WO_ID" ]; then
+        echo "ERROR: no WO_ID matching WO-[A-Z][A-Z0-9-]+-[0-9]+ in USER_MESSAGE" >&2
+        exit 1
+      fi
+
+      # Parse --project override (optional)
+      TARGET_HINT=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo -- '--project[[:space:]]+[A-Za-z0-9._-]+' | head -n 1 | awk '{print $2}' || true)
+
+      SPEC_CONTENT=""
+      SPEC_PATH=""
+
+      # 1) docs/work-orders/<WO_ID>.md
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+
+      # 2) docs/superpowers/specs/<WO_ID>.md
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+
+      # 3) date-prefix glob in docs/superpowers/specs/
+      if [ -z "$SPEC_CONTENT" ]; then
+        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1 || true)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+
+      # 4) GitHub issue body fallback
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="bdc-xo:issues/${ISSUE_NUM}"
+        fi
+      fi
+
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "ERROR: SPEC_MISSING ${WO_ID} not found in bdc-xo (docs/work-orders, docs/superpowers/specs direct, date-glob, issue search)" >&2
+        exit 1
+      fi
+
+      # Write canonical artifact
+      printf '%s\n' "$SPEC_CONTENT" > "$DEST"
+      {
+        echo "WO_ID=${WO_ID}"
+        echo "SPEC_PATH=bdc-xo:${SPEC_PATH}"
+        echo "TARGET_HINT=${TARGET_HINT:-unknown}"
+        echo "SPEC_BYTES=$(wc -c < "$DEST")"
+      } > "$META"
+
+      echo "fetch-spec: wrote $(wc -c < "$DEST") bytes to $DEST"
+      echo "WO_ID=${WO_ID}"
+      echo "SPEC_PATH=bdc-xo:${SPEC_PATH}"
+      echo "TARGET_HINT=${TARGET_HINT:-unknown}"
+      echo "SPEC_ARTIFACT=$DEST"
+      echo "FETCH_OK=true"
+
+  # Node 2a: normalize-spec (xo prompt — reads the fetched artifact, extracts fields)
+  # Reads ONLY $ARTIFACTS_DIR/source-spec.md (written by fetch-spec). Does NOT attempt
+  # any gh/repo access (the xo persona has no Bash tool). Pure extraction/judgment.
   - id: normalize-spec
     agent: xo
     context: fresh
-    depends_on: [preflight]
+    depends_on: [fetch-spec]
     prompt: |
-      You are the BDC on-ramp spec normalizer. Parse the USER_MESSAGE, fetch the
-      WO spec from bdc-xo, and emit a normalized block.
+      You are the BDC on-ramp spec normalizer. The spec has ALREADY been fetched by
+      the fetch-spec bash node and written to a file. Read ONLY that file and emit a
+      normalized block. Do NOT attempt any gh/repo access — you have no shell.
 
-      ## Input
-      USER_MESSAGE: $USER_MESSAGE
+      ## Inputs
+      fetch-spec output: $fetch-spec.output
+      The raw spec is in the file referenced by SPEC_ARTIFACT (read it with your Read tool).
+      WO_ID and TARGET_HINT are in the fetch-spec output above.
 
-      ## Step 1 â€” Parse WO_ID
-      Extract the WO ID matching pattern `WO-[A-Z][A-Z0-9-]+-[0-9]+` from USER_MESSAGE.
-      If none found, output `SPEC_MISSING: no WO_ID found in USER_MESSAGE` and stop.
+      ## Step 1 — Read the spec artifact
+      Read the file at the SPEC_ARTIFACT path from fetch-spec output (typically
+      $ARTIFACTS_DIR/source-spec.md). That file IS the WO spec body. If you cannot
+      read it or it is empty, output `SPEC_MISSING: artifact unreadable` and stop.
 
-      ## Step 2 â€” Parse TARGET_REPO
-      Look for `--project <repo>` in USER_MESSAGE. If present, use it.
-      Otherwise emit `target_repo_hint=unknown` and the generate-yaml node will
-      infer from the spec's Â§10 Deploy Target.
+      ## Step 2 — Determine TARGET_REPO
+      Prefer the TARGET_HINT from fetch-spec output if not "unknown". Otherwise parse
+      the spec body for `target_repo:`, `**Target repo:**`, or `Target Repo:` lines.
+      Default to `unknown` if not parseable.
 
-      ## Step 3 â€” Fetch spec (priority order, stop at first hit)
-      1. `gh api repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/<WO_ID>.md?ref=main --jq .content | base64 -d`
-      2. `gh api repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/<WO_ID>.md?ref=main --jq .content | base64 -d`
-      3. Date-glob: `gh api repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main --template '{{range .}}{{.path}}{{"\n"}}{{end}}'` then grep for `<WO_ID>.md` and fetch the match
-      4. GitHub issue title search: `gh issue list --repo bluedevilcollectibles/bdc-xo --search "<WO_ID> in:title" --json number,body --jq '.[0]'`
-
-      If all four fail, output `SPEC_MISSING: <WO_ID> not found in bdc-xo docs/work-orders, docs/superpowers/specs, or issue search` and stop.
-
-      ## Step 4 â€” Extract fields from spec
-      From the fetched spec body, extract:
-      - TARGET_REPO: from `target_repo: <owner>/<repo>` OR `**Target repo:** \`<owner>/<repo>\`` OR `Target repo: <owner>/<repo>` OR `**Target Repo:** \`<owner>/<repo>\``. Default to `unknown` if not parseable.
-      - TARGET_REPO_FULL: `bluedevilcollectibles/<TARGET_REPO>` (strip org prefix if already present; add it if missing)
-      - RULE20_STAGING_GATE: true if TARGET_REPO_FULL is one of: bluedevilcollectibles/lspro-react, bluedevilcollectibles/shopops-storefront, bluedevilcollectibles/shopops. Otherwise false.
-      - WO_CLASS: CODE, INFRA, or MIXED (from spec Class field if present; default CODE)
-      - BUSINESS_RISK_INVARIANT: the single most critical must-not-break invariant for this WO. Derive from Â§12 Stop Point, Â§2 Behavior Source of Truth, or any "MUST NEVER break" statement in the spec. Keep to one sentence. This will be used as a fail-closed guard in the child YAML.
-      - IN_SCOPE_FILES: Â§3 / Â§7 files listed as in-scope (comma-separated)
-      - VERIFY_COMMANDS: Â§12 stop-condition commands (newline-separated)
+      ## Step 3 — Extract fields from the spec body
+      - TARGET_REPO: short repo name (e.g. shopops)
+      - TARGET_REPO_FULL: bluedevilcollectibles/<TARGET_REPO> (add org prefix if missing)
+      - RULE20_STAGING_GATE: true if TARGET_REPO_FULL is one of:
+        bluedevilcollectibles/lspro-react, bluedevilcollectibles/shopops-storefront,
+        bluedevilcollectibles/shopops. Otherwise false.
+      - WO_CLASS: CODE, INFRA, or MIXED (from spec Class field; default CODE)
+      - BUSINESS_RISK_INVARIANT: the single most critical must-not-break invariant.
+        Derive from the Stop Point / Behavior Source of Truth / any "MUST NEVER break"
+        statement. One sentence, specific to THIS WO. Never emit the literal words
+        "placeholder", "TODO", "one sentence", or "<BUSINESS_RISK...".
+      - IN_SCOPE_FILES: in-scope files (comma-separated)
+      - VERIFY_COMMANDS: stop-condition commands (newline-separated)
 
       ## Required Output Format (emit exactly, no markdown fences)
 
@@ -119,12 +194,11 @@ nodes:
       WO_CLASS=<CODE|INFRA|MIXED>
       BUSINESS_RISK_INVARIANT=<one sentence>
       IN_SCOPE_FILES=<comma-separated or "(see spec)">
-      VERIFY_COMMANDS=<newline-separated commands or "(see spec Â§12)">
+      VERIFY_COMMANDS=<newline-separated commands or "(see spec)">
 
       === SPEC_CONTENT ===
-      <full spec body verbatim>
+      <full spec body verbatim from the artifact>
       ```
-
 
   # Node 2b: assert-spec-resolved (load-bearing guard)
   # Fails closed if normalize-spec did not retrieve a real spec.
