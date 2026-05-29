@@ -93,3 +93,22 @@ describe('dagNodeSchema agent field', () => {
     expect(result.success).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// effortLevelSchema tests
+// ---------------------------------------------------------------------------
+
+describe('effortLevelSchema', () => {
+  test('accepts all valid effort levels including xhigh', () => {
+    const validLevels = ['low', 'medium', 'high', 'max', 'xhigh'];
+    for (const level of validLevels) {
+      const result = dagNodeSchema.safeParse({ id: 'step', prompt: 'x', effort: level });
+      expect(result.success).toBe(true);
+    }
+  });
+
+  test('rejects unknown effort level', () => {
+    const result = dagNodeSchema.safeParse({ id: 'step', prompt: 'x', effort: 'ultra' });
+    expect(result.success).toBe(false);
+  });
+});
