@@ -307,9 +307,9 @@ nodes:
           if grep -qi "$BAD" "$DRAFT" 2>/dev/null; then echo "FAIL: child YAML contains placeholder text: $BAD" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); break; fi
         done
 
-        # python3 parse
-        if ! python3 -c "import yaml,sys; yaml.safe_load(open('$DRAFT'))" 2>>"$FEEDBACK"; then
-          echo "FAIL: python3 yaml.safe_load failed -- YAML is not valid (see parse error above)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+        # bun YAML parse (container has bun, not python-yaml)
+        if ! bun -e "Bun.YAML.parse(require('fs').readFileSync('$DRAFT','utf8'))" 2>>"$FEEDBACK"; then
+          echo "FAIL: bun YAML parse failed -- YAML is not valid (see parse error above)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
         fi
 
         if [ "$ERRORS" -gt 0 ]; then
@@ -419,7 +419,7 @@ nodes:
       fi
 
       # Hard re-check: parse + structural musts
-      python3 -c "import yaml,sys; yaml.safe_load(open('$YAML_FILENAME'))" 2>/dev/null || { echo "ERROR: draft does not parse as YAML" >&2; exit 1; }
+      bun -e "Bun.YAML.parse(require('fs').readFileSync('$YAML_FILENAME','utf8'))" 2>/dev/null || { echo "ERROR: draft does not parse as YAML" >&2; exit 1; }
       grep -q 'id: business-risk-gate' "$YAML_FILENAME" || { echo "ERROR: business-risk-gate missing" >&2; exit 1; }
       grep -q 'id: flip-notion' "$YAML_FILENAME" || { echo "ERROR: flip-notion missing" >&2; exit 1; }
       for BAD in "placeholder" "<BUSINESS_RISK" "invariant here" "one sentence"; do
