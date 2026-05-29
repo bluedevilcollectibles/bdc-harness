@@ -125,12 +125,53 @@ nodes:
       <full spec body verbatim>
       ```
 
+
+  # Node 2b: assert-spec-resolved (load-bearing guard)
+  # Fails closed if normalize-spec did not retrieve a real spec.
+  - id: assert-spec-resolved
+    load_bearing: true
+    depends_on: [normalize-spec]
+    bash: |
+      set -euo pipefail
+      NORM_OUT=$normalize-spec.output
+
+      if printf '%s\n' "$NORM_OUT" | grep -qE '^SPEC_MISSING:'; then
+        MSG=$(printf '%s\n' "$NORM_OUT" | grep '^SPEC_MISSING:' | head -1)
+        echo "ERROR: normalize-spec could not retrieve spec: $MSG" >&2
+        exit 1
+      fi
+
+      SPEC_LEN=$(printf '%s\n' "$NORM_OUT" | awk '/=== SPEC_CONTENT ===/,0' | wc -c || echo 0)
+      if [ "${SPEC_LEN:-0}" -lt 200 ]; then
+        echo "ERROR: SPEC_CONTENT section missing or too short (${SPEC_LEN} chars)" >&2
+        exit 1
+      fi
+
+      BRI=$(printf '%s\n' "$NORM_OUT" | sed -n 's/^BUSINESS_RISK_INVARIANT=//p' | head -1)
+      if [ -z "$BRI" ]; then
+        echo "ERROR: BUSINESS_RISK_INVARIANT missing from normalize-spec output" >&2
+        exit 1
+      fi
+      for BAD in placeholder TODO unknown "BUSINESS_RISK_INVARIANT" "invariant here" "one sentence"; do
+        if printf '%s\n' "$BRI" | grep -qi "$BAD"; then
+          echo "ERROR: BUSINESS_RISK_INVARIANT is a placeholder: $BRI" >&2
+          exit 1
+        fi
+      done
+      if [ "${#BRI}" -lt 20 ]; then
+        echo "ERROR: BUSINESS_RISK_INVARIANT too short (${#BRI} chars): $BRI" >&2
+        exit 1
+      fi
+
+      echo "SPEC_RESOLVED=true"
+      echo "BRI ok: $BRI"
+
   # Node 3: generate-yaml
   # Authors a tailored child YAML from bdc-feature-development.yaml base.
   # Bakes in the BUSINESS_RISK_INVARIANT as a fail-closed business-risk-gate node.
   - id: generate-yaml
     agent: war-council-architect
-    depends_on: [normalize-spec]
+    depends_on: [assert-spec-resolved]
     loop:
       fresh_context: true
       until: YAML_DRAFTED
@@ -138,6 +179,13 @@ nodes:
       prompt: |
         You are the BDC YAML architect. Author a tailored child workflow YAML for
         the Work Order described in the normalized spec below.
+
+        ## GUARD: Fail immediately if spec is incomplete
+        Before drafting, check the normalized spec input:
+        1. If SPEC_MISSING: present -> emit YAML_DRAFT_FAILURE reason=spec-not-retrieved and STOP.
+        2. If BUSINESS_RISK_INVARIANT missing/empty/placeholder -> emit YAML_DRAFT_FAILURE reason=placeholder-invariant and STOP.
+        3. If SPEC_CONTENT < 200 chars -> emit YAML_DRAFT_FAILURE reason=spec-too-short and STOP.
+        Only proceed if all three checks pass.
 
         ## Inputs
         Normalized spec: $normalize-spec.output
@@ -333,6 +381,25 @@ nodes:
         ERRORS=$((ERRORS+1))
       else
         echo "PASS: python3 yaml.safe_load OK"
+      fi
+
+      # Placeholder text checks
+      for BAD in "placeholder" "TODO" "<BUSINESS_RISK" "invariant here" "one sentence" "BUSINESS_RISK_INVARIANT from normalize"; do
+        if grep -qi "$BAD" "$YAML_FILENAME" 2>/dev/null; then
+          echo "FAIL: child YAML contains placeholder text: $BAD" >&2
+          ERRORS=$((ERRORS+1))
+          break
+        fi
+      done
+
+      # business-risk-gate must be load_bearing: true
+      if grep -q "id: business-risk-gate" "$YAML_FILENAME" 2>/dev/null; then
+        if ! awk '/id: business-risk-gate/{f=1} f && /load_bearing: true/{print; f=0}' "$YAML_FILENAME" | grep -q "."; then
+          echo "FAIL: business-risk-gate node missing load_bearing: true" >&2
+          ERRORS=$((ERRORS+1))
+        else
+          echo "PASS: business-risk-gate load_bearing: true"
+        fi
       fi
 
       if [ "$ERRORS" -gt 0 ]; then
@@ -867,7 +934,12 @@ nodes:
   - id: flip-notion
     agent: xo
     depends_on: [build-manifest]
+    when: "BINDING_OK=true"
     prompt: |
+      ## GUARD: Only flip if run succeeded end-to-end
+      Check build-manifest output for VALIDATION: PASS.
+      If VALIDATION: BLOCKED or FAIL -> output XO_TODO: do not flip WO-CAULDRON-ONRAMP-ATOM-01 and stop.
+
       Flip the on-ramp's OWN Work Order (WO-CAULDRON-ONRAMP-ATOM-01) to REVIEW
       in Notion. Do NOT touch the child product WO — the child run's own flip-notion
       node will handle that at the end of its execution.
