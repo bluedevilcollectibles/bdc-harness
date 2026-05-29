@@ -81,14 +81,14 @@ nodes:
       META="$ARTIFACTS_DIR/source-spec.meta"
 
       # Parse WO_ID from USER_MESSAGE
-      WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z][A-Z0-9-]+-[0-9]-> | head -n 1 || true)
+      WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z][A-Z0-9-]+-[0-9]+' | head -n 1 || true)
       if [ -z "$WO_ID" ]; then
         echo "ERROR: no WO_ID matching WO-[A-Z][A-Z0-9-]+-[0-9]+ in USER_MESSAGE" >&2
         exit 1
       fi
 
       # Parse --project override (optional)
-      TARGET_HINT=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo -- '--project[[:space:]]+[A-Za-z0-9._-]-> | head -n 1 | awk '{print $2}' || true)
+      TARGET_HINT=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo -- '--project[[:space:]]+[A-Za-z0-9._-]+' | head -n 1 | awk '{print $2}' || true)
 
       SPEC_CONTENT=""
       SPEC_PATH=""
@@ -889,7 +889,7 @@ nodes:
           data=json.load(sys.stdin)
           runs=data if isinstance(data,list) else data.get('runs',[])
           run_id=os.environ.get('RUN_ID',''); wo_id=os.environ.get('WO_ID',''); wo_slug=os.environ.get('WO_SLUG','')
-          next((print(str(r.get('codebase','') or r.get('repo','') or r.get('repository','') or '')->|'+r.get('status','unknown')) for r in runs if str(r.get('id',''))==run_id or wo_id in (r.get('initial_message','') or r.get('message','') or '') or wo_slug in (r.get('workflow_name','') or r.get('workflowName',''))), None)
+          next((print(str(r.get('codebase','') or r.get('repo','') or r.get('repository','') or '')+'|'+r.get('status','unknown')) for r in runs if str(r.get('id',''))==run_id or wo_id in (r.get('initial_message','') or r.get('message','') or '') or wo_slug in (r.get('workflow_name','') or r.get('workflowName',''))), None)
           - 2>/dev/null || echo "")
 
         if [ -n "$MATCH" ]; then
