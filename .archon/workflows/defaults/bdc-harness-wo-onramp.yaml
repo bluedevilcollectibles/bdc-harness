@@ -166,252 +166,235 @@ nodes:
       echo "SPEC_RESOLVED=true"
       echo "BRI ok: $BRI"
 
-  # Node 3: generate-yaml
-  # Authors a tailored child YAML from bdc-feature-development.yaml base.
-  # Bakes in the BUSINESS_RISK_INVARIANT as a fail-closed business-risk-gate node.
-  - id: generate-yaml
-    agent: war-council-architect
+  # Node 3: yaml-author (write-capable builder + in-loop validation)
+  # major-build authors the child YAML. until_bash runs the full validation after
+  # each iteration; failures are written to a feedback file the next iteration reads.
+  # The loop IS the validate->fix retry. max_iterations is the retry budget.
+  - id: yaml-author
+    agent: major-build
     depends_on: [assert-spec-resolved]
     loop:
       fresh_context: true
-      until: YAML_DRAFTED
+      until: YAML_READY
       max_iterations: 4
-      prompt: |
-        You are the BDC YAML architect. Author a tailored child workflow YAML for
-        the Work Order described in the normalized spec below.
+      until_bash: |
+        set -uo pipefail
+        FEEDBACK="$ARTIFACTS_DIR/yaml-author-validation.txt"
+        : > "$FEEDBACK"
 
-        ## GUARD: Fail immediately if spec is incomplete
-        Before drafting, check the normalized spec input:
-        1. If SPEC_MISSING: present -> emit YAML_DRAFT_FAILURE reason=spec-not-retrieved and STOP.
-        2. If BUSINESS_RISK_INVARIANT missing/empty/placeholder -> emit YAML_DRAFT_FAILURE reason=placeholder-invariant and STOP.
-        3. If SPEC_CONTENT < 200 chars -> emit YAML_DRAFT_FAILURE reason=spec-too-short and STOP.
-        Only proceed if all three checks pass.
+        # Resolve the draft filename: prefer a single *.yaml.draft in CWD.
+        DRAFT=$(ls -1 *.yaml.draft 2>/dev/null | head -n 1 || true)
+        if [ -z "$DRAFT" ] || [ ! -f "$DRAFT" ]; then
+          echo "FAIL: no .yaml.draft file found in CWD" >> "$FEEDBACK"
+          cat "$FEEDBACK"
+          exit 1
+        fi
+
+        ERRORS=0
+
+        # Rule 1: model: sonnet at root
+        grep -Eq '^model:[[:space:]]*sonnet$' "$DRAFT" || { echo "FAIL Rule 1: missing 'model: sonnet' at root" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+
+        # Rule 6: policyFile at root
+        grep -Eq '^policyFile:[[:space:]]*harness/policies/agent-behavior\.md$' "$DRAFT" || { echo "FAIL Rule 6: missing 'policyFile: harness/policies/agent-behavior.md' at root" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+
+        # Rule 4/9: no BDC_XO/ prefix in paths
+        if grep -E 'BDC_XO/' "$DRAFT" | grep -qv '#'; then echo "FAIL Rule 4/9: BDC_XO/ prefix found (paths must be repo-root-relative)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); fi
+
+        # Rule 10: every loop: has until, max_iterations, fresh_context
+        LOOP_COUNT=$(grep -c '^[[:space:]]*loop:' "$DRAFT" 2>/dev/null || echo 0)
+        if [ "$LOOP_COUNT" -gt 0 ]; then
+          UNTIL_COUNT=$(grep -c '[[:space:]]*until:' "$DRAFT" 2>/dev/null || echo 0)
+          MAXITER_COUNT=$(grep -c '[[:space:]]*max_iterations:' "$DRAFT" 2>/dev/null || echo 0)
+          FC_COUNT=$(grep -c '[[:space:]]*fresh_context:' "$DRAFT" 2>/dev/null || echo 0)
+          if [ "$UNTIL_COUNT" -lt "$LOOP_COUNT" ] || [ "$MAXITER_COUNT" -lt "$LOOP_COUNT" ] || [ "$FC_COUNT" -lt "$LOOP_COUNT" ]; then
+            echo "FAIL Rule 10: loop blocks missing until/max_iterations/fresh_context (loops=$LOOP_COUNT until=$UNTIL_COUNT maxiter=$MAXITER_COUNT fc=$FC_COUNT)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+          fi
+        fi
+
+        # Rule 7: flip-notion node present
+        grep -q 'id: flip-notion' "$DRAFT" || { echo "FAIL Rule 7: flip-notion node not found" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+
+        # business-risk-gate present
+        grep -q 'id: business-risk-gate' "$DRAFT" || { echo "FAIL: business-risk-gate node not found (required)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+
+        # business-risk-gate must be load_bearing: true
+        if grep -q 'id: business-risk-gate' "$DRAFT"; then
+          if ! awk '/id: business-risk-gate/{f=1} f && /load_bearing: true/{print; f=0}' "$DRAFT" | grep -q '.'; then
+            echo "FAIL: business-risk-gate missing load_bearing: true" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+          fi
+        fi
+
+        # Rule 11: no n8n webhook calls
+        if grep -E 'n8n\.bluedevilcollectibles\.com' "$DRAFT" | grep -qv '#'; then echo "FAIL Rule 11: n8n webhook call found (hangs in executor subprocess)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); fi
+
+        # Placeholder text checks
+        for BAD in "placeholder" "TODO" "<BUSINESS_RISK" "invariant here" "one sentence" "BUSINESS_RISK_INVARIANT from normalize"; do
+          if grep -qi "$BAD" "$DRAFT" 2>/dev/null; then echo "FAIL: child YAML contains placeholder text: $BAD" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); break; fi
+        done
+
+        # python3 parse
+        if ! python3 -c "import yaml,sys; yaml.safe_load(open('$DRAFT'))" 2>>"$FEEDBACK"; then
+          echo "FAIL: python3 yaml.safe_load failed -- YAML is not valid (see parse error above)" >> "$FEEDBACK"; ERRORS=$((ERRORS+1));
+        fi
+
+        if [ "$ERRORS" -gt 0 ]; then
+          echo "" >> "$FEEDBACK"
+          echo "$ERRORS validation error(s). Fix every line above and re-draft." >> "$FEEDBACK"
+          echo "=== yaml-author validation FAILED ($ERRORS errors) ==="
+          cat "$FEEDBACK"
+          exit 1
+        fi
+
+        echo "ARTIFACTS_DIR=$ARTIFACTS_DIR" >> "$FEEDBACK"
+        echo "YAML_READY=true (draft: $DRAFT)"
+        exit 0
+      prompt: |
+        You are major-build. Author a tailored child workflow YAML for the Work
+        Order in the normalized spec below, then write it to disk. You have full
+        write tools -- you MUST actually create the file.
+
+        ## STEP 0 -- Read prior-iteration validation feedback FIRST
+        Run this before anything else:
+          cat "$ARTIFACTS_DIR/yaml-author-validation.txt" 2>/dev/null || echo "(no prior feedback -- first iteration)"
+        If the file lists failures, FIX EVERY ONE of them in this iteration. Do not
+        repeat a mistake the previous iteration already made.
+
+        ## GUARD -- fail closed if spec is incomplete
+        Check the normalized spec input. If any of these, emit YAML_DRAFT_FAILURE
+        with a reason and STOP (do NOT draft, do NOT emit YAML_READY):
+        1. SPEC_MISSING present -> reason=spec-not-retrieved
+        2. BUSINESS_RISK_INVARIANT missing/empty/placeholder -> reason=placeholder-invariant
+        3. SPEC_CONTENT < 200 chars -> reason=spec-too-short
 
         ## Inputs
         Normalized spec: $normalize-spec.output
-        Previous iteration output (empty on first): $LOOP_PREV_OUTPUT
 
         ## Base pattern
         Use bdc-feature-development.yaml as the structural base:
-        - preflight-github-auth (load_bearing bash)
-        - read-spec (bash, cross-repo from bdc-xo)
-        - plan (prompt, war-council-architect)
-        - implement (loop, major-build, fresh_context: true, until: COMPLETE, max_iterations: 5)
-        - checkpoint-push (bash, overseer, best-effort)
-        - war-council-validator (prompt)
-        - decide-push-target (prompt, major-build)
-        - commit-and-push (bash, overseer, load_bearing)
-        - open-pr-if-needed (bash, major-build, load_bearing)
-        - build-manifest (prompt, major-build, trigger_rule: all_done)
-        - flip-notion (prompt, xo)
+        preflight-github-auth (load_bearing) -> read-spec -> plan -> implement
+        (loop, major-build, fresh_context: true, until: COMPLETE, max_iterations: 5)
+        -> war-council-validator -> business-risk-gate -> decide-push-target ->
+        commit-and-push (load_bearing) -> open-pr-if-needed (load_bearing) ->
+        build-manifest (trigger_rule: all_done) -> flip-notion.
 
         ## Tailoring requirements
 
-        **1. Bake in WO_ID**
-        The child YAML must hardcode the WO_ID from normalize-spec output so it
-        does not need a USER_MESSAGE at fire time (the on-ramp already parsed it).
-        Add at root level:
-        ```yaml
-        inputs:
-          WO_ID:
-            default: "<WO_ID>"
-        ```
+        1. Bake in WO_ID at root so the child needs no USER_MESSAGE at fire time:
+           inputs:
+             WO_ID:
+               default: "<WO_ID from normalize-spec>"
 
-        **2. Add business-risk-gate node**
-        Insert a `business-risk-gate` node between `war-council-validator` and
-        `decide-push-target`. This node is load_bearing and fails closed if the
-        invariant is violated:
-        ```yaml
-        - id: business-risk-gate
-          load_bearing: true
-          bash: |
-            set -euo pipefail
-            echo "=== business-risk-gate ==="
-            echo "Invariant: <BUSINESS_RISK_INVARIANT from normalize-spec>"
-            echo ""
-            echo "Checking invariant against implementation..."
-            # Emit the invariant for the validator to see in context
-            echo "BUSINESS_RISK_INVARIANT: <verbatim invariant text>"
-            echo ""
-            # The adversarial check: grep for the invariant pattern in changed files.
-            # If the implementation touches the invariant surface, at minimum the
-            # changed diff must include a test or guard for it.
-            DIFF=$(git diff --stat HEAD~1 HEAD 2>/dev/null || git diff --stat HEAD 2>/dev/null || echo "(no diff)")
-            echo "Changed files:"
-            echo "$DIFF"
-            echo ""
-            echo "business-risk-gate: invariant surfaced for validator review."
-            echo "RISK_GATE_SURFACED=true"
-        ```
+        2. Add a business-risk-gate node (load_bearing: true) before decide-push-target
+           that fails closed if the WO's BUSINESS_RISK_INVARIANT is violated. Put the
+           ACTUAL invariant text from normalize-spec into the node -- never the literal
+           words "placeholder", "TODO", "one sentence", or "<BUSINESS_RISK...".
 
-        **3. Rule 20 staging gate**
-        If RULE20_STAGING_GATE=true: in decide-push-target and commit-and-push,
-        hardcode `staging_gate_required: true` and `--base staging` for the PR.
+        3. If RULE20_STAGING_GATE=true: decide-push-target and commit-and-push must use
+           --base staging for the PR.
 
-        **4. Child YAML filename**
-        Derive from WO_ID: WO-SHOPOPS-FOO-01 → bdc-shopops-foo-01.yaml
-        Pattern: lowercase WO_ID, replace `WO-` prefix with `bdc-`, replace underscores with hyphens.
+        4. Child YAML filename: lowercase the WO_ID, replace WO- prefix with bdc-,
+           replace underscores with hyphens. Write to <slug>.yaml.draft in CWD.
 
-        **5. YAML must pass all 13 Archon-YAML-Authoring hard rules**
+        ## Hard rules the child YAML MUST satisfy (validated by until_bash after you finish)
         - model: sonnet at root
         - policyFile: harness/policies/agent-behavior.md at root
-        - No n8n webhook calls in bash nodes
-        - All loop: blocks have prompt, until, max_iterations, fresh_context
-        - Paths relative to repo root (no BDC_XO/ prefix)
-        - flip-notion as final node
-        - load_bearing: true on preflight-github-auth, commit-and-push, open-pr-if-needed, business-risk-gate
+        - every loop: has prompt + until + max_iterations + fresh_context
+        - paths repo-root-relative (no BDC_XO/ prefix)
+        - no n8n webhook calls
+        - flip-notion final node; business-risk-gate present and load_bearing: true
+        - no placeholder text anywhere
 
-        ## Output requirements
+        ## Output
+        1. WRITE the file <slug>.yaml.draft to disk (you have write tools -- use them).
+        2. Emit this footer:
+           === YAML-AUTHOR RESULT ===
+           YAML_FILENAME=<slug>.yaml.draft
+           WO_SLUG=<bdc-slug>
+           WO_ID=<WO_ID>
+           TARGET_REPO_FULL=<bluedevilcollectibles/repo>
+           RULE20_STAGING_GATE=<true|false>
+           BUSINESS_RISK_INVARIANT=<one sentence, verbatim from spec>
+        3. Emit the sentinel YAML_READY on its own line.
 
-        1. Write the complete YAML to a file named exactly `<WO_SLUG>.yaml.draft` in the
-           current working directory (CWD = bdc-harness repo root).
-        2. Emit a footer block:
-        ```
-        === GENERATE-YAML RESULT ===
-        YAML_FILENAME=<wo-slug>.yaml.draft
-        WO_SLUG=<bdc-wo-slug>
-        WO_ID=<WO_ID>
-        TARGET_REPO_FULL=<bluedevilcollectibles/repo>
-        RULE20_STAGING_GATE=<true|false>
-        BUSINESS_RISK_INVARIANT=<one sentence>
-        ```
+        The until_bash gate validates your draft after this iteration. If it fails,
+        you will see the errors in the feedback file next iteration -- fix them.
 
-        ## Sentinel Rule
-        Emit `<promise>YAML_DRAFTED</promise>` ONLY when:
-        - The `.yaml.draft` file has been written to disk
-        - The footer block is present in your output
-        - The YAML passes a mental-model check against all 13 hard rules
-
-        If iteration 4 ends without a valid draft, emit:
-        ```
-        YAML_DRAFT_FAILURE:
-          WO_ID: <id>
-          reason: <specific gap>
-        ```
-
-  # Node 4: validate-yaml
-  # Checks hard rules 1/6/9/10 via grep, asserts flip-notion and business-risk-gate
-  # nodes exist, parses via python3 yaml.safe_load.
-  - id: validate-yaml
+  # Node 4: assert-yaml-ready (load-bearing hard gate, defense-in-depth)
+  # Even if the loop exhausted iterations or emitted the sentinel without a valid
+  # draft, this gate re-runs the parse + key structural checks and fails the run
+  # cleanly rather than letting a bad draft reach adversarial-review/register.
+  - id: assert-yaml-ready
     load_bearing: true
-    depends_on: [generate-yaml]
+    depends_on: [yaml-author]
     bash: |
       set -euo pipefail
-      GEN_OUT=$generate-yaml.output
+      AUTHOR_OUT=$yaml-author.output
 
-      YAML_FILENAME=$(printf '%s\n' "$GEN_OUT" | sed -n 's/^YAML_FILENAME=//p' | head -n 1)
-      WO_SLUG=$(printf '%s\n' "$GEN_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
+      YAML_FILENAME=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^YAML_FILENAME=//p' | head -n 1)
+      WO_SLUG=$(printf '%s\n' "$AUTHOR_OUT" | sed -n 's/^WO_SLUG=//p' | head -n 1)
 
+      # Fall back to globbing if the footer was malformed
       if [ -z "$YAML_FILENAME" ] || [ ! -f "$YAML_FILENAME" ]; then
-        echo "ERROR: generate-yaml did not produce a .yaml.draft file (expected: $YAML_FILENAME)." >&2
-        printf '%s\n' "$GEN_OUT" | grep -q 'YAML_DRAFT_FAILURE' && echo "generate-yaml hit YAML_DRAFT_FAILURE." >&2
+        YAML_FILENAME=$(ls -1 *.yaml.draft 2>/dev/null | head -n 1 || true)
+      fi
+      if [ -z "$YAML_FILENAME" ] || [ ! -f "$YAML_FILENAME" ]; then
+        echo "ERROR: yaml-author produced no .yaml.draft file -- run failed clean (no dead-end)." >&2
+        printf '%s\n' "$AUTHOR_OUT" | grep -q 'YAML_DRAFT_FAILURE' && echo "yaml-author hit YAML_DRAFT_FAILURE." >&2
         exit 1
       fi
 
-      echo "=== validate-yaml: checking $YAML_FILENAME ==="
-      ERRORS=0
-
-      # Rule 1: model: sonnet at root level
-      if ! grep -Eq '^model:[[:space:]]*sonnet$' "$YAML_FILENAME"; then
-        echo "FAIL Rule 1: 'model: sonnet' not found at root level" >&2
-        ERRORS=$((ERRORS+1))
-      else
-        echo "PASS Rule 1: model: sonnet"
-      fi
-
-      # Rule 6: policyFile at root
-      if ! grep -Eq '^policyFile:[[:space:]]*harness/policies/agent-behavior\.md$' "$YAML_FILENAME"; then
-        echo "FAIL Rule 6: 'policyFile: harness/policies/agent-behavior.md' not found at root level" >&2
-        ERRORS=$((ERRORS+1))
-      else
-        echo "PASS Rule 6: policyFile"
-      fi
-
-      # Rule 9: no discovery-breaking paths (sanity check: no BDC_XO/ prefix in paths)
-      if grep -E 'BDC_XO/' "$YAML_FILENAME" | grep -qv '#'; then
-        echo "FAIL Rule 4/9: BDC_XO/ prefix found in YAML (paths must be repo-root-relative)" >&2
-        ERRORS=$((ERRORS+1))
-      else
-        echo "PASS Rule 4/9: no BDC_XO/ prefix"
-      fi
-
-      # Rule 10: all loop: blocks have until, max_iterations, fresh_context, prompt
-      LOOP_COUNT=$(grep -c '^[[:space:]]*loop:' "$YAML_FILENAME" 2>/dev/null || echo 0)
-      if [ "$LOOP_COUNT" -gt 0 ]; then
-        UNTIL_COUNT=$(grep -c '[[:space:]]*until:' "$YAML_FILENAME" 2>/dev/null || echo 0)
-        MAXITER_COUNT=$(grep -c '[[:space:]]*max_iterations:' "$YAML_FILENAME" 2>/dev/null || echo 0)
-        FC_COUNT=$(grep -c '[[:space:]]*fresh_context:' "$YAML_FILENAME" 2>/dev/null || echo 0)
-        if [ "$UNTIL_COUNT" -lt "$LOOP_COUNT" ] || [ "$MAXITER_COUNT" -lt "$LOOP_COUNT" ] || [ "$FC_COUNT" -lt "$LOOP_COUNT" ]; then
-          echo "FAIL Rule 10: loop blocks missing until/max_iterations/fresh_context (loops=$LOOP_COUNT until=$UNTIL_COUNT maxiter=$MAXITER_COUNT fc=$FC_COUNT)" >&2
-          ERRORS=$((ERRORS+1))
-        else
-          echo "PASS Rule 10: loop block fields"
-        fi
-      else
-        echo "PASS Rule 10: no loop blocks to check"
-      fi
-
-      # Rule 7: flip-notion node present
-      if ! grep -q 'id: flip-notion' "$YAML_FILENAME"; then
-        echo "FAIL Rule 7: flip-notion node not found" >&2
-        ERRORS=$((ERRORS+1))
-      else
-        echo "PASS Rule 7: flip-notion present"
-      fi
-
-      # business-risk-gate node present
-      if ! grep -q 'id: business-risk-gate' "$YAML_FILENAME"; then
-        echo "FAIL: business-risk-gate node not found (required by on-ramp spec)" >&2
-        ERRORS=$((ERRORS+1))
-      else
-        echo "PASS: business-risk-gate present"
-      fi
-
-      # Rule 11: no n8n webhook calls
-      if grep -E 'n8n\.bluedevilcollectibles\.com' "$YAML_FILENAME" | grep -qv '#'; then
-        echo "FAIL Rule 11: n8n webhook call found in YAML (hangs in executor subprocess)" >&2
-        ERRORS=$((ERRORS+1))
-      else
-        echo "PASS Rule 11: no n8n webhook calls"
-      fi
-
-      # Python3 YAML parse
-      if ! python3 -c "import yaml,sys; yaml.safe_load(open('$YAML_FILENAME'))" 2>/dev/null; then
-        echo "FAIL: python3 yaml.safe_load failed — YAML is not valid" >&2
-        ERRORS=$((ERRORS+1))
-      else
-        echo "PASS: python3 yaml.safe_load OK"
-      fi
-
-      # Placeholder text checks
-      for BAD in "placeholder" "TODO" "<BUSINESS_RISK" "invariant here" "one sentence" "BUSINESS_RISK_INVARIANT from normalize"; do
-        if grep -qi "$BAD" "$YAML_FILENAME" 2>/dev/null; then
-          echo "FAIL: child YAML contains placeholder text: $BAD" >&2
-          ERRORS=$((ERRORS+1))
-          break
-        fi
+      # Hard re-check: parse + structural musts
+      python3 -c "import yaml,sys; yaml.safe_load(open('$YAML_FILENAME'))" 2>/dev/null || { echo "ERROR: draft does not parse as YAML" >&2; exit 1; }
+      grep -q 'id: business-risk-gate' "$YAML_FILENAME" || { echo "ERROR: business-risk-gate missing" >&2; exit 1; }
+      grep -q 'id: flip-notion' "$YAML_FILENAME" || { echo "ERROR: flip-notion missing" >&2; exit 1; }
+      for BAD in "placeholder" "<BUSINESS_RISK" "invariant here" "one sentence"; do
+        if grep -qi "$BAD" "$YAML_FILENAME"; then echo "ERROR: placeholder text remains: $BAD" >&2; exit 1; fi
       done
-
-      # business-risk-gate must be load_bearing: true
-      if grep -q "id: business-risk-gate" "$YAML_FILENAME" 2>/dev/null; then
-        if ! awk '/id: business-risk-gate/{f=1} f && /load_bearing: true/{print; f=0}' "$YAML_FILENAME" | grep -q "."; then
-          echo "FAIL: business-risk-gate node missing load_bearing: true" >&2
-          ERRORS=$((ERRORS+1))
-        else
-          echo "PASS: business-risk-gate load_bearing: true"
-        fi
-      fi
-
-      if [ "$ERRORS" -gt 0 ]; then
-        echo "YAML_VALID=false"
-        echo "validate-yaml failed with $ERRORS error(s). generate-yaml must fix and re-draft." >&2
-        exit 1
-      fi
 
       echo "YAML_VALID=true"
       echo "YAML_FILENAME=$YAML_FILENAME"
       echo "WO_SLUG=$WO_SLUG"
-      echo "validate-yaml PASS"
+      echo "assert-yaml-ready PASS"
+
+  # Node 4b: war-council-review (read-only structure critique)
+  # The architect reviews the drafted child YAML for structural/architectural
+  # soundness BEFORE the overseer attacks risk. Read-only -- suggests, does not write.
+  - id: war-council-review
+    agent: war-council-architect
+    context: fresh
+    depends_on: [assert-yaml-ready]
+    prompt: |
+      You are the War Council Architect. Review the drafted child workflow YAML for
+      STRUCTURAL and ARCHITECTURAL soundness. You are read-only -- you critique, you
+      do not edit. The builder (major-build) already authored it and it passed
+      mechanical validation; your job is the judgment layer the validator cannot do.
+
+      ## Inputs
+      Normalized spec: $normalize-spec.output
+      yaml-author output: $yaml-author.output
+      assert-yaml-ready output: $assert-yaml-ready.output
+
+      Read the YAML at YAML_FILENAME (from assert-yaml-ready output).
+
+      ## Review dimensions
+      1. Node DAG shape: do depends_on edges form a sensible order? Any orphan nodes?
+      2. Does the implement loop's scope match the spec's in-scope files (no creep)?
+      3. Is the business-risk-gate placed where it actually guards the risk surface
+         (before the push, not after)?
+      4. Rule 20: if the target repo is customer-facing, is staging enforced correctly?
+      5. Does flip-notion target the CHILD product WO (not the on-ramp's own WO)?
+
+      ## Output
+      === WAR-COUNCIL-REVIEW ===
+      STRUCTURE_OK=<true|false>
+      CONCERNS:
+      <bullet list of structural issues, or "(none)">
+      RECOMMENDATION=<PROCEED|REVISE>
+
+      This is advisory context for the overseer and the operator. It does not block
+      by itself -- the overseer's adversarial pass and the operator's approval are the
+      gates.
 
   # Node 5: adversarial-review
   # Scores 8 criteria 1-10. Any score <7 sets ADV_PASS=false.
@@ -419,7 +402,7 @@ nodes:
     agent: overseer-opus
     effort: xhigh
     context: fresh
-    depends_on: [validate-yaml]
+    depends_on: [war-council-review]
     prompt: |
       You are an adversarial YAML reviewer with no benefit of the doubt. Score the
       child workflow YAML drafted by generate-yaml on 8 criteria (1-10 each).
@@ -427,10 +410,10 @@ nodes:
 
       ## Inputs
       Normalized spec: $normalize-spec.output
-      Generate-yaml output: $generate-yaml.output
-      Validate-yaml output: $validate-yaml.output
+      yaml-author output: $yaml-author.output
+      assert-yaml-ready output: $assert-yaml-ready.output
 
-      Read the YAML file at path YAML_FILENAME from validate-yaml output.
+      Read the YAML file at path YAML_FILENAME from assert-yaml-ready output.
 
       ## 8 Scoring Criteria
 
@@ -506,8 +489,8 @@ nodes:
 
       ## Inputs
       Normalized spec: $normalize-spec.output
-      Generate-yaml output: $generate-yaml.output
-      Validate-yaml output: $validate-yaml.output
+      yaml-author output: $yaml-author.output
+      assert-yaml-ready output: $assert-yaml-ready.output
       Adversarial review: $adversarial-review.output
 
       ## Step 1 — Duplicate-run check
@@ -890,8 +873,8 @@ nodes:
 
       ## Inputs
       Normalize-spec: $normalize-spec.output
-      Generate-yaml: $generate-yaml.output
-      Validate-yaml: $validate-yaml.output
+      yaml-author: $yaml-author.output
+      assert-yaml-ready: $assert-yaml-ready.output
       Adversarial-review: $adversarial-review.output
       Prefire-plan: $prefire-plan.output
       Approval-gate: $approval-gate.output
