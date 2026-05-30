@@ -437,11 +437,15 @@ nodes:
     task_class: medium_work
     loop:
       fresh_context: true
-      # NF3: NO `until:` sentinel here. Completion is `sentinel OR until_bash`, so a
-      # text sentinel could short-circuit the mechanical gate before the flag + debug
-      # checks ran. until_bash is the SOLE authority -- it requires the done.flag to
-      # exist AND the feature diff to have no debug prints. The agent still writes the
-      # flag (see prompt), but its prose can no longer complete the loop on its own.
+      # NF3 + schema fix: the loader REQUIRES loop.until (schemas/loop.ts:11,
+      # z.string().min(1)) -- omitting it makes the DAG invalid and the loader
+      # SILENTLY DROPS the whole workflow (anchor: 2026-05-30 the entire lane went
+      # unregistered). Completion is `sentinel OR until_bash`. To keep until_bash the
+      # SOLE real authority (so a premature text sentinel can't short-circuit the
+      # flag+debug gate), `until:` is set to a sentinel the agent is instructed to
+      # NEVER emit. Thus only until_bash (done.flag exists AND no debug prints in the
+      # feature diff) can complete the loop.
+      until: __NEVER_EMIT_USE_UNTIL_BASH__
       max_iterations: 3
       until_bash: |
         set -uo pipefail
@@ -499,15 +503,17 @@ nodes:
           SINGLE_DECISION_NEEDED=<one sentence John can answer>
           SAFE_STATE=<work is local in the worktree; nothing committed or pushed yet>
 
-        ## Signal done (success-only -- order matters)
-        ONLY when you have addressed every fixable finding (or there were none) AND
+        ## Signal done (the FLAG is the only gate -- there is NO completion token)
+        The loop completes ONLY via until_bash, which checks that the done.flag exists
+        AND the feature diff has no debug prints. There is NO text sentinel that finishes
+        this loop (loop.until is set to a token you must NEVER emit) -- do not try to
+        emit one. When you have addressed every fixable finding (or there were none) AND
         introduced no debug prints:
-          1. Write an empty file at $ARTIFACTS_DIR/diff-repair-done.flag
-          2. THEN emit, on its own line as the LAST line: DIFF_REPAIR_APPROVED
-        Do NOT emit DIFF_REPAIR_APPROVED if you escalated or could not resolve a finding
-        (emit DIFF_REPAIR_BLOCKED instead and do not write the flag). The flag + sentinel
-        together are the gate; diff-review-final still re-checks semantics next -- "approved"
-        here means "repair pass complete", not "semantically certified".
+          - Write an empty file at $ARTIFACTS_DIR/diff-repair-done.flag   (the ONLY signal)
+        If you escalated or could not resolve a finding, do NOT write the flag: the loop
+        will exhaust max_iterations and fail closed, and diff-review-final adjudicates the
+        unresolved state. The flag means "repair pass complete", not "semantically
+        certified" -- diff-review-final re-checks semantics next.
 
   # capture-diff-final: refresh the diff artifact AFTER repair so the final reviewer sees
   # the repaired tree, not the pre-repair diff. trigger_rule all_done so it runs even if
