@@ -452,9 +452,12 @@ nodes:
         [ -f "$DONE" ] || { echo "repair not signalled done"; exit 1; }
         # F4: implement already committed, so `git diff --cached` is empty. Check the
         # real feature diff: merge-base..HEAD (committed) PLUS HEAD..worktree (unstaged).
+        # NF2: empty-tree fallback (not HEAD) so a single-commit/no-base repo still
+        # produces a non-empty committed diff to scan for debug prints.
         BASE_REF="origin/${BASE_BRANCH:-main}"
-        MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
-        [ -n "$MB" ] || MB=HEAD
+        EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+        MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+        [ -n "$MB" ] || MB="$EMPTY_TREE"
         DEBUG_RE='console\.log\(|debugger;|binding\.pry|import pdb'
         if { git diff --unified=0 "$MB"..HEAD 2>/dev/null; git diff --unified=0 HEAD 2>/dev/null; } \
              | grep -E '^\+' | grep -Eq "$DEBUG_RE"; then
