@@ -818,8 +818,15 @@ nodes:
       BUILD=$assert-implement-produced-work.output
       PRECHECK=$gate-already-satisfied.output
 
+      # WO-FEATURE-DEV-BLOCK-CLASSIFY-SENTINEL-PARSE-01 (2026-05-30):
+      # diff-review-final is a Codex PROSE node; the verdict token appears mid-paragraph,
+      # never at column 0. Use anchor-free grep -oE and take the LAST occurrence so the
+      # final stated verdict wins (guards against earlier "if not satisfied..." mentions).
+      # Fail-closed: when no token is present, final_ok stays false.
+      final_verdict=$(printf '%s\n' "$DIFF_FINAL" \
+        | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' | tail -n 1)
       final_ok=false
-      printf '%s\n' "$DIFF_FINAL" | grep -q '^DIFF_REVIEW_FINAL=satisfied' && final_ok=true
+      [ "$final_verdict" = "DIFF_REVIEW_FINAL=satisfied" ] && final_ok=true
       outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
 
       # Codex FINDING_2: PROCEED requires BOTH a real build AND a satisfied final review.
@@ -1060,7 +1067,11 @@ nodes:
         exit 1
       fi
       # Final-review sanity (still required for a real build): diff-review-final must be satisfied.
-      if ! printf '%s\n' "$DIFF_FINAL" | grep -q '^DIFF_REVIEW_FINAL=satisfied'; then
+      # WO-FEATURE-DEV-BLOCK-CLASSIFY-SENTINEL-PARSE-01 (2026-05-30):
+      # Anchor-free parse (Codex prose, mid-paragraph token), last occurrence wins, fail-closed.
+      if [ "$(printf '%s\n' "$DIFF_FINAL" \
+        | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' | tail -n 1)" \
+        != "DIFF_REVIEW_FINAL=satisfied" ]; then
         echo "ERROR: diff-review-final not satisfied despite PROCEED status -- refusing commit (defense in depth)." >&2
         exit 1
       fi
