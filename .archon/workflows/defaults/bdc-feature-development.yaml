@@ -564,7 +564,7 @@ nodes:
 
       ## Branch on the repair outcome FIRST
       - If diff-repair FAILED or exhausted iterations (its output is empty, shows
-        ESCALATION_REQUIRED=true, or never reached DIFF_REPAIR_APPROVED): do NOT certify.
+        ESCALATION_REQUIRED=true, or the done.flag was never written): do NOT certify.
         Emit DIFF_REVIEW_FINAL=needs_revision, summarize the unresolved repair state in
         UNRESOLVED, and carry through any escalation reason. Never PASS on failed repair.
       - Otherwise: re-inspect the repaired diff. For EACH finding you raised originally,
