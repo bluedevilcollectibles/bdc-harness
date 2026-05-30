@@ -70,16 +70,91 @@ nodes:
         fi
       fi
       if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
-      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\n\n' "$WO_ID" "$SPEC_PATH"
+      # Fix-A (2026-05-30, Codex FINDING_1): capture an IMMUTABLE run-start base SHA of the
+      # assigned worktree BEFORE any node mutates/commits/pushes. assert-implement-produced-work
+      # compares HEAD against THIS, so a real build that checkpoint-push already committed+pushed
+      # is still detected as REAL_BUILD (post-push CHANGED/AHEAD are 0 and would misread otherwise).
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      RUN_START_SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo unknown)
+      mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
+      printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || true
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA"
       printf '%s\n' "$SPEC_CONTENT"
+
+  # check-already-satisfied (Fix B, 2026-05-30 -- idempotency short-circuit).
+  # Cheap read-only check BEFORE plan/implement: are the WO's deliverables ALREADY
+  # present in THIS worktree's HEAD? If clearly yes, route to the ALREADY_SATISFIED
+  # terminal (success-no-op) instead of burning a full ~7min implement pass on a
+  # re-fire of an already-done WO (anchor 04daeafc). FAILS OPEN: if unsure, proceeds to
+  # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
+  # net, this is only an optimization that must never wrongly skip real work.
+  - id: check-already-satisfied
+    persona: war-council-architect
+    agent: war-council-architect
+    depends_on: [read-spec]
+    task_class: clerical
+    prompt: |
+      You decide ONE thing: are this WO's deliverables ALREADY fully present in the
+      CURRENT worktree's HEAD, such that a build would produce no changes? You are
+      READ-ONLY. Judge ONLY against this worktree (you are cd'd into it; use plain git
+      and Read/Grep/Glob on local files). Do NOT consult origin/main or other worktrees.
+
+      ## Spec
+      $read-spec.output
+
+      ## How to decide
+      - Extract the spec's Stop Point / verification commands / grep assertions / named
+        deliverable files.
+      - Check whether those deliverables ALREADY exist and satisfy the assertions IN THIS
+        worktree (the files exist with the required content; grep assertions already pass).
+      - This is a HIGH BAR. Only conclude already-satisfied if you are confident a fresh
+        implementation would change nothing. ANY doubt -> proceed (false).
+
+      ## Output (exactly one of these on its own last line)
+      - If every deliverable is already present and satisfied in this worktree:
+          ALREADY_SATISFIED=true
+        followed by: SATISFIED_EVIDENCE=<one line naming the deliverables + how verified>
+      - Otherwise (work is needed, OR you cannot confirm with high confidence):
+          ALREADY_SATISFIED=false
+      Default to false. Skipping a build that was actually needed is far worse than
+      running a redundant build that the downstream no-op guard will catch.
+
+  # gate-already-satisfied: bash gate that reads check-already-satisfied's verdict and
+  # records BUILD_OUTCOME for the terminal nodes. If ALREADY_SATISFIED=true, the plan ->
+  # implement -> review chain still runs but will legitimately find no diff; flip-notion
+  # records verified-no-op. (We do NOT hard-skip nodes here -- the executor has no goto;
+  # instead the outcome is recorded and the no-op flows through the existing chain, which
+  # now distinguishes ALREADY_SATISFIED from FALSE_COMPLETE via assert-implement-produced-work.)
+  - id: gate-already-satisfied
+    depends_on: [check-already-satisfied]
+    bash: |
+      set -uo pipefail
+      CAS=$check-already-satisfied.output
+      if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
+        echo "ALREADY_SATISFIED=true"
+        echo "PRECHECK_VERDICT=already-satisfied"
+        printf '%s\n' "$CAS" | grep '^SATISFIED_EVIDENCE=' | head -1 || true
+        echo "Note: WO appears already implemented in this worktree; the build chain will"
+        echo "produce no diff and the run will resolve as a verified no-op (not a failure)."
+      else
+        echo "ALREADY_SATISFIED=false"
+        echo "PRECHECK_VERDICT=needs-build"
+      fi
+      exit 0
 
   - id: plan
     persona: war-council-architect
-    depends_on: [read-spec]
+    depends_on: [gate-already-satisfied]
     agent: war-council-architect
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
+
+      ## Idempotency note
+      Pre-check verdict (from gate-already-satisfied): $gate-already-satisfied.output
+      If PRECHECK_VERDICT=already-satisfied, the deliverables already exist in this
+      worktree. Produce a minimal plan that VERIFIES the existing state rather than
+      re-creating it; implement will correctly make no changes and emit ALREADY_SATISFIED.
 
       ## Required Output
       Return structured Markdown with these headings:
@@ -221,12 +296,34 @@ nodes:
         that is reviewer metadata, not the plan.
         $plan-review.output
 
+        ## WORKTREE PINNING (Fix A, 2026-05-30 -- anchor run 04daeafc)
+        You run inside ONE assigned git worktree. ALL of your work and ALL of your
+        completion judgments MUST happen inside it. Resolve it first:
+          WT=$(git rev-parse --show-toplevel)
+        Then:
+        - Make EVERY git/grep/diff/log call relative to THIS worktree (you are already
+          cd'd into it; use plain `git ...`, or `git -C "$WT" ...`).
+        - You MUST NOT read, grep, `git -C`, or judge "already done" against any OTHER
+          location: not the shared `source/` checkout, not `origin/main`, not another
+          thread's worktree (e.g. `.../worktrees/archon/thread-<other>`). Whether the WO
+          is satisfied is decided ONLY by the state of THIS worktree's HEAD + working tree.
+        - If you believe the WO is already implemented, that conclusion is only valid if
+          it is true IN THIS WORKTREE. If the work exists only on origin/main or another
+          thread, it is NOT present here -- treat the WO as needing implementation here,
+          OR emit `ALREADY_SATISFIED` (see Completion) only after confirming the
+          deliverables are reachable from THIS worktree's HEAD.
+        Anchor: run 04daeafc judged "already done" against a sibling worktree + origin/main,
+        made an empty verify-only commit on the wrong thread, and emitted a fraudulent
+        COMPLETE. The review pipeline inspected THIS worktree (correctly empty) and blocked.
+
         ## Execution Rules
         - Modify only the files identified as in scope by the spec.
         - Prefer existing repo patterns and helpers.
         - Do not reformat unrelated code.
         - Do not deploy.
         - Do not bypass approval gates.
+        - Do NOT use `git commit --allow-empty` or any empty/verify-only commit to
+          simulate completion. A commit must contain real, in-scope file changes.
         - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
 
         ## Commit-and-push BEFORE exit (Patch 2, 2026-05-16)
@@ -254,18 +351,54 @@ nodes:
         Worst case: the downstream commit-and-push node runs and is a no-op because HEAD is
         already pushed. Best case: your work is on origin even if everything else fails.
 
-        ## Completion Criteria + Sentinel Emission (Patch 3, 2026-05-16)
-        Output ALL THREE of the following standard BDC sentinels, each on its own line at the
-        very end of your output, when all spec stop conditions are met OR a true blocker is
-        identified with evidence:
+        ## Completion Criteria + Sentinel Emission (Patch 3, 2026-05-16; Fix A 2026-05-30)
+        Before emitting any completion sentinel, run this self-check IN THIS WORKTREE:
+          WT=$(git rev-parse --show-toplevel)
+          CHANGED=$(git -C "$WT" status --porcelain | wc -l)
+          AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null \
+                  || git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+        Then choose EXACTLY ONE ending:
 
-        COMPLETE
-        BUILD_COMPLETE
-        <promise>COMPLETE</promise>
+        1. REAL BUILD (you made in-scope changes): only if CHANGED>0 OR AHEAD>0 with real
+           file changes. Emit, each on its own line:
+             COMPLETE
+             BUILD_COMPLETE
+             <promise>COMPLETE</promise>
+
+        2. ALREADY SATISFIED (the WO's deliverables are ALREADY reachable from THIS
+           worktree's HEAD and you correctly made no changes): emit BOTH lines, each on
+           its own line:
+             ALREADY_SATISFIED: <one sentence: which deliverables already exist in this worktree HEAD>
+             COMPLETE
+           The COMPLETE line is REQUIRED here ONLY to let the until:COMPLETE loop exit -- do
+           NOT also emit BUILD_COMPLETE or <promise>COMPLETE</promise>, and do NOT make an
+           empty commit. assert-implement-produced-work re-checks the worktree: because it
+           is genuinely clean, it reclassifies this to ALREADY_SATISFIED (a verified no-op,
+           NOT a fraudulent build). This is the SINGLE no-op completion contract -- see also
+           the "Loop exit" section below, which says the same thing.
+
+        3. TRUE BLOCKER (spec ambiguous / missing source of truth / cannot proceed):
+             BLOCKED: <one-sentence reason>
+
+        ANTI-FRAUD RULE: you may emit the case-1 BUILD sentinels (BUILD_COMPLETE +
+        <promise>COMPLETE</promise>) ONLY if you made real in-scope edits (CHANGED>0 OR
+        AHEAD>0). If you did no work because it was already done, that is case 2
+        (ALREADY_SATISFIED: + a bare COMPLETE to exit the loop), NOT case 1 -- do not claim
+        a build you did not do. The downstream guard re-checks the worktree and will catch a
+        bare COMPLETE with no ALREADY_SATISFIED and no real changes as FALSE_COMPLETE.
 
         Reason: BDC YAMLs have used different sentinel strings over time. Emitting all three
-        guarantees the loop's `until:` matcher finds one. If you found a true blocker, end
-        with a single line `BLOCKED: <one-sentence reason>` instead.
+        case-1 sentinels guarantees the loop's `until:` matcher finds one.
+
+        ## Loop exit -- the no-op contract (stated once; matches case 2 above)
+        The loop's `until:` matches COMPLETE. A real build emits the three case-1 sentinels.
+        A genuine no-op (already satisfied in THIS worktree) emits exactly:
+          ALREADY_SATISFIED: <which deliverables already exist in this worktree HEAD>
+          COMPLETE
+        That bare COMPLETE is what lets the loop exit; assert-implement-produced-work sees
+        the clean worktree + the ALREADY_SATISFIED line and reclassifies to ALREADY_SATISFIED
+        (verified no-op, not a fraudulent build). NEVER emit COMPLETE if you simply failed to
+        do needed work (no ALREADY_SATISFIED line + clean worktree => FALSE_COMPLETE).
       until: COMPLETE
       max_iterations: 5
       fresh_context: true
@@ -322,9 +455,79 @@ nodes:
       fi
       exit 0
 
+  # assert-implement-produced-work (Fix A guard, 2026-05-30 -- anchor run 04daeafc).
+  # Distinguishes three post-implement states from the ASSIGNED worktree's own state:
+  #   REAL_BUILD       -- worktree has changes / commits ahead -> proceed to review chain
+  #   ALREADY_SATISFIED-- implement said ALREADY_SATISFIED + worktree genuinely clean -> emit
+  #                       BUILD_OUTCOME=ALREADY_SATISFIED so flip-notion records verified-no-op
+  #   FALSE_COMPLETE   -- implement emitted COMPLETE/BUILD_COMPLETE but worktree shows ZERO
+  #                       real changes (the fraud 04daeafc committed) -> emit
+  #                       BUILD_OUTCOME=FALSE_COMPLETE (the commit-and-push gate turns this
+  #                       into a PAUSE, not a hard fail -- see Fix D).
+  # Load-bearing: this is the truth check that the implement self-report cannot bypass.
+  - id: assert-implement-produced-work
+    persona: overseer
+    depends_on: [checkpoint-push]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      IMPL=$implement.output
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      # Codex FINDING_1 fix: compare against the IMMUTABLE run-start SHA (captured by
+      # read-spec BEFORE checkpoint-push committed+pushed), NOT post-push upstream state.
+      # After checkpoint-push, @{upstream}..HEAD is 0 even for a real build -- that false-
+      # negative is what would have misrouted every legitimate build to BLOCKED.
+      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
+      HEAD_NOW=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
+      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || echo 0)
+      # commits since run start (real work this run produced, even after a checkpoint push)
+      if [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ]; then
+        AHEAD=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null || echo 0)
+      else
+        # fallback: no base captured -> use any-uncommitted OR diff vs upstream
+        AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null || echo 0)
+      fi
+      HAS_WORK=false
+      if [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; then HAS_WORK=true; fi
+
+      SAID_COMPLETE=false
+      if printf '%s\n' "$IMPL" | grep -qE '^(COMPLETE|BUILD_COMPLETE)$|<promise>COMPLETE</promise>'; then SAID_COMPLETE=true; fi
+      SAID_ALREADY=false
+      if printf '%s\n' "$IMPL" | grep -qE '^ALREADY_SATISFIED:'; then SAID_ALREADY=true; fi
+
+      echo "WORKTREE=$WT"
+      echo "CHANGED_FILES=$CHANGED"
+      echo "COMMITS_AHEAD=$AHEAD"
+      echo "IMPL_SAID_COMPLETE=$SAID_COMPLETE"
+      echo "IMPL_SAID_ALREADY_SATISFIED=$SAID_ALREADY"
+
+      if [ "$HAS_WORK" = "true" ]; then
+        echo "BUILD_OUTCOME=REAL_BUILD"
+        echo "assert-implement-produced-work: real changes present -- proceeding to review chain"
+        exit 0
+      fi
+
+      # No work in this worktree.
+      # Codex FINDING_3 interaction: implement now emits BOTH "ALREADY_SATISFIED:" AND
+      # COMPLETE in the genuine no-op case (COMPLETE is required to exit the until:COMPLETE
+      # loop). So ALREADY_SATISFIED WINS whenever the agent declared it AND the worktree is
+      # genuinely clean -- the clean worktree is the truth check that makes this non-fraudulent.
+      if [ "$SAID_ALREADY" = "true" ]; then
+        echo "BUILD_OUTCOME=ALREADY_SATISFIED"
+        echo "assert-implement-produced-work: implement reported ALREADY_SATISFIED and worktree is genuinely clean -- legitimate no-op"
+        exit 0
+      fi
+
+      # No work, and implement did NOT declare already-satisfied, yet it claimed COMPLETE
+      # (or emitted nothing usable): false/fraudulent completion.
+      echo "BUILD_OUTCOME=FALSE_COMPLETE"
+      echo "ERROR: implement emitted COMPLETE but produced ZERO real changes in the assigned worktree (CHANGED=$CHANGED AHEAD=$AHEAD)." >&2
+      echo "This is a false/fraudulent completion (anchor 04daeafc). Downstream gate will PAUSE for correction, not commit." >&2
+      exit 0
+
   - id: war-council-validator
     persona: captain-ci-validator
-    depends_on: [checkpoint-push]
+    depends_on: [assert-implement-produced-work]
     task_class: medium_work
     prompt: |
       Invoke or emulate the war-council-validator review for this Work Order.
@@ -484,6 +687,22 @@ nodes:
           drift, close the unsafe path. Modify only in-scope files. Do not reformat
           unrelated code. Do not deploy.
 
+        ## NEVER FABRICATE A DIFF (Fix C, 2026-05-30 -- anchor run 04daeafc)
+        If the captured diff is empty / header-only because the WO appears already
+        implemented on origin/main or in other commits, you MUST NOT regenerate or
+        reconstruct $ARTIFACTS_DIR/diff.patch (or diff-final.patch) from those
+        already-merged commits, from origin/main, or from any other branch/worktree.
+        The diff artifact must reflect ONLY real, uncommitted-or-this-worktree changes.
+        Manufacturing a reviewable artifact from already-merged work is fraud -- it tricks
+        the final reviewer into certifying changes this run did not make.
+        If the diff is genuinely empty because there is nothing to repair (the WO is
+        already satisfied or implement produced no changes), do NOT write the done.flag
+        and do NOT fabricate -- instead write the escalation block (below) with
+        ESCALATION_REASON=already-implemented-no-diff and STOP. diff-review-final will
+        see the empty diff and the run will pause for correction (not silently pass).
+        Anchor: run 04daeafc's diff-repair tried to "regenerate diff.patch with the actual
+        implementation content from those commits" -- exactly the fraud this rule forbids.
+
         ## Escalation (ONLY these -- else fix and let the loop continue)
         Write the escalation block to $ARTIFACTS_DIR/diff-repair-escalation.txt and STOP if:
         - a finding requires a new side-effect class / scope the lane was not granted
@@ -493,7 +712,7 @@ nodes:
         - the same finding survived a prior repair attempt and you cannot resolve it
         Escalation block (exact keys):
           ESCALATION_REQUIRED=true
-          ESCALATION_REASON=<new-side-effect-class|human-only-authority|ambiguous-spec|loop-exhausted>
+          ESCALATION_REASON=<new-side-effect-class|human-only-authority|ambiguous-spec|loop-exhausted|already-implemented-no-diff>
           WO_ID=<id>
           NODE=diff-repair
           ATTEMPTS=<n>/3
@@ -578,9 +797,152 @@ nodes:
       DIFF_REVIEW_FINAL=satisfied ONLY if every original finding is genuinely resolved and
       no new unsafe behavior was introduced by the repair.
 
+  # ===== Fix D (2026-05-30): pause-not-fail + Opus-tier on a blocked irreversible gate =====
+  # Replaces commit-and-push's old `exit 1` dead-end. A blocked run must NOT terminate as
+  # "failed"; it goes: classify -> Opus auto-repair (one pass) -> re-classify -> PAUSE
+  # (resumable approval) -> human corrects+resumes OR rejects. A clean run PROCEEDs with no
+  # human gate. An already-satisfied no-op resolves as success. (doctrine: fail-closed-must-
+  # pause-not-fail + self-repair-review-loops autonomy ladder.)
+  #
+  # block-classify: emit ONE JSON line so downstream `when:` can read $block-classify.output.status
+  # (condition-evaluator parses $node.output.field as JSON). status one of:
+  #   PROCEED           -- diff-review-final=satisfied AND real build -> commit/PR
+  #   ALREADY_SATISFIED -- no work needed, worktree clean, legitimately done -> success no-op
+  #   BLOCKED           -- false-completion OR diff-review-final=needs_revision -> repair/pause
+  - id: block-classify
+    depends_on: [diff-review-final]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      DIFF_FINAL=$diff-review-final.output
+      BUILD=$assert-implement-produced-work.output
+      PRECHECK=$gate-already-satisfied.output
+
+      final_ok=false
+      printf '%s\n' "$DIFF_FINAL" | grep -q '^DIFF_REVIEW_FINAL=satisfied' && final_ok=true
+      outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
+
+      # Codex FINDING_2: PROCEED requires BOTH a real build AND a satisfied final review.
+      # A missing/unparseable BUILD_OUTCOME must NOT slip through as PROCEED.
+      if [ "$outcome" = "ALREADY_SATISFIED" ]; then
+        STATUS=ALREADY_SATISFIED
+      elif [ "$outcome" = "REAL_BUILD" ] && [ "$final_ok" = "true" ]; then
+        STATUS=PROCEED
+      else
+        # FALSE_COMPLETE, unknown outcome, or final review not satisfied -> block.
+        STATUS=BLOCKED
+      fi
+      # single JSON line = the entire stdout, so $block-classify.output.status parses
+      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}"
+
+  # opus-repair: one harder AUTONOMOUS fix pass by the Opus overseer when BLOCKED, BEFORE
+  # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
+  # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
+  - id: opus-repair
+    agent: overseer-opus
+    effort: xhigh
+    context: fresh
+    depends_on: [block-classify]
+    when: "$block-classify.output.status == 'BLOCKED'"
+    prompt: |
+      The bdc-feature-development run is BLOCKED before the irreversible commit. Before a
+      human is paused, you get ONE autonomous repair pass. Diagnose and, if you can,
+      resolve it so the build can proceed safely.
+
+      ## Why blocked
+      block-classify: $block-classify.output
+      diff-review-final: $diff-review-final.output
+      assert-implement-produced-work: $assert-implement-produced-work.output
+      Original Codex findings: $diff-review.output
+
+      ## Your job
+      - If the block is FALSE_COMPLETE (implement claimed done but produced no real changes
+        in THIS worktree): determine whether the WO genuinely needs work here. If it does and
+        you can make the in-scope changes, make them in the assigned worktree (you have the
+        tools). If the WO is genuinely already implemented in this worktree, say so.
+      - If the block is diff-review-final=needs_revision: make the specific fix the final
+        reviewer named, in scope, in this worktree.
+      - Judge ONLY against this worktree (no origin/main, no sibling worktrees). NEVER
+        fabricate a diff from already-merged commits.
+
+      ## Output (last lines)
+      - If you resolved it (real in-scope changes now exist in this worktree):
+          OPUS_REPAIR=fixed
+      - If it is genuinely already-satisfied (no work needed in this worktree):
+          OPUS_REPAIR=already-satisfied
+      - If you could NOT resolve it and a human must decide:
+          OPUS_REPAIR=needs-human
+          REASON=<one sentence>
+
+  # block-reclassify: after the Opus pass (or skip if it wasn't BLOCKED), re-emit the
+  # JSON status. trigger_rule all_done so it runs whether or not opus-repair ran.
+  - id: block-reclassify
+    depends_on: [block-classify, opus-repair]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      PRIOR=$block-classify.output
+      OPUS=$opus-repair.output
+      prior_status=$(printf '%s\n' "$PRIOR" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+
+      # If it wasn't blocked, keep the prior status unchanged.
+      if [ "$prior_status" != "BLOCKED" ]; then
+        printf '{"status":"%s"}\n' "${prior_status:-BLOCKED}"
+        exit 0
+      fi
+
+      # It was blocked: did Opus fix it? Re-check the worktree for real work.
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      CHANGED=$(git -C "$WT" status --porcelain 2>/dev/null | grep -c . || echo 0)
+      AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null \
+              || git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+
+      if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed' && { [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; }; then
+        # Opus made real changes -> needs a fresh review before proceeding. We do NOT
+        # auto-PROCEED (the new diff was not Codex-reviewed). Pause for human to re-run
+        # review or approve. Conservative: treat as BLOCKED-for-human with a clear note.
+        printf '{"status":"BLOCKED","note":"opus-made-changes-need-re-review"}\n'
+      elif printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=already-satisfied'; then
+        printf '{"status":"ALREADY_SATISFIED","note":"opus-confirmed-already-satisfied"}\n'
+      else
+        printf '{"status":"BLOCKED","note":"opus-could-not-resolve"}\n'
+      fi
+
+  # pause-gate: the ONLY human touch, and ONLY when still BLOCKED after Opus. This PAUSES
+  # the run (status=paused, resumable via /workflow approve|reject) -- it does NOT fail.
+  - id: pause-gate
+    depends_on: [block-reclassify]
+    when: "$block-reclassify.output.status == 'BLOCKED'"
+    approval:
+      message: |
+        This run is BLOCKED before the irreversible commit and the AI tiers could not
+        safely resolve it. The run is PAUSED (not failed) -- nothing was committed or
+        pushed. Review and either correct + resume, or reject.
+
+        What to inspect:
+        - block-classify / block-reclassify: why it blocked (FALSE_COMPLETE = implement
+          produced no real changes; or diff-review-final = needs_revision).
+        - diff-review-final verdict + the Codex findings.
+        - opus-repair output: what the Opus tier tried and why it could not finish.
+        - $ARTIFACTS_DIR/diff-repair-escalation.txt if present (the escalation payload).
+
+        SAFE STATE: no commit, no push, no PR, no Notion write has happened.
+
+        - "approved" / "proceed" -> resume (only do this if you have corrected the worktree
+          so a real, reviewed change exists; commit-and-push still re-checks the gate)
+        - "reject" / "stop" -> halt; the worktree changes (if any) remain for manual handling
+      capture_response: true
+      on_reject:
+        prompt: |
+          The operator rejected the blocked run. Summarize what was blocked, what the AI
+          tiers tried, and what a human must change before re-running. Do not commit or fire.
+          Output: OPERATOR_REJECTED: <reason from approval response>
+        max_attempts: 2
+
   - id: decide-push-target
     persona: major-build
-    depends_on: [diff-review-final]
+    depends_on: [block-reclassify]
+    when: "$block-reclassify.output.status == 'PROCEED'"
     task_class: clerical
     prompt: |
       Decide the push target for this BDC feature Work Order.
@@ -657,6 +1019,7 @@ nodes:
   - id: commit-and-push
     persona: overseer
     depends_on: [decide-push-target]
+    when: "$block-reclassify.output.status == 'PROCEED'"
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -680,24 +1043,25 @@ nodes:
         exit 1
       fi
       DIFF_FINAL=$diff-review-final.output
+      RECLASS=$block-reclassify.output
       echo "$DECIDE_OUTPUT"
       if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
         echo "Out of scope for bdc-feature-development; failing closed." >&2
         exit 1
       fi
-      # Irreversible-action gate (doctrine: self-repair-review-loops). commit-and-push is
-      # the first irreversible step. The diff-review/repair/final chain must have cleared
-      # semantic findings. If the FINAL Codex re-review still says needs_revision, do NOT
-      # commit -- surface the escalation payload (if the repair loop wrote one) and stop.
+      # Irreversible-action gate (Fix D, 2026-05-30): the BLOCK/PAUSE decision now lives
+      # upstream in block-classify -> opus-repair -> block-reclassify -> pause-gate. This
+      # node only runs `when: $block-reclassify.output.status == 'PROCEED'`. We keep a
+      # belt-and-suspenders re-check here (defense in depth) but it must NEVER be the place
+      # a block surfaces as a raw failure -- if status isn't PROCEED we should not be here.
+      RECLASS_STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$RECLASS_STATUS" != "PROCEED" ]; then
+        echo "ERROR: commit-and-push reached with status='$RECLASS_STATUS' (expected PROCEED). The when-gate should have skipped this node; refusing to commit." >&2
+        exit 1
+      fi
+      # Final-review sanity (still required for a real build): diff-review-final must be satisfied.
       if ! printf '%s\n' "$DIFF_FINAL" | grep -q '^DIFF_REVIEW_FINAL=satisfied'; then
-        echo "ERROR: diff-review-final did not return satisfied -- blocking commit (irreversible-action gate)." >&2
-        ESC="$ARTIFACTS_DIR/diff-repair-escalation.txt"
-        if [ -f "$ESC" ]; then
-          echo "--- ESCALATION (diff-repair) ---" >&2
-          cat "$ESC" >&2
-        fi
-        echo "--- diff-review-final verdict ---" >&2
-        printf '%s\n' "$DIFF_FINAL" >&2
+        echo "ERROR: diff-review-final not satisfied despite PROCEED status -- refusing commit (defense in depth)." >&2
         exit 1
       fi
       BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^push_target: feature-branch://p' | head -n 1)
@@ -953,10 +1317,22 @@ nodes:
 
   - id: build-manifest
     persona: major-build
-    depends_on: [open-pr-if-needed]
+    depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
+    trigger_rule: all_done
     task_class: clerical
     prompt: |
       Construct the Captain CI completion manifest for this BDC feature Work Order.
+
+      ## Outcome branch (Fix D, 2026-05-30) -- read this FIRST
+      block-reclassify status: $block-reclassify.output
+      - If status=PROCEED: a real build was committed + a PR opened. Build the full v2
+        manifest below (this is the normal case).
+      - If status=ALREADY_SATISFIED: the WO was already implemented in this worktree; no
+        commit/PR. Emit a SHORT manifest: WO ID, OUTCOME=ALREADY_SATISFIED, the evidence
+        from check-already-satisfied, VALIDATION: PASS (verified no-op). Do NOT claim a PR.
+      - If status=BLOCKED: the run paused for human correction (pause-gate). Emit
+        OUTCOME=BLOCKED, the block reason, what the AI tiers tried, VALIDATION: BLOCKED.
+        Do NOT claim a PR or DONE.
 
       ## Inputs
       Spec:
@@ -1004,14 +1380,19 @@ nodes:
   - id: flip-notion
     persona: xo
     depends_on: [build-manifest]
+    trigger_rule: all_done
     task_class: clerical
     prompt: |
       Update the Notion Work Order page if Notion MCP is available in this runtime.
 
-      ## Required Notion Changes
-      - Claude Status: REVIEW
-      - Status: Review
-      - Add the Captain CI manifest as a page comment
+      ## Outcome branch (Fix D, 2026-05-30) -- read block-reclassify FIRST
+      block-reclassify status: $block-reclassify.output
+      - status=PROCEED: set Claude Status: REVIEW, Status: Review, add the manifest as a
+        page comment (normal case).
+      - status=ALREADY_SATISFIED: set Claude Status: REVIEW with a note that the WO was
+        already implemented (verified no-op); add the short manifest. Do NOT claim a PR.
+      - status=BLOCKED: do NOT flip to REVIEW. Add a comment that the run PAUSED for human
+        correction with the block reason, and emit an XO_ACTION line. Leave status as-is.
 
       ## Manifest
       $build-manifest.output
