@@ -367,8 +367,12 @@ nodes:
       mkdir -p "$ARTIFACTS_DIR"
       OUT="$ARTIFACTS_DIR/diff.patch"
       BASE_REF="origin/${BASE_BRANCH:-main}"
-      MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
-      [ -n "$MB" ] || MB=HEAD
+      # NF2: when there is no merge-base and no HEAD~1 (single-commit / no-base repo),
+      # fall back to the empty-tree hash, NOT HEAD. HEAD..HEAD is an EMPTY diff (reviewer
+      # sees nothing); empty-tree..HEAD shows all committed content as added (meaningful).
+      EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+      MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+      [ -n "$MB" ] || MB="$EMPTY_TREE"
       {
         echo "### git diff --stat ($MB..HEAD)"
         git diff --stat "$MB"..HEAD 2>/dev/null || true
@@ -433,12 +437,11 @@ nodes:
     task_class: medium_work
     loop:
       fresh_context: true
-      # Completion is `sentinel OR until_bash` in the executor. To avoid the sentinel
-      # short-circuiting the mechanical gate (F3), the prompt is instructed to emit the
-      # DIFF_REPAIR_APPROVED sentinel ONLY after the done.flag is written AND mechanical
-      # checks would pass -- and until_bash re-verifies independently. Either path
-      # completing still requires the flag to exist (the prompt ties them together).
-      until: DIFF_REPAIR_APPROVED
+      # NF3: NO `until:` sentinel here. Completion is `sentinel OR until_bash`, so a
+      # text sentinel could short-circuit the mechanical gate before the flag + debug
+      # checks ran. until_bash is the SOLE authority -- it requires the done.flag to
+      # exist AND the feature diff to have no debug prints. The agent still writes the
+      # flag (see prompt), but its prose can no longer complete the loop on its own.
       max_iterations: 3
       until_bash: |
         set -uo pipefail
@@ -514,8 +517,12 @@ nodes:
       mkdir -p "$ARTIFACTS_DIR"
       OUT="$ARTIFACTS_DIR/diff-final.patch"
       BASE_REF="origin/${BASE_BRANCH:-main}"
-      MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
-      [ -n "$MB" ] || MB=HEAD
+      # NF2: when there is no merge-base and no HEAD~1 (single-commit / no-base repo),
+      # fall back to the empty-tree hash, NOT HEAD. HEAD..HEAD is an EMPTY diff (reviewer
+      # sees nothing); empty-tree..HEAD shows all committed content as added (meaningful).
+      EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+      MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+      [ -n "$MB" ] || MB="$EMPTY_TREE"
       {
         echo "### committed diff ($MB..HEAD)"
         git diff "$MB"..HEAD 2>/dev/null || true
@@ -653,10 +660,16 @@ nodes:
       # plan-review emits a fenced output. Extract ONLY the approved-plan block so the
       # changed-file allowlist + commit message never ingest reviewer critique (F8 fix).
       # Must be the revised plan (not pre-review) or a plan-review scope change would be
-      # rejected by the allowlist. Fall back to the full output if the fence is absent.
+      # rejected by the allowlist. FAIL CLOSED if the fence is absent (NF1): never fall
+      # back to raw output, or PLAN_REVIEW_FINDINGS critique would poison the allowlist.
       PLAN_REVIEW_RAW=$plan-review.output
       PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/=== APPROVED_PLAN_BEGIN ===/,/=== APPROVED_PLAN_END ===/p' | sed '1d;$d')
-      [ -z "$PLAN_OUTPUT" ] && PLAN_OUTPUT="$PLAN_REVIEW_RAW"
+      if [ -z "$PLAN_OUTPUT" ]; then
+        echo "ERROR: plan-review output missing the APPROVED_PLAN fence -- cannot extract the approved plan (NF1 fail-closed)." >&2
+        echo "--- raw plan-review output (for debugging) ---" >&2
+        printf '%s\n' "$PLAN_REVIEW_RAW" >&2
+        exit 1
+      fi
       DIFF_FINAL=$diff-review-final.output
       echo "$DECIDE_OUTPUT"
       if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
@@ -822,10 +835,14 @@ nodes:
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
       DECIDE_OUTPUT=$decide-push-target.output
       # Extract ONLY the approved-plan block for the PR title/body (F8 fix) -- keep
-      # reviewer critique out of the customer-visible PR. Fall back to full output.
+      # reviewer critique out of the customer-visible PR. FAIL CLOSED if the fence is
+      # absent (NF1): never put raw critique-bearing output in the PR body.
       PLAN_REVIEW_RAW=$plan-review.output
       PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | sed -n '/=== APPROVED_PLAN_BEGIN ===/,/=== APPROVED_PLAN_END ===/p' | sed '1d;$d')
-      [ -z "$PLAN_OUTPUT" ] && PLAN_OUTPUT="$PLAN_REVIEW_RAW"
+      if [ -z "$PLAN_OUTPUT" ]; then
+        echo "ERROR: plan-review output missing the APPROVED_PLAN fence -- cannot build PR body (NF1 fail-closed)." >&2
+        exit 1
+      fi
       IMPLEMENT_OUTPUT=$implement.output
       VALIDATOR_OUTPUT=$war-council-validator.output
       COMMIT_PUSH_OUTPUT=$commit-and-push.output
