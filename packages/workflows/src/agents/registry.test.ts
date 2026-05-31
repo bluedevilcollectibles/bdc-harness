@@ -177,7 +177,9 @@ Prompt.
     expect(err?.code).toBe('agent_name_filename_mismatch');
   });
 
-  test('agent_missing_model: frontmatter has no model field', async () => {
+  test('no model field: loads successfully (model is optional at the registry layer)', async () => {
+    // A `provider: codex` persona MUST omit `model:`. The registry no longer
+    // requires it; provider-specific enforcement lives in resolveAgentPersona.
     const content = `---
 name: no-model
 ---
@@ -185,14 +187,9 @@ name: no-model
 Prompt.
 `;
     const filePath = await writeAgent('no-model.md', content);
-    let err: AgentRegistryError | null = null;
-    try {
-      await loadAgentFile(filePath);
-    } catch (e) {
-      err = e as AgentRegistryError;
-    }
-    expect(err).not.toBeNull();
-    expect(err?.code).toBe('agent_missing_model');
+    const persona = await loadAgentFile(filePath);
+    expect(persona.name).toBe('no-model');
+    expect(persona.model).toBeUndefined();
   });
 
   test('agent_invalid_model: model alias not in known set', async () => {
@@ -289,7 +286,9 @@ describe('loadAgentRegistry', () => {
 
   test('throws on first invalid file (fail-closed)', async () => {
     await writeAgent('valid-agent.md', VALID_AGENT.replace('test-agent', 'valid-agent'));
-    await writeAgent('bad-agent.md', '---\nname: bad-agent\n---\n\nMissing model.');
+    // Invalid: a model is present but is not a known alias (agent_invalid_model).
+    // (A missing model is now valid — codex personas omit it.)
+    await writeAgent('bad-agent.md', '---\nname: bad-agent\nmodel: gpt-9000\n---\n\nBad alias.');
 
     let err: AgentRegistryError | null = null;
     try {
@@ -298,7 +297,7 @@ describe('loadAgentRegistry', () => {
       err = e as AgentRegistryError;
     }
     expect(err).not.toBeNull();
-    expect(err?.code).toBe('agent_missing_model');
+    expect(err?.code).toBe('agent_invalid_model');
   });
 
   test('ignores non-.md files in directory', async () => {

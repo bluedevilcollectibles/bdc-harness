@@ -560,35 +560,78 @@ import type { AgentPersona } from './agents/registry';
  * Result of resolving an agent persona for a DAG node dispatch.
  *
  * When an agent persona is resolved:
- * - `model` overrides the node's model (agent wins, log a warning if different)
+ * - `model` overrides the node's model (agent wins, log a warning if different).
+ *   May be undefined for a `provider: codex` persona, in which case the codex
+ *   provider falls back to assistants.codex.model or the account default.
  * - `systemPrompt` is prepended to the node's prompt
  * - `tools` is set as `allowed_tools` on the dispatch options (if the agent declares tools)
  */
 export interface AgentPersonaResolution {
-  model: string;
+  model?: string;
   systemPrompt: string;
   allowedTools?: string[];
   agentName: string;
 }
 
 /**
- * Apply an agent persona to node dispatch options.
+ * Error raised when a persona/provider combination cannot be resolved because
+ * the fix is a harness/persona/config change, not a runtime/approve-reject
+ * decision. The dag-executor surfaces `infraCode` in the failure message so an
+ * operator is told "fix the substrate" rather than "approve or reject."
+ */
+export class InfrastructureClassBlock extends Error {
+  readonly infraCode = 'INFRASTRUCTURE_CLASS_BLOCK' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'InfrastructureClassBlock';
+  }
+}
+
+/**
+ * Apply an agent persona to node dispatch options, provider-aware.
  *
- * The persona's model takes precedence over the node's resolved model.
- * If a mismatch is detected, a warning is logged.
- * The persona's system prompt is prepended to the node prompt.
- * The persona's tool list (if present) is applied as allowed_tools.
+ * INVARIANT: a `provider: codex` node MUST NEVER receive `persona.model`.
+ *
+ * - provider === 'codex': persona.model MUST be absent. If present, throw
+ *   InfrastructureClassBlock (a codex persona declaring an Anthropic model is a
+ *   config bug). If absent, resolution.model is undefined and the codex provider
+ *   uses assistants.codex.model or the account default.
+ * - provider === 'claude' (default): persona.model is REQUIRED. If absent, throw
+ *   InfrastructureClassBlock. If present, the persona model wins over the node
+ *   model (today's behavior), and a mismatch is logged.
+ * - any other provider (e.g. pi): pass persona.model through unchanged. Do NOT
+ *   apply the codex constraint — providers such as pi require a model.
  */
 export function resolveAgentPersona(
   persona: AgentPersona,
-  currentModel: string | undefined
+  currentModel: string | undefined,
+  provider: string
 ): AgentPersonaResolution {
-  if (currentModel !== undefined && currentModel !== persona.model) {
-    getLog().warn(
-      { agentName: persona.name, agentModel: persona.model, nodeModel: currentModel },
-      'agent.model_mismatch_agent_wins'
-    );
+  if (provider === 'codex') {
+    if (persona.model !== undefined) {
+      throw new InfrastructureClassBlock(
+        `Codex persona '${persona.name}' must not declare 'model:'. A 'provider: codex' ` +
+          "node cannot receive an Anthropic model alias. Remove the 'model:' line from the " +
+          'persona; configure the Codex model at assistant/account level (assistants.codex.model) ' +
+          'if deterministic routing is needed.'
+      );
+    }
+  } else if (provider === 'claude') {
+    if (persona.model === undefined) {
+      throw new InfrastructureClassBlock(
+        `Claude persona '${persona.name}' must declare a 'model:' in its front matter.`
+      );
+    }
+    // Persona model wins over the node model; surface a mismatch (claude only --
+    // for codex, persona.model is undefined and this comparison is meaningless).
+    if (currentModel !== undefined && currentModel !== persona.model) {
+      getLog().warn(
+        { agentName: persona.name, agentModel: persona.model, nodeModel: currentModel },
+        'agent.model_mismatch_agent_wins'
+      );
+    }
   }
+  // else (pi / future providers): leave persona.model as-is, no constraint.
 
   const resolution: AgentPersonaResolution = {
     model: persona.model,
@@ -601,7 +644,12 @@ export function resolveAgentPersona(
   }
 
   getLog().info(
-    { name: persona.name, model: persona.model, tools: persona.tools ?? [] },
+    {
+      name: persona.name,
+      model: persona.model ?? '(provider-default)',
+      provider,
+      tools: persona.tools ?? [],
+    },
     'agent.resolved'
   );
 

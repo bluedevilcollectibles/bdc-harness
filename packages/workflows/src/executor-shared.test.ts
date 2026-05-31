@@ -29,6 +29,7 @@ import {
   formatSubprocessFailure,
   classifyError,
   resolveAgentPersona,
+  InfrastructureClassBlock,
 } from './executor-shared';
 
 describe('substituteWorkflowVariables', () => {
@@ -607,44 +608,44 @@ describe('resolveAgentPersona', () => {
 
   it('uses persona model as the resolved model', () => {
     const persona = makePersona({ model: 'opus' });
-    const resolution = resolveAgentPersona(persona, undefined);
+    const resolution = resolveAgentPersona(persona, undefined, 'claude');
     expect(resolution.model).toBe('opus');
   });
 
   it('persona model wins over current node model', () => {
     const persona = makePersona({ model: 'sonnet' });
-    const resolution = resolveAgentPersona(persona, 'opus');
+    const resolution = resolveAgentPersona(persona, 'opus', 'claude');
     expect(resolution.model).toBe('sonnet');
   });
 
   it('returns the persona systemPrompt', () => {
     const persona = makePersona({ systemPrompt: 'You are the architect.' });
-    const resolution = resolveAgentPersona(persona, undefined);
+    const resolution = resolveAgentPersona(persona, undefined, 'claude');
     expect(resolution.systemPrompt).toBe('You are the architect.');
   });
 
   it('returns persona name in agentName field', () => {
     const persona = makePersona({ name: 'war-council-architect' });
-    const resolution = resolveAgentPersona(persona, undefined);
+    const resolution = resolveAgentPersona(persona, undefined, 'claude');
     expect(resolution.agentName).toBe('war-council-architect');
   });
 
   it('sets allowedTools when persona has a tools list', () => {
     const persona = makePersona({ tools: ['Read', 'Grep', 'Glob'] });
-    const resolution = resolveAgentPersona(persona, undefined);
+    const resolution = resolveAgentPersona(persona, undefined, 'claude');
     expect(resolution.allowedTools).toEqual(['Read', 'Grep', 'Glob']);
   });
 
   it('allowedTools is undefined when persona has no tools', () => {
     const persona = makePersona({ tools: undefined });
-    const resolution = resolveAgentPersona(persona, undefined);
+    const resolution = resolveAgentPersona(persona, undefined, 'claude');
     expect(resolution.allowedTools).toBeUndefined();
   });
 
   it('logs a warning when node model differs from persona model', () => {
     mockLogFn.mockClear();
     const persona = makePersona({ model: 'sonnet' });
-    resolveAgentPersona(persona, 'opus');
+    resolveAgentPersona(persona, 'opus', 'claude');
     const warnCalls = mockLogFn.mock.calls.filter(
       (call: unknown[]) => typeof call[1] === 'string' && (call[1] as string).includes('mismatch')
     );
@@ -654,7 +655,7 @@ describe('resolveAgentPersona', () => {
   it('does not log a warning when node model matches persona model', () => {
     mockLogFn.mockClear();
     const persona = makePersona({ model: 'sonnet' });
-    resolveAgentPersona(persona, 'sonnet');
+    resolveAgentPersona(persona, 'sonnet', 'claude');
     const warnCalls = mockLogFn.mock.calls.filter(
       (call: unknown[]) => typeof call[1] === 'string' && (call[1] as string).includes('mismatch')
     );
@@ -664,10 +665,46 @@ describe('resolveAgentPersona', () => {
   it('does not log a warning when currentModel is undefined', () => {
     mockLogFn.mockClear();
     const persona = makePersona({ model: 'opus' });
-    resolveAgentPersona(persona, undefined);
+    resolveAgentPersona(persona, undefined, 'claude');
     const warnCalls = mockLogFn.mock.calls.filter(
       (call: unknown[]) => typeof call[1] === 'string' && (call[1] as string).includes('mismatch')
     );
     expect(warnCalls.length).toBe(0);
+  });
+
+  // ── Provider-aware cases (WO-HARNESS-PROVIDER-AWARE-MODEL-RESOLUTION-01) ──
+
+  it('claude: throws InfrastructureClassBlock when persona has no model', () => {
+    const persona = makePersona({ model: undefined });
+    expect(() => resolveAgentPersona(persona, undefined, 'claude')).toThrow(
+      InfrastructureClassBlock
+    );
+  });
+
+  it('codex: throws InfrastructureClassBlock when persona declares a model', () => {
+    // A provider:codex node must never receive persona.model.
+    const persona = makePersona({ model: 'sonnet' });
+    expect(() => resolveAgentPersona(persona, undefined, 'codex')).toThrow(
+      InfrastructureClassBlock
+    );
+  });
+
+  it('codex: resolves model to undefined when persona omits model', () => {
+    const persona = makePersona({ model: undefined });
+    const resolution = resolveAgentPersona(persona, undefined, 'codex');
+    expect(resolution.model).toBeUndefined();
+    expect(resolution.agentName).toBe('test-agent');
+  });
+
+  it('pi: passes the persona model through unchanged (codex rule does not apply)', () => {
+    const persona = makePersona({ model: 'sonnet' });
+    const resolution = resolveAgentPersona(persona, undefined, 'pi');
+    expect(resolution.model).toBe('sonnet');
+  });
+
+  it('pi: leaves model undefined when persona omits it (no codex constraint)', () => {
+    const persona = makePersona({ model: undefined });
+    const resolution = resolveAgentPersona(persona, undefined, 'pi');
+    expect(resolution.model).toBeUndefined();
   });
 });
