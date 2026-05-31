@@ -1,6 +1,13 @@
 ---
 name: codex-adversarial-reviewer
-model: opus
+# No model pin: this persona runs via `provider: codex` (diff-review,
+# diff-review-final). The persona model ALWAYS wins over a node-level model
+# (resolveAgentPersona, executor-shared.ts), so pinning an Anthropic model name
+# here forced the codex provider to request it -> ChatGPT-account Codex 400s
+# ("'opus' is not supported when using Codex with a ChatGPT account"), failing
+# both diff-review nodes and the whole lane. With no pin, buildThreadOptions
+# (codex/provider.ts) passes model: undefined and the Codex SDK uses the
+# account's own default model. Do NOT add an Anthropic model name here.
 tools: [Read, Grep, Glob]
 description: Schema and code adversarial reviewer. Read-only. Finds gaps, inconsistencies, type errors.
 ---
