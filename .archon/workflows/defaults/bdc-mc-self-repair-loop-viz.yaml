@@ -1,0 +1,300 @@
+# Drafted by yaml-author subagent for WO-MC-SELF-REPAIR-LOOP-VIZ-01 on 2026-05-31
+# Source pattern: bdc-template-single-repo-code.yaml (adapted) + bdc-feature-development.yaml (read-spec cross-repo fetch, preflight-github-auth)
+# Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
+# Pre-flight: codebase bluedevilcollectibles/bdc-harness must be registered in Archon
+#   (verify via: ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases\"")
+# Pre-flight: WO spec MUST be committed + pushed to bdc-xo docs/work-orders/WO-MC-SELF-REPAIR-LOOP-VIZ-01.md on main BEFORE firing (read-spec fetches via gh api ref=main).
+# Pre-flight: Notion WO page = 371ef4c9-ce00-81b6-9f7f-cde4248aac8e (filled into flip-notion below).
+# Branch model: bdc-harness uses `dev` as integration branch (NOT main). PR base = dev. bdc-harness is NOT a Rule 20 staging-gate repo.
+# Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh WO-MC-SELF-REPAIR-LOOP-VIZ-01.yaml
+# REVIEW BEFORE DEPLOY - human verifies schema-audit tables, test thresholds, WO-specific prompts.
+
+name: bdc-mc-self-repair-loop-viz
+description: |
+  Use when: Executing WO-MC-SELF-REPAIR-LOOP-VIZ-01 - Cauldron run-page visualization of the
+    self-repair review loop + autonomy ladder (loop arcs, cycle banner, paused-gate distinction).
+  Input: WO_ID = WO-MC-SELF-REPAIR-LOOP-VIZ-01.
+  Does:
+    - Reads spec from bdc-xo docs/work-orders/.
+    - Plans + implements in bdc-harness packages/web (ReactFlow run-detail view - EXTEND, no new layout system).
+    - Verifies: bun run build (web) + bunx tsc --noEmit, both zero errors.
+    - Commits, pushes feature branch off dev, opens PR to dev.
+    - Flips Notion to REVIEW (NOT DONE - the grader closes both fields after VALIDATED).
+  Repo: bluedevilcollectibles/bdc-harness (branch off origin/dev - integration branch, NOT main).
+  WO Class: CODE (frontend React/ReactFlow, read-only rendering of existing events; no backend, no schema, no migration).
+  parallel_ok: true.
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+inputs:
+  WO_ID:
+    default: "WO-MC-SELF-REPAIR-LOOP-VIZ-01"
+
+nodes:
+
+  # Fail closed if the container cannot push to origin (WO-169 anchor, 2026-05-16).
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  # Spec lives in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api.
+  # Rule 5: try docs/work-orders/ direct, then docs/superpowers/specs/ direct, then date-prefix glob, then issue body.
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-MC-SELF-REPAIR-LOOP-VIZ-01}"
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        MATCH=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1 || true)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/bluedevilcollectibles/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for WO_ID=${WO_ID} (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, GitHub issue body)" >&2
+        exit 1
+      fi
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\n\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC_PATH" "$SPEC_CONTENT"
+
+  # Fresh branch off dev (bdc-harness integration branch - NOT main).
+  # Worktree-locked-branch fallback + shell-local timestamp suffix (Rule 2).
+  - id: fresh-branch
+    persona: major-build
+    depends_on: [read-spec]
+    bash: |
+      set -euo pipefail
+      BASE_BRANCH="dev"
+      git fetch origin "$BASE_BRANCH" --depth=50 || true
+      git checkout "$BASE_BRANCH" 2>/dev/null || echo "branch held; staying on current HEAD"
+      git reset --hard "origin/$BASE_BRANCH" 2>/dev/null || true
+      BRANCH="wo/mc-self-repair-loop-viz-01-run-$(date +%Y%m%d%H%M%S)"
+      git checkout -b "$BRANCH"
+      echo "BRANCH=${BRANCH}"
+      echo "BASE_BRANCH=${BASE_BRANCH}"
+
+  - id: implement
+    persona: major-build
+    agent: major-build
+    depends_on: [fresh-branch]
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 6
+      prompt: |
+        Implement WO-MC-SELF-REPAIR-LOOP-VIZ-01 in bdc-harness packages/web. CWD = repo root.
+
+        ## Spec
+        $read-spec.output
+
+        ## Branch
+        $fresh-branch.output
+
+        ## Ground-truth-first (Rule 17 - code wins over this WO and over your assumptions)
+        Before writing rendering logic, read the live wiring:
+        1. Read the ACTUAL bdc-feature-development workflow YAML in
+           .archon/workflows/defaults/bdc-feature-development.yaml - enumerate the REAL ladder
+           node ids and their depends_on / loop / when / trigger_rule wiring. Do NOT hardcode the
+           conceptual rung labels from the WO (diff-review / block-classify / opus-repair /
+           block-reclassify / pause-gate). If the YAML node ids differ, the YAML wins.
+        2. Confirm the EXACT event_type strings emitted for pause/resume by grepping
+           packages/workflows/src/dag-executor.ts and packages/server/src/routes/api.ts.
+           CONTRACT (architect-verified): approval-gate ENTERED = approval_requested; human
+           APPROVED/REJECTED gate = approval_received (data.decision); operator pause/resume =
+           run_paused / run_resumed (DISTINCT from the approval gate). After approve, run.status is
+           transiently 'failed' during auto-resume - that is NOT an error state. Re-grep to confirm
+           the strings are unchanged; if they differ, the mapper uses the actual strings.
+        3. Read the existing surfaces you are EXTENDING (do not introduce a new layout/graph system):
+           - packages/web/src/components/workflows/WorkflowExecution.tsx (event->DagNodeState hydrate)
+           - packages/web/src/components/workflows/WorkflowDagViewer.tsx  (ReactFlow surface)
+           - packages/web/src/components/workflows/ExecutionDagNode.tsx   (per-node render)
+           - packages/web/src/components/workflows/NodePeekPanel.tsx      (#60 side panel)
+           - packages/web/src/lib/dag-layout.ts                           (dagNodesToReactFlow, hasCycle, resolveNodeDisplay)
+           - packages/web/src/lib/types.ts                                (WorkflowStepStatus, DagNodeState, LoopIterationInfo)
+           - packages/web/src/lib/api.ts                                  (approve/reject/resumeWorkflowRun - EXISTING, reuse)
+
+        ## Deliverables (close the three gaps - all rendering/aggregation over EXISTING events)
+        - Gap A: add deriveLoopArcs(yamlNodes, events) to packages/web/src/lib/dag-layout.ts -
+          compute loop-back edges (review->repair, gate->review) + per-arc traversal count from the
+          YAML on_fail/loop/when wiring + event traversal; EXTEND dagNodesToReactFlow to merge those
+          arcs with the depends_on edges (render arcs dashed/curved, labeled "x<count>"). Reuse the
+          EXISTING hasCycle to validate loop edges before render.
+        - Gap B: add deriveCycleState(events) - aggregate { currentCycle, currentRung, paused,
+          resolved } and render a NEW CycleBanner component (top-left overlay in WorkflowDagViewer),
+          shown ONLY when >=1 review->repair edge has been traversed.
+        - Gap C: EXTEND the WorkflowExecution REST hydrate to map approval_requested -> node
+          awaiting-approval state and approval_received (data.decision='approved') -> resumed/cleared
+          state (joined with run.status === 'paused'). ALSO recover approval context from the
+          approval_requested event's data.{message,nodeId} (WorkflowState.approval is SSE-only, absent
+          on the REST hydrate). Render inline Approve/Reject ONLY for approval-gate pauses (not
+          operator run_paused), bound to EXISTING approveWorkflowRun(runId)/rejectWorkflowRun(runId);
+          surface node_failed data.error truncated inline on the failed rung. Tolerate the transient
+          run.status='failed' during auto-resume without rendering an error.
+
+        ## Invariants that MUST NEVER break (WO Section 6 Q6)
+        - Existing linear/depends_on rendering for NON-loop runs is unchanged (no phantom arc, no banner).
+        - No new instrumentation, events, schema, or backend route. Read-only render over events.
+        - Guard EVERY new field read - do NOT reintroduce the #74 "Cannot read properties of
+          undefined" crash. Browser console must be clean on render.
+        - No write path to remote_agent_workflow_events.
+
+        ## Tests - doctrine baseline (Rule 10 of Builder Accountability: tests assert real behavior)
+        Write at least 5 tests (Vitest, or the harness web test runner you find in package.json)
+        that assert ACTUAL behavior, not "did not throw":
+        1. Looped run (fixture replaying anchor run 3bb2cbac events) -> deriveLoopArcs returns >=1
+           loop-back edge with a traversal count; deriveCycleState returns currentCycle/currentRung.
+        2. Paused run (approval_requested, no approval_received, run.status='paused') -> pause-gate
+           node resolves to awaiting-approval state, NOT running.
+        3. No-loop run (zero review->repair traversals) -> deriveLoopArcs returns [] and no
+           CycleBanner is rendered (no false positive).
+        4. node_failed with data.error -> the failed rung exposes the truncated error inline.
+        5. approval_received (data.decision='approved') after pause -> gate->review arc traversal
+           count increments; a transient run.status='failed' does NOT render as an error.
+
+        ## Execution rules
+        1. Modify only files in scope per the spec. Prefer existing repo patterns and helpers.
+        2. Do not reformat unrelated code. Do not deploy. Do not bypass approval gates.
+        3. After writing code, from packages/web (or repo root with the workspace filter):
+           - Run: bun run build   (the harness web build - must succeed, zero errors)
+           - Run: bunx tsc --noEmit   (must exit 0)
+           - Run the web test suite (bun test or the runner in package.json - new tests pass)
+        4. Commit (real in-scope changes only; NEVER git commit --allow-empty):
+           BRANCH=$(git rev-parse --abbrev-ref HEAD)
+           git add -A
+           git diff --cached --quiet || git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+             commit -m "feat(web): WO-MC-SELF-REPAIR-LOOP-VIZ-01 - self-repair loop + ladder run-page viz"
+           git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - backstop node will retry"
+        5. Do NOT open the PR here.
+
+        Output COMPLETE on its own line when build + tsc + tests pass and the commit is pushed.
+
+  # Build + typecheck gate (WO Section 12 stop condition: both succeed, zero errors).
+  - id: verify-build-tsc
+    persona: major-build
+    depends_on: [implement]
+    bash: |
+      set -euo pipefail
+      # bun only (no npm/npx/pnpm/yarn). Web build + typecheck must both pass.
+      bun install --frozen-lockfile 2>&1 || bun install 2>&1
+      bun run --filter './packages/web' build 2>&1 || (cd packages/web && bun run build 2>&1)
+      (cd packages/web && bunx tsc --noEmit) 2>&1 || bunx tsc --noEmit -p packages/web 2>&1
+      echo "verify-build-tsc PASS (bun run build + tsc --noEmit, zero errors)"
+
+  # Backstop commit + push (no-op if implement already pushed).
+  - id: commit-and-push
+    persona: major-build
+    depends_on: [verify-build-tsc]
+    bash: |
+      set -euo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      git add -A
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "chore(web): backstop commit WO-MC-SELF-REPAIR-LOOP-VIZ-01"
+      fi
+      git push -u origin "$BRANCH"
+      echo "SHA=$(git rev-parse HEAD)"
+      echo "BRANCH=${BRANCH}"
+
+  # Manifest grep assertions (WO Section 12 - bash-executable, rerunnable from fresh checkout).
+  # These are the THREE exact assertions from the spec. They gate the PR (must all pass).
+  - id: verify-grep-assertions
+    persona: major-build
+    depends_on: [commit-and-push]
+    bash: |
+      set -euo pipefail
+      grep -c 'deriveLoopArcs' packages/web/src/lib/dag-layout.ts && [ $(grep -c 'deriveLoopArcs' packages/web/src/lib/dag-layout.ts) -ge 1 ]
+      grep -c 'approval_requested\|approval_received' packages/web/src/components/workflows/WorkflowExecution.tsx && [ $(grep -c 'approval_requested\|approval_received' packages/web/src/components/workflows/WorkflowExecution.tsx) -ge 1 ]
+      grep -rc 'CycleBanner' packages/web/src/components/workflows/ && [ $(grep -rl 'CycleBanner' packages/web/src/components/workflows/ | wc -l) -ge 1 ]
+      echo "verify-grep-assertions PASS (deriveLoopArcs, approval_requested|approval_received, CycleBanner)"
+
+  - id: open-pr
+    persona: major-build
+    depends_on: [verify-grep-assertions]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-MC-SELF-REPAIR-LOOP-VIZ-01}"
+      REPO="bluedevilcollectibles/bdc-harness"
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      # bdc-harness integration branch is dev (NOT main). Not a Rule 20 staging-gate repo.
+      BASE="dev"
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
+      for attempt in 1 2 3; do
+        if URL=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" \
+            --title "feat(web): ${WO_ID} - self-repair loop + autonomy-ladder run-page viz" \
+            --body "Implements ${WO_ID}. Spec: bdc-xo docs/work-orders/${WO_ID}.md (on main).
+
+        Extends Cauldron Mission Control run-detail DAG: loop arcs (Gap A), cycle banner + ladder
+        state (Gap B), paused-gate distinction + inline approve/reject + failed-rung reason (Gap C).
+        Read-only render over existing remote_agent_workflow_events - no backend, schema, or migration.
+        Base = dev (bdc-harness integration branch)." \
+            --label "review" 2>&1); then
+          echo "PR_URL=$URL"; exit 0
+        fi
+        sleep $((attempt * 5))
+      done
+      echo "ERROR: gh pr create failed after 3 attempts" >&2; exit 1
+
+  # Rule 7: flip Notion. Sets Claude Status=REVIEW + Status=Review (NEVER DONE - the
+  # Cauldron grader closes BOTH fields after VALIDATED). Manifest goes in Notes, not a comment.
+  - id: flip-notion
+    persona: xo
+    depends_on: [open-pr]
+    task_class: clerical
+    prompt: |
+      Flip the Notion WO page for WO-MC-SELF-REPAIR-LOOP-VIZ-01 to REVIEW.
+
+      Notion page ID: 371ef4c9-ce00-81b6-9f7f-cde4248aac8e
+
+      Write the manifest below into the Notes property VERBATIM (NOT as a page comment -
+      Captain CI / the Cauldron grader reads Notes). Then update the two status fields.
+
+      WO: WO-MC-SELF-REPAIR-LOOP-VIZ-01
+      Builder: Devils Cauldron (Archon bdc-mc-self-repair-loop-viz)
+      Files modified: [from implement output - e.g. packages/web/src/lib/dag-layout.ts, .../WorkflowExecution.tsx, .../WorkflowDagViewer.tsx, .../ExecutionDagNode.tsx]
+      Files created: [from implement output - e.g. packages/web/src/components/workflows/CycleBanner.tsx + test files]
+      Tests: bun run build PASS; bunx tsc --noEmit PASS (zero errors); web test suite - new render tests for looped/paused/no-loop runs pass
+      PRs: $open-pr.output (base dev)
+      Merge ancestors: bdc-harness dev HEAD, behind_by: 0
+      Grep assertions:
+        grep -c 'deriveLoopArcs' packages/web/src/lib/dag-layout.ts && [ $(grep -c 'deriveLoopArcs' packages/web/src/lib/dag-layout.ts) -ge 1 ]
+        grep -c 'approval_requested\|approval_received' packages/web/src/components/workflows/WorkflowExecution.tsx && [ $(grep -c 'approval_requested\|approval_received' packages/web/src/components/workflows/WorkflowExecution.tsx) -ge 1 ]
+        grep -rc 'CycleBanner' packages/web/src/components/workflows/ && [ $(grep -rl 'CycleBanner' packages/web/src/components/workflows/ | wc -l) -ge 1 ]
+      Runtime verification: N/A (frontend render change; visual verification on a real looped run, e.g. anchor 3bb2cbac, post-deploy)
+      Vercel deployment: N/A for source-grep close - Cauldron web deploys per harness pipeline (container rebuild on archon-app-1, or Vercel if web split); operator confirms current path post-merge
+      VALIDATION: PASS
+
+      Update the page properties:
+       - Claude Status -> REVIEW
+       - Status -> Review
+       - Notes -> the manifest above, verbatim
+      Do NOT set DONE - only the grader closes the WO after VALIDATED.
+
+      Context for filling [bracketed] fields:
+      PR: $open-pr.output
+      Implement: $implement.output
