@@ -27,6 +27,11 @@ import type {
 } from '@/lib/types';
 
 import type { WorkflowEventResponse } from '@/lib/api';
+import {
+  deriveLoopArcs,
+  deriveCycleState,
+  extractApprovalContext,
+} from '@/lib/dag-self-repair-loop';
 
 /** Tool call event extracted from workflow_events for display in WorkflowLogs. */
 export interface ToolEvent {
@@ -221,6 +226,59 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
               });
             }
 
+            // Third pass (WO-MC-SELF-REPAIR-LOOP-VIZ-01, Gap C): map approval
+            // events to per-node state. approval_requested with no later
+            // approval_received AND run.status === 'paused' = awaiting_approval.
+            // approval_received with decision='approved' is already covered by
+            // the node_completed event the server emits alongside it
+            // (api.ts:2653), so we only need to set awaiting_approval here and
+            // let the existing pass mark completed/failed normally.
+            const approvalRequestedAt = new Map<string, number>();
+            const approvalReceivedAt = new Map<string, number>();
+            for (const e of data.events) {
+              const nodeId = e.step_name ?? '';
+              if (!nodeId) continue;
+              const ts = new Date(e.created_at).getTime();
+              if (e.event_type === 'approval_requested') {
+                const prior = approvalRequestedAt.get(nodeId) ?? -1;
+                if (ts > prior) approvalRequestedAt.set(nodeId, ts);
+              } else if (e.event_type === 'approval_received') {
+                const prior = approvalReceivedAt.get(nodeId) ?? -1;
+                if (ts > prior) approvalReceivedAt.set(nodeId, ts);
+              }
+            }
+            for (const [nodeId, requestedAt] of approvalRequestedAt) {
+              const receivedAt = approvalReceivedAt.get(nodeId) ?? -1;
+              const unresolved = receivedAt < requestedAt;
+              if (!unresolved) continue;
+              if (data.run.status !== 'paused') continue;
+              const existing = nodeMap.get(nodeId);
+              // Pull the message from the unresolved approval_requested event.
+              const reqEvent = data.events.find(
+                ev =>
+                  ev.event_type === 'approval_requested' &&
+                  ev.step_name === nodeId &&
+                  new Date(ev.created_at).getTime() === requestedAt
+              );
+              const reqMessage = reqEvent
+                ? ((reqEvent.data as { message?: string }).message ?? '')
+                : '';
+              if (existing) {
+                nodeMap.set(nodeId, {
+                  ...existing,
+                  status: 'awaiting_approval',
+                  error: reqMessage || existing.error,
+                });
+              } else {
+                nodeMap.set(nodeId, {
+                  nodeId,
+                  name: nodeId,
+                  status: 'awaiting_approval',
+                  error: reqMessage || undefined,
+                });
+              }
+            }
+
             return Array.from(nodeMap.values());
           })(),
           artifacts: data.events
@@ -239,6 +297,12 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
           completedAt: data.run.completed_at
             ? new Date(ensureUtc(data.run.completed_at)).getTime()
             : undefined,
+          // WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): on the REST hydrate path,
+          // WorkflowState.approval is otherwise undefined (it is set only on
+          // the SSE handler). Recover the unresolved approval context from
+          // events so the inline Approve/Reject affordance has something to
+          // bind to on a page refresh of a paused run.
+          approval: extractApprovalContext(data.events, data.run.status),
         },
         workerPlatformId: data.run.worker_platform_id ?? null,
         parentPlatformId: data.run.parent_platform_id ?? null,
@@ -336,6 +400,29 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
   // Use workflow definition when available, fall back to dagNodes from run state.
   const isDag = dagDefinitionNodes !== null || (initialData?.dagNodes.length ?? 0) > 0;
 
+  // WO-MC-SELF-REPAIR-LOOP-VIZ-01: compute the self-repair loop overlays
+  // (loop-back arcs + cycle state) from the YAML topology and the events
+  // stream. Pure derivation — re-runs cheaply on every poll tick.
+  const events = queryData?.events ?? null;
+  const loopArcs = useMemo(() => {
+    if (!dagDefinitionNodes || !events) return [];
+    try {
+      return deriveLoopArcs(dagDefinitionNodes, events);
+    } catch (err) {
+      console.warn('[WorkflowExecution] deriveLoopArcs failed; rendering without loop arcs', err);
+      return [];
+    }
+  }, [dagDefinitionNodes, events]);
+  const cycleState = useMemo(() => {
+    if (!dagDefinitionNodes || !events) return null;
+    try {
+      return deriveCycleState(dagDefinitionNodes, events, initialData?.status);
+    } catch (err) {
+      console.warn('[WorkflowExecution] deriveCycleState failed; suppressing banner', err);
+      return null;
+    }
+  }, [dagDefinitionNodes, events, initialData?.status]);
+
   // When SSE reports a terminal status but React Query data is still stale,
   // invalidate the cache to trigger an immediate re-fetch with correct data.
   const liveStatus = liveWorkflow?.status;
@@ -382,7 +469,13 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
     }
     // Merge: use liveWorkflow's dynamic status but preserve initialData's
     // structural data when liveWorkflow is sparse (missed earlier events).
-    return {
+    // WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): preserve the REST-hydrated
+    // approval object (recovered from events) when SSE has none — the SSE
+    // store sets approval=undefined whenever status !== 'paused', which
+    // would erase the context on a transient 'failed' status during the
+    // approval auto-resume window.
+    const mergedApproval = liveWorkflow.approval ?? initialData.approval;
+    const merged: WorkflowState = {
       ...initialData,
       status: liveWorkflow.status,
       completedAt: liveWorkflow.completedAt ?? initialData.completedAt,
@@ -391,10 +484,42 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
       // otherwise fall back to the REST snapshot.
       dagNodes: liveWorkflow.dagNodes.length > 0 ? liveWorkflow.dagNodes : initialData.dagNodes,
       artifacts: liveWorkflow.artifacts.length > 0 ? liveWorkflow.artifacts : initialData.artifacts,
+      approval: mergedApproval,
 
       currentIteration: liveWorkflow.currentIteration ?? initialData.currentIteration,
       maxIterations: liveWorkflow.maxIterations ?? initialData.maxIterations,
     };
+    // WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): if SSE dagNodes won the merge but
+    // do NOT carry the awaiting_approval status (SSE emits no node-level
+    // event for approval gates), overlay it here so the pause-gate node
+    // still renders distinct from a running node.
+    if (merged.status === 'paused' && mergedApproval) {
+      const targetId = mergedApproval.nodeId;
+      let touched = false;
+      const nextDagNodes = merged.dagNodes.map(n => {
+        if (n.nodeId !== targetId) return n;
+        if (n.status === 'awaiting_approval') return n;
+        touched = true;
+        return { ...n, status: 'awaiting_approval' as const };
+      });
+      if (touched) {
+        merged.dagNodes = nextDagNodes;
+      } else if (!merged.dagNodes.some(n => n.nodeId === targetId)) {
+        // Node has not emitted any node_* event yet but the run is paused on
+        // its approval gate. Synthesize a minimal awaiting_approval entry so
+        // the visual is correct even on a sparse SSE-only path.
+        merged.dagNodes = [
+          ...merged.dagNodes,
+          {
+            nodeId: targetId,
+            name: targetId,
+            status: 'awaiting_approval' as const,
+            error: mergedApproval.message,
+          },
+        ];
+      }
+    }
+    return merged;
   })();
 
   // Running total cost across all completed nodes in this run
@@ -628,6 +753,9 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   currentlyExecuting={currentlyExecuting ?? undefined}
                   selectedNodeId={selectedDagNode}
                   onNodeClick={handleNodeClick}
+                  loopArcs={loopArcs}
+                  cycleState={cycleState}
+                  runStatus={workflow.status}
                 />
               ) : (
                 <div className="flex items-center justify-center h-full text-text-secondary">
@@ -642,6 +770,8 @@ export function WorkflowExecution({ runId }: WorkflowExecutionProps): React.Reac
                   nodeDef={peekNodeDef}
                   nodeStatus={peekNodeStatus}
                   isRunning={isRunning}
+                  runStatus={workflow.status}
+                  approval={workflow.approval}
                   onClose={(): void => {
                     setPeekOpen(false);
                   }}

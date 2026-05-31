@@ -8,15 +8,17 @@ import {
   MiniMap,
 } from '@xyflow/react';
 import type { Edge, NodeTypes } from '@xyflow/react';
-import type { DagNodeState, WorkflowStepStatus } from '@/lib/types';
+import type { DagNodeState, WorkflowRunStatus, WorkflowStepStatus } from '@/lib/types';
 import type { DagNode } from '@/lib/api';
-import { dagNodesToReactFlow, resolveNodeDisplay } from '@/lib/dag-layout';
+import { dagNodesToReactFlow, mergeLoopArcsIntoEdges, resolveNodeDisplay } from '@/lib/dag-layout';
+import type { CycleState, LoopArc } from '@/lib/dag-self-repair-loop';
 import { formatDurationMs } from '@/lib/format';
 import {
   executionDagNode,
   type ExecutionFlowNode,
   type ExecutionNodeData,
 } from './ExecutionDagNode';
+import { CycleBanner } from './CycleBanner';
 
 import '@xyflow/react/dist/style.css';
 
@@ -28,6 +30,8 @@ const STATUS_MINIMAP_COLORS: Partial<Record<WorkflowStepStatus, string>> = {
   running: 'var(--accent-bright)',
   failed: 'var(--error)',
   skipped: 'var(--text-tertiary)',
+  // WO-MC-SELF-REPAIR-LOOP-VIZ-01: awaiting_approval renders amber in minimap.
+  awaiting_approval: 'var(--warning)',
 };
 const DEFAULT_MINIMAP_COLOR = 'var(--surface-elevated)';
 
@@ -35,6 +39,7 @@ const EDGE_STROKE_BY_STATUS: Partial<Record<WorkflowStepStatus, string>> = {
   completed: 'var(--success)',
   running: 'var(--accent-bright)',
   failed: 'var(--error)',
+  awaiting_approval: 'var(--warning)',
 };
 const DEFAULT_EDGE_STROKE = 'var(--border)';
 
@@ -45,6 +50,16 @@ interface WorkflowDagViewerProps {
   currentlyExecuting?: { nodeName: string; startedAt: number };
   selectedNodeId?: string | null;
   onNodeClick?: (nodeId: string) => void;
+  /** WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap A): dashed back-edges for the
+   *  review-repair / gate-resume / internal `loop:` arcs. Defaults to [],
+   *  in which case the viewer renders exactly as before. */
+  loopArcs?: readonly LoopArc[];
+  /** WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap B): aggregate cycle state for the
+   *  CycleBanner overlay. Null/undefined => no banner (clean linear render). */
+  cycleState?: CycleState | null;
+  /** Run-level status; used by the banner to choose tone (paused vs running
+   *  vs resolved). */
+  runStatus?: WorkflowRunStatus;
 }
 
 export function WorkflowDagViewer({
@@ -54,6 +69,8 @@ export function WorkflowDagViewer({
   currentlyExecuting,
   selectedNodeId,
   onNodeClick,
+  loopArcs,
+  cycleState,
 }: WorkflowDagViewerProps): React.ReactElement {
   // Compute topology layout ONCE from the workflow definition.
   // Only re-layout when the definition changes (node/edge count), not on status updates.
@@ -61,6 +78,14 @@ export function WorkflowDagViewer({
     const { nodes, edges } = dagNodesToReactFlow(dagNodes);
     return { baseNodes: nodes, edges };
   }, [dagNodes]);
+
+  // WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap A): merge dashed loop-back arcs into
+  // the depends_on edge set. Dagre is NOT re-run on the merged set — back
+  // edges would either crash or move nodes. Arcs are visual overlays only.
+  const edgesWithLoopArcs = useMemo(
+    () => mergeLoopArcsIntoEdges(baseNodes, layoutedEdges, loopArcs ?? []),
+    [baseNodes, layoutedEdges, loopArcs]
+  );
 
   // Build a status lookup map from live SSE/REST data
   const statusMap = useMemo(() => {
@@ -102,9 +127,14 @@ export function WorkflowDagViewer({
     });
   }, [baseNodes, statusMap, dagNodes, selectedNodeId]);
 
-  // Color edges based on target node status
+  // Color edges based on target node status.
+  // Loop-arc overlays carry their own dashed style + warning color; do not
+  // recolor them by target status (a paused gate would otherwise repaint the
+  // self-loop arc in amber twice). Detect via the synthetic id prefix the
+  // merge helper uses.
   const edges: Edge[] = useMemo(() => {
-    return layoutedEdges.map(edge => {
+    return edgesWithLoopArcs.map(edge => {
+      if (edge.id.startsWith('__loop_')) return edge;
       const targetStatus = statusMap.get(edge.target)?.status;
       const stroke = (targetStatus && EDGE_STROKE_BY_STATUS[targetStatus]) ?? DEFAULT_EDGE_STROKE;
       return {
@@ -114,10 +144,11 @@ export function WorkflowDagViewer({
         style: { stroke, strokeWidth: 1.5 },
       };
     });
-  }, [layoutedEdges, statusMap]);
+  }, [edgesWithLoopArcs, statusMap]);
 
   return (
     <div className="h-full w-full relative">
+      {cycleState && <CycleBanner cycleState={cycleState} />}
       {isRunning && currentlyExecuting && (
         <div className="absolute top-3 right-3 z-10 flex items-center gap-2 rounded-md bg-surface/90 backdrop-blur-sm border border-border px-3 py-1.5 text-xs">
           <span className="inline-block w-2 h-2 rounded-full bg-accent-bright animate-pulse" />

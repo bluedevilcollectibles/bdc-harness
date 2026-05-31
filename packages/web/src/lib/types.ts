@@ -13,7 +13,15 @@ export type WorkflowStepStatus =
   /** WO-170: exit-0 but emitted STATUS=*_failed on stdout. Yellow in UI. */
   | 'completed_with_warning'
   | 'failed'
-  | 'skipped';
+  | 'skipped'
+  /**
+   * WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): approval-gate node has emitted
+   * approval_requested with no later approval_received AND run.status ===
+   * 'paused'. Distinct from `running` so the operator can tell at a glance
+   * that the node is waiting for human input, not work. Distinct from
+   * `paused` (a run-level status) because step status is per-node.
+   */
+  | 'awaiting_approval';
 export type ArtifactType = 'pr' | 'commit' | 'file_created' | 'file_modified' | 'branch';
 
 // Base SSE event

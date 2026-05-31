@@ -1,4 +1,4 @@
-import { Pause } from 'lucide-react';
+import { Lock, Pause } from 'lucide-react';
 
 export function StatusIcon({ status }: { status: string }): React.ReactElement {
   switch (status) {
@@ -13,6 +13,10 @@ export function StatusIcon({ status }: { status: string }): React.ReactElement {
       );
     case 'paused':
       return <Pause className="h-3 w-3 text-warning" />;
+    case 'awaiting_approval':
+      // WO-MC-SELF-REPAIR-LOOP-VIZ-01: lock glyph distinguishes a paused
+      // approval gate from a generic paused/running node at a glance.
+      return <Lock className="h-3 w-3 text-warning animate-pulse" />;
     case 'failed':
       return <span className="text-error text-sm">&#x2717;</span>;
     case 'cancelled':
