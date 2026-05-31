@@ -65,7 +65,32 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
 }
 
 /**
- * Build thread options for Codex SDK
+ * Anthropic model aliases that must never reach the Codex SDK.
+ * If a caller passes one of these (e.g. via node.model or assistantConfig.model),
+ * it is silently dropped — Codex authenticates via its own account and resolves
+ * the model internally.  Non-Anthropic models (gpt-5-codex, o3, etc.) are passed through.
+ */
+const ANTHROPIC_MODEL_ALIASES: ReadonlySet<string> = new Set([
+  'sonnet',
+  'opus',
+  'haiku',
+  'opus[1m]',
+  'sonnet[1m]',
+  'claude-opus-4-7',
+  'claude-sonnet-4-6',
+  'claude-haiku-4-5',
+  'claude-haiku-4-5-20251001',
+]);
+
+function isAnthropicAlias(model: string): boolean {
+  // Also catch any full claude-* IDs not yet in the set
+  return ANTHROPIC_MODEL_ALIASES.has(model) || model.startsWith('claude-');
+}
+
+/**
+ * Build thread options for Codex SDK.
+ * Anthropic model aliases are dropped — the Codex SDK rejects them and resolves
+ * the model via the user's OpenAI/Codex account configuration.
  */
 function buildThreadOptions(
   cwd: string,
@@ -73,13 +98,20 @@ function buildThreadOptions(
   assistantConfig?: Record<string, unknown>
 ): ThreadOptions {
   const config = parseCodexConfig(assistantConfig ?? {});
+  // Resolve the candidate model from caller arg or assistantConfig, then drop
+  // it if it is an Anthropic alias.  This closes the SDK-boundary leak where a
+  // codex node could still receive an Anthropic model from node.model or
+  // assistantConfig.model even though resolveAgentPersona returned undefined.
+  const candidateModel = model ?? config.model;
+  const resolvedModel =
+    candidateModel !== undefined && isAnthropicAlias(candidateModel) ? undefined : candidateModel;
   return {
     workingDirectory: cwd,
     skipGitRepoCheck: true,
     sandboxMode: 'danger-full-access',
     networkAccessEnabled: true,
     approvalPolicy: 'never',
-    model: model ?? config.model,
+    ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
     modelReasoningEffort: config.modelReasoningEffort,
     webSearchMode: config.webSearchMode,
     additionalDirectories: config.additionalDirectories,

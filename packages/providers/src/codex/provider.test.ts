@@ -714,6 +714,80 @@ describe('CodexProvider', () => {
       );
     });
 
+    test('F1 SDK boundary: Anthropic model aliases are dropped from codex thread options', async () => {
+      // An Anthropic alias passed via node.model or assistantConfig.model must NOT
+      // reach the Codex SDK.  The SDK rejects Anthropic model names; dropping them
+      // lets the SDK fall back to the account-level model configured in OpenAI settings.
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      const anthropicAliases = [
+        'opus',
+        'sonnet',
+        'haiku',
+        'opus[1m]',
+        'sonnet[1m]',
+        'claude-opus-4-7',
+        'claude-sonnet-4-6',
+        'claude-haiku-4-5',
+      ];
+      for (const alias of anthropicAliases) {
+        mockStartThread.mockClear();
+        for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+          model: alias,
+        })) {
+          // consume
+        }
+        const callArg = mockStartThread.mock.calls[0]?.[0] as Record<string, unknown>;
+        expect(callArg).not.toHaveProperty(
+          'model',
+          `Anthropic alias '${alias}' must not be forwarded to the Codex SDK`
+        );
+      }
+    });
+
+    test('F1 SDK boundary: a genuine codex model is forwarded to the SDK', async () => {
+      // Codex-native models (gpt-5.2-codex, gpt-5.3-codex, o3, etc.) MUST be
+      // forwarded so explicit account-level model overrides work.
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+      mockStartThread.mockClear();
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        model: 'gpt-5.2-codex',
+      })) {
+        // consume
+      }
+      const callArg = mockStartThread.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(callArg).toHaveProperty('model', 'gpt-5.2-codex');
+    });
+
+    test('F1 SDK boundary: Anthropic alias in assistantConfig.model is also dropped', async () => {
+      // The leak can come from assistantConfig.model (not just requestOptions.model).
+      // Both paths must be blocked.
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+      mockStartThread.mockClear();
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        assistantConfig: { model: 'claude-sonnet-4-6' },
+      })) {
+        // consume
+      }
+      const callArg = mockStartThread.mock.calls[0]?.[0] as Record<string, unknown>;
+      expect(callArg).not.toHaveProperty(
+        'model',
+        'assistantConfig.model Anthropic alias must not be forwarded to the Codex SDK'
+      );
+    });
+
     test('passes outputFormat schema as outputSchema in TurnOptions', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {

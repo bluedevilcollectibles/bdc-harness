@@ -78,6 +78,7 @@ import {
   isInlineScript,
   formatSubprocessFailure,
   resolveAgentPersona,
+  InfrastructureClassBlock,
 } from './executor-shared';
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
 import type { AgentRegistry } from './agents/registry';
@@ -499,7 +500,7 @@ async function resolveNodeProviderAndModel(
     const registry = await getAgentRegistry(cwd);
     const persona = resolveAgent(agentName, registry);
     if (persona) {
-      const personaResolution = resolveAgentPersona(persona, effectiveModel);
+      const personaResolution = resolveAgentPersona(persona, effectiveModel, provider);
       effectiveModel = personaResolution.model;
       // Prepend agent system prompt (agent role comes before node task)
       effectiveSystemPrompt = effectiveSystemPrompt
@@ -512,7 +513,7 @@ async function resolveNodeProviderAndModel(
 
       // Load persona context (wiki + oracle) and prepend to system prompt
       if (persona.context) {
-        const contextBlock = await loadContext(persona).catch(err => {
+        const contextBlock = await loadContext(persona).catch((err: unknown) => {
           getLog().warn({ agentName, err: (err as Error).message }, 'agent.context_load_failed');
           return '';
         });
@@ -1978,7 +1979,14 @@ async function executeLoopNode(
     const registry = await getAgentRegistry(cwd);
     const persona = resolveAgent(loopAgentName, registry);
     if (persona) {
-      const personaResolution = resolveAgentPersona(persona, resolvedOptions.model);
+      // workflowProvider here is already the per-node provider (the outer
+      // dispatch resolves node.provider ?? workflowProvider before calling
+      // executeLoopNode), so a codex loop node is correctly recognized.
+      const personaResolution = resolveAgentPersona(
+        persona,
+        resolvedOptions.model,
+        workflowProvider
+      );
       resolvedOptions.model = personaResolution.model;
       resolvedOptions.systemPrompt = resolvedOptions.systemPrompt
         ? `${personaResolution.systemPrompt}\n\n${resolvedOptions.systemPrompt}`
@@ -3161,13 +3169,28 @@ export async function executeDagWorkflow(
           return { nodeId: node.id, output };
         } catch (error) {
           const err = error as Error;
-          getLog().error({ err, nodeId: node.id }, 'dag_node_pre_execution_failed');
+          // Infrastructure-class block: a persona/provider/config fault that no
+          // approve/reject decision can fix (e.g. a codex persona declaring an
+          // Anthropic model). Label it so an operator is told to fix the
+          // substrate rather than treat it as an ordinary node failure. This
+          // surfaces at the pre-execution catch, NOT the approval/pause-gate —
+          // a throw here never reaches that gate.
+          const isInfraBlock = err instanceof InfrastructureClassBlock;
+          const failMessage = isInfraBlock
+            ? `INFRASTRUCTURE FAULT in node '${node.id}': ${err.message} ` +
+              'Resuming will not help — the fix is a harness/persona/config change, not an ' +
+              'approve/reject decision. Reject this run and fix the substrate.'
+            : `Node '${node.id}' failed before execution: ${err.message}`;
+          getLog().error(
+            { err, nodeId: node.id, infraClassBlock: isInfraBlock },
+            'dag_node_pre_execution_failed'
+          );
           deps.store
             .createWorkflowEvent({
               workflow_run_id: workflowRun.id,
               event_type: 'node_failed',
               step_name: node.id,
-              data: { error: err.message },
+              data: { error: failMessage, ...(isInfraBlock ? { infra_class_block: true } : {}) },
             })
             .catch((dbErr: Error) => {
               getLog().error({ err: dbErr, nodeId: node.id }, 'workflow_event_persist_failed');
@@ -3177,17 +3200,15 @@ export async function executeDagWorkflow(
             runId: workflowRun.id,
             nodeId: node.id,
             nodeName: node.command ?? node.id,
-            error: err.message,
+            error: failMessage,
           });
-          await safeSendMessage(
-            platform,
-            conversationId,
-            `Node '${node.id}' failed before execution: ${err.message}`,
-            { workflowId: workflowRun.id, nodeName: node.id }
-          );
+          await safeSendMessage(platform, conversationId, failMessage, {
+            workflowId: workflowRun.id,
+            nodeName: node.id,
+          });
           return {
             nodeId: node.id,
-            output: { state: 'failed' as const, output: '', error: err.message },
+            output: { state: 'failed' as const, output: '', error: failMessage },
           };
         }
       })

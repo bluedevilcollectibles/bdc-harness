@@ -71,7 +71,11 @@ export interface AgentContext {
 /** Parsed frontmatter from an agent .md file */
 export interface AgentFrontmatter {
   name: string;
-  model: string;
+  // Optional: a `provider: codex` node's persona MUST omit `model:` (the codex
+  // SDK rejects Anthropic model names). The registry only validates a model when
+  // present; provider-specific required/forbidden enforcement lives in the
+  // resolver (resolveAgentPersona in executor-shared.ts), which sees node.provider.
+  model?: string;
   tools?: string[];
   description?: string;
   context?: AgentContext;
@@ -80,7 +84,7 @@ export interface AgentFrontmatter {
 /** A fully loaded and validated agent persona */
 export interface AgentPersona {
   name: string;
-  model: string;
+  model?: string;
   tools?: string[];
   description?: string;
   context?: AgentContext;
@@ -136,6 +140,15 @@ export function parseFrontmatter(
     const rest = line.slice(colonIdx + 1).trim();
 
     if (rest === '' || rest === null) {
+      // Special-case: a blank `model:` scalar (e.g. `model:` with no value) must
+      // be recorded as an empty string so the model validator below can fire
+      // agent_invalid_model.  Without this, the empty-scalar path never sets
+      // frontmatter.model and the validator treats it as "omitted" (valid).
+      if (key === 'model') {
+        frontmatter[key] = '';
+        i++;
+        continue;
+      }
       // Peek at next line to determine if this is a block sequence or nested object
       const nextLine = lines[i + 1] ?? '';
       if (nextLine.startsWith('  - ')) {
@@ -271,21 +284,28 @@ export async function loadAgentFile(filePath: string): Promise<AgentPersona> {
   }
 
   // --- model validation ---
-  if (typeof frontmatter.model !== 'string' || !frontmatter.model) {
-    throw new AgentRegistryError(
-      'agent_missing_model',
-      filePath,
-      `Agent file '${filePath}' is missing required frontmatter field 'model:' [agent_missing_model]`
-    );
-  }
-
-  if (!KNOWN_MODEL_ALIASES.has(frontmatter.model)) {
-    throw new AgentRegistryError(
-      'agent_invalid_model',
-      filePath,
-      `Agent file '${filePath}': unknown model alias '${frontmatter.model}'. ` +
-        `Valid aliases: ${[...KNOWN_MODEL_ALIASES].sort().join(', ')} [agent_invalid_model]`
-    );
+  // `model:` is OPTIONAL at the registry layer. A `provider: codex` persona must
+  // omit it (the codex SDK cannot serve an Anthropic model alias); a claude
+  // persona must declare it. That provider-specific required/forbidden rule is
+  // enforced in resolveAgentPersona (executor-shared.ts), which is the only place
+  // that knows the node's provider. Here we only reject a model that IS present
+  // but is not a known alias.
+  if (frontmatter.model !== undefined) {
+    if (typeof frontmatter.model !== 'string' || !frontmatter.model) {
+      throw new AgentRegistryError(
+        'agent_invalid_model',
+        filePath,
+        `Agent file '${filePath}': 'model:' must be a non-empty string when present [agent_invalid_model]`
+      );
+    }
+    if (!KNOWN_MODEL_ALIASES.has(frontmatter.model)) {
+      throw new AgentRegistryError(
+        'agent_invalid_model',
+        filePath,
+        `Agent file '${filePath}': unknown model alias '${frontmatter.model}'. ` +
+          `Valid aliases: ${[...KNOWN_MODEL_ALIASES].sort().join(', ')} [agent_invalid_model]`
+      );
+    }
   }
 
   // --- tools validation ---
