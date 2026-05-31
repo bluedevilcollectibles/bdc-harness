@@ -819,7 +819,12 @@ nodes:
       PRECHECK=$gate-already-satisfied.output
 
       final_ok=false
-      printf '%s\n' "$DIFF_FINAL" | grep -q '^DIFF_REVIEW_FINAL=satisfied' && final_ok=true
+      # Anchor-free parse: diff-review-final is Codex prose; sentinel appears inline,
+      # not at column 0. Take LAST occurrence so the final verdict always wins.
+      final_verdict=$(printf '%s\n' "$DIFF_FINAL" \
+        | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | tail -n 1)
+      if [ "$final_verdict" = "DIFF_REVIEW_FINAL=satisfied" ]; then final_ok=true; fi
       outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
 
       # Codex FINDING_2: PROCEED requires BOTH a real build AND a satisfied final review.
@@ -1060,7 +1065,12 @@ nodes:
         exit 1
       fi
       # Final-review sanity (still required for a real build): diff-review-final must be satisfied.
-      if ! printf '%s\n' "$DIFF_FINAL" | grep -q '^DIFF_REVIEW_FINAL=satisfied'; then
+      # Anchor-free parse (defense-in-depth mirror of block-classify). Fail-closed:
+      # anything other than an explicit satisfied leaves the gate refusing.
+      final_verdict_cap=$(printf '%s\n' "$DIFF_FINAL" \
+        | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | tail -n 1)
+      if [ "$final_verdict_cap" != "DIFF_REVIEW_FINAL=satisfied" ]; then
         echo "ERROR: diff-review-final not satisfied despite PROCEED status -- refusing commit (defense in depth)." >&2
         exit 1
       fi
