@@ -1,0 +1,32 @@
+name: bdc-thinman-storefront-deploy-factory-poc
+description: Storefront deployment factory stub using the shared deployment-request contract. Does not perform production storefront mutation.
+provider: codex
+model: gpt-5.3-codex
+interactive: true
+target_repo: bluedevilcollectibles/thinman-freight
+worktree:
+  enabled: true
+inputs:
+  request_path:
+    default: deployments/examples/storefront-preview.json
+nodes:
+  - id: validate-request
+    bash: bun scripts/deploy-factory/deploy-factory.mjs validate --request "${input.request_path}" --product storefront
+
+  - id: verify-repo
+    depends_on: [validate-request]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs repo-ready
+
+  - id: terraform-plan-only
+    depends_on: [verify-repo]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs terraform-plan --environment storefront-preview --request "${input.request_path}"
+
+  - id: storefront-porting-report
+    depends_on: [terraform-plan-only]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs evidence --request "${input.request_path}" --plan-only
+
+  - id: stop-before-mutation
+    depends_on: [storefront-porting-report]
+    approval:
+      message: Storefront production automation is intentionally stubbed. Port to Cauldron/bdc-harness only after Thinman POC passes.
+      capture_response: true

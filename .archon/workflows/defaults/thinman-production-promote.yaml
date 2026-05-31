@@ -1,0 +1,30 @@
+name: bdc-thinman-production-promote
+description: Thinman Freight production promotion dry run. Captures current production state and writes promote/rollback evidence without aliasing.
+provider: codex
+model: gpt-5.3-codex
+interactive: true
+target_repo: bluedevilcollectibles/thinman-freight
+worktree:
+  enabled: true
+inputs:
+  deployment_url:
+    default: REPLACE_WITH_VALIDATED_VERCEL_DEPLOYMENT_URL
+  previous_deployment_url:
+    default: REPLACE_WITH_PREVIOUS_DEPLOYMENT_URL
+  primary_domain:
+    default: freight.thinmansoftware.com
+  migration_table:
+    default: docs/deployment-factory/production-cutover-migration-table.md
+  mode:
+    default: dry-run
+nodes:
+  - id: validate-promotion-inputs
+    bash: bun scripts/deploy-factory/deploy-factory.mjs production-promote-validate --deployment-url "${input.deployment_url}" --previous-deployment-url "${input.previous_deployment_url}" --primary-domain "${input.primary_domain}" --migration-table "${input.migration_table}" --mode "${input.mode}"
+
+  - id: capture-current-production
+    depends_on: [validate-promotion-inputs]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs production-promote-capture --deployment-url "${input.deployment_url}" --previous-deployment-url "${input.previous_deployment_url}" --primary-domain "${input.primary_domain}" --migration-table "${input.migration_table}" --mode "${input.mode}"
+
+  - id: write-promotion-plan
+    depends_on: [capture-current-production]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs production-promote-plan --deployment-url "${input.deployment_url}" --previous-deployment-url "${input.previous_deployment_url}" --primary-domain "${input.primary_domain}" --migration-table "${input.migration_table}" --mode "${input.mode}"

@@ -1,0 +1,44 @@
+name: bdc-storefront-deploy-factory-plan-only
+description: Storefront deployment factory plan-only lane for future ComicStoreOS onboarding. Validates tenant request, preflights runtime and targets, prepares ignored tfvars, runs Terraform plan, writes evidence, and stops before any apply or deploy.
+provider: codex
+model: gpt-5.3-codex
+interactive: true
+target_repo: bluedevilcollectibles/thinman-freight
+worktree:
+  enabled: true
+inputs:
+  request_path:
+    default: deployments/examples/storefront-preview.json
+nodes:
+  - id: validate-request
+    bash: bun scripts/deploy-factory/deploy-factory.mjs validate --request "${input.request_path}" --product storefront
+
+  - id: verify-repo
+    depends_on: [validate-request]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs repo-ready
+
+  - id: runtime-check
+    depends_on: [verify-repo]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs runtime-check --environment storefront-preview
+
+  - id: deployment-preflight
+    depends_on: [runtime-check]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs preflight --environment storefront-preview --request "${input.request_path}" --product storefront
+
+  - id: prepare-terraform-inputs
+    depends_on: [deployment-preflight]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs prepare-tfvars --environment storefront-preview --request "${input.request_path}"
+
+  - id: terraform-plan
+    depends_on: [prepare-terraform-inputs]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs terraform-plan --environment storefront-preview --request "${input.request_path}"
+
+  - id: storefront-porting-report
+    depends_on: [terraform-plan]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs evidence --request "${input.request_path}" --plan-only
+
+  - id: stop-before-mutation
+    depends_on: [storefront-porting-report]
+    bash: |
+      echo "STOREFRONT_PLAN_ONLY_COMPLETE"
+      echo "No Terraform apply, DNS mutation, Vercel deploy, production promotion, paid provisioning, or approval gate was executed."
