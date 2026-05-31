@@ -1,0 +1,44 @@
+name: bdc-thinman-deploy-factory-plan-only
+description: Thinman Freight deployment factory plan-only lane. Validates request, preflights runtime and targets, prepares ignored tfvars, runs Terraform plan, writes evidence, and stops before any apply or deploy.
+provider: codex
+model: gpt-5.3-codex
+interactive: true
+target_repo: bluedevilcollectibles/thinman-freight
+worktree:
+  enabled: true
+inputs:
+  request_path:
+    default: deployments/examples/thinman-dev.json
+nodes:
+  - id: validate-request
+    bash: bun scripts/deploy-factory/deploy-factory.mjs validate --request "${input.request_path}" --product thinman
+
+  - id: verify-repo
+    depends_on: [validate-request]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs repo-ready
+
+  - id: runtime-check
+    depends_on: [verify-repo]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs runtime-check --environment thinman-dev
+
+  - id: deployment-preflight
+    depends_on: [runtime-check]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs preflight --environment thinman-dev --request "${input.request_path}" --product thinman
+
+  - id: prepare-terraform-inputs
+    depends_on: [deployment-preflight]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs prepare-tfvars --environment thinman-dev --request "${input.request_path}"
+
+  - id: terraform-plan
+    depends_on: [prepare-terraform-inputs]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs terraform-plan --environment thinman-dev --request "${input.request_path}"
+
+  - id: evidence-pack
+    depends_on: [terraform-plan]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs evidence --request "${input.request_path}" --plan-only
+
+  - id: stop-before-mutation
+    depends_on: [evidence-pack]
+    bash: |
+      echo "PLAN_ONLY_COMPLETE"
+      echo "No Terraform apply, DNS mutation, Vercel deploy, production promotion, paid provisioning, or approval gate was executed."

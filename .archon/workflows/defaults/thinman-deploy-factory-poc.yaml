@@ -1,0 +1,60 @@
+name: bdc-thinman-deploy-factory-poc
+description: Thinman-first Cauldron deployment factory POC with Terraform plan, approval gates, preview deploy, and evidence manifest.
+provider: codex
+model: gpt-5.3-codex
+interactive: true
+target_repo: bluedevilcollectibles/thinman-freight
+worktree:
+  enabled: true
+inputs:
+  request_path:
+    default: deployments/examples/thinman-dev.json
+nodes:
+  - id: validate-request
+    bash: bun scripts/deploy-factory/deploy-factory.mjs validate --request "${input.request_path}" --product thinman
+
+  - id: verify-repo
+    depends_on: [validate-request]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs repo-ready
+
+  - id: runtime-check
+    depends_on: [verify-repo]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs runtime-check --environment thinman-dev
+
+  - id: deployment-preflight
+    depends_on: [runtime-check]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs preflight --environment thinman-dev --request "${input.request_path}" --product thinman
+
+  - id: prepare-terraform-inputs
+    depends_on: [deployment-preflight]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs prepare-tfvars --environment thinman-dev --request "${input.request_path}"
+
+  - id: terraform-plan
+    depends_on: [prepare-terraform-inputs]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs terraform-plan --environment thinman-dev --request "${input.request_path}"
+
+  - id: overseer-dev-preview-apply-gate
+    depends_on: [terraform-plan]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs overseer-dev-preview-gate --environment thinman-dev --request "${input.request_path}"
+
+  - id: apply-dev-preview
+    depends_on: [overseer-dev-preview-apply-gate]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs terraform-apply --environment thinman-dev --request "${input.request_path}"
+    timeout: 600000
+
+  - id: vercel-preview
+    depends_on: [apply-dev-preview]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs vercel-preview --environment thinman-dev --request "${input.request_path}" --web-path thinman-web
+    timeout: 600000
+
+  - id: run-canaries
+    depends_on: [vercel-preview]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs canaries --environment thinman-dev --request "${input.request_path}"
+
+  - id: evidence-pack
+    depends_on: [run-canaries]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs evidence --request "${input.request_path}"
+
+  - id: overseer-production-readiness-record
+    depends_on: [evidence-pack]
+    bash: bun scripts/deploy-factory/deploy-factory.mjs production-approval-evidence --request "${input.request_path}"
