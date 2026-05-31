@@ -211,6 +211,27 @@ Prompt.
     expect(err?.code).toBe('agent_invalid_model');
   });
 
+  test('agent_invalid_model: blank model scalar (model: with no value) is rejected (F3)', async () => {
+    // A bare `model:` with no value must fire agent_invalid_model rather than
+    // being silently treated as "omitted" (which would bypass the validator).
+    const content = `---
+name: blank-model
+model:
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('blank-model.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_model');
+  });
+
   test('agent_invalid_tool: tool not in known allowlist', async () => {
     const content = `---
 name: bad-tool

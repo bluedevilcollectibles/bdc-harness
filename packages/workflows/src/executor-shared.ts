@@ -633,8 +633,16 @@ export function resolveAgentPersona(
   }
   // else (pi / future providers): leave persona.model as-is, no constraint.
 
+  // For non-codex/non-claude providers (e.g. pi), fall back to the node's
+  // currentModel when the persona omits `model:`.  Providers such as pi
+  // require a model; without this fallback they throw "requires a model".
+  // For claude: persona.model was validated non-undefined above.
+  // For codex: persona.model is undefined (the codex branch throws if set).
+  const resolvedModel =
+    provider !== 'codex' && provider !== 'claude' ? (persona.model ?? currentModel) : persona.model;
+
   const resolution: AgentPersonaResolution = {
-    model: persona.model,
+    model: resolvedModel,
     systemPrompt: persona.systemPrompt,
     agentName: persona.name,
   };

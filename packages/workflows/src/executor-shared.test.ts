@@ -707,4 +707,12 @@ describe('resolveAgentPersona', () => {
     const resolution = resolveAgentPersona(persona, undefined, 'pi');
     expect(resolution.model).toBeUndefined();
   });
+
+  it('pi: falls back to currentModel when persona omits model (F2 — pi requires a model)', () => {
+    // A pi persona that omits `model:` must receive the node currentModel rather
+    // than undefined, so pi does not throw "requires a model" at runtime.
+    const persona = makePersona({ model: undefined });
+    const resolution = resolveAgentPersona(persona, 'opus', 'pi');
+    expect(resolution.model).toBe('opus');
+  });
 });

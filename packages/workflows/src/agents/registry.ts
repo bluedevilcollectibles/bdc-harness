@@ -140,6 +140,15 @@ export function parseFrontmatter(
     const rest = line.slice(colonIdx + 1).trim();
 
     if (rest === '' || rest === null) {
+      // Special-case: a blank `model:` scalar (e.g. `model:` with no value) must
+      // be recorded as an empty string so the model validator below can fire
+      // agent_invalid_model.  Without this, the empty-scalar path never sets
+      // frontmatter.model and the validator treats it as "omitted" (valid).
+      if (key === 'model') {
+        frontmatter[key] = '';
+        i++;
+        continue;
+      }
       // Peek at next line to determine if this is a block sequence or nested object
       const nextLine = lines[i + 1] ?? '';
       if (nextLine.startsWith('  - ')) {
