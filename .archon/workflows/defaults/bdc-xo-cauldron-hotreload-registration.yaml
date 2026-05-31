@@ -1,0 +1,379 @@
+# Drafted by yaml-author subagent for WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01 on 2026-05-31
+# Source pattern: bdc-template-single-repo-code.yaml (adapted; --base main for bdc-xo; INFRA runtime-verify added)
+# Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time)
+#
+# CODEBASE BINDING (IMPORTANT - verified against bdc-harness orchestrator-agent.ts:80-87):
+#   Workflow name MUST start with `bdc-xo-` to bind to bluedevilcollectibles/bdc-xo.
+#   The WO-suggested name `bdc-harness-...` would bind to bluedevilcollectibles/bdc-harness
+#   (WRONG repo) because `bdc-harness-` is in WORKFLOW_CODEBASE_PREFIXES -> bdc-harness.
+#   The change lives in BDC_XO/scripts/archon-bridge/sync-workflows.sh = a bdc-xo file,
+#   so the workflow is named bdc-xo-cauldron-hotreload-registration. DO NOT rename to
+#   the bdc-harness- form or it will clone + PR the wrong repo.
+#
+# Pre-flight (operator verifies BEFORE fire):
+#   1. Codebase bluedevilcollectibles/bdc-xo registered in Archon:
+#      ssh hetzner-prod "sqlite3 /opt/bdc/archon-data/archon.db \"SELECT name FROM remote_agent_codebases;\""
+#      (verified present 2026-05-09 per archon-yaml-authoring Rule 8 anchor; re-confirm.)
+#   2. WO spec committed + pushed to bdc-xo main BEFORE fire (read-spec fetches via
+#      gh api ...?ref=main). Spec lives at docs/work-orders/WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01.md
+#      The local working copy must be on origin/main, not just on disk.
+#   3. NOTION_PAGE_ID below is a PLACEHOLDER. Create the Notion WO row, paste its page id,
+#      then fire. flip-notion needs it to write the manifest into Notes.
+#   4. bdc-xo default branch is main (NOT master; master retired 2026-05-31). open-pr uses --base main.
+#
+# Deploy: BDC_XO/scripts/archon-bridge/sync-workflows.sh bdc-xo-cauldron-hotreload-registration.yaml
+#   (Place this file in bdc-harness .archon/workflows/defaults/ first, renamed without the WO-ID
+#    prefix: bdc-xo-cauldron-hotreload-registration.yaml. sync-workflows.sh reads name: from the YAML.)
+#
+# REVIEW BEFORE DEPLOY - human verifies grep thresholds, the auth-header discrepancy note below,
+#   and that the runtime-verification best-effort wrapper matches operator container capabilities.
+
+name: bdc-xo-cauldron-hotreload-registration
+description: |
+  Use when: Executing WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01 - add a hot-reload
+  registration path to sync-workflows.sh so registering a workflow YAML no longer rebuilds
+  + restarts the shared archon-app-1 container.
+  Input: WO_ID = WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01.
+  Does:
+    - Reads the WO spec from bdc-xo docs/work-orders/ on main.
+    - Plans + implements a --hot / hot_register path in scripts/archon-bridge/sync-workflows.sh.
+    - Verifies the script edit with bash-executable grep assertions (Section 12).
+    - Best-effort live-runtime verification (Rule 19 INFRA): StartedAt unchanged across a
+      --hot sync + GET /api/workflows lists the hot-registered workflow.
+    - Commits, pushes a feature branch, opens a PR to bdc-xo main.
+    - Flips Notion to REVIEW (NEVER DONE) with the manifest in Notes.
+  Repo: bluedevilcollectibles/bdc-xo (binds via bdc-xo- name prefix).
+  WO Class: INFRA. parallel_ok: false (touches the deploy script for the shared container).
+
+policyFile: harness/policies/agent-behavior.md
+model: sonnet
+
+inputs:
+  WO_ID:
+    default: "WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01"
+  NOTION_PAGE_ID:
+    default: "REPLACE_WITH_NOTION_PAGE_ID"
+
+nodes:
+
+  - id: preflight-github-auth
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01}"
+      # Specs live in bdc-xo on main (NOT the worktree). Cross-repo fetch via gh api.
+      # Rule 5: try docs/work-orders/ direct, then date-prefix glob in docs/superpowers/specs/.
+      SPEC_CONTENT=$(gh api \
+        "repos/bluedevilcollectibles/bdc-xo/contents/docs/work-orders/${WO_ID}.md?ref=main" \
+        --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        SPEC_CONTENT=$(gh api \
+          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs/${WO_ID}.md?ref=main" \
+          --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        GLOB_PATH=$(gh api \
+          "repos/bluedevilcollectibles/bdc-xo/contents/docs/superpowers/specs?ref=main" \
+          --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null \
+          | grep "${WO_ID}.md$" | head -1 || true)
+        if [ -n "$GLOB_PATH" ]; then
+          SPEC_CONTENT=$(gh api \
+            "repos/bluedevilcollectibles/bdc-xo/contents/${GLOB_PATH}?ref=main" \
+            --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        ISSUE_NUM=$(gh issue list --repo bluedevilcollectibles/bdc-xo \
+          --search "${WO_ID} in:title" --json number --jq '.[0].number' 2>/dev/null || true)
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo bluedevilcollectibles/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        echo "Spec not found for ${WO_ID} (tried docs/work-orders/, docs/superpowers/specs/ direct + glob, and GitHub issue search). Spec must be on bdc-xo main before fire." >&2
+        exit 1
+      fi
+      printf 'WO_ID=%s\n\n--- SPEC ---\n%s\n' "$WO_ID" "$SPEC_CONTENT"
+
+  - id: fresh-branch
+    depends_on: [read-spec]
+    bash: |
+      set -euo pipefail
+      DEFAULT_BRANCH="$(git remote show origin | sed -n 's,.*HEAD branch: ,,p')"
+      git fetch origin "$DEFAULT_BRANCH" --depth=50 || true
+      git checkout "$DEFAULT_BRANCH" 2>/dev/null || echo "branch held; staying on current HEAD"
+      git reset --hard "origin/$DEFAULT_BRANCH" 2>/dev/null || true
+      BRANCH="wo/cauldron-hotreload-registration-01-run-$(date +%Y%m%d%H%M%S)"
+      git checkout -b "$BRANCH"
+      echo "BRANCH=${BRANCH}"
+
+  - id: implement
+    depends_on: [fresh-branch]
+    loop:
+      fresh_context: true
+      until: COMPLETE
+      max_iterations: 5
+      prompt: |
+        Implement WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01 in bluedevilcollectibles/bdc-xo.
+        CWD = repo root (the bdc-xo worktree).
+
+        ## Spec
+        $read-spec.output
+
+        ## Branch
+        $fresh-branch.output
+
+        ## Target file (the ONLY file in scope)
+        scripts/archon-bridge/sync-workflows.sh
+
+        ## What to add (per spec Sections 6, 7, 8)
+        1. A `--hot` flag (and/or YAML-only auto-detect) that selects a hot-reload registration
+           path INSTEAD of the rebuild+restart path.
+        2. A `hot_register()` function that, for each target YAML:
+           - reuses the EXISTING lint + parse-validate gate (already in the script),
+           - resolves the operator token via the EXISTING _archon-auth.sh (already sourced at
+             line 50; the var is ARCHON_TOKEN),
+           - PUTs the parsed YAML definition to the harness endpoint, then GETs to confirm.
+           The PUT endpoint is: PUT /api/workflows/<name>?cwd=<registered-codebase-cwd>
+           Body shape is { "definition": <parsed-yaml-as-json> } (saveWorkflowBodySchema).
+           NO container rebuild, NO docker compose build, NO restart on the hot path.
+        3. detect_change_class() (or equivalent inline logic): if the only changed paths are
+           *.yaml under defaults/, prefer the hot path; engine/dependency/Dockerfile/env/compose
+           changes take the EXISTING rebuild path.
+
+        ## VERIFY THE AUTH HEADER AGAINST THE CODE (Rule 17 - code is ground truth)
+        The WO spec text mentions "Authorization: Bearer". The EXISTING script uses the header
+        `x-archon-operator-token: $ARCHON_TOKEN` (see sync-workflows.sh --verify mode + the
+        poll loop). Use the SAME header the rest of the script already uses unless you confirm
+        from the live harness route that PUT requires a different scheme. Do NOT introduce a
+        second auth pattern. If PUT genuinely requires Bearer and GET requires the
+        x-archon-operator-token header, document that divergence in a code comment and in your
+        completion notes so the reviewer sees it.
+
+        ## INVARIANTS THAT MUST NOT BREAK (spec Q6)
+        - require_restart_approval() and require_no_active_runs() MUST remain and MUST still
+          gate the rebuild path. Do NOT remove or weaken them. The string `require_restart_approval`
+          must still be present in the file.
+        - Invalid YAML must register nothing: the existing parse-validate gate runs BEFORE any PUT,
+          and the endpoint itself rejects invalid definitions (400). Preserve both.
+        - This WO does NOT fire any workflow. Registration only.
+        - Keep the git-PR durability path available (the volume copy is runtime; git is source of
+          truth). Document explicitly that archon_data is a named volume so it survives recreate.
+
+        ## Execution rules
+        - Modify ONLY scripts/archon-bridge/sync-workflows.sh. Do not reformat unrelated lines.
+        - Prefer existing helpers (ok/warn/err/step, _archon-auth.sh, validate_yaml_parses).
+        - ASCII only. No emojis, no em-dashes, no smart quotes. Use the ASCII hyphen.
+        - Do NOT deploy. Do NOT run sync-workflows.sh itself here; the runtime check is a
+          separate downstream node.
+        - bash is the language of this file; this is a shell-script edit, not a bun/npm build.
+          (There is no package build step for this WO. If you touch any JS/TS tooling for a
+          helper, use bun, never npm/npx/pnpm/yarn - but you should not need to.)
+
+        ## Self-verify the grep assertions from spec Section 12 BEFORE you finish
+        Run these from the repo root and confirm both exit 0:
+          grep -c 'hot_register\|--hot\|/api/workflows/' scripts/archon-bridge/sync-workflows.sh \
+            && [ $(grep -c 'hot_register\|--hot' scripts/archon-bridge/sync-workflows.sh) -ge 1 ]
+          grep -c 'require_restart_approval' scripts/archon-bridge/sync-workflows.sh \
+            && [ $(grep -c 'require_restart_approval' scripts/archon-bridge/sync-workflows.sh) -ge 1 ]
+
+        ## Commit BEFORE exit
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        git add -A
+        git diff --cached --quiet || git -c user.name="John Ranson" \
+          -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "feat(archon-bridge): WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01 - hot-reload workflow registration (no container rebuild)"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - backstop node will retry"
+
+        Output COMPLETE on its own line when the edit is done and both grep assertions pass.
+
+  - id: verify-script-edit
+    depends_on: [implement]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      F="scripts/archon-bridge/sync-workflows.sh"
+      if [ ! -f "$F" ]; then
+        echo "ERROR: $F not found in worktree" >&2
+        exit 1
+      fi
+      # Spec Section 12 grep assertion 1: hot path present.
+      grep -c 'hot_register\|--hot\|/api/workflows/' "$F"
+      [ "$(grep -c 'hot_register\|--hot' "$F")" -ge 1 ] || {
+        echo "ERROR: hot_register/--hot not found in $F (grep assertion 1 failed)" >&2
+        exit 1
+      }
+      # Spec Section 12 grep assertion 2: restart-approval gate preserved.
+      grep -c 'require_restart_approval' "$F"
+      [ "$(grep -c 'require_restart_approval' "$F")" -ge 1 ] || {
+        echo "ERROR: require_restart_approval missing from $F (invariant Q6a violated; grep assertion 2 failed)" >&2
+        exit 1
+      }
+      # Bash-syntax sanity check (this is a shell script, not a build target).
+      bash -n "$F" || {
+        echo "ERROR: bash -n syntax check failed on $F" >&2
+        exit 1
+      }
+      echo "verify-script-edit PASS: hot path present, restart gate preserved, bash -n clean"
+
+  - id: commit-and-push
+    depends_on: [verify-script-edit]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      git add -A
+      if ! git diff --cached --quiet; then
+        git -c user.name="John Ranson" -c user.email="admin@bluedevilcollectibles.com" \
+          commit -m "chore: backstop commit WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01"
+      fi
+      git push -u origin "$BRANCH"
+      echo "SHA=$(git rev-parse HEAD)"
+      echo "BRANCH=${BRANCH}"
+
+  # Runtime verification (Rule 19 - INFRA WO). BEST-EFFORT: the executor worktree container
+  # may not have ssh to hetzner-prod (docker inspect archon-app-1) nor the ARCHON_OPERATOR_TOKEN
+  # for an authed GET. Both calls can legitimately fail from inside the executor. We wrap with
+  # the doctrine best-effort pattern (set -e OMITTED) and ALWAYS exit 0; downstream reads STATUS=.
+  # NOTE: this node does NOT actually run the edited sync-workflows.sh --hot (that would require
+  # operator token + a real target YAML + write access to the shared container). It probes what
+  # it CAN: container StartedAt (if ssh available) + GET /api/workflows reachability. The full
+  # StartedAt-unchanged-across-a-real-hot-sync proof is an OPERATOR step at PR-review time.
+  - id: runtime-verify
+    depends_on: [commit-and-push]
+    bash: |
+      # set -e DELIBERATELY OMITTED -- best-effort INFRA probe (archon-yaml-authoring best-effort wrapper)
+      API_BASE="https://archon.bluedevilcollectibles.com"
+
+      # Probe 1: container StartedAt via ssh (may not be available inside executor).
+      STARTED_BEFORE=$(ssh -o BatchMode=yes -o ConnectTimeout=8 hetzner-prod \
+        "docker inspect -f '{{.State.StartedAt}}' archon-app-1" 2>&1)
+      SSH_EXIT=$?
+      if [ $SSH_EXIT -eq 0 ] && [ -n "$STARTED_BEFORE" ]; then
+        echo "STARTEDAT_STATUS=captured"
+        echo "STARTEDAT_BEFORE=$STARTED_BEFORE"
+      elif echo "$STARTED_BEFORE" | grep -qiE 'permission|denied|timed out|connection|not found|no route|host key|command not found'; then
+        echo "STARTEDAT_STATUS=skipped_no_host_access"
+        echo "STARTEDAT_DETAIL=executor lacks ssh/docker access to archon-app-1; operator must capture StartedAt before+after a --hot sync at PR-review time"
+      else
+        echo "STARTEDAT_STATUS=failed_unexpected"
+        echo "STARTEDAT_DETAIL=$STARTED_BEFORE"
+      fi
+
+      # Probe 2: GET /api/workflows reachability. Try authed header first (token may be in env),
+      # then anonymous, then accept any 200/JSON-ish body as reachable.
+      WF_BODY=$(curl -s --max-time 15 \
+        -H "x-archon-operator-token: ${ARCHON_OPERATOR_TOKEN:-}" \
+        "$API_BASE/api/workflows" 2>&1)
+      CURL_EXIT=$?
+      if [ $CURL_EXIT -eq 0 ] && echo "$WF_BODY" | grep -q '"workflows"'; then
+        echo "GET_WORKFLOWS_STATUS=reachable"
+        echo "GET_WORKFLOWS_DETAIL=GET /api/workflows returned a workflows list (on-read discovery confirmed live)"
+      elif echo "$WF_BODY" | grep -qiE 'unauthorized|forbidden|token'; then
+        echo "GET_WORKFLOWS_STATUS=reachable_needs_token"
+        echo "GET_WORKFLOWS_DETAIL=endpoint reachable but auth needed from executor; operator confirms listing with ARCHON_OPERATOR_TOKEN"
+      else
+        echo "GET_WORKFLOWS_STATUS=skipped_unreachable"
+        echo "GET_WORKFLOWS_DETAIL=$WF_BODY"
+      fi
+
+      echo "RUNTIME_VERIFY_NOTE=Full Rule 19 proof (StartedAt unchanged across a real sync-workflows.sh --hot + GET lists the hot-registered workflow) is an operator step at PR-review; this node proves only reachability + that no restart was attempted by this build."
+      exit 0
+
+  - id: open-pr
+    depends_on: [runtime-verify]
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WO_ID="${WO_ID:-WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01}"
+      REPO="bluedevilcollectibles/bdc-xo"
+      BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+      # bdc-xo default branch is main (master retired 2026-05-31). Non-staging repo -> --base main.
+      BASE="main"
+      EXIST=$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then echo "PR_URL=$EXIST"; exit 0; fi
+      for attempt in 1 2 3; do
+        if URL=$(gh pr create --repo "$REPO" --base "$BASE" --head "$BRANCH" \
+            --title "feat(archon-bridge): ${WO_ID} - hot-reload workflow registration" \
+            --body "Implements ${WO_ID}. Adds a --hot / hot_register path to scripts/archon-bridge/sync-workflows.sh so YAML-only registration PUTs to the mounted .archon/workflows volume instead of rebuilding + restarting archon-app-1. Rebuild path preserved behind require_restart_approval for engine changes. Spec: bdc-xo docs/work-orders/${WO_ID}.md" 2>&1); then
+          echo "PR_URL=$URL"; exit 0
+        fi
+        sleep $((attempt * 5))
+      done
+      echo "ERROR: gh pr create failed after 3 attempts" >&2; exit 1
+
+  - id: build-manifest
+    depends_on: [open-pr]
+    task_class: clerical
+    prompt: |
+      Construct the Captain CI v2 completion manifest for WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01.
+      This is an INFRA-class WO (shell-script edit + best-effort live-runtime check).
+
+      ## Inputs
+      Implement output: $implement.output
+      Verify script edit: $verify-script-edit.output
+      Commit + push: $commit-and-push.output
+      Runtime verify (best-effort): $runtime-verify.output
+      PR: $open-pr.output
+
+      ## Required manifest fields (verbatim shape)
+      WO: WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01
+      Builder: Devils Cauldron (Archon bdc-xo-cauldron-hotreload-registration)
+      Files modified: scripts/archon-bridge/sync-workflows.sh
+      Files created: (none)
+      Tests: bash -n scripts/archon-bridge/sync-workflows.sh PASS; both spec Section 12 grep assertions PASS (from verify-script-edit output)
+      PRs: <PR_URL from open-pr>, behind_by: 0
+      Merge ancestors: bdc-xo main HEAD, manifest commit, behind_by: 0
+      Grep assertions:
+        grep -c 'hot_register\|--hot\|/api/workflows/' scripts/archon-bridge/sync-workflows.sh && [ $(grep -c 'hot_register\|--hot' scripts/archon-bridge/sync-workflows.sh) -ge 1 ]
+        grep -c 'require_restart_approval' scripts/archon-bridge/sync-workflows.sh && [ $(grep -c 'require_restart_approval' scripts/archon-bridge/sync-workflows.sh) -ge 1 ]
+      Runtime verification (Rule 19 INFRA): from runtime-verify output - report STARTEDAT_STATUS,
+        GET_WORKFLOWS_STATUS, and the RUNTIME_VERIFY_NOTE. If either probe was skipped because the
+        executor lacked host/token access, state plainly that the full StartedAt-unchanged-across-a
+        -real---hot-sync proof is an OPERATOR step at PR-review (capture docker inspect archon-app-1
+        .State.StartedAt before + after running sync-workflows.sh --hot <test-yaml>, assert unchanged,
+        and GET /api/workflows lists the hot-registered workflow). Do NOT claim a runtime proof the
+        executor did not actually perform.
+      Vercel deployment: N/A (bdc-xo is not a Vercel app; this is operator tooling)
+      VALIDATION: PASS
+
+      Emit the manifest as a single fenced block exactly in the shape above so flip-notion can
+      paste it verbatim into the Notion Notes property.
+
+  - id: flip-notion
+    depends_on: [build-manifest]
+    task_class: clerical
+    prompt: |
+      Flip the Notion Work Order for WO-HARNESS-CAULDRON-HOTRELOAD-REGISTRATION-01 to REVIEW.
+      Put the manifest in the Notes PROPERTY (NOT a page comment - Captain CI reads Notes).
+
+      ## Notion page
+      Page id: $NOTION_PAGE_ID
+      If the page id is the literal placeholder REPLACE_WITH_NOTION_PAGE_ID (operator did not set
+      it), do NOT guess. Emit an XO_ACTION line asking the operator to set Claude Status -> REVIEW,
+      Status -> Review, and paste the manifest into Notes manually, and STOP.
+
+      ## Updates (single update if MCP available)
+      - Claude Status -> REVIEW
+      - Status -> Review
+      - Notes -> the manifest below, verbatim
+      (NEVER set Claude Status or Status to DONE. Only Captain CI / the Cauldron grader closes WOs.)
+
+      ## Manifest
+      $build-manifest.output
+
+      If Notion MCP is not available inside the container, do not invent a workaround. Emit an
+      XO_ACTION line asking XO to flip Notion manually with the manifest above.
