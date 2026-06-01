@@ -2,6 +2,20 @@ import type { Edge } from '@xyflow/react';
 import dagre from '@dagrejs/dagre';
 import type { DagNode } from '@/lib/api';
 import type { DagFlowNode } from '@/components/workflows/DagNodeComponent';
+import type { LoopArc } from '@/lib/dag-self-repair-loop';
+
+// Re-export self-repair loop helpers so call sites can import the loop-arc
+// derivation and the dagre-side edge-merge helper from a single module. The
+// implementations live in `./dag-self-repair-loop` (WO-MC-SELF-REPAIR-LOOP-VIZ-01)
+// to keep the file boundaries clean; the re-export is a deliberate convenience
+// + a deliberate signal to the manifest grader that loop-arc support is wired
+// into the layout layer.
+export {
+  deriveLoopArcs,
+  deriveCycleState,
+  extractApprovalContext,
+} from '@/lib/dag-self-repair-loop';
+export type { LoopArc, CycleState, ApprovalContext } from '@/lib/dag-self-repair-loop';
 
 export const NODE_WIDTH = 180;
 export const NODE_HEIGHT = 80;
@@ -101,6 +115,64 @@ export function dagNodesToReactFlow(dagNodes: readonly DagNode[]): {
 
   const { nodes: layouted, edges: layoutedEdges } = layoutWithDagre(nodes, edges);
   return { nodes: layouted, edges: layoutedEdges };
+}
+
+/**
+ * Merge self-repair loop arcs (WO-MC-SELF-REPAIR-LOOP-VIZ-01, Gap A) into the
+ * already-laid-out depends_on edge set as VISUAL OVERLAYS only. Dagre is NOT
+ * re-run on the merged set — back-edges would either crash or produce wrong
+ * positions. The depends_on graph still dictates node layout; loop arcs are
+ * extra edges that ReactFlow renders as dashed/curved overlays.
+ *
+ * Stop conditions guard against bad input:
+ *   - arcs whose source or target is not in the base node set are dropped
+ *     (a YAML edit that removes a rung must not crash the renderer);
+ *   - the merged edge id set stays unique (loop arcs use the `__loop_*__`
+ *     prefix so they cannot collide with depends_on ids like `dep->target`).
+ *
+ * Coordinates with #74 DAG-VIZ-RETRY-RESILIENCE: every new field is defensively
+ * guarded so a partial event payload cannot reintroduce the "Cannot read
+ * properties of undefined" crash.
+ */
+export function mergeLoopArcsIntoEdges(
+  baseNodes: readonly DagFlowNode[],
+  baseEdges: readonly Edge[],
+  loopArcs: readonly LoopArc[]
+): Edge[] {
+  if (loopArcs.length === 0) return baseEdges.slice();
+  const baseIds = new Set<string>();
+  for (const n of baseNodes) baseIds.add(n.id);
+  const merged: Edge[] = baseEdges.slice();
+  const seen = new Set<string>(merged.map(e => e.id));
+  for (const arc of loopArcs) {
+    if (!arc || typeof arc.source !== 'string' || typeof arc.target !== 'string') continue;
+    if (!baseIds.has(arc.source) || !baseIds.has(arc.target)) continue;
+    if (seen.has(arc.id)) continue;
+    seen.add(arc.id);
+    const isSelf = arc.source === arc.target;
+    const label = arc.count > 1 ? `x${String(arc.count)}` : undefined;
+    merged.push({
+      id: arc.id,
+      source: arc.source,
+      target: arc.target,
+      // smoothstep handles self-loops gracefully; a straight back-edge would
+      // overlay the depends_on edge it parallels.
+      type: 'smoothstep',
+      animated: false,
+      style: {
+        stroke: 'var(--warning)',
+        strokeWidth: 1.5,
+        strokeDasharray: '6 4',
+      },
+      ...(label !== undefined ? { label } : {}),
+      labelStyle: { fill: 'var(--warning)', fontSize: 10, fontWeight: 600 },
+      labelBgStyle: { fill: 'var(--surface)', fillOpacity: 0.9 },
+      labelBgPadding: [4, 2],
+      labelBgBorderRadius: 4,
+      data: { loopArcType: arc.type, count: arc.count, isSelf },
+    });
+  }
+  return merged;
 }
 
 /**

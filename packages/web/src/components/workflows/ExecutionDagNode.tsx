@@ -33,6 +33,11 @@ const STATUS_STYLES: Partial<Record<WorkflowStepStatus, string>> = {
   running: 'border-l-2 border-accent-bright bg-accent/5 shadow-[0_0_8px_var(--accent)]',
   failed: 'border-l-2 border-error bg-error/5',
   skipped: 'opacity-50 border-l-2 border-border',
+  // WO-MC-SELF-REPAIR-LOOP-VIZ-01 (Gap C): amber pulse glow + tint so a
+  // paused approval-gate node is visually distinct from any running node
+  // in the same graph. The pulse animation comes from the StatusIcon's
+  // animate-pulse on the Lock glyph.
+  awaiting_approval: 'border-l-2 border-warning bg-warning/10 shadow-[0_0_8px_var(--warning)]',
 };
 const DEFAULT_STYLE = 'border-l-2 border-border bg-surface-elevated';
 
