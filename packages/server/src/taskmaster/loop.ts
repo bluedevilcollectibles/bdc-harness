@@ -62,14 +62,14 @@ export const MAX_FIRES_PER_TICK = 3;
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
  *
  * When the control row is paused with scope='effects', only the daily canary
- * and self-pause notice may leave the process. A
+ * may leave the process through the proposal delivery path. A
  * pause with any non-'effects' scope keeps the legacy watching-never-dark
  * exemption for escalate_p0 and the digest. Callers must still check
  * pause_state !== 'RUNNING' before consulting this helper.
  */
 export function isPauseEffectsExempt(proposalType: string, pauseScope: string | null): boolean {
   if (pauseScope === 'effects') {
-    return proposalType === 'canary' || proposalType === 'self_pause_notice';
+    return proposalType === 'canary';
   }
   return proposalType === 'escalate_p0' || proposalType === 'digest';
 }
@@ -643,10 +643,11 @@ function digestProposal(
   nowMs: number
 ): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
+  const digestActions = actions24h.filter(action => action.thread_ref !== 'taskmaster:reset');
   const outcomeCount = (outcome: taskmasterDb.TmActionOutcome): number =>
-    actions24h.filter(action => action.outcome === outcome).length;
+    digestActions.filter(action => action.outcome === outcome).length;
   const sent = outcomeCount('sent');
-  const activity = actions24h.length === 0 ? 'no proposals today' : `sent=${sent}`;
+  const activity = digestActions.length === 0 ? 'no proposals today' : `sent=${sent}`;
   const summary = `sent=${sent}, parked=${outcomeCount('parked')}, rejected=${outcomeCount('rejected')}`;
   const pauseDetail =
     control.pause_state === 'RUNNING'
@@ -1403,7 +1404,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (
       control.pause_state !== 'RUNNING' &&
       !isPauseEffectsExempt(
-        proposal.threadRef.startsWith('digest:') ? 'canary' : proposal.type,
+        proposal.type === 'digest' ? 'canary' : proposal.type,
         control.pause_scope
       )
     ) {
@@ -1470,7 +1471,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     const freshPauseWithhold =
       fresh.pause_state !== 'RUNNING' &&
       !isPauseEffectsExempt(
-        proposal.threadRef.startsWith('digest:') ? 'canary' : proposal.type,
+        proposal.type === 'digest' ? 'canary' : proposal.type,
         fresh.pause_scope
       );
     if (fresh.epoch !== epoch || freshPauseWithhold) {
@@ -1530,9 +1531,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             correlation_id: `tm-${journalRow.id}`,
             idempotency_key: proposal.idempotencyKey,
             task_type: 'agent_message',
-            recipient: proposal.threadRef.startsWith('digest:')
-              ? 'duty-officer'
-              : proposal.recipient,
+            recipient: proposal.type === 'digest' ? 'duty-officer' : proposal.recipient,
             body: proposal.body,
             // Same-subject grouping + unconditional per-verb repeat reason
             // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.

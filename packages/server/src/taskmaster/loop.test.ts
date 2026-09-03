@@ -40,9 +40,9 @@ import type {
 import type { HeadroomReading } from './ledger';
 
 describe('Taskmaster reset visibility and canary', () => {
-  test('only canary and self-pause notice escape an effects pause', () => {
+  test('only the canary proposal escapes an effects pause', () => {
     expect(isPauseEffectsExempt('canary', 'effects')).toBe(true);
-    expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(false);
     expect(isPauseEffectsExempt('digest', 'effects')).toBe(false);
     expect(isPauseEffectsExempt('escalate_p0', 'effects')).toBe(false);
   });
@@ -70,6 +70,30 @@ describe('Taskmaster reset visibility and canary', () => {
     await tick(createTaskmasterState(60_000), makeDeps(world));
     expect(world.sentMessages).toHaveLength(1);
     expect(world.sentMessages[0]?.recipient).toBe('duty-officer');
+    expect(world.sentMessages[0]?.body).toContain('no proposals today');
+  });
+
+  test('reset audit does not inflate a quiet daily canary outcome count', async () => {
+    const world = makeWorld();
+    world.journal.push({
+      id: 'reset-audit',
+      created_at: new Date(world.nowMs).toISOString(),
+      thread_ref: 'taskmaster:reset',
+      action_type: 'digest',
+      proposal_json: JSON.stringify({ audit_type: 'taskmaster_reset' }),
+      idempotency_key: null,
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.sentMessages).toHaveLength(1);
+    expect(world.sentMessages[0]?.body).toContain('sent=0, parked=0, rejected=0');
     expect(world.sentMessages[0]?.body).toContain('no proposals today');
   });
 
