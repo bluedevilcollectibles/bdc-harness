@@ -176,6 +176,55 @@ export async function recordAction(data: {
   return normalizeJournal(row);
 }
 
+/** Record one audit row for every operator reset invocation. */
+export async function recordResetAudit(data: {
+  actor: string;
+  reason: string | null;
+  previousEpoch: number;
+  newEpoch: number;
+  transitioned: boolean;
+}): Promise<TmJournalEntry> {
+  return recordAction({
+    thread_ref: 'taskmaster:reset',
+    action_type: 'digest',
+    proposal_json: JSON.stringify({
+      audit_type: 'taskmaster_reset',
+      actor: data.actor,
+      reason: data.reason,
+      previous_epoch: data.previousEpoch,
+      new_epoch: data.newEpoch,
+      transitioned: data.transitioned,
+    }),
+    outcome: 'sent',
+  });
+}
+
+/** Execute the resume endpoint's idempotent reset sequence. */
+export async function resetTaskmaster(data: { actor: string; reason: string | null }): Promise<{
+  control: TmControlState;
+  expiredProposals: number;
+  audit: TmJournalEntry;
+}> {
+  const previous = await getPauseState();
+  const expiredProposals = await expireParkedActions();
+  const transitioned = previous.pause_state !== 'RUNNING';
+  const control = await setPauseState({
+    pause_state: 'RUNNING',
+    pause_scope: null,
+    pause_reason: null,
+    pause_actor: data.actor,
+    incrementEpoch: transitioned,
+  });
+  const audit = await recordResetAudit({
+    actor: data.actor,
+    reason: data.reason,
+    previousEpoch: previous.epoch,
+    newEpoch: control.epoch,
+    transitioned,
+  });
+  return { control, expiredProposals, audit };
+}
+
 /** Read one logical action by stable idempotency key without a time window. */
 export async function getActionByIdempotencyKey(key: string): Promise<TmJournalEntry | null> {
   const result = await getDatabase().query<TmJournalRow>(

@@ -61,14 +61,16 @@ export const MAX_FIRES_PER_TICK = 3;
 /**
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
  *
- * When the control row is paused with scope='effects', ZERO effects leave the
- * process -- nothing is exempt, including P0 escalations and the digest. A
+ * When the control row is paused with scope='effects', only the daily canary
+ * and self-pause notice may leave the process. A
  * pause with any non-'effects' scope keeps the legacy watching-never-dark
  * exemption for escalate_p0 and the digest. Callers must still check
  * pause_state !== 'RUNNING' before consulting this helper.
  */
 export function isPauseEffectsExempt(proposalType: string, pauseScope: string | null): boolean {
-  if (pauseScope === 'effects') return false;
+  if (pauseScope === 'effects') {
+    return proposalType === 'canary' || proposalType === 'self_pause_notice';
+  }
   return proposalType === 'escalate_p0' || proposalType === 'digest';
 }
 
@@ -615,24 +617,51 @@ export async function defaultGetGithubIssueEvidence(
   };
 }
 
-function digestProposal(actions24h: taskmasterDb.TmJournalEntry[], nowMs: number): ActionProposal {
+const RESET_COMMAND =
+  "bash scripts/taskmaster/reset.sh --confirm --reason '<why>'";
+
+export function buildSelfPauseNotice(reason: string, epoch: number): CreateAuthenticatedMessageData {
+  return {
+    correlation_id: `tm-self-pause-${epoch}`,
+    idempotency_key: `tm:self-pause:${epoch}`,
+    task_type: 'agent_message',
+    recipient: 'duty-officer',
+    body: `Taskmaster self-paused: ${reason} Reset with: ${RESET_COMMAND}`,
+    subject_key: 'taskmaster:self-pause',
+    repeat_reason: 'A new Taskmaster epoch self-paused and requires Duty Officer attention.',
+  };
+}
+
+/*
+ * RETIREMENT: The daily canary retires when the Taskmaster has run 30 consecutive days with at least
+ * one `outcome='sent'` row per day and zero self-pause events in that window. Retirement is
+ * a board decision, not an automatic expiry -- the code MUST NOT self-disable.
+ */
+function digestProposal(
+  actions24h: taskmasterDb.TmJournalEntry[],
+  control: taskmasterDb.TmControlState,
+  nowMs: number
+): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
-  const counts: Record<string, number> = {};
-  for (const action of actions24h) {
-    counts[`${action.action_type}:${action.outcome}`] =
-      (counts[`${action.action_type}:${action.outcome}`] ?? 0) + 1;
-  }
-  const summary =
-    Object.entries(counts)
-      .map(([k, v]) => `${k}=${v}`)
-      .join(', ') || 'no actions in the last 24h';
+  const outcomeCount = (outcome: taskmasterDb.TmActionOutcome): number =>
+    actions24h.filter(action => action.outcome === outcome).length;
+  const sent = outcomeCount('sent');
+  const activity = actions24h.length === 0 ? 'no proposals today' : `sent=${sent}`;
+  const summary = `sent=${sent}, parked=${outcomeCount('parked')}, rejected=${outcomeCount('rejected')}`;
+  const pauseDetail =
+    control.pause_state === 'RUNNING'
+      ? activity
+      : `reason=${control.pause_reason ?? 'unspecified'}; reset with: ${RESET_COMMAND}`;
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
+    // The proposal remains on the existing allowlisted operator route; the
+    // dispatch step resolves the canary's concrete Duty Officer seat.
     recipient: 'operator',
     body:
-      `Taskmaster daily digest for ${dateKey}: ${summary}. ` +
-      'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
+      `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
+      `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
+      `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.`,
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
   };
@@ -1072,9 +1101,12 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   // and pause-parks on the fresh scope.
   if (control.pause_state === 'RUNNING') {
     try {
-      const gradedWindow = await dal.getActionsSince(
-        new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString()
-      );
+      const lookbackStartMs = nowMs - JOURNAL_LOOKBACK_MS;
+      const epochStartMs = Date.parse(control.updated_at);
+      const floorStartMs = Number.isFinite(epochStartMs)
+        ? Math.max(lookbackStartMs, epochStartMs)
+        : lookbackStartMs;
+      const gradedWindow = await dal.getActionsSince(new Date(floorStartMs).toISOString());
       let usefulCount = 0;
       let noiseCount = 0;
       for (const a of gradedWindow) {
@@ -1083,16 +1115,26 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       }
       if (usefulRateFloorBreached(usefulCount, noiseCount)) {
         const graded = usefulCount + noiseCount;
-        await dal.setPauseState({
+        const pauseReason =
+          `M-155 useful-rate floor auto-pause: ${usefulCount} useful of ` +
+          `${graded} graded (${Math.round((usefulCount / graded) * 100)}%) in the ` +
+          'epoch-bounded lookback is below the ratified 40% floor. Resume requires an ' +
+          'operator decision, not a timer.';
+        control = await dal.setPauseState({
           pause_state: 'PAUSED',
           pause_scope: 'effects',
-          pause_reason:
-            `M-155 useful-rate floor auto-pause: ${usefulCount} useful of ` +
-            `${graded} graded (${Math.round((usefulCount / graded) * 100)}%) in the ` +
-            '7-day lookback is below the ratified 40% floor. Resume requires an ' +
-            'operator decision, not a timer.',
+          pause_reason: pauseReason,
           pause_actor: 'taskmaster:useful-rate-floor',
         });
+        try {
+          await createTask(
+            { kind: 'system', sender: 'taskmaster' },
+            buildSelfPauseNotice(pauseReason, control.epoch)
+          );
+        } catch (error) {
+          tickFailures += 1;
+          log.error({ err: error as Error }, 'taskmaster.self_pause_notice_failed');
+        }
         log.warn({ usefulCount, noiseCount }, 'taskmaster.useful_rate_floor_auto_paused');
       }
     } catch (error) {
@@ -1266,7 +1308,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
 
   // Daily digest: one summary message per UTC day through the same path.
-  const digest = digestProposal(actions24h, nowMs);
+  const digest = digestProposal(actions24h, control, nowMs);
   proposals.push(digest);
 
   // Exceptions first so the per-tick budget can never starve them.
@@ -1360,7 +1402,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     // digest alive so watching never goes dark.
     if (
       control.pause_state !== 'RUNNING' &&
-      !isPauseEffectsExempt(proposal.type, control.pause_scope)
+      !isPauseEffectsExempt(
+        proposal.threadRef.startsWith('digest:') ? 'canary' : proposal.type,
+        control.pause_scope
+      )
     ) {
       result.parked += 1;
       await dal.recordAction({
@@ -1423,7 +1468,11 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     // mid-tick is caught even for escalate_p0/digest.
     const fresh = await dal.getPauseState();
     const freshPauseWithhold =
-      fresh.pause_state !== 'RUNNING' && !isPauseEffectsExempt(proposal.type, fresh.pause_scope);
+      fresh.pause_state !== 'RUNNING' &&
+      !isPauseEffectsExempt(
+        proposal.threadRef.startsWith('digest:') ? 'canary' : proposal.type,
+        fresh.pause_scope
+      );
     if (fresh.epoch !== epoch || freshPauseWithhold) {
       // A pause that landed mid-tick (fresh scope withholds this effect) is a
       // pause-park, not an ordinary stale-epoch/resume expiry: re-tag the
@@ -1481,7 +1530,9 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             correlation_id: `tm-${journalRow.id}`,
             idempotency_key: proposal.idempotencyKey,
             task_type: 'agent_message',
-            recipient: proposal.recipient,
+            recipient: proposal.threadRef.startsWith('digest:')
+              ? 'duty-officer'
+              : proposal.recipient,
             body: proposal.body,
             // Same-subject grouping + unconditional per-verb repeat reason
             // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.

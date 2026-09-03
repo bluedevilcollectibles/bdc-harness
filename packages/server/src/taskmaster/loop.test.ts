@@ -19,6 +19,7 @@ import {
   resolveRecipient,
   MAX_EFFECTS_PER_TICK,
   OWNER_RECIPIENT_MAP,
+  isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
   type TaskmasterDeps,
   type ListedThread,
@@ -37,6 +38,67 @@ import type {
   TmJournalEntry,
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
+
+describe('Taskmaster reset visibility and canary', () => {
+  test('only canary and self-pause notice escape an effects pause', () => {
+    expect(isPauseEffectsExempt('canary', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('digest', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('escalate_p0', 'effects')).toBe(false);
+  });
+
+  test('paused daily canary reaches duty-officer once and carries reset guidance', async () => {
+    const world = makeWorld();
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.control.pause_reason = 'operator safety pause';
+    const deps = makeDeps(world);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    await tick(state, deps);
+
+    const canaries = world.sentMessages.filter(m => m.idempotency_key === `tm:digest:${TODAY_KEY}`);
+    expect(canaries).toHaveLength(1);
+    expect(canaries[0]?.recipient).toBe('duty-officer');
+    expect(canaries[0]?.body).toContain('operator safety pause');
+    expect(canaries[0]?.body).toContain('scripts/taskmaster/reset.sh');
+  });
+
+  test('healthy quiet day still sends a daily canary', async () => {
+    const world = makeWorld();
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.sentMessages).toHaveLength(1);
+    expect(world.sentMessages[0]?.recipient).toBe('duty-officer');
+    expect(world.sentMessages[0]?.body).toContain('no proposals today');
+  });
+
+  test('post-resume noise pauses and sends the Duty Officer reset notice', async () => {
+    const world = makeWorld();
+    for (let i = 0; i < 20; i += 1) {
+      world.journal.push({
+        id: `noise-${i}`,
+        created_at: new Date(T0 + i + 1).toISOString(),
+        thread_ref: `gh:test/repo#${i}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: `noise-${i}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: new Date(T0 + i + 1).toISOString(),
+        grade: 'noise',
+      });
+    }
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.control.pause_state).toBe('PAUSED');
+    const notice = world.sentMessages.find(m => m.idempotency_key.startsWith('tm:self-pause:'));
+    expect(notice?.recipient).toBe('duty-officer');
+    expect(notice?.body).toContain('scripts/taskmaster/reset.sh');
+    expect(notice?.body).toContain('M-155 useful-rate floor auto-pause');
+  });
+});
 
 const T0 = Date.parse('2026-08-07T12:00:00.000Z');
 const TODAY_KEY = new Date(T0).toISOString().slice(0, 10);

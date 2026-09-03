@@ -33,6 +33,8 @@ import {
   getPauseState,
   gradeAction,
   recordAction,
+  recordResetAudit,
+  resetTaskmaster,
   recordUsageSample,
   setPauseState,
   updateActionOutcome,
@@ -62,6 +64,59 @@ afterEach(async () => {
 }, SQLITE_HOOK_TIMEOUT_MS);
 
 describe('tm_journal DAL', () => {
+  test('records one distinct reset audit row per invocation', async () => {
+    const first = await recordResetAudit({
+      actor: 'operator',
+      reason: 'recover Taskmaster',
+      previousEpoch: 1,
+      newEpoch: 2,
+      transitioned: true,
+    });
+    const second = await recordResetAudit({
+      actor: 'operator',
+      reason: 'recover Taskmaster',
+      previousEpoch: 2,
+      newEpoch: 2,
+      transitioned: false,
+    });
+    expect(first.id).not.toBe(second.id);
+    const audits = await db.query<{ proposal_json: string }>(
+      "SELECT proposal_json FROM tm_journal WHERE thread_ref = 'taskmaster:reset'"
+    );
+    expect(audits.rows).toHaveLength(2);
+    expect(JSON.parse(audits.rows[1]!.proposal_json).transitioned).toBe(false);
+  });
+
+  test('reset is safe twice: expires once, increments once, and audits both calls', async () => {
+    await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    const before = await getPauseState();
+    await recordAction({
+      thread_ref: 'gh:test/repo#1',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'parked',
+    });
+
+    const first = await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+    const second = await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+
+    expect(first.control.pause_state).toBe('RUNNING');
+    expect(first.control.epoch).toBe(before.epoch + 1);
+    expect(first.expiredProposals).toBe(1);
+    expect(second.control.epoch).toBe(first.control.epoch);
+    expect(second.expiredProposals).toBe(0);
+    expect(first.audit.id).not.toBe(second.audit.id);
+    const audits = await db.query<{ cnt: number | string }>(
+      "SELECT COUNT(*) AS cnt FROM tm_journal WHERE thread_ref = 'taskmaster:reset'"
+    );
+    expect(Number(audits.rows[0]?.cnt)).toBe(2);
+  });
+
   test('fire_cauldron is accepted by the fresh SQLite CHECK', async () => {
     const row = await recordAction({
       thread_ref: 'gh:thinmansoftware/bdc-harness#99',

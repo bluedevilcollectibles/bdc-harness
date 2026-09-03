@@ -580,12 +580,14 @@ describe('M-155 exception push (rules)', () => {
   });
 
   test('M-155 Q3: useful-rate floor boundaries', () => {
+    // A zero-graded post-resume window is the expected warm-up state.
+    expect(usefulRateFloorBreached(0, 0)).toBe(false);
     // Below the minimum graded sample: never breaches, even at 0% useful.
     expect(usefulRateFloorBreached(0, USEFUL_RATE_MIN_GRADED - 1)).toBe(false);
     // At the minimum sample and 0% useful: breaches.
     expect(usefulRateFloorBreached(0, USEFUL_RATE_MIN_GRADED)).toBe(true);
-    // Exactly 40% (2 useful / 5 graded): does NOT breach -- floor is strict-below.
-    expect(usefulRateFloorBreached(2, 3)).toBe(false);
+    // Exactly 40% (8 useful / 20 graded): does NOT breach -- floor is strict-below.
+    expect(usefulRateFloorBreached(8, 12)).toBe(false);
     // Just under 40% (39 useful / 100 graded): breaches.
     expect(usefulRateFloorBreached(39, 61)).toBe(true);
     // Healthy: all useful never breaches.

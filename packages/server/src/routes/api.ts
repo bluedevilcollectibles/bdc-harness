@@ -3344,23 +3344,23 @@ export function registerApiRoutes(
   // stale proposals are EXPIRED, never replayed.
   registerOpenApiRoute(postTaskmasterResumeRoute, async c => {
     try {
-      const body: { actor: string } = (getValidatedBody(c, taskmasterResumeBodySchema) as
-        | { actor: string }
+      const body: { actor: string; reason?: string } = (getValidatedBody(
+        c,
+        taskmasterResumeBodySchema
+      ) as
+        | { actor: string; reason?: string }
         | undefined) ?? {
         actor: 'john',
       };
-      const expired = await taskmasterDb.expireParkedActions();
-      const control = await taskmasterDb.setPauseState({
-        pause_state: 'RUNNING',
-        pause_scope: null,
-        pause_reason: null,
-        pause_actor: body.actor,
-        incrementEpoch: true,
+      const { control, expiredProposals, audit } = await taskmasterDb.resetTaskmaster({
+        actor: body.actor,
+        reason: body.reason ?? null,
       });
       return c.json({
         pause_state: control.pause_state,
         epoch: control.epoch,
-        expired_proposals: expired,
+        expired_proposals: expiredProposals,
+        audit_id: audit.id,
       });
     } catch (error) {
       getLog().error({ err: error }, 'taskmaster_resume_failed');
