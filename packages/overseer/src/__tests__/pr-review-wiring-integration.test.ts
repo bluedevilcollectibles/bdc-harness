@@ -268,6 +268,18 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
        WHERE id = $1`,
       [first.messageId]
     );
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: first.correlationId ?? '',
+        messageId: first.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 148,
+        headSha: '1'.repeat(40),
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
 
     const secondHeadSha = '2'.repeat(40);
     const secondPayload = payloadFor('synchronize', secondHeadSha);
@@ -291,7 +303,9 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       [second.messageId]
     );
     expect(rows.rows).toHaveLength(1);
-    expect(rows.rows[0]?.repeat_reason).toBe(`review_exact_head:${secondHeadSha}`);
+    expect(rows.rows[0]?.repeat_reason).toContain('changes_requested verdict');
+    expect(rows.rows[0]?.repeat_reason).toContain('1'.repeat(40));
+    expect(rows.rows[0]?.repeat_reason).toContain(secondHeadSha);
     expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
   });
 
@@ -372,7 +386,7 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     ]);
     expect(rows.rows).toHaveLength(1);
     expect(rows.rows[0]?.status).toBe('queued');
-    expect(rows.rows[0]?.repeat_reason).toBe(`review_exact_head:${secondHeadSha}`);
+    expect(rows.rows[0]?.repeat_reason).toBeNull();
     expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
 
     // The original (older-head) queued row was cancelled, not left dangling.

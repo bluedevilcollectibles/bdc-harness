@@ -84,6 +84,20 @@ export interface PriorReviewWork {
   messageId: string;
   headSha: string;
   status: 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
+  verdict: 'approved' | 'changes_requested' | 'other' | null;
+  verdictId: string | null;
+  isAutoRereview: boolean;
+}
+
+/** Maximum auto-triggered re-reviews per PR; the initial review is not an attempt. */
+export const MAX_REREVIEW_ATTEMPTS = 3;
+
+export function buildRereviewReason(
+  priorVerdictId: string,
+  priorHeadSha: string,
+  newHeadSha: string
+): string {
+  return `changes_requested verdict ${priorVerdictId} reviewed head ${priorHeadSha}; re-review new head ${newHeadSha}`;
 }
 
 export interface IngestDeps {
@@ -117,6 +131,7 @@ export interface IngestDeps {
     headSha: string;
     baseRef: string;
     author: string;
+    repeatReason: string | null;
   }): Promise<{ messageId: string; alreadyExisted: boolean }>;
   /** Persist a correlated audit receipt. Never throws the ingest path open. */
   recordReceipt(input: {
@@ -329,8 +344,9 @@ export async function ingestPullRequestEvent(
   // review for this PR bound to a different head. Prior work on the SAME head
   // is a duplicate, not a supersession.
   let invalidatedMessageIds: string[] = [];
+  let prior: PriorReviewWork[] = [];
   try {
-    const prior = await deps.listPriorReviewWork({ owner, repo, prNumber });
+    prior = await deps.listPriorReviewWork({ owner, repo, prNumber });
     const staleIds = prior
       .filter(work => work.headSha !== headSha)
       .filter(work => work.status === 'queued' || work.status === 'claimed')
@@ -362,6 +378,38 @@ export async function ingestPullRequestEvent(
     return result;
   }
 
+  const priorAtDifferentHead = prior.find(work => work.headSha !== headSha);
+  let repeatReason: string | null = null;
+  if (priorAtDifferentHead?.verdict === 'changes_requested') {
+    const rereviewAttempts = prior.filter(work => work.isAutoRereview).length;
+    if (rereviewAttempts >= MAX_REREVIEW_ATTEMPTS) {
+      const result: IngestResult = {
+        disposition: 'blocked',
+        status: 200,
+        reason: 'rereview_attempts_exhausted',
+        correlationId,
+        headSha,
+        ...(invalidatedMessageIds.length > 0 ? { invalidatedMessageIds } : {}),
+      };
+      await safeReceipt(deps, {
+        correlationId,
+        deliveryId,
+        owner,
+        repo,
+        prNumber,
+        headSha,
+        disposition: result.disposition,
+        reason: result.reason,
+      });
+      return result;
+    }
+    repeatReason = buildRereviewReason(
+      priorAtDifferentHead.verdictId ?? priorAtDifferentHead.messageId,
+      priorAtDifferentHead.headSha,
+      headSha
+    );
+  }
+
   // Queue durable work bound to this EXACT head.
   try {
     const enqueued = await deps.enqueueReviewWork({
@@ -373,6 +421,7 @@ export async function ingestPullRequestEvent(
       headSha,
       baseRef,
       author,
+      repeatReason,
     });
     const disposition: IngestDisposition = enqueued.alreadyExisted
       ? 'duplicate_delivery'
