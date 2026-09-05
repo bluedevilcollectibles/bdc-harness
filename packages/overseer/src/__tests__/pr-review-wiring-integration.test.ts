@@ -309,6 +309,102 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
   });
 
+  test('an approved receipt round-trip does not authorize review of a newer head', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: 149,
+        pull_request: {
+          number: 149,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = '6'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-approved-head-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+    const submitDeps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() });
+    await submitDeps.recordReceipt({
+      correlationId: first.correlationId ?? '',
+      messageId: first.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 149,
+      headSha: firstHeadSha,
+      disposition: 'submission_failed',
+      reason: 'transient_failure',
+    });
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET created_at = '2000-01-01 00:00:00'
+       WHERE idempotency_key = $1`,
+      [`pr-review-submit-receipt:${first.messageId}:submission_failed`]
+    );
+    await submitDeps.recordReceipt({
+      correlationId: first.correlationId ?? '',
+      messageId: first.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 149,
+      headSha: firstHeadSha,
+      disposition: 'approved',
+      event: 'APPROVE',
+    });
+
+    const prior = await deps.listPriorReviewWork({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 149,
+    });
+    expect(prior.find(work => work.messageId === first.messageId)?.verdict).toBe('approved');
+
+    const secondHeadSha = '7'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-approved-head-2',
+      },
+      deps
+    );
+
+    expect(second.disposition).toBe('blocked');
+    expect(second.reason).toBe('enqueue_failed:repeat_reason_required');
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages
+       WHERE recipient = $1 AND body LIKE $2`,
+      [REVIEW_RECIPIENT, `%${secondHeadSha}%`]
+    );
+    expect(rows.rows).toHaveLength(0);
+  });
+
   /**
    * Real-world reproduction (2026-09-02): a `synchronize` push arrives while
    * the FIRST review for that PR is still 'queued' (not yet claimed or

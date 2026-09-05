@@ -74,7 +74,7 @@ describe('bounded repeat reason policy', () => {
     expect(reason).toContain(NEW_HEAD);
   });
 
-  test('same-head delivery gets no reason and remains protected by the guard', async () => {
+  test('an unreasoned enqueue attempt with prior work remains protected by the guard', async () => {
     const fake = deps([work({ headSha: NEW_HEAD })]);
     expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
       'enqueue_failed:repeat_reason_required'

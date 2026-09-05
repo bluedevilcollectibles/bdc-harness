@@ -152,6 +152,10 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
             disposition?: string;
           };
           if (body.kind !== 'pr_review_submit_receipt' || !body.messageId) continue;
+          // listMessages returns newest-first. Keep the first receipt for a
+          // message so an older failed attempt cannot overwrite a later,
+          // authoritative submission verdict.
+          if (verdictByMessageId.has(body.messageId)) continue;
           verdictByMessageId.set(body.messageId, {
             verdict:
               body.disposition === 'approved'
