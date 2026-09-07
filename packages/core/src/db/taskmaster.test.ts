@@ -117,6 +117,53 @@ describe('tm_journal DAL', () => {
     expect(Number(audits.rows[0]?.cnt)).toBe(2);
   });
 
+  test('concurrent resets increment the epoch once and report their own atomic audit', async () => {
+    await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects', pause_actor: 'test' });
+    const before = await getPauseState();
+    await recordAction({
+      thread_ref: 'gh:test/repo#1',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'parked',
+    });
+    const results = await Promise.all([
+      resetTaskmaster({ actor: 'first', reason: 'recover' }),
+      resetTaskmaster({ actor: 'second', reason: 'recover' }),
+    ]);
+    expect((await getPauseState()).epoch).toBe(before.epoch + 1);
+    expect(results.map(result => result.expiredProposals).sort()).toEqual([0, 1]);
+    const audits = results.map(result => JSON.parse(result.audit.proposal_json));
+    expect(audits.filter(audit => audit.transitioned)).toHaveLength(1);
+    expect(audits.map(audit => audit.new_epoch)).toEqual([before.epoch + 1, before.epoch + 1]);
+    expect(new Set(results.map(result => result.audit.id)).size).toBe(2);
+    expect(results[0]!.control.pause_actor).toBe('first');
+    expect(results[1]!.control.pause_actor).toBe('second');
+  });
+
+  test('audit insertion failure rolls back reset state and proposal expiration', async () => {
+    await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects', pause_actor: 'test' });
+    const before = await getPauseState();
+    const action = await recordAction({
+      thread_ref: 'gh:test/repo#1',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'parked',
+    });
+    await db.query(`CREATE TRIGGER reject_reset_audit BEFORE INSERT ON tm_journal
+      WHEN NEW.thread_ref = 'taskmaster:reset'
+      BEGIN SELECT RAISE(ABORT, 'test reset audit failure'); END`);
+    await expect(resetTaskmaster({ actor: 'operator', reason: 'recover' })).rejects.toThrow(
+      'test reset audit failure'
+    );
+    expect(await getPauseState()).toEqual(before);
+    expect(
+      (await db.query('SELECT outcome FROM tm_journal WHERE id = $1', [action.id])).rows
+    ).toEqual([{ outcome: 'parked' }]);
+    expect(
+      (await db.query("SELECT id FROM tm_journal WHERE thread_ref = 'taskmaster:reset'")).rows
+    ).toEqual([]);
+  });
+
   test('fire_cauldron is accepted by the fresh SQLite CHECK', async () => {
     const row = await recordAction({
       thread_ref: 'gh:thinmansoftware/bdc-harness#99',

@@ -13,6 +13,10 @@ import { randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import type { QueryResult } from './adapters/types';
+import {
+  withOverseerControlPlaneImmediateTransaction,
+  type OverseerControlPlaneQuery,
+} from './overseer-control-plane-sqlite';
 
 const log = createLogger('db/taskmaster');
 
@@ -176,27 +180,43 @@ export async function recordAction(data: {
   return normalizeJournal(row);
 }
 
-/** Record one audit row for every operator reset invocation. */
-export async function recordResetAudit(data: {
+interface ResetAuditData {
   actor: string;
   reason: string | null;
   previousEpoch: number;
   newEpoch: number;
   transitioned: boolean;
-}): Promise<TmJournalEntry> {
-  return recordAction({
-    thread_ref: 'taskmaster:reset',
-    action_type: 'digest',
-    proposal_json: JSON.stringify({
-      audit_type: 'taskmaster_reset',
-      actor: data.actor,
-      reason: data.reason,
-      previous_epoch: data.previousEpoch,
-      new_epoch: data.newEpoch,
-      transitioned: data.transitioned,
-    }),
-    outcome: 'sent',
-  });
+}
+
+async function insertResetAudit(
+  query: OverseerControlPlaneQuery,
+  data: ResetAuditData
+): Promise<TmJournalEntry> {
+  const result = await query<TmJournalRow>(
+    `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+     VALUES ($1, $2, 'taskmaster:reset', 'digest', $3, 'sent') RETURNING *`,
+    [
+      randomUUID(),
+      new Date().toISOString(),
+      JSON.stringify({
+        audit_type: 'taskmaster_reset',
+        actor: data.actor,
+        reason: data.reason,
+        previous_epoch: data.previousEpoch,
+        new_epoch: data.newEpoch,
+        transitioned: data.transitioned,
+      }),
+    ]
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error('Failed to record taskmaster reset audit');
+  return normalizeJournal(row);
+}
+
+/** Record one audit row for every operator reset invocation. */
+export async function recordResetAudit(data: ResetAuditData): Promise<TmJournalEntry> {
+  const db = getDatabase();
+  return insertResetAudit(db.query.bind(db), data);
 }
 
 /** Execute the resume endpoint's idempotent reset sequence. */
@@ -205,24 +225,56 @@ export async function resetTaskmaster(data: { actor: string; reason: string | nu
   expiredProposals: number;
   audit: TmJournalEntry;
 }> {
-  const previous = await getPauseState();
-  const expiredProposals = await expireParkedActions();
-  const transitioned = previous.pause_state !== 'RUNNING';
-  const control = await setPauseState({
-    pause_state: 'RUNNING',
-    pause_scope: null,
-    pause_reason: null,
-    pause_actor: data.actor,
-    incrementEpoch: transitioned,
-  });
-  const audit = await recordResetAudit({
-    actor: data.actor,
-    reason: data.reason,
-    previousEpoch: previous.epoch,
-    newEpoch: control.epoch,
-    transitioned,
-  });
-  return { control, expiredProposals, audit };
+  const db = getDatabase();
+  const reset = async (
+    query: OverseerControlPlaneQuery
+  ): Promise<{
+    control: TmControlState;
+    expiredProposals: number;
+    audit: TmJournalEntry;
+  }> => {
+    await query(
+      `INSERT INTO tm_control (id, pause_state, epoch, updated_at)
+       VALUES (1, 'RUNNING', 0, $1) ON CONFLICT (id) DO NOTHING`,
+      [new Date().toISOString()]
+    );
+    const previousResult = await query<TmControlRow>(
+      'SELECT * FROM tm_control WHERE id = 1' + (db.dialect === 'postgres' ? ' FOR UPDATE' : '')
+    );
+    const previousRow = previousResult.rows[0];
+    if (!previousRow) throw new Error('tm_control singleton missing during reset');
+    const previous = normalizeControl(previousRow);
+    const expired = await query(
+      "UPDATE tm_journal SET outcome = 'expired' WHERE outcome IN ('parked', 'pending')"
+    );
+    const transition = await query(
+      `UPDATE tm_control SET pause_state = 'RUNNING', epoch = epoch + 1
+       WHERE id = 1 AND pause_state <> 'RUNNING'`
+    );
+    const transitioned = transition.rowCount === 1;
+    await query(
+      `UPDATE tm_control SET pause_scope = NULL, pause_reason = NULL,
+       pause_actor = $1, updated_at = $2 WHERE id = 1`,
+      [data.actor, new Date().toISOString()]
+    );
+    const current = await query<TmControlRow>('SELECT * FROM tm_control WHERE id = 1');
+    const currentRow = current.rows[0];
+    if (!currentRow) throw new Error('tm_control singleton missing after reset');
+    const control = normalizeControl(currentRow);
+    const audit = await insertResetAudit(query, {
+      actor: data.actor,
+      reason: data.reason,
+      previousEpoch: previous.epoch,
+      newEpoch: control.epoch,
+      transitioned,
+    });
+    return { control, expiredProposals: expired.rowCount, audit };
+  };
+  // Reuse the existing SQLite writer-lock/async-serialization primitive;
+  // PostgreSQL pins a pool connection and locks the singleton inside its transaction.
+  return db.dialect === 'sqlite'
+    ? withOverseerControlPlaneImmediateTransaction(db, reset)
+    : db.withTransaction(reset);
 }
 
 /** Read one logical action by stable idempotency key without a time window. */

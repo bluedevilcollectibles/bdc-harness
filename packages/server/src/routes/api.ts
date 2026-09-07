@@ -3347,9 +3347,7 @@ export function registerApiRoutes(
       const body: { actor: string; reason?: string } = (getValidatedBody(
         c,
         taskmasterResumeBodySchema
-      ) as
-        | { actor: string; reason?: string }
-        | undefined) ?? {
+      ) as { actor: string; reason?: string } | undefined) ?? {
         actor: 'john',
       };
       const { control, expiredProposals, audit } = await taskmasterDb.resetTaskmaster({

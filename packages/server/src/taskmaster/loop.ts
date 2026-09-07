@@ -617,10 +617,12 @@ export async function defaultGetGithubIssueEvidence(
   };
 }
 
-const RESET_COMMAND =
-  "bash scripts/taskmaster/reset.sh --confirm --reason '<why>'";
+const RESET_COMMAND = "bash scripts/taskmaster/reset.sh --confirm --reason '<why>'";
 
-export function buildSelfPauseNotice(reason: string, epoch: number): CreateAuthenticatedMessageData {
+export function buildSelfPauseNotice(
+  reason: string,
+  epoch: number
+): CreateAuthenticatedMessageData {
   return {
     correlation_id: `tm-self-pause-${epoch}`,
     idempotency_key: `tm:self-pause:${epoch}`,
