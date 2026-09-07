@@ -4,7 +4,9 @@ import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
 import type {
+  DiscoveredPullRequest,
   GitHubClientDeps,
+  GitHubOpenPullRequestListInput,
   GitHubPullRequestMergeInput,
   GitHubPullRequestSearchInput,
   PullRequestCheckSummary,
@@ -80,7 +82,12 @@ export interface RealGitHubOctokitLike {
         state: string;
         merged_at?: string | null;
         html_url: string;
-        head: { sha: string };
+        head: { sha: string; ref?: string };
+        // Present on the real API; optional here so existing narrow mocks that
+        // only exercise the head-branch fast path keep type-checking.
+        draft?: boolean;
+        base?: { ref?: string };
+        body?: string | null;
       }[];
     }>;
     get(input: Record<string, unknown>): Promise<{
@@ -818,6 +825,127 @@ export function createRealSubmitPullRequestReview(
 }
 
 /**
+ * Aggregate a PR's review decision from its individual reviews (bdc-harness#758).
+ *
+ * GitHub exposes `reviewDecision` only on the GraphQL PullRequest type; the REST
+ * listing this adapter uses does not carry it, so it is DERIVED here using the
+ * same rule GitHub applies: only each reviewer's LATEST state counts, a single
+ * outstanding CHANGES_REQUESTED beats any number of approvals, and COMMENTED /
+ * DISMISSED / PENDING states do not constitute a decision.
+ *
+ * Returns null when no reviewer has left an APPROVED or CHANGES_REQUESTED state.
+ * Null means "no decision recorded", never "approved" -- the caller treats
+ * anything other than the literal 'APPROVED' as not approved.
+ */
+export function deriveReviewDecision(
+  reviews: readonly { login: string; state: string }[]
+): string | null {
+  const latestByReviewer = new Map<string, string>();
+  for (const review of reviews) {
+    const state = review.state.toUpperCase();
+    // COMMENTED and PENDING never replace a reviewer's standing verdict --
+    // that is GitHub's own rule, and collapsing them would silently clear a
+    // CHANGES_REQUESTED when the same reviewer later left a plain comment.
+    if (state !== 'APPROVED' && state !== 'CHANGES_REQUESTED' && state !== 'DISMISSED') continue;
+    latestByReviewer.set(review.login.toLowerCase(), state);
+  }
+  const states = [...latestByReviewer.values()];
+  if (states.includes('CHANGES_REQUESTED')) return 'CHANGES_REQUESTED';
+  if (states.includes('APPROVED')) return 'APPROVED';
+  return null;
+}
+
+/** Pull a WO id out of a PR title or body, so evidence lookup can search by it. */
+export function extractWoId(title: string, body: string | null | undefined): string | undefined {
+  const match = /\bWO-[A-Z0-9][A-Z0-9-]*\b/.exec(`${title}\n${body ?? ''}`);
+  return match?.[0];
+}
+
+/**
+ * Real listOpenPullRequests for PR-first merge candidate discovery
+ * (bdc-harness#758). Lists open PRs, filters to the watched base branches, and
+ * derives each one's review decision from its reviews.
+ *
+ * Every field is populated from live API data. A PR whose review listing fails
+ * gets `reviewDecision: null` -- which excludes it as `review_not_approved`
+ * rather than admitting it on an assumption. Failing closed on an unknown
+ * review state is the only safe direction for a merge candidate.
+ */
+export function createRealListOpenPullRequests(
+  octokit: RealGitHubOctokitLike
+): (input: GitHubOpenPullRequestListInput) => Promise<readonly DiscoveredPullRequest[]> {
+  return async (input: GitHubOpenPullRequestListInput) => {
+    const bases = (input.baseBranches ?? []).map(base => base.trim().toLowerCase()).filter(Boolean);
+    const listed = await octokit.pulls.list({
+      owner: input.owner,
+      repo: input.repo,
+      state: 'open',
+      per_page: 100,
+    });
+    const discovered: DiscoveredPullRequest[] = [];
+    for (const pr of listed.data) {
+      const baseRef = pr.base?.ref ?? '';
+      // Filter bases here rather than via the API's `base` param so that a PR
+      // targeting an unwatched base is still COUNTED as evaluated upstream and
+      // reports `base_branch_not_watched`, instead of silently not existing --
+      // silent absence is the exact failure #758 is about.
+      if (bases.length > 0 && !bases.includes(baseRef.trim().toLowerCase())) {
+        discovered.push({
+          owner: input.owner,
+          repo: input.repo,
+          prNumber: pr.number,
+          title: pr.title,
+          state: pr.state,
+          draft: pr.draft === true,
+          baseRef,
+          headRef: pr.head.ref ?? '',
+          headSha: pr.head.sha,
+          reviewDecision: null,
+          woId: extractWoId(pr.title, pr.body),
+        });
+        continue;
+      }
+
+      let reviewDecision: string | null = null;
+      if (octokit.pulls.listReviews) {
+        try {
+          const reviews = await octokit.pulls.listReviews({
+            owner: input.owner,
+            repo: input.repo,
+            pull_number: pr.number,
+            per_page: 100,
+          });
+          reviewDecision = deriveReviewDecision(
+            reviews.data.map(review => ({
+              login: review.user?.login ?? '',
+              state: review.state,
+            }))
+          );
+        } catch {
+          // Unknown review state stays unknown, and unknown is not approved.
+          reviewDecision = null;
+        }
+      }
+
+      discovered.push({
+        owner: input.owner,
+        repo: input.repo,
+        prNumber: pr.number,
+        title: pr.title,
+        state: pr.state,
+        draft: pr.draft === true,
+        baseRef,
+        headRef: pr.head.ref ?? '',
+        headSha: pr.head.sha,
+        reviewDecision,
+        woId: extractWoId(pr.title, pr.body),
+      });
+    }
+    return discovered;
+  };
+}
+
+/**
  * Build the real (non-fake) GitHubClientDeps composition for Overseer. Fails
  * loudly at construction time if the token is missing -- never silently
  * degrades to a stub in real mode.
@@ -861,5 +989,6 @@ export function createRealGitHubClientDeps(
       return { commented: true, url: response.data.html_url };
     },
     approvePullRequest: createRealApprovePullRequest(octokit),
+    listOpenPullRequests: createRealListOpenPullRequests(octokit),
   };
 }
