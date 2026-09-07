@@ -21,6 +21,7 @@ import {
   createRealOctokitClient,
   createRealSubmitPullRequestReview,
 } from './adapters/github-real-deps';
+import { isAutoRereviewReason } from './pr-review-ingest';
 import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
 import {
   configuredReviewIdentity,
@@ -178,7 +179,12 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
             status: message.status,
             verdict: verdictByMessageId.get(message.id)?.verdict ?? null,
             verdictId: verdictByMessageId.get(message.id)?.verdictId ?? null,
-            isAutoRereview: message.repeat_reason !== null,
+            // Only a reason THIS module stamped counts toward the attempt cap.
+            // repeat_reason is shared free text (legacy `review_exact_head:`
+            // rows, Taskmaster nudges, hand-written operator requests), so
+            // `!== null` would exhaust the budget on rows that were never
+            // automatic re-reviews. See AUTO_REREVIEW_REASON_PREFIX.
+            isAutoRereview: isAutoRereviewReason(message.repeat_reason),
           };
         })
         .filter((work): work is PriorReviewWork => work.headSha !== '');

@@ -48,9 +48,15 @@ afterAll(() => {
 });
 
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
-const { createRealIngestDeps, createRealSubmitDeps, REVIEW_RECIPIENT, REVIEW_SENDER } =
-  await import('../pr-review-wiring.ts');
-const { ingestPullRequestEvent } = await import('../pr-review-ingest.ts');
+const {
+  createRealIngestDeps,
+  createRealSubmitDeps,
+  reviewSubjectKey,
+  REVIEW_RECIPIENT,
+  REVIEW_SENDER,
+} = await import('../pr-review-wiring.ts');
+const { AUTO_REREVIEW_REASON_PREFIX, MAX_REREVIEW_ATTEMPTS, ingestPullRequestEvent } =
+  await import('../pr-review-ingest.ts');
 const { createHmac } = await import('crypto');
 
 function cleanupDb(path: string): void {
@@ -491,6 +497,162 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       [first.messageId]
     );
     expect(cancelledPriorStatus.rows[0]?.status).toBe('cancelled');
+  });
+
+  /**
+   * Review finding (Overseer, PR #772): `isAutoRereview` was derived from
+   * `repeat_reason !== null`. Because the pre-2026-09 enqueue path stamped
+   * EVERY review -- initial ones included -- with `review_exact_head:<sha>`,
+   * and because unrelated writers (Taskmaster nudges, operator re-review
+   * requests) also fill that shared column, a PR whose history predates this
+   * change could exhaust MAX_REREVIEW_ATTEMPTS without a single automatic
+   * re-review having run. Verified live 2026-09-06: 6 legacy-format rows and
+   * 134 prose reasons on the reviewer queue, shopops#662 holding 16 alone.
+   *
+   * This proves the derivation against the REAL dispatch DAL, since the fake
+   * IngestDeps in the unit suite set `isAutoRereview` directly and so cannot
+   * exercise the wiring where the defect lived.
+   */
+  test('legacy and foreign repeat_reason rows are not counted as auto re-review attempts', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const prNumber = 662;
+    const subjectKey = reviewSubjectKey('thinmansoftware', 'shopops', prNumber);
+
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: prNumber,
+        pull_request: {
+          number: prNumber,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'shopops', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = '8'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-reason-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    // Backfill the legacy shape onto the initial review, exactly as the old
+    // enqueue path wrote it, and add more legacy/foreign rows than the cap
+    // allows. None of these were automatic re-reviews.
+    await db.query(`UPDATE agent_dispatch_messages SET repeat_reason = $1 WHERE id = $2`, [
+      `review_exact_head:${firstHeadSha}`,
+      first.messageId,
+    ]);
+    const legacyReasons = [
+      `review_exact_head:${'a'.repeat(40)}`,
+      'tm:nudge:follow-up',
+      'Fresh exact-head review after source repair.',
+      'system XO escalation handoff',
+    ];
+    expect(legacyReasons.length).toBeGreaterThan(MAX_REREVIEW_ATTEMPTS);
+    for (const [index, reason] of legacyReasons.entries()) {
+      // Backdated: listMessages orders subject_key queries newest-first, and
+      // in real history these legacy rows predate the review that carries the
+      // CHANGES_REQUESTED verdict. Keeping that order means this test
+      // exercises the attempt cap rather than the reason-selection path.
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient,
+            body, subject_key, repeat_reason, status, created_at)
+         VALUES ($1, $2, $3, 'run_review', $4, $5, $6, $7, $8, 'done', '2000-01-01 00:00:00')`,
+        [
+          `legacy-row-${index}`,
+          `legacy-correlation-${index}`,
+          `legacy-idempotency-${index}`,
+          REVIEW_SENDER,
+          REVIEW_RECIPIENT,
+          JSON.stringify({
+            owner: 'thinmansoftware',
+            repo: 'shopops',
+            prNumber,
+            headSha: String(index + 1).repeat(40),
+            baseRef: 'dev',
+            author: 'bluedevilcollectibles',
+          }),
+          subjectKey,
+          reason,
+        ]
+      );
+    }
+
+    const prior = await deps.listPriorReviewWork({
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+      prNumber,
+    });
+    expect(prior.length).toBe(legacyReasons.length + 1);
+    expect(prior.every(work => work.isAutoRereview === false)).toBe(true);
+
+    // Give the initial review a CHANGES_REQUESTED verdict so the next push
+    // takes the re-review path -- the path the cap guards.
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: first.correlationId ?? '',
+        messageId: first.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'shopops',
+        prNumber,
+        headSha: firstHeadSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
+
+    const secondHeadSha = '9'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-reason-2',
+      },
+      deps
+    );
+
+    // Pre-fix this was 'blocked' / 'rereview_attempts_exhausted'.
+    expect(second.disposition).toBe('queued');
+
+    // The reason the auto path just wrote IS the one the cap reads back.
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages WHERE id = $1`,
+      [second.messageId]
+    );
+    const writtenReason = rows.rows[0]?.repeat_reason ?? null;
+    expect(writtenReason).toContain(AUTO_REREVIEW_REASON_PREFIX);
+    const afterRereview = await deps.listPriorReviewWork({
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+      prNumber,
+    });
+    expect(afterRereview.filter(work => work.isAutoRereview).length).toBe(1);
+    expect(afterRereview.find(work => work.messageId === second.messageId)?.isAutoRereview).toBe(
+      true
+    );
   });
 
   test('a same-head redelivery while the review is still queued is a duplicate, not a new enqueue', async () => {

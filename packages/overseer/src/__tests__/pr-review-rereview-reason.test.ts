@@ -1,9 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { createHmac } from 'crypto';
 import {
+  AUTO_REREVIEW_REASON_PREFIX,
   MAX_REREVIEW_ATTEMPTS,
   buildRereviewReason,
   ingestPullRequestEvent,
+  isAutoRereviewReason,
   type IngestDeps,
   type PriorReviewWork,
 } from '../pr-review-ingest.ts';
@@ -121,5 +123,91 @@ describe('bounded repeat reason policy', () => {
       (await ingestPullRequestEvent(request('thinmansoftware', 'shopops', 650), fake.value))
         .disposition
     ).toBe('queued');
+  });
+});
+
+/**
+ * Review finding (Overseer, PR #772): the attempt cap must count only the
+ * automatic re-review path's OWN marker. `repeat_reason` is shared free text,
+ * and before this change every enqueue -- initial reviews included -- was
+ * stamped `review_exact_head:<sha>`, so a `!== null` derivation exhausted the
+ * budget on rows that were never automatic re-reviews.
+ */
+describe('auto re-review marker recognition', () => {
+  test('the reason the auto path writes is the one the cap recognizes', () => {
+    const reason = buildRereviewReason('verdict-1', OLD_HEAD, NEW_HEAD);
+    expect(reason.startsWith(AUTO_REREVIEW_REASON_PREFIX)).toBe(true);
+    expect(isAutoRereviewReason(reason)).toBe(true);
+    // The traceability the reason already carried is preserved.
+    expect(reason).toContain('verdict-1');
+    expect(reason).toContain(OLD_HEAD);
+    expect(reason).toContain(NEW_HEAD);
+  });
+
+  test('legacy, foreign and absent reasons are not auto re-reviews', () => {
+    expect(isAutoRereviewReason(`review_exact_head:${OLD_HEAD}`)).toBe(false);
+    expect(isAutoRereviewReason('tm:nudge:follow-up')).toBe(false);
+    expect(isAutoRereviewReason('system XO escalation handoff')).toBe(false);
+    expect(isAutoRereviewReason('Fresh exact-head review after source repair.')).toBe(false);
+    expect(isAutoRereviewReason(null)).toBe(false);
+    expect(isAutoRereviewReason(undefined)).toBe(false);
+    // The marker must lead; a reason merely mentioning it does not count.
+    expect(isAutoRereviewReason(`see ${AUTO_REREVIEW_REASON_PREFIX}${NEW_HEAD}`)).toBe(false);
+  });
+
+  test('a PR carrying only legacy review_exact_head rows is NOT capped', async () => {
+    // The exact defect: more legacy rows than MAX_REREVIEW_ATTEMPTS, zero
+    // actual automatic re-reviews. Pre-fix this blocked on the first push.
+    const legacy = Array.from({ length: MAX_REREVIEW_ATTEMPTS + 1 }, (_, index) =>
+      work({
+        messageId: `legacy-${index}`,
+        headSha: String(index + 1).repeat(40),
+        isAutoRereview: isAutoRereviewReason(`review_exact_head:${String(index + 1).repeat(40)}`),
+      })
+    );
+    const fake = deps([work(), ...legacy]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+    expect(isAutoRereviewReason(fake.enqueued[0]?.repeatReason ?? null)).toBe(true);
+  });
+
+  test('rows marked by the auto path still count toward the cap', async () => {
+    const attempts = Array.from({ length: MAX_REREVIEW_ATTEMPTS }, (_, index) =>
+      work({
+        messageId: `auto-${index}`,
+        headSha: String(index + 1).repeat(40),
+        isAutoRereview: isAutoRereviewReason(
+          buildRereviewReason(`verdict-${index}`, OLD_HEAD, String(index + 1).repeat(40))
+        ),
+      })
+    );
+    expect(attempts.every(attempt => attempt.isAutoRereview)).toBe(true);
+    const fake = deps([work(), ...attempts]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
+      'rereview_attempts_exhausted'
+    );
+    expect(fake.enqueued).toHaveLength(0);
+  });
+
+  test('legacy rows do not dilute a genuine cap', async () => {
+    // Mixed history: enough auto attempts to cap, plus legacy noise that must
+    // neither add to nor subtract from the count.
+    const autos = Array.from({ length: MAX_REREVIEW_ATTEMPTS }, (_, index) =>
+      work({
+        messageId: `auto-${index}`,
+        headSha: String(index + 1).repeat(40),
+        isAutoRereview: isAutoRereviewReason(
+          buildRereviewReason(`verdict-${index}`, OLD_HEAD, String(index + 1).repeat(40))
+        ),
+      })
+    );
+    const noise = work({
+      messageId: 'legacy-noise',
+      headSha: '9'.repeat(40),
+      isAutoRereview: isAutoRereviewReason('tm:nudge:follow-up'),
+    });
+    const fake = deps([work(), noise, ...autos]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
+      'rereview_attempts_exhausted'
+    );
   });
 });

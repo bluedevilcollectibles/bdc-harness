@@ -86,18 +86,57 @@ export interface PriorReviewWork {
   status: 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
   verdict: 'approved' | 'changes_requested' | 'other' | null;
   verdictId: string | null;
+  /**
+   * True only when this row was enqueued by the AUTOMATIC re-review path --
+   * i.e. its repeat_reason carries AUTO_REREVIEW_REASON_PREFIX. Initial
+   * reviews, legacy `review_exact_head:` rows, and reasons written by other
+   * subsystems or by hand are all false and never consume the attempt budget.
+   */
   isAutoRereview: boolean;
 }
 
 /** Maximum auto-triggered re-reviews per PR; the initial review is not an attempt. */
 export const MAX_REREVIEW_ATTEMPTS = 3;
 
+/**
+ * Explicit machine-readable marker prefixing every repeat_reason this module
+ * writes for an AUTOMATIC re-review.
+ *
+ * `repeat_reason` is shared free text: Dispatch requires SOME reason on any
+ * repeat send, and several unrelated writers already fill it -- Taskmaster
+ * nudges (`tm:nudge:*`), XO escalation handoffs, hand-written operator
+ * re-review requests, and the pre-2026-09 Overseer enqueue path which stamped
+ * EVERY review (initial ones included) with `review_exact_head:<sha>`. So a
+ * non-null reason proves nothing about who wrote it or why.
+ *
+ * Review finding (Overseer, PR #772): deriving `isAutoRereview` from
+ * `repeat_reason !== null` therefore counts all of those as automatic
+ * re-review attempts, and a PR carrying MAX_REREVIEW_ATTEMPTS legacy rows is
+ * capped before a single automatic re-review has actually run. Verified
+ * against the live event store 2026-09-06: 6 rows in the legacy
+ * `review_exact_head:` format and 134 hand-written prose reasons, with
+ * shopops#662 alone holding 16 -- every one of which would have counted.
+ *
+ * The cap now counts ONLY rows this module marked. Anything else -- legacy
+ * format, another subsystem, a human -- is not an attempt.
+ */
+export const AUTO_REREVIEW_REASON_PREFIX = 'auto_rereview:head_moved:';
+
+/**
+ * True only for a repeat_reason this module wrote for an automatic re-review.
+ * Deliberately narrow: unrecognized reasons are NOT attempts, so an unrelated
+ * writer can never consume a PR's re-review budget.
+ */
+export function isAutoRereviewReason(repeatReason: string | null | undefined): boolean {
+  return typeof repeatReason === 'string' && repeatReason.startsWith(AUTO_REREVIEW_REASON_PREFIX);
+}
+
 export function buildRereviewReason(
   priorVerdictId: string,
   priorHeadSha: string,
   newHeadSha: string
 ): string {
-  return `changes_requested verdict ${priorVerdictId} reviewed head ${priorHeadSha}; re-review new head ${newHeadSha}`;
+  return `${AUTO_REREVIEW_REASON_PREFIX}${newHeadSha} changes_requested verdict ${priorVerdictId} reviewed head ${priorHeadSha}; re-review new head ${newHeadSha}`;
 }
 
 export interface IngestDeps {
