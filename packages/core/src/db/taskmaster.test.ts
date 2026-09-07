@@ -34,12 +34,63 @@ import {
   gradeAction,
   recordAction,
   recordUsageSample,
+  registerExpectation,
+  listDueExpectations,
+  markMet,
+  incrementRetry,
+  markEscalated,
   setPauseState,
   updateActionOutcome,
   upsertAdoptionRow,
   upsertHealthSample,
   type TmAdoptionRow,
 } from './taskmaster';
+
+describe('tm_expectations DAL', () => {
+  test('expectation_met_before_deadline', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-1',
+      recipient: 'xo',
+      evidence_json: JSON.stringify({ kind: 'issue_comment_exists', repo: 'x/y', number: 1 }),
+      due_at: new Date(Date.now() + 60_000).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    const active = await listDueExpectations(new Date().toISOString());
+    expect(active.map(row => row.id)).toContain(id);
+    await markMet(id, 'https://github.com/x/y/issues/1#issuecomment-1');
+    const row = await db.query<{ status: string; evidence_pointer: string }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]).toEqual({
+      status: 'met',
+      evidence_pointer: 'https://github.com/x/y/issues/1#issuecomment-1',
+    });
+  });
+
+  test('retry and escalation mutations are bounded state transitions', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-2',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    await incrementRetry(id, new Date().toISOString());
+    await markEscalated(id, 'dispatch:escalation');
+    const row = await db.query<{ status: string; retries: number; evidence_pointer: string }>(
+      'SELECT status, retries, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]).toEqual({
+      status: 'escalated',
+      retries: 1,
+      evidence_pointer: 'dispatch:escalation',
+    });
+  });
+});
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {

@@ -42,6 +42,7 @@ import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibi
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
 import { fireBackoffDecision } from './backoff';
+import { checkExpectations } from './expectations';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -118,7 +119,16 @@ type TaskmasterDal = Pick<
   // Suppression accessors (M-155 WO 3) are optional on injected DALs so
   // pre-WO3 test doubles keep compiling; when absent, durable suppression
   // writes are inert (the pure grade-based check still applies).
-  Partial<Pick<typeof taskmasterDb, 'getSuppression' | 'setSuppression' | 'clearSuppression'>>;
+  Partial<
+    Pick<
+      typeof taskmasterDb,
+      | 'getSuppression'
+      | 'setSuppression'
+      | 'clearSuppression'
+      | 'registerExpectation'
+      | 'getExpectationCounts'
+    >
+  >;
 
 export interface GithubIssueEvidence {
   state: 'open' | 'closed';
@@ -167,6 +177,7 @@ export interface TaskmasterDeps {
   getHealthSample?: typeof taskmasterDb.getHealthSample;
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
+  checkExpectations?: (now: Date) => Promise<void>;
 }
 
 export interface TickResult {
@@ -228,7 +239,7 @@ async function defaultListUndeliveredRulings(): Promise<ThreadSnapshot[]> {
     }));
 }
 
-function priorityFromLabels(labels: string[]): ThreadPriority {
+export function priorityFromLabels(labels: string[]): ThreadPriority | null {
   for (const p of ['P0', 'P1', 'P2', 'P3'] as const) {
     if (
       labels.some(label => {
@@ -238,8 +249,10 @@ function priorityFromLabels(labels: string[]): ThreadPriority {
     )
       return p;
   }
-  return 'P2';
+  return null;
 }
+
+let unlabelledPriorityTriage: string[] = [];
 
 interface GithubIssue {
   number: number;
@@ -381,6 +394,7 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
     .filter(Boolean);
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ListedThread[] = [];
+  unlabelledPriorityTriage = [];
   for (const repo of repos) {
     const seen = new Set<number>();
     for (const label of WORK_LABELS) {
@@ -406,6 +420,12 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
           seen.add(issue.number);
           const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
           const priority = priorityFromLabels(labels);
+          if (priority === null) {
+            const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
+            unlabelledPriorityTriage.push(ref);
+            log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
+            continue;
+          }
           const normalizedLabels = labels.map(label => label.trim().toLowerCase());
           const hasClaimStatus = normalizedLabels.some(label =>
             ['status:building', 'status:review'].includes(label)
@@ -615,7 +635,11 @@ export async function defaultGetGithubIssueEvidence(
   };
 }
 
-function digestProposal(actions24h: taskmasterDb.TmJournalEntry[], nowMs: number): ActionProposal {
+function digestProposal(
+  actions24h: taskmasterDb.TmJournalEntry[],
+  nowMs: number,
+  expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>
+): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
   const counts: Record<string, number> = {};
   for (const action of actions24h) {
@@ -626,12 +650,18 @@ function digestProposal(actions24h: taskmasterDb.TmJournalEntry[], nowMs: number
     Object.entries(counts)
       .map(([k, v]) => `${k}=${v}`)
       .join(', ') || 'no actions in the last 24h';
+  const expectationSummary = expectationCounts
+    ? ` Expectations: pending=${expectationCounts.pending}, met=${expectationCounts.met}, failed=${expectationCounts.failed}, escalated=${expectationCounts.escalated}, given_up=${expectationCounts.given_up}.`
+    : '';
+  const triageSummary = unlabelledPriorityTriage.length
+    ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
+    : '';
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
     recipient: 'operator',
     body:
-      `Taskmaster daily digest for ${dateKey}: ${summary}. ` +
+      `Taskmaster daily digest for ${dateKey}: ${summary}.${expectationSummary}${triageSummary} ` +
       'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
@@ -990,6 +1020,14 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   recordTickAttempt(state.deadman, nowMs);
   let tickFailures = 0;
 
+  try {
+    if (deps.checkExpectations) await deps.checkExpectations(new Date(nowMs));
+    else if (!deps.db) await checkExpectations(new Date(nowMs));
+  } catch (error) {
+    tickFailures += 1;
+    log.warn({ err: error as Error }, 'taskmaster.expectations_tick_failed');
+  }
+
   // 1. Pause state + epoch captured.
   let control = await dal.getPauseState();
   const epoch = control.epoch;
@@ -1266,7 +1304,17 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
 
   // Daily digest: one summary message per UTC day through the same path.
-  const digest = digestProposal(actions24h, nowMs);
+  let expectationCounts: Record<taskmasterDb.TmExpectationStatus, number> | undefined;
+  try {
+    expectationCounts = dal.getExpectationCounts
+      ? await dal.getExpectationCounts()
+      : deps.db
+        ? undefined
+        : await taskmasterDb.getExpectationCounts();
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
+  }
+  const digest = digestProposal(actions24h, nowMs, expectationCounts);
   proposals.push(digest);
 
   // Exceptions first so the per-tick budget can never starve them.
@@ -1469,13 +1517,27 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           );
         });
         const admitted = await admission;
+        const registerExpectation =
+          dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
+        await registerExpectation?.({
+          dispatch_ref: admitted.cascadeId,
+          recipient: proposal.recipient,
+          evidence_json: JSON.stringify({
+            kind: 'db_row_exists',
+            table: 'remote_agent_workflow_runs',
+            where: { id: admitted.cascadeId },
+          }),
+          due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+          on_absence: 'escalate',
+          max_retries: 0,
+        });
         await dal.updateActionOutcome(
           journalRow.id,
           'sent',
           JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
         );
       } else {
-        await createTask(
+        const dispatched = await createTask(
           { kind: 'system', sender: 'taskmaster' },
           {
             correlation_id: `tm-${journalRow.id}`,
@@ -1489,6 +1551,20 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
           }
         );
+        const registerExpectation =
+          dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
+        await registerExpectation?.({
+          dispatch_ref: dispatched.id,
+          recipient: proposal.recipient,
+          evidence_json: JSON.stringify({
+            kind: 'dispatch_reply_exists',
+            correlation_id: `tm-${journalRow.id}`,
+            classification: 'succeeded',
+          }),
+          due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+          on_absence: proposal.type === 'digest' ? 'escalate' : 'redispatch',
+          max_retries: 2,
+        });
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
       journalRow.outcome = 'sent';

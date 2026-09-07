@@ -11,6 +11,7 @@ import {
   defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
+  priorityFromLabels,
   tick,
   resolveTaskmasterIntervalMs,
   resolveFireVerbEnabled,
@@ -2031,12 +2032,19 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const byNumber = new Map(threads.map(thread => [Number(thread.ref.split('#')[1]), thread]));
     expect([10, 11, 12].map(number => byNumber.get(number)?.priority)).toEqual(['P1', 'P1', 'P1']);
     expect(byNumber.get(13)?.priority).toBe('P0');
-    expect(byNumber.get(14)?.priority).toBe('P2');
+    expect(byNumber.has(14)).toBe(false);
     expect(byNumber.get(15)?.isBlocked).toBe(true);
     expect(byNumber.get(16)?.isUnclaimedP0).toBe(false);
     expect(byNumber.get(17)?.isBlocked).toBe(false);
     expect(byNumber.get(17)?.isHeld).toBe(true);
     expect(byNumber.get(18)?.isUnclaimed).toBe(false);
+  });
+
+  test('unlabelled_priority_surfaces_for_triage', async () => {
+    const { fetchImpl } = fakeGithubFetch({ wo: [ghIssue(44, ['wo'])] });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(0);
+    expect(priorityFromLabels(['wo'])).toBeNull();
   });
 
   test('defaults to bdc-xo when TASKMASTER_GH_REPOS is unset', async () => {

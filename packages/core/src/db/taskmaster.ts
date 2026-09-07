@@ -29,6 +29,23 @@ export type TmGrade = 'useful' | 'noise' | 'harmful';
 export type TmPauseState = 'RUNNING' | 'PAUSED' | 'HARD_PAUSE';
 export type TmHealthState = 'healthy' | 'degraded' | 'dark' | 'unknown';
 export type TmUsageConfidence = 'high' | 'low' | 'none';
+export type TmExpectationAbsence = 'redispatch' | 'escalate' | 'give_up';
+export type TmExpectationStatus = 'pending' | 'met' | 'failed' | 'escalated' | 'given_up';
+
+export interface TmExpectation {
+  id: string;
+  dispatch_ref: string;
+  recipient: string;
+  evidence_json: string;
+  due_at: string;
+  on_absence: TmExpectationAbsence;
+  max_retries: number;
+  retries: number;
+  status: TmExpectationStatus;
+  evidence_pointer: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface TmJournalEntry {
   id: string;
@@ -113,6 +130,99 @@ function normalizeControl(row: TmControlRow): TmControlState {
     epoch: Number(row.epoch),
     updated_at: toIso(row.updated_at),
   };
+}
+
+function normalizeExpectation(row: TmExpectation): TmExpectation {
+  return {
+    ...row,
+    max_retries: row.max_retries,
+    retries: row.retries,
+    due_at: toIso(row.due_at),
+    created_at: toIso(row.created_at),
+    updated_at: toIso(row.updated_at),
+  };
+}
+
+export async function registerExpectation(data: {
+  dispatch_ref: string;
+  recipient: string;
+  evidence_json: string;
+  due_at: string;
+  on_absence: TmExpectationAbsence;
+  max_retries: number;
+}): Promise<string> {
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  await getDatabase().query(
+    `INSERT INTO tm_expectations
+     (id, dispatch_ref, recipient, evidence_json, due_at, on_absence, max_retries,
+      retries, status, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'pending', $8, $8)`,
+    [
+      id,
+      data.dispatch_ref,
+      data.recipient,
+      data.evidence_json,
+      data.due_at,
+      data.on_absence,
+      data.max_retries,
+      now,
+    ]
+  );
+  return id;
+}
+
+/** Active expectations are returned even before due_at so success can close early. */
+export async function listDueExpectations(_now: string): Promise<TmExpectation[]> {
+  const result = await getDatabase().query<TmExpectation>(
+    "SELECT * FROM tm_expectations WHERE status IN ('pending', 'failed') ORDER BY due_at ASC"
+  );
+  return result.rows.map(normalizeExpectation);
+}
+
+async function updateExpectation(
+  id: string,
+  status: TmExpectationStatus,
+  evidencePointer?: string | null
+): Promise<void> {
+  await getDatabase().query(
+    'UPDATE tm_expectations SET status = $1, evidence_pointer = $2, updated_at = $3 WHERE id = $4',
+    [status, evidencePointer ?? null, new Date().toISOString(), id]
+  );
+}
+
+export async function markMet(id: string, evidencePointer: string): Promise<void> {
+  await updateExpectation(id, 'met', evidencePointer);
+}
+export async function markFailed(id: string): Promise<void> {
+  await updateExpectation(id, 'failed');
+}
+export async function incrementRetry(id: string, dueAt: string): Promise<void> {
+  await getDatabase().query(
+    "UPDATE tm_expectations SET status = 'failed', retries = retries + 1, due_at = $1, updated_at = $2 WHERE id = $3",
+    [dueAt, new Date().toISOString(), id]
+  );
+}
+export async function markEscalated(id: string, evidencePointer?: string): Promise<void> {
+  await updateExpectation(id, 'escalated', evidencePointer);
+}
+export async function markGivenUp(id: string, reason: string): Promise<void> {
+  await updateExpectation(id, 'given_up', reason);
+}
+
+export async function getExpectationCounts(): Promise<Record<TmExpectationStatus, number>> {
+  const counts: Record<TmExpectationStatus, number> = {
+    pending: 0,
+    met: 0,
+    failed: 0,
+    escalated: 0,
+    given_up: 0,
+  };
+  const result = await getDatabase().query<{ status: TmExpectationStatus; count: number | string }>(
+    'SELECT status, COUNT(*) AS count FROM tm_expectations GROUP BY status'
+  );
+  for (const row of result.rows) counts[row.status] = Number(row.count);
+  return counts;
 }
 
 /**
