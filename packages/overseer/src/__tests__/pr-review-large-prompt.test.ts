@@ -12,7 +12,9 @@
  *  3. The posted summary carries the error code and never the error detail.
  */
 import { describe, expect, test } from 'bun:test';
+import { rm, stat } from 'node:fs/promises';
 import {
+  buildReviewModelTransport,
   evaluatePullRequest,
   isTransportError,
   resolveReviewModelTimeoutMs,
@@ -135,6 +137,113 @@ describe('#789 -- E2BIG defers instead of blocking the PR', () => {
     // An unrecognized failure must NOT become an endless deferral loop.
     expect(result.verdict).toBe('INDETERMINATE');
     expect(reviewErrorCode(result.error)).toBe('model_output_invalid');
+  });
+});
+
+describe('#789 -- a reached rung makes the failure terminal, not a deferral', () => {
+  test('codex ENOENT then grok invalid output is INDETERMINATE, not TRANSPORT_ERROR', async () => {
+    // Review finding (Overseer, PR #790): a permanently dead first rung used to
+    // dominate a later rung that actually ran, so a genuine judgment failure
+    // was classified as transport and retried forever instead of posting a
+    // verdict.
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async binary => {
+          if (binary === 'codex') {
+            const error = new Error('spawn codex ENOENT') as Error & { code: string };
+            error.code = 'ENOENT';
+            throw error;
+          }
+          return { exitCode: 0, timedOut: false, stdout: 'not json' };
+        },
+      })
+    );
+
+    expect(result.verdict).toBe('INDETERMINATE');
+    expect(reviewErrorCode(result.error)).toBe('model_output_invalid');
+    expect(result.retry_after_ms).toBeUndefined();
+  });
+
+  test('a dead rung before a nonzero-exit rung is also terminal', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async binary => {
+          if (binary === 'codex') throw e2bigError();
+          return { exitCode: 3, timedOut: false, stdout: 'refused' };
+        },
+      })
+    );
+
+    expect(result.verdict).toBe('INDETERMINATE');
+    expect(reviewErrorCode(result.error)).toBe('model_exit_nonzero');
+  });
+
+  test('a dead rung followed by a timed-out rung still defers -- neither was reached', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async binary => {
+          if (binary === 'codex') throw e2bigError();
+          return { exitCode: 124, timedOut: true, stdout: '' };
+        },
+      })
+    );
+
+    expect(result.verdict).toBe('TRANSPORT_ERROR');
+    // The FIRST transport failure is reported, and it is still a deferral
+    // because no rung ever returned anything to judge.
+    expect(reviewErrorCode(result.error)).toBe('model_error');
+  });
+});
+
+describe('#789 -- the prompt file is not world-readable', () => {
+  test('grok prompts live in a 0700 dir as a 0600 file, removed after the run', async () => {
+    const transport = await buildReviewModelTransport('grok', 'private diff contents');
+    expect(transport.promptFile).toBeDefined();
+    expect(transport.promptDir).toBeDefined();
+    // The prompt travels as a short PATH argument, never as the prompt itself.
+    expect(transport.argv).toEqual(['grok', '--prompt-file', transport.promptFile!]);
+    expect(await Bun.file(transport.promptFile!).text()).toBe('private diff contents');
+
+    // Unix permission bits are not implemented on Windows, where the mode is
+    // synthesized -- assert them only where they are real.
+    if (process.platform !== 'win32') {
+      const fileMode = (await stat(transport.promptFile!)).mode & 0o777;
+      const dirMode = (await stat(transport.promptDir!)).mode & 0o777;
+      expect(fileMode).toBe(0o600);
+      expect(dirMode).toBe(0o700);
+      // Explicitly: no group or other access to either.
+      expect(fileMode & 0o077).toBe(0);
+      expect(dirMode & 0o077).toBe(0);
+    }
+
+    await rm(transport.promptDir!, { recursive: true, force: true });
+  });
+
+  test('codex uses stdin and writes no prompt file at all', async () => {
+    const transport = await buildReviewModelTransport('codex', 'private diff contents');
+    expect(transport.stdinPrompt).toBe('private diff contents');
+    expect(transport.promptFile).toBeUndefined();
+    expect(transport.promptDir).toBeUndefined();
+    // The prompt is absent from argv -- the whole point of the fix.
+    expect(transport.argv.join(' ')).not.toContain('private diff contents');
+  });
+
+  test('two concurrent prompts never share a path', async () => {
+    const [a, b] = await Promise.all([
+      buildReviewModelTransport('grok', 'a'),
+      buildReviewModelTransport('grok', 'b'),
+    ]);
+    expect(a.promptDir).not.toBe(b.promptDir);
+    expect(await Bun.file(a.promptFile!).text()).toBe('a');
+    expect(await Bun.file(b.promptFile!).text()).toBe('b');
+    await rm(a.promptDir!, { recursive: true, force: true });
+    await rm(b.promptDir!, { recursive: true, force: true });
   });
 });
 

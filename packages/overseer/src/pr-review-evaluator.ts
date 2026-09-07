@@ -1,5 +1,6 @@
-import { unlink } from 'node:fs/promises';
+import { chmod, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 
@@ -386,22 +387,34 @@ export async function evaluatePullRequest(
   });
   const ladder = deps.ladder ?? defaultReviewLadder();
   let lastError = 'model_unavailable';
-  // A transport failure on ANY rung is remembered separately from a judgment
-  // failure. If every rung failed and at least one did so for transport
-  // reasons, the whole attempt is a deferral -- posting CHANGES_REQUESTED when
-  // no model was ever reached is the bug this fixes.
+  // TRANSPORT vs JUDGMENT across the whole ladder.
+  //
+  // The attempt defers ONLY when NO rung was ever successfully reached. If any
+  // rung ran and produced output to judge -- even bad output -- the failure is
+  // one of judgment and stays TERMINAL (INDETERMINATE), because a judgment
+  // failure that deferred would retry forever and never post a verdict.
+  //
+  // Review finding (Overseer, PR #790): tracking this as a sticky
+  // "sawTransportFailure" flag was wrong -- a permanently dead rung (codex
+  // ENOENT) would outvote a later rung that ran and returned invalid output,
+  // classifying a genuine `model_output_invalid` as transport and looping.
+  // `reachedAnyRung` is the correct predicate: it can only be set by a rung
+  // that actually ran, and it is never cleared.
+  let reachedAnyRung = false;
   let transportFailure: string | null = null;
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
     try {
       const result = await deps.invokeModel(binary, prompt);
       if (result.timedOut) {
-        // A timeout is transport, not judgment: the model may have been mid
-        // answer. Try the next rung, but if none succeeds this defers.
+        // A timeout is transport, not judgment: the process started but never
+        // delivered anything to judge, so this rung was not reached.
         lastError = `model_timeout:${binary}`;
         transportFailure ??= lastError;
         continue;
       }
+      // The process ran and returned. Whatever happens below is judgment.
+      reachedAnyRung = true;
       if (result.exitCode !== 0) {
         lastError = `model_exit_nonzero:${binary}`;
         continue;
@@ -423,12 +436,14 @@ export async function evaluatePullRequest(
       };
     } catch (error) {
       lastError = `model_error:${errorMessage(error)}`;
-      // E2BIG and friends: the process never ran. Remember it so the ladder's
-      // exhaustion becomes a deferral rather than a verdict at this head.
+      // E2BIG and friends: the process never ran, so this rung was not reached.
       if (isTransportError(error)) transportFailure ??= lastError;
     }
   }
-  if (transportFailure) {
+  // Defer only when the ladder was never reached at all. A rung that ran and
+  // returned something to judge makes this terminal, whichever rung failed
+  // first.
+  if (transportFailure && !reachedAnyRung) {
     return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
   }
   return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
@@ -481,9 +496,43 @@ interface ReviewModelTransport {
   stdinPrompt?: string;
   /** Temp file holding the prompt; removed after the process settles. */
   promptFile?: string;
+  /** Private 0700 directory containing `promptFile`; removed with it. */
+  promptDir?: string;
 }
 
-async function buildReviewModelTransport(
+/** Owner-only directory (rwx------). */
+const PROMPT_DIR_MODE = 0o700;
+/** Owner-only file (rw-------). */
+const PROMPT_FILE_MODE = 0o600;
+
+/**
+ * Write the prompt to a file only the running user can read.
+ *
+ * Review finding (Overseer, PR #790): the prompt embeds the FULL private diff
+ * and the acceptance criteria. Writing it straight into the shared system temp
+ * directory with default permissions leaves it world-readable under a typical
+ * 022 umask, exposing repository contents to any other local user or process
+ * for as long as the judge runs.
+ *
+ * `mkdtemp` creates the directory atomically and exclusively -- no
+ * predictable-name race, and no pre-existing path can be hijacked. The mode is
+ * then set explicitly rather than trusted to the umask, and the file is written
+ * before its mode is tightened, so the window is inside a 0700 directory the
+ * whole time.
+ */
+async function writePrivatePromptFile(
+  prompt: string
+): Promise<{ promptFile: string; promptDir: string }> {
+  const promptDir = await mkdtemp(join(tmpdir(), 'overseer-review-'));
+  await chmod(promptDir, PROMPT_DIR_MODE);
+  const promptFile = join(promptDir, 'prompt.txt');
+  await writeFile(promptFile, prompt, { mode: PROMPT_FILE_MODE });
+  await chmod(promptFile, PROMPT_FILE_MODE);
+  return { promptFile, promptDir };
+}
+
+/** Exported for the permission test; not part of the review API surface. */
+export async function buildReviewModelTransport(
   binary: string,
   prompt: string
 ): Promise<ReviewModelTransport> {
@@ -493,11 +542,8 @@ async function buildReviewModelTransport(
       stdinPrompt: prompt,
     };
   }
-  const promptFile = `${tmpdir()}/overseer-review-${Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2)}.txt`;
-  await Bun.write(promptFile, prompt);
-  return { argv: [binary, '--prompt-file', promptFile], promptFile };
+  const { promptFile, promptDir } = await writePrivatePromptFile(prompt);
+  return { argv: [binary, '--prompt-file', promptFile], promptFile, promptDir };
 }
 
 export async function invokeConfiguredReviewModel(
@@ -509,12 +555,21 @@ export async function invokeConfiguredReviewModel(
   try {
     return await runReviewModelProcess(transport, binary, timeoutMs);
   } finally {
+    // Always in a finally: the prompt holds the private diff, so it must not
+    // outlive the judge process on any path -- success, throw, or timeout.
     if (transport.promptFile) {
       try {
         await unlink(transport.promptFile);
       } catch {
         // Best effort: a leaked temp prompt is far less bad than a throw that
         // would reclassify a successful review as a model_error.
+      }
+    }
+    if (transport.promptDir) {
+      try {
+        await rm(transport.promptDir, { recursive: true, force: true });
+      } catch {
+        // Same rationale: cleanup never changes the review's outcome.
       }
     }
   }
