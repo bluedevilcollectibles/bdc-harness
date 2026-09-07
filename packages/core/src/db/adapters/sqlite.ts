@@ -310,43 +310,37 @@ export class SqliteAdapter implements IDatabase {
       }
     }
     // Migration 046: older on-disk databases used a composite primary key for
-    // tm_health. That makes the DAL's ON CONFLICT (provider) invalid, so rebuild
-    // the table and retain only the newest sample for each provider.
-    const healthSchema = this.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_health'")
-      .get() as { sql?: string } | undefined;
-    const healthColumns = this.pragmaAll("PRAGMA table_info('tm_health')") as {
-      name: string;
-      pk: number;
-    }[];
-    const healthPrimaryKey = healthColumns
-      .filter(column => column.pk > 0)
-      .sort((left, right) => left.pk - right.pk)
-      .map(column => column.name);
-    if (healthSchema?.sql && healthPrimaryKey.join(',') !== 'provider') {
-      this.db.run('BEGIN');
+    // tm_health. Add a provider-only UNIQUE index (allowed by the WO) instead
+    // of rebuilding: table constraints, columns, indexes and triggers survive.
+    const hasHealthConflictTarget = (): boolean =>
+      this.db
+        .prepare(
+          `
+          SELECT 1 FROM pragma_index_list('tm_health') AS idx
+          WHERE idx."unique" = 1 AND idx.partial = 0
+            AND (SELECT COUNT(*) FROM pragma_index_info(idx.name)) = 1
+            AND (SELECT name FROM pragma_index_info(idx.name)) = 'provider'
+          LIMIT 1
+        `
+        )
+        .get() != null;
+    if (!hasHealthConflictTarget()) {
+      this.db.run('BEGIN IMMEDIATE');
       try {
-        this.db.run(`
-          CREATE TABLE tm_health_new (
-            provider TEXT PRIMARY KEY,
-            state TEXT NOT NULL,
-            sampled_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            evidence TEXT
-          );
-          INSERT INTO tm_health_new (provider, state, sampled_at, expires_at, evidence)
-          SELECT provider, state, sampled_at, COALESCE(expires_at, sampled_at), evidence
-          FROM tm_health AS sample
-          WHERE sample.rowid = (
-            SELECT candidate.rowid
-            FROM tm_health AS candidate
-            WHERE candidate.provider = sample.provider
-            ORDER BY candidate.sampled_at DESC, candidate.rowid DESC
-            LIMIT 1
-          );
-          DROP TABLE tm_health;
-          ALTER TABLE tm_health_new RENAME TO tm_health;
-        `);
+        // Another connection may have repaired it while this one awaited the
+        // writer lock. Recheck before deleting rows or creating the index.
+        if (!hasHealthConflictTarget()) {
+          this.db.run(`
+            DELETE FROM tm_health AS older
+            WHERE EXISTS (
+              SELECT 1 FROM tm_health AS newer
+              WHERE newer.provider = older.provider
+                AND (newer.sampled_at > older.sampled_at
+                  OR (newer.sampled_at = older.sampled_at AND newer.rowid > older.rowid))
+            );
+            CREATE UNIQUE INDEX tm_health_provider_unique ON tm_health(provider);
+          `);
+        }
         this.db.run('COMMIT');
       } catch (error: unknown) {
         this.db.run('ROLLBACK');
