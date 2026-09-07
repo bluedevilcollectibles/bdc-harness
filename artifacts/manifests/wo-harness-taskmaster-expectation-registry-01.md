@@ -4,7 +4,7 @@ Builder: Codex
 Files modified: packages/server/src/taskmaster/loop.ts, packages/server/src/taskmaster/loop.test.ts, packages/core/src/db/taskmaster.ts, packages/core/src/db/taskmaster.test.ts, packages/core/src/db/adapters/sqlite.ts
 Files created: migrations/047_tm_expectations.sql, packages/server/src/taskmaster/expectations.ts, packages/server/src/taskmaster/expectations.test.ts, artifacts/manifests/wo-harness-taskmaster-expectation-registry-01.md
 Tests: 218/218 (bun test packages/core/src/db/taskmaster.test.ts packages/server/src/taskmaster)
-PRs: pending creation after manifest commit
+PRs: https://github.com/thinmansoftware/bdc-harness/pull/785
 Merge ancestors:
  - thinmansoftware/bdc-harness dev HEAD: d70acb537f4088c5509e9d715f517cdbad26ba9f | manifest base: d70acb537f4088c5509e9d715f517cdbad26ba9f | behind_by: 0
  - WO-HARNESS-TASKMASTER-FIRE-ALL-PRIORITIES-01 merged head: d70acb53 (bdc-harness #746)
