@@ -34,6 +34,22 @@ beforeAll(async () => {
   primary = new PostgresAdapter(url.toString());
   secondary = new PostgresAdapter(url.toString());
   active = primary;
+  // Use the canonical Dispatch schema in this isolated loopback-test namespace.
+  for (const migration of [
+    '028_agent_dispatch.sql',
+    '029_board_authority_foundation.sql',
+    '031_board_motion_dispatch.sql',
+    '040_agent_messaging_phase0.sql',
+    '042_agent_messaging_phase1.sql',
+    '043_agent_messaging_phase15.sql',
+  ]) {
+    await primary.query(
+      readFileSync(resolve(import.meta.dir, '../../../../migrations', migration), 'utf8')
+    );
+  }
+  await primary.query(`INSERT INTO dispatch_principals
+    (principal_id, display_name, delivery_mode, active)
+    VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', TRUE)`);
   await primary.query(
     readFileSync(
       resolve(import.meta.dir, '../../../../migrations/041_taskmaster_slice1.sql'),
@@ -46,6 +62,7 @@ beforeEach(async () => {
   active = primary;
   await primary.query('DROP TRIGGER IF EXISTS reject_reset_audit ON tm_journal');
   await primary.query('TRUNCATE tm_journal');
+  await primary.query('TRUNCATE agent_dispatch_messages');
   await primary.query(
     "UPDATE tm_control SET pause_state='PAUSED', epoch=7, pause_scope='all', pause_reason='test', pause_actor='test' WHERE id=1"
   );
@@ -118,7 +135,55 @@ test('PostgreSQL notice fence rejects a reset that won before enqueue', async ()
   expect(notice).toBeNull();
   expect(
     (await primary.query('SELECT pause_state, epoch FROM tm_control WHERE id=1')).rows
-  ).toEqual([{ pause_state: 'RUNNING', epoch: 8 }]);
+  ).toEqual([{ pause_state: 'RUNNING', epoch: '8' }]);
+});
+
+test('PostgreSQL paused notice queues once with BIGINT epoch and holds its row lock', async () => {
+  const originalTransaction = primary.withTransaction.bind(primary);
+  let competingWriterError: unknown;
+  let checkedLock = false;
+  primary.withTransaction = async fn =>
+    originalTransaction(async query =>
+      fn(async <T>(sql: string, params?: unknown[]) => {
+        const result = await query<T>(sql, params);
+        if (sql.startsWith('SELECT pause_state, epoch FROM tm_control')) {
+          checkedLock = true;
+          try {
+            await secondary.withTransaction(q =>
+              q('SELECT id FROM tm_control WHERE id=1 FOR UPDATE NOWAIT')
+            );
+          } catch (error) {
+            competingWriterError = error;
+          }
+        }
+        return result;
+      })
+    );
+  const data = {
+    correlation_id: 'pg-valid-notice',
+    idempotency_key: 'tm:self-pause:7',
+    task_type: 'agent_message' as const,
+    recipient: 'duty-officer',
+    body: 'valid paused notice',
+  };
+  try {
+    const notice = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      data,
+      { taskmasterPausedEpoch: 7 }
+    );
+    expect(checkedLock).toBe(true);
+    expect((competingWriterError as { code?: string })?.code).toBe('55P03');
+    expect(notice?.status).toBe('queued');
+    primary.withTransaction = originalTransaction;
+    const retry = await createAuthenticatedMessage({ kind: 'system', sender: 'taskmaster' }, data, {
+      taskmasterPausedEpoch: 7,
+    });
+    expect(retry?.id).toBe(notice?.id);
+    expect((await primary.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
+  } finally {
+    primary.withTransaction = originalTransaction;
+  }
 });
 
 test('PostgreSQL audit failure rolls back control and pending expiration', async () => {
@@ -141,6 +206,17 @@ test('PostgreSQL audit failure rolls back control and pending expiration', async
 });
 
 describe('tm_health PostgreSQL migration 046', () => {
+  // These cases replace tm_health with drifted shapes; restore migration 041's
+  // canonical table afterwards so no later suite inherits a dropped table.
+  afterAll(async () => {
+    await primary.query('DROP TABLE IF EXISTS tm_health CASCADE');
+    await primary.query(`CREATE TABLE tm_health (
+      provider TEXT PRIMARY KEY, state TEXT NOT NULL,
+      sampled_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
+      evidence TEXT
+    )`);
+  });
+
   for (const key of ['absent', 'composite', 'provider'] as const) {
     test(`${key} primary key: preserves latest data, supports upserts, and replays safely`, async () => {
       const db = primary;

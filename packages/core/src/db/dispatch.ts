@@ -366,12 +366,16 @@ export async function createAuthenticatedMessage(
     const enqueue = async (query: DispatchQueryExecutor): Promise<DispatchMessage | null> => {
       // Serialize with resetTaskmaster, through the actual queue insertion.
       // PostgreSQL uses one pinned connection and locks the same singleton.
-      const control = await query<{ pause_state: string; epoch: number }>(
+      const control = await query<{ pause_state: string; epoch: number | string }>(
         'SELECT pause_state, epoch FROM tm_control WHERE id = 1' +
           (db.dialect === 'postgres' ? ' FOR UPDATE' : '')
       );
       const row = control.rows[0];
-      if (!row || row.pause_state === 'RUNNING' || row.epoch !== fence.taskmasterPausedEpoch) {
+      if (
+        !row ||
+        row.pause_state === 'RUNNING' ||
+        Number(row.epoch) !== fence.taskmasterPausedEpoch
+      ) {
         return null;
       }
       return createAuthenticatedMessageWithQuery(query, { bound, data });

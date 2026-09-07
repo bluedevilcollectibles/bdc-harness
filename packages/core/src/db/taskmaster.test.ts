@@ -155,6 +155,42 @@ describe('tm_journal DAL', () => {
     }
   });
 
+  test('notice fence accepts a paused epoch returned as text by the database driver', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects' });
+    const originalQuery = db.query.bind(db);
+    db.query = <T>(sql: string, params?: unknown[]) =>
+      originalQuery<T>(
+        sql.replace(
+          'SELECT pause_state, epoch FROM tm_control',
+          'SELECT pause_state, CAST(epoch AS TEXT) AS epoch FROM tm_control'
+        ),
+        params
+      );
+    try {
+      const notice = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: 'text-epoch',
+          idempotency_key: `tm:self-pause:${paused.epoch}`,
+          task_type: 'agent_message',
+          recipient: 'duty-officer',
+          body: 'valid paused notice',
+        },
+        { taskmasterPausedEpoch: paused.epoch }
+      );
+      expect(notice?.status).toBe('queued');
+      expect(
+        (await db.query("SELECT id FROM agent_dispatch_messages WHERE correlation_id='text-epoch'"))
+          .rowCount
+      ).toBe(1);
+    } finally {
+      db.query = originalQuery;
+    }
+  });
+
   test('notice fence cannot be used by a different system sender', async () => {
     await expect(
       createAuthenticatedMessage(
