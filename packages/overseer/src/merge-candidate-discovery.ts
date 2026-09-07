@@ -86,6 +86,7 @@ export type MergeCandidateExclusionReason =
   | 'not_mergeable'
   | 'mergeable_unknown'
   | 'evidence_lookup_failed'
+  | 'evidence_mismatch'
   | 'already_a_run_candidate';
 
 export interface MergeCandidateExclusion {
@@ -212,6 +213,68 @@ export function classifyPullRequestEvidence(
   return null;
 }
 
+/**
+ * Verify that fetched evidence actually describes the PR we listed.
+ *
+ * THE DEFECT THIS CLOSES (Overseer review of d62d6dd5, [major])
+ * ------------------------------------------------------------
+ * `findPullRequest` is addressed by head BRANCH and WO id, neither of which is
+ * a unique key. Two open PRs can carry the same `headRef` (a fork and the
+ * upstream, or two forks, all pushing `fix/thing`), and one WO id routinely
+ * spans several PRs. The lookup therefore returns *a* pull request, not
+ * necessarily *this* one -- and the caller was accepting it unconditionally.
+ * The result is the worst possible shape of wrong: PR A's listing (its title,
+ * its APPROVED review decision) fused to PR B's evidence (B's green checks, B's
+ * clean mergeable state), emitted as one `merge_ready` record whose downstream
+ * merge targets whichever number the record carries. An approval on one PR
+ * would authorize a merge of another.
+ *
+ * The bind is on BOTH coordinates and both are required:
+ *
+ *  - `evidence.pr.number` must equal `pr.prNumber`. This is the identity check.
+ *    A missing `pr` ref cannot be waved through: absent identity is unverified
+ *    identity, and the whole point is to stop accepting unverified identity.
+ *  - `evidence.headSha` must equal `pr.headSha`. This is the freshness check.
+ *    Even for the right PR, evidence read after a push describes a DIFFERENT
+ *    commit than the one whose review decision we classified. Admitting it
+ *    would approve code no one reviewed -- the same stale-head hole the Review
+ *    Gate closes downstream with `commitId === headSha`, closed here too so a
+ *    candidate is never built on a moved head in the first place.
+ *
+ * Fails CLOSED in every uncertain direction: a mismatch, an absent `pr` ref and
+ * an absent `headSha` all exclude. Excluding a good PR costs one tick (the
+ * sweep is idempotent and re-evaluates next cycle); admitting a mis-bound one
+ * merges the wrong code.
+ */
+export function classifyEvidenceBinding(
+  pr: DiscoveredPullRequest,
+  evidence: PullRequestEvidence
+): MergeCandidateExclusionReason | null {
+  // A failed or empty lookup carries no identity to bind, but "we did not learn
+  // anything" is a different operator fact from "we learned about the WRONG PR".
+  // Yield to `evidence_lookup_failed` so a transient API outage never reads as
+  // an ambiguity in the repo.
+  if (evidence.lookupFailed || !evidence.exists) return 'evidence_lookup_failed';
+  if (evidence.pr?.number !== pr.prNumber) return 'evidence_mismatch';
+  if (!evidence.headSha || evidence.headSha !== pr.headSha) return 'evidence_mismatch';
+  return null;
+}
+
+/** Human-readable amplification of a binding exclusion. Names both coordinates. */
+function bindingDetail(
+  reason: MergeCandidateExclusionReason,
+  pr: DiscoveredPullRequest,
+  evidence: PullRequestEvidence
+): string {
+  if (reason === 'evidence_lookup_failed') return evidenceDetail(reason, evidence);
+  if (evidence.pr?.number !== pr.prNumber) {
+    const found = evidence.pr === undefined ? 'no pr ref' : `#${evidence.pr.number}`;
+    return `evidence resolved to ${found} while listing #${pr.prNumber} -- ambiguous head branch or WO id`;
+  }
+  const found = evidence.headSha ? evidence.headSha : 'no head sha';
+  return `evidence head ${found} does not match listed head ${pr.headSha} -- stale evidence for a moved head`;
+}
+
 function detailFor(reason: MergeCandidateExclusionReason, pr: DiscoveredPullRequest): string {
   switch (reason) {
     case 'draft':
@@ -260,25 +323,37 @@ function evidenceDetail(
  * `runId` is namespaced `pr-discovery:` on purpose. It is NOT a workflow run id
  * and must never be mistaken for one: downstream `insertOverseerAction` rows
  * carry it, and a reader has to be able to tell at a glance that this candidate
- * came from the PR sweep rather than from a run. The provenance gate compares a
- * run worktree against the PR head; with no worktree there is nothing to
- * compare, so these candidates hold there exactly as an unattributable run
- * would. That is the correct, fail-closed outcome -- discovery widens what is
- * LOOKED AT, never what is authorized.
+ * came from the PR sweep rather than from a run.
+ *
+ * PROVENANCE (John, 2026-09-07: "always merge on green, you do not need to ask
+ * me"). The provenance gate compares a RUN'S OWN WORKTREE tip against the PR
+ * head. A PR-discovered candidate has no run and so no worktree, which means
+ * that check could only ever answer `working_path_missing` -- holding every
+ * such PR permanently and recreating, one layer down, exactly the deadlock this
+ * module was written to clear. For these candidates provenance is therefore
+ * recorded as the named condition `provenance_no_run` and does not block.
+ *
+ * Nothing else relaxes. The merge still requires an exact-head approval from
+ * the Review Gate identity, all required checks SUCCESS, a CLEAN mergeable
+ * state, an allowed base, and it still hits the production-effect hold and the
+ * Grok judge where configured. `provenance_no_run` is an ABSENT run, which is a
+ * different fact from an UNVERIFIABLE one: a real run whose worktree was swept
+ * still fails closed, because for it "which commit did this run produce" is a
+ * real question we merely could not answer.
  */
 export function buildDiscoveredCandidateRecord(
   pr: DiscoveredPullRequest,
   evidence: PullRequestEvidence
 ): WatchedRunRecord {
   return {
-    runId: `pr-discovery:${pr.owner}/${pr.repo}#${pr.prNumber}`,
+    runId: `${PR_DISCOVERY_RUN_ID_PREFIX}${pr.owner}/${pr.repo}#${pr.prNumber}`,
     woId: pr.woId ?? `gh:${pr.owner}/${pr.repo}#${pr.prNumber}`,
     owner: pr.owner,
     repo: pr.repo,
     status: 'pr_discovered',
     headBranch: pr.headRef,
     metadata: {
-      discovery_source: 'pr_first_sweep',
+      discovery_source: PR_DISCOVERY_SOURCE,
       base_branch: pr.baseRef,
       head_sha: pr.headSha,
       pr_number: String(pr.prNumber),
@@ -312,6 +387,42 @@ export interface DiscoverMergeCandidatesOptions {
 
 export function pullRequestKey(owner: string, repo: string, prNumber: number): string {
   return `${owner.toLowerCase()}/${repo.toLowerCase()}#${prNumber}`;
+}
+
+/** Prefix marking a synthetic runId minted by the PR-first sweep, not a workflow run. */
+export const PR_DISCOVERY_RUN_ID_PREFIX = 'pr-discovery:' as const;
+
+/** Metadata marker written on every PR-discovered candidate. */
+export const PR_DISCOVERY_SOURCE = 'pr_first_sweep' as const;
+
+/**
+ * True only for candidates this module minted -- a PR found by sweeping GitHub
+ * that has NO originating Cauldron run.
+ *
+ * Load-bearing for the provenance rule (John, 2026-09-07: "always merge on
+ * green, you do not need to ask me"). A PR-discovered candidate has no run and
+ * therefore no engine-written worktree to bind a head SHA against, so the
+ * provenance gate can only ever report `working_path_missing` for it -- which
+ * held every such PR forever and is precisely the deadlock #758 set out to
+ * clear.
+ *
+ * BOTH markers are required, and that is deliberate. A real workflow run whose
+ * worktree was swept must keep failing provenance closed: it HAS a run, so
+ * "which commit did that run produce" is a real question with a real answer we
+ * simply could not read, and skipping the check there would let a merge proceed
+ * on an unverified claim. Requiring the synthetic `pr-discovery:` runId AND the
+ * discovery metadata means only a record this sweep built can take the relaxed
+ * path; a run-derived record can never impersonate one by losing a field.
+ */
+export function isPullRequestDiscoveredCandidate(record: {
+  runId?: string;
+  metadata?: Record<string, unknown>;
+}): boolean {
+  return (
+    typeof record.runId === 'string' &&
+    record.runId.startsWith(PR_DISCOVERY_RUN_ID_PREFIX) &&
+    record.metadata?.discovery_source === PR_DISCOVERY_SOURCE
+  );
 }
 
 /**
@@ -396,6 +507,11 @@ export async function discoverMergeCandidates(
           repo: pr.repo,
           headBranch: pr.headRef,
           woId: pr.woId,
+          // The unique key, passed so an adapter that can address a PR directly
+          // resolves THIS one instead of searching by the ambiguous branch/WO.
+          // Optional in the contract, so existing implementations that ignore it
+          // still work -- and are still caught by the binding check below.
+          prNumber: pr.prNumber,
         });
       } catch {
         exclusions.push({
@@ -404,6 +520,24 @@ export async function discoverMergeCandidates(
           prNumber: pr.prNumber,
           reason: 'evidence_lookup_failed',
           detail: 'PR evidence lookup threw -- state unknown, will be retried next tick',
+        });
+        continue;
+      }
+
+      // BIND FIRST, then read. A lookup addressed by branch/WO id can return a
+      // DIFFERENT pull request (duplicate head branches across forks, one WO id
+      // spanning several PRs) or the right one at a MOVED head. Checking the
+      // substantive predicates before identity would report `checks_failing` or
+      // `not_mergeable` about a PR we never asked for -- a wrong reason attached
+      // to the wrong number, which is worse than no reason at all.
+      const bindingReason = classifyEvidenceBinding(pr, evidence);
+      if (bindingReason) {
+        exclusions.push({
+          owner: pr.owner,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+          reason: bindingReason,
+          detail: bindingDetail(bindingReason, pr, evidence),
         });
         continue;
       }

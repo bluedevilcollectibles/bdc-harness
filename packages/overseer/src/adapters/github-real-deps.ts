@@ -143,10 +143,24 @@ export interface RealGitHubOctokitLike {
       repo: string;
       pull_number: number;
       per_page: number;
+      /**
+       * 1-based page. REQUIRED to read past review 100: a busy PR's LATEST
+       * review -- exactly where a late CHANGES_REQUESTED lands -- falls off the
+       * first page, and an unpaginated read cannot see it.
+       */
+      page?: number;
     }): Promise<{
       data: { user: { login?: string | null } | null; state: string; commit_id: string }[];
     }>;
   };
+  /**
+   * GraphQL entry point. Optional so narrow test mocks and any REST-only client
+   * keep type-checking. When present, PR-first discovery reads GitHub's OWN
+   * aggregate `reviewDecision` -- which alone accounts for required approval
+   * counts and CODEOWNERS rules that REST reviews cannot express -- instead of
+   * deriving a substitute.
+   */
+  graphql?: (query: string, variables?: Record<string, unknown>) => Promise<unknown>;
   search: {
     issuesAndPullRequests(input: Record<string, unknown>): Promise<{
       data: { items: { number: number; pull_request?: unknown; repository_url?: string }[] };
@@ -505,9 +519,14 @@ export function createRealFindPullRequest(
   return async (input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence> => {
     if (now() < rateLimitBackoffUntil) return LOOKUP_FAILED_EVIDENCE;
     try {
-      let prNumber: number | null = null;
+      // An explicit number is the only UNIQUE key GitHub offers here. When the
+      // caller has it (PR-first discovery always does), address the PR directly
+      // and skip the branch/WO search entirely -- `pulls.list` by head branch
+      // takes `data[0]` of up to 5 matches, so a branch name shared across forks
+      // resolves to whichever GitHub happened to order first.
+      let prNumber: number | null = input.prNumber ?? null;
 
-      if (input.headBranch) {
+      if (prNumber === null && input.headBranch) {
         const list = await octokit.pulls.list({
           owner: input.owner,
           repo: input.repo,
@@ -824,35 +843,118 @@ export function createRealSubmitPullRequestReview(
   };
 }
 
+/** Env var naming the Review Gate identity whose approval a candidate requires. */
+export const DISCOVERY_REVIEW_GATE_LOGIN_ENV = 'MERGE_MANAGER_REVIEW_GATE_LOGIN' as const;
+
+/** The Overseer App identity. Same default the Merge Manager's Review Gate uses. */
+export const DEFAULT_REVIEW_GATE_LOGIN = 'thinman-overseer[bot]' as const;
+
+export function resolveReviewGateLogin(
+  raw: string | undefined = process.env[DISCOVERY_REVIEW_GATE_LOGIN_ENV]
+): string {
+  const trimmed = (raw ?? '').trim();
+  return trimmed === '' ? DEFAULT_REVIEW_GATE_LOGIN : trimmed;
+}
+
+/** One review as the derivation reads it. `commitId` is the head it was left on. */
+export interface ReviewForDecision {
+  readonly login: string;
+  readonly state: string;
+  readonly commitId?: string;
+}
+
+export interface DeriveReviewDecisionOptions {
+  /** Current PR head. An approval on any other commit does not count. */
+  readonly headSha?: string;
+  /** Identity that must be among the approvers. Defaults to the env/Overseer bot. */
+  readonly reviewGateLogin?: string;
+  /**
+   * True when the caller could not prove it read EVERY review (a page was
+   * dropped, the listing threw). An incomplete set can hide a later
+   * CHANGES_REQUESTED, so it can never yield APPROVED.
+   */
+  readonly reviewsIncomplete?: boolean;
+}
+
 /**
- * Aggregate a PR's review decision from its individual reviews (bdc-harness#758).
+ * Derive a PR's review decision CONSERVATIVELY from its individual reviews.
  *
- * GitHub exposes `reviewDecision` only on the GraphQL PullRequest type; the REST
- * listing this adapter uses does not carry it, so it is DERIVED here using the
- * same rule GitHub applies: only each reviewer's LATEST state counts, a single
- * outstanding CHANGES_REQUESTED beats any number of approvals, and COMMENTED /
- * DISMISSED / PENDING states do not constitute a decision.
+ * THE DEFECT THIS CLOSES (Overseer review of d62d6dd5, [major])
+ * ------------------------------------------------------------
+ * The previous derivation returned APPROVED whenever any one reviewer's latest
+ * state was APPROVED. That is not what GitHub's aggregate `reviewDecision`
+ * means, and every gap between the two is in the PERMISSIVE direction -- it
+ * admits PRs GitHub still considers review-required:
  *
- * Returns null when no reviewer has left an APPROVED or CHANGES_REQUESTED state.
- * Null means "no decision recorded", never "approved" -- the caller treats
- * anything other than the literal 'APPROVED' as not approved.
+ *  - REQUIRED APPROVAL COUNT. A branch requiring two approvals reads APPROVED
+ *    off one. REST reviews cannot see the requirement at all.
+ *  - CODE OWNERS. An approval from someone who owns none of the touched paths
+ *    does not satisfy a CODEOWNERS rule, but looked identical here.
+ *  - STALE COMMIT. An approval carries the `commit_id` it was left on. After a
+ *    push it is stale and GitHub drops it from the aggregate (with dismiss-stale
+ *    enabled), yet it still read as APPROVED -- authorizing a merge of code no
+ *    one reviewed. This is the sharpest one: it turns discovery into a path
+ *    around the Review Gate's own exact-head check.
+ *  - PAGINATION. `per_page: 100` unpaginated. Review 101 -- typically the LATEST,
+ *    which on a busy PR is where a CHANGES_REQUESTED lands -- was invisible.
+ *
+ * Since REST cannot answer the first two at all, this derivation does not
+ * pretend to reconstruct GitHub's aggregate. It substitutes a STRICTER
+ * predicate that the merge path already requires downstream, and only ever
+ * errs toward not-approved:
+ *
+ *   (a) every review is read (see `reviewsIncomplete`),
+ *   (b) an APPROVED counts only when its `commitId` equals the current head,
+ *   (c) any standing CHANGES_REQUESTED blocks outright,
+ *   (d) the Review Gate identity must be among the surviving approvers.
+ *
+ * (d) is what makes the strictness sound: the Merge Manager's `mergePreconditionMiss`
+ * already refuses to merge without an exact-head APPROVED from that identity, so
+ * requiring it at discovery admits nothing the merge path would not, and drops
+ * PRs it would have refused later anyway. Where this is stricter than GitHub's
+ * aggregate the cost is a PR that waits; where it is looser the cost is a wrong
+ * merge. Prefer waiting. `createRealListOpenPullRequests` prefers GitHub's real
+ * aggregate over this whenever a GraphQL client is available.
+ *
+ * Returns 'CHANGES_REQUESTED', 'APPROVED', or null. Null means "no decision
+ * established" and is never treated as approval by the caller.
  */
 export function deriveReviewDecision(
-  reviews: readonly { login: string; state: string }[]
+  reviews: readonly ReviewForDecision[],
+  options: DeriveReviewDecisionOptions = {}
 ): string | null {
-  const latestByReviewer = new Map<string, string>();
+  const latestByReviewer = new Map<string, ReviewForDecision>();
   for (const review of reviews) {
     const state = review.state.toUpperCase();
     // COMMENTED and PENDING never replace a reviewer's standing verdict --
     // that is GitHub's own rule, and collapsing them would silently clear a
     // CHANGES_REQUESTED when the same reviewer later left a plain comment.
     if (state !== 'APPROVED' && state !== 'CHANGES_REQUESTED' && state !== 'DISMISSED') continue;
-    latestByReviewer.set(review.login.toLowerCase(), state);
+    latestByReviewer.set(review.login.toLowerCase(), { ...review, state });
   }
-  const states = [...latestByReviewer.values()];
-  if (states.includes('CHANGES_REQUESTED')) return 'CHANGES_REQUESTED';
-  if (states.includes('APPROVED')) return 'APPROVED';
-  return null;
+
+  const latest = [...latestByReviewer.values()];
+
+  // A standing objection blocks even on an incomplete read: seeing one is
+  // proof, unlike not seeing one.
+  if (latest.some(review => review.state === 'CHANGES_REQUESTED')) return 'CHANGES_REQUESTED';
+
+  // Beyond here we would be asserting the ABSENCE of an objection, which an
+  // incomplete listing cannot support. Unknown is not approved.
+  if (options.reviewsIncomplete) return null;
+
+  // Without a head to compare against, staleness is unknowable -- and an
+  // approval that cannot be proven current is not proven at all.
+  const headSha = options.headSha;
+  if (!headSha) return null;
+
+  const gateLogin = (options.reviewGateLogin ?? resolveReviewGateLogin()).toLowerCase();
+  const approvedOnHead = latest.filter(
+    review => review.state === 'APPROVED' && review.commitId === headSha
+  );
+  if (approvedOnHead.length === 0) return null;
+  if (!approvedOnHead.some(review => review.login.toLowerCase() === gateLogin)) return null;
+  return 'APPROVED';
 }
 
 /** Pull a WO id out of a PR title or body, so evidence lookup can search by it. */
@@ -861,27 +963,166 @@ export function extractWoId(title: string, body: string | null | undefined): str
   return match?.[0];
 }
 
+/** Hard ceiling on review pages read per PR, so one pathological PR cannot spin the tick. */
+const MAX_REVIEW_PAGES = 10;
+const REVIEW_PAGE_SIZE = 100;
+
+interface GraphQLReviewDecisionNode {
+  number?: number;
+  reviewDecision?: string | null;
+}
+
+/**
+ * Read GitHub's OWN aggregate `reviewDecision` for the listed PRs.
+ *
+ * This is the authoritative answer and is preferred over any local derivation,
+ * because it is the only source that accounts for required approval COUNTS and
+ * CODEOWNERS rules -- neither of which appears anywhere in the REST reviews
+ * listing, and both of which the REST derivation was silently ignoring.
+ *
+ * Returns a map of PR number to decision. A PR missing from the map (or a
+ * wholesale failure, which returns an empty map) falls back to the conservative
+ * REST derivation -- never to an assumed approval.
+ */
+export async function fetchReviewDecisions(
+  octokit: RealGitHubOctokitLike,
+  input: { owner: string; repo: string; prNumbers: readonly number[] }
+): Promise<Map<number, string | null>> {
+  const decisions = new Map<number, string | null>();
+  if (!octokit.graphql || input.prNumbers.length === 0) return decisions;
+
+  // One aliased field per PR: GraphQL has no "pullRequests(numbers:)" filter,
+  // so aliasing is how a batch is requested in a single round trip.
+  const fields = input.prNumbers
+    .map(number => `  pr${number}: pullRequest(number: ${number}) { number reviewDecision }`)
+    .join('\n');
+  const query = `query($owner: String!, $repo: String!) {\n  repository(owner: $owner, name: $repo) {\n${fields}\n  }\n}`;
+
+  try {
+    // Invoked through `octokit` so a real client method keeps its receiver.
+    const response = (await octokit.graphql?.(query, {
+      owner: input.owner,
+      repo: input.repo,
+    })) as { repository?: Record<string, GraphQLReviewDecisionNode | null> } | null;
+    const repository = response?.repository;
+    if (!repository) return decisions;
+    for (const node of Object.values(repository)) {
+      if (!node || typeof node.number !== 'number') continue;
+      decisions.set(node.number, node.reviewDecision ?? null);
+    }
+  } catch {
+    // A GraphQL outage must not admit anything: an empty map means every PR
+    // falls back to the conservative derivation, which fails closed.
+    return new Map<number, string | null>();
+  }
+  return decisions;
+}
+
+/**
+ * Read EVERY review on a PR, following pages.
+ *
+ * `per_page: 100` unpaginated was the bug: review 101 is invisible, and on a
+ * busy PR the latest review -- where a late CHANGES_REQUESTED lands -- is
+ * exactly the one past the first page. `complete` reports whether the whole set
+ * was actually read; the derivation refuses to return APPROVED when it was not,
+ * because asserting the absence of an objection requires having looked
+ * everywhere it could be.
+ */
+export async function fetchAllPullRequestReviews(
+  octokit: RealGitHubOctokitLike,
+  input: { owner: string; repo: string; prNumber: number }
+): Promise<{ reviews: ReviewForDecision[]; complete: boolean }> {
+  if (!octokit.pulls.listReviews) return { reviews: [], complete: false };
+  // Called through `octokit.pulls` rather than detached, so a real client method
+  // keeps its receiver.
+  const listReviews: NonNullable<RealGitHubOctokitLike['pulls']['listReviews']> = args =>
+    octokit.pulls.listReviews?.(args) ?? Promise.resolve({ data: [] });
+
+  const reviews: ReviewForDecision[] = [];
+  for (let page = 1; page <= MAX_REVIEW_PAGES; page += 1) {
+    let batch: Awaited<ReturnType<typeof listReviews>>;
+    try {
+      batch = await listReviews({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+        per_page: REVIEW_PAGE_SIZE,
+        page,
+      });
+    } catch {
+      // A dropped page means an unread review may exist. Return what we have,
+      // flagged incomplete, so the derivation cannot conclude APPROVED.
+      return { reviews, complete: false };
+    }
+
+    const data = batch.data ?? [];
+    for (const review of data) {
+      reviews.push({
+        login: review.user?.login ?? '',
+        state: review.state,
+        commitId: review.commit_id,
+      });
+    }
+    // A short page is the last page.
+    if (data.length < REVIEW_PAGE_SIZE) return { reviews, complete: true };
+  }
+  // Hit the page ceiling with full pages throughout: more may remain unread.
+  return { reviews, complete: false };
+}
+
+export interface RealListOpenPullRequestsOptions {
+  /** Review Gate identity required among approvers. Defaults to env/Overseer bot. */
+  readonly reviewGateLogin?: string;
+}
+
 /**
  * Real listOpenPullRequests for PR-first merge candidate discovery
  * (bdc-harness#758). Lists open PRs, filters to the watched base branches, and
- * derives each one's review decision from its reviews.
+ * resolves each one's review decision.
  *
- * Every field is populated from live API data. A PR whose review listing fails
- * gets `reviewDecision: null` -- which excludes it as `review_not_approved`
- * rather than admitting it on an assumption. Failing closed on an unknown
- * review state is the only safe direction for a merge candidate.
+ * TWO SOURCES, IN ORDER OF AUTHORITY:
+ *
+ *  1. GitHub's own aggregate `reviewDecision` via GraphQL, batched into a
+ *     single query for the whole page of PRs. Preferred whenever a GraphQL
+ *     client is present, because it is the ONLY source that accounts for
+ *     required approval counts and CODEOWNERS rules -- neither is expressible
+ *     in the REST reviews listing at all.
+ *  2. Otherwise the conservative REST derivation: every review paginated, only
+ *     approvals on the current head counted, any standing CHANGES_REQUESTED
+ *     blocking, and the Review Gate identity required among the approvers.
+ *
+ * Every field is populated from live API data. A PR whose review listing fails,
+ * or whose pages could not all be read, gets `reviewDecision: null` -- which
+ * excludes it as `review_not_approved` rather than admitting it on an
+ * assumption. Failing closed on an unknown review state is the only safe
+ * direction for a merge candidate.
  */
 export function createRealListOpenPullRequests(
-  octokit: RealGitHubOctokitLike
+  octokit: RealGitHubOctokitLike,
+  options: RealListOpenPullRequestsOptions = {}
 ): (input: GitHubOpenPullRequestListInput) => Promise<readonly DiscoveredPullRequest[]> {
   return async (input: GitHubOpenPullRequestListInput) => {
     const bases = (input.baseBranches ?? []).map(base => base.trim().toLowerCase()).filter(Boolean);
+    const reviewGateLogin = options.reviewGateLogin ?? resolveReviewGateLogin();
     const listed = await octokit.pulls.list({
       owner: input.owner,
       repo: input.repo,
       state: 'open',
       per_page: 100,
     });
+
+    const matchesBase = (baseRef: string): boolean =>
+      bases.length === 0 || bases.includes(baseRef.trim().toLowerCase());
+
+    // Batch GitHub's authoritative decision for every PR we will actually
+    // evaluate. PRs on unwatched bases are excluded upstream on base grounds,
+    // so spending query budget on them buys nothing.
+    const graphqlDecisions = await fetchReviewDecisions(octokit, {
+      owner: input.owner,
+      repo: input.repo,
+      prNumbers: listed.data.filter(pr => matchesBase(pr.base?.ref ?? '')).map(pr => pr.number),
+    });
+
     const discovered: DiscoveredPullRequest[] = [];
     for (const pr of listed.data) {
       const baseRef = pr.base?.ref ?? '';
@@ -889,7 +1130,7 @@ export function createRealListOpenPullRequests(
       // targeting an unwatched base is still COUNTED as evaluated upstream and
       // reports `base_branch_not_watched`, instead of silently not existing --
       // silent absence is the exact failure #758 is about.
-      if (bases.length > 0 && !bases.includes(baseRef.trim().toLowerCase())) {
+      if (!matchesBase(baseRef)) {
         discovered.push({
           owner: input.owner,
           repo: input.repo,
@@ -906,25 +1147,22 @@ export function createRealListOpenPullRequests(
         continue;
       }
 
+      // GitHub's own answer wins whenever we have it -- it is the aggregate the
+      // REST derivation can only approximate.
       let reviewDecision: string | null = null;
-      if (octokit.pulls.listReviews) {
-        try {
-          const reviews = await octokit.pulls.listReviews({
-            owner: input.owner,
-            repo: input.repo,
-            pull_number: pr.number,
-            per_page: 100,
-          });
-          reviewDecision = deriveReviewDecision(
-            reviews.data.map(review => ({
-              login: review.user?.login ?? '',
-              state: review.state,
-            }))
-          );
-        } catch {
-          // Unknown review state stays unknown, and unknown is not approved.
-          reviewDecision = null;
-        }
+      if (graphqlDecisions.has(pr.number)) {
+        reviewDecision = graphqlDecisions.get(pr.number) ?? null;
+      } else {
+        const { reviews, complete } = await fetchAllPullRequestReviews(octokit, {
+          owner: input.owner,
+          repo: input.repo,
+          prNumber: pr.number,
+        });
+        reviewDecision = deriveReviewDecision(reviews, {
+          headSha: pr.head.sha,
+          reviewGateLogin,
+          reviewsIncomplete: !complete,
+        });
       }
 
       discovered.push({

@@ -480,3 +480,141 @@ describe('watchOnce integration -- discovered PRs reach the outcome set', () => 
     expect(logged.some(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated')).toBe(true);
   });
 });
+
+/**
+ * EVIDENCE BINDING (Overseer [major] on d62d6dd5).
+ *
+ * `findPullRequest` is addressed by head BRANCH and WO id. Neither is unique:
+ * two forks can push the same branch name, and one WO id routinely spans
+ * several PRs. Discovery was accepting whatever came back without checking it
+ * described the PR it had listed -- so PR A's APPROVED listing could be fused
+ * to PR B's green checks and clean mergeable state and emitted as one
+ * merge_ready record. These tests pin that a mis-bound or stale-head evidence
+ * response excludes with a NAMED reason instead of becoming a candidate.
+ */
+describe('merge candidate discovery -- evidence binding', () => {
+  test('two PRs sharing a head branch do not borrow each other evidence', async () => {
+    // Both PRs push `fix/shared` (upstream and a fork). The lookup resolves by
+    // branch and always answers with #800's evidence -- green and clean.
+    const upstream = pr({ prNumber: 800, headRef: 'fix/shared', headSha: 'sha-800' });
+    const fork = pr({ prNumber: 801, headRef: 'fix/shared', headSha: 'sha-801' });
+
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [upstream, fork],
+        // Branch-keyed lookup: the exact ambiguity the finding describes.
+        findPullRequest: async () => greenEvidence(800),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    // #800 binds and is a candidate. #801 must NOT inherit #800's greenness.
+    expect(result.candidates.map(candidate => candidate.metadata?.pr_number)).toEqual(['800']);
+
+    const mismatch = result.exclusions.find(exclusion => exclusion.prNumber === 801);
+    expect(mismatch?.reason).toBe('evidence_mismatch');
+    expect(mismatch?.detail).toContain('#800');
+    expect(mismatch?.detail).toContain('#801');
+  });
+
+  test('an ambiguous WO match resolving to another PR excludes rather than merges it', async () => {
+    // One WO id spanning two PRs; the search returns the WRONG one.
+    const listed = pr({ prNumber: 810, woId: 'WO-HARNESS-THING-01', headSha: 'sha-810' });
+
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [listed],
+        findPullRequest: async () => ({ ...greenEvidence(999), headSha: 'sha-810' }),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions[0]?.reason).toBe('evidence_mismatch');
+    expect(result.exclusions[0]?.prNumber).toBe(810);
+  });
+
+  // Right PR, WRONG COMMIT. Evidence read after a push describes a different
+  // commit than the one whose review decision was classified; admitting it
+  // would build a candidate on unreviewed code.
+  test('evidence for a stale head excludes rather than becoming a candidate', async () => {
+    const listed = pr({ prNumber: 820, headSha: 'sha-new' });
+
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [listed],
+        findPullRequest: async () => ({ ...greenEvidence(820), headSha: 'sha-old' }),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions[0]?.reason).toBe('evidence_mismatch');
+    expect(result.exclusions[0]?.detail).toContain('sha-old');
+    expect(result.exclusions[0]?.detail).toContain('sha-new');
+  });
+
+  // Absent identity is UNVERIFIED identity. Waving it through is exactly the
+  // acceptance-without-checking the finding is about.
+  test('evidence with no pr ref and no head sha is excluded, not trusted', async () => {
+    const listed = pr({ prNumber: 830, headSha: 'sha-830' });
+
+    const noRef = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [listed],
+        findPullRequest: async () => {
+          const evidence = { ...greenEvidence(830) };
+          delete (evidence as { pr?: unknown }).pr;
+          return evidence;
+        },
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+    expect(noRef.candidates).toHaveLength(0);
+    expect(noRef.exclusions[0]?.reason).toBe('evidence_mismatch');
+
+    const noSha = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [listed],
+        findPullRequest: async () => {
+          const evidence = { ...greenEvidence(830) };
+          delete (evidence as { headSha?: unknown }).headSha;
+          return evidence;
+        },
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+    expect(noSha.candidates).toHaveLength(0);
+    expect(noSha.exclusions[0]?.reason).toBe('evidence_mismatch');
+  });
+
+  // A transient outage is a DIFFERENT operator fact from an ambiguity in the
+  // repo, and must keep its own name.
+  test('a failed lookup still reports evidence_lookup_failed, not a mismatch', async () => {
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [pr({ prNumber: 840 })],
+        findPullRequest: async () => lookupFailedEvidence(),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.exclusions[0]?.reason).toBe('evidence_lookup_failed');
+  });
+
+  test('the exact PR number is passed to the lookup so an adapter can disambiguate', async () => {
+    const seen: (number | undefined)[] = [];
+    await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [pr({ prNumber: 850, headSha: 'sha-850' })],
+        findPullRequest: async input => {
+          seen.push(input.prNumber);
+          return { ...greenEvidence(850), headSha: 'sha-850' };
+        },
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(seen).toEqual([850]);
+  });
+});

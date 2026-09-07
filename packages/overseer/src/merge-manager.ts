@@ -476,9 +476,29 @@ export function createMergeManager(
     // Provenance gate (John, 2026-07-23: "only act on runs it actually oversaw").
     // Runs BEFORE the judge: if we cannot attribute this PR to this run, there is
     // nothing worth judging. Fails closed -- any unresolvable input holds.
+    //
+    // One exception, added on John's 2026-09-07 ruling ("always merge on green,
+    // you do not need to ask me"): a PR-first DISCOVERED candidate has no
+    // originating run and so no worktree to bind against. That is an ABSENT run,
+    // not an unverified one, and it does not hold -- see merge-provenance.ts.
+    // It is recorded and logged by name so the relaxation is never silent.
     const provenance = await verifyMergeProvenance(record, evidence.record.prEvidence.headSha, {
       readWorktreeHeadSha,
     });
+    if (provenance.verified && provenance.reason === 'no_run') {
+      await recordManagerAction(deps, record, 'provenance_no_run', 'provenance_no_run');
+      log.info(
+        {
+          runId: record.runId,
+          woId: record.woId,
+          prNumber: evidence.pr_number,
+          prHeadSha: provenance.prHeadSha,
+          baseBranch: evidence.base_branch,
+          mode,
+        },
+        'merge_manager.provenance_no_run -- PR-discovered candidate, no originating run; proceeding on green'
+      );
+    }
     if (!provenance.verified) {
       await recordManagerAction(deps, record, 'merge_denied', `provenance_${provenance.reason}`);
       log.warn(

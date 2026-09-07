@@ -148,6 +148,15 @@ export interface GitHubPullRequestSearchInput {
   repo: string;
   headBranch?: string;
   woId?: string;
+  /**
+   * Exact pull request number, when the caller already knows it (PR-first
+   * discovery does). `headBranch` and `woId` are both NON-UNIQUE -- two forks
+   * can push the same branch name and one WO id can span several PRs -- so an
+   * implementation that can address a PR directly should prefer this. Optional:
+   * implementations may ignore it, and callers verify the returned evidence
+   * binds to the PR they asked about regardless.
+   */
+  prNumber?: number;
 }
 
 export interface GitHubPullRequestMergeInput extends PullRequestRef {
