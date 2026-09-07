@@ -50,7 +50,7 @@ interface ResultMapping {
 }
 
 function mapSubmitOutcome(
-  disposition: Exclude<SubmitDisposition, 'checks_pending'>
+  disposition: Exclude<SubmitDisposition, 'checks_pending' | 'superseded_head'>
 ): ResultMapping {
   switch (disposition) {
     case 'approved':
@@ -132,7 +132,12 @@ export async function tickReviewWorkerClock(
         // CHECKS PENDING is non-terminal: release the claim (not postResult) with
         // a backoff so the item is retried on a later tick once CI concludes,
         // rather than orphaned or re-polled every tick.
-        if (outcome.disposition === 'checks_pending') {
+        //
+        // SUPERSEDED HEAD (#777 review finding) is non-terminal for the same
+        // reason: the PR moved before a required-contexts BLOCK could be
+        // recorded, so the item is requeued and re-evaluated against the new
+        // head rather than terminated for a head nobody reviewed.
+        if (outcome.disposition === 'checks_pending' || outcome.disposition === 'superseded_head') {
           await deps.releaseMessage({
             id: claimed.id,
             worker_id: REVIEW_WORKER_ID,

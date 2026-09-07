@@ -175,6 +175,27 @@ describe('review worker clock', () => {
     }
   );
 
+  // #777 review finding: a head superseded before a required-contexts BLOCK is
+  // NON-terminal. It must be released and requeued for the new head, never
+  // posted as a terminal result -- posting would retire the work item for a
+  // head nobody reviewed.
+  test('releases (never posts) a superseded-head item so the new head is reviewed', async () => {
+    const deps = fakeDeps([message('superseded', 'exact-head')], () => ({
+      disposition: 'superseded_head',
+      reason: 'head_advanced_before_required_contexts_block',
+    }));
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
+    const releaseArg = (deps.releaseMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      id: string;
+    };
+    expect(releaseArg.id).toBe('superseded');
+    // Not terminal: nothing is posted, so the item stays claimable for head B.
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
   // WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01: a checks-pending item is
   // released (not posted as a result) with a future not_before, and is retried
   // until it reaches a terminal disposition.

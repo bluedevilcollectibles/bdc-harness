@@ -321,6 +321,90 @@ describe('required contexts unavailable -- blocked, never approved (#775)', () =
     expect(rec.submitted).toHaveLength(0);
   });
 
+  test('head moved to B: no comment, no blocked for A, and B stays reviewable (#777)', async () => {
+    // The exact exposure the #777 review found. The reviewer evaluated head A
+    // and could not read the required contexts; meanwhile the PR was pushed to
+    // head B. Blocking is TERMINAL, so recording it here would retire the work
+    // item for a head nobody reviewed and leave B with no review at all.
+    let currentHeadCalls = 0;
+    const { deps, rec } = makeDeps({
+      runReviewer: blockedReviewer(),
+      currentHeadSha: async () => {
+        currentHeadCalls += 1;
+        return NEW_HEAD;
+      },
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+
+    // Non-terminal: requeued for the new head, never blocked, never approved.
+    expect(outcome.disposition).toBe('superseded_head');
+    expect(outcome.disposition).not.toBe('blocked_required_contexts_unavailable');
+    expect(outcome.reason).toBe('head_advanced_before_required_contexts_block');
+    // The live head WAS actually re-read -- the gate is not being skipped.
+    expect(currentHeadCalls).toBe(1);
+    // Nothing was posted to the PR for head A.
+    expect(rec.submitted).toHaveLength(0);
+    // And no terminal blocked receipt exists for A.
+    expect(rec.receipts.some(r => r.disposition === 'blocked_required_contexts_unavailable')).toBe(
+      false
+    );
+
+    // B is still reviewable: the same work item bound to B, with the head now
+    // stable, reaches the terminal blocked outcome on its own evidence.
+    const workAtB: ReviewWorkItem = { ...WORK, headSha: NEW_HEAD };
+    const { deps: depsB, rec: recB } = makeDeps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: BLOCKED_SUMMARY,
+        reviewedHeadSha: NEW_HEAD,
+        requiredContextsUnavailable: true,
+      }),
+      currentHeadSha: async () => NEW_HEAD,
+    });
+    const outcomeB = await runAndSubmitReview(workAtB, depsB);
+    expect(outcomeB.disposition).toBe('blocked_required_contexts_unavailable');
+    expect(recB.submitted[0]?.event).toBe('COMMENT');
+    expect(recB.submitted[0]?.commitId).toBe(NEW_HEAD);
+  });
+
+  test('a stale evaluator result is superseded, not blocked', async () => {
+    // The reviewer returned a verdict for a DIFFERENT head than the work item
+    // is bound to. Same rule: a terminal block must never land on a head the
+    // reviewer did not actually evaluate.
+    const { deps, rec } = makeDeps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: BLOCKED_SUMMARY,
+        reviewedHeadSha: NEW_HEAD,
+        requiredContextsUnavailable: true,
+      }),
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+
+    expect(outcome.disposition).toBe('superseded_head');
+    expect(outcome.reason).toBe('reviewer_examined_different_head_before_required_contexts_block');
+    expect(rec.submitted).toHaveLength(0);
+    expect(rec.receipts.some(r => r.disposition === 'blocked_required_contexts_unavailable')).toBe(
+      false
+    );
+  });
+
+  test('a failed live-head re-read does not block either', async () => {
+    // If we cannot even establish what the live head is, we certainly cannot
+    // terminate on it.
+    const { deps, rec } = makeDeps({
+      runReviewer: blockedReviewer(),
+      currentHeadSha: async () => {
+        throw new Error('github unreachable');
+      },
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+
+    expect(outcome.disposition).toBe('submission_failed');
+    expect(outcome.disposition).not.toBe('blocked_required_contexts_unavailable');
+    expect(rec.submitted).toHaveLength(0);
+  });
+
   test('custody is still enforced ahead of the blocked branch', async () => {
     const { deps, rec } = makeDeps({ runReviewer: blockedReviewer() });
     const outcome = await runAndSubmitReview({ ...WORK, author: REVIEWER }, deps);
