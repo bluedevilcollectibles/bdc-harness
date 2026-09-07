@@ -618,3 +618,93 @@ describe('merge candidate discovery -- evidence binding', () => {
     expect(seen).toEqual([850]);
   });
 });
+
+/**
+ * FALLBACK COUNTER ON THE HEARTBEAT.
+ *
+ * When GitHub's aggregate review decision is unavailable, the conservative REST
+ * derivation runs instead. It is STRICTER than GitHub's answer, so the merge
+ * gate quietly tightens and approved PRs stop merging -- indistinguishable, on
+ * the heartbeat, from having nothing to merge. `prsFallbackDecision` is what
+ * separates "the gate is degraded" from "the queue is empty".
+ */
+describe('merge candidate discovery -- fallback review decision counter', () => {
+  test('counts every evaluated PR whose decision came from the fallback', async () => {
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [
+          pr({ prNumber: 940, headSha: 'sha-940', reviewDecisionFromFallback: true }),
+          pr({ prNumber: 941, headSha: 'sha-941', reviewDecisionFromFallback: true }),
+          pr({ prNumber: 942, headSha: 'sha-942', reviewDecisionFromFallback: false }),
+        ],
+        findPullRequest: async input => {
+          const number = input.prNumber ?? 0;
+          return { ...greenEvidence(number), headSha: `sha-${number}` };
+        },
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.evaluated).toBe(3);
+    expect(result.fallbackReviewDecisions).toBe(2);
+  });
+
+  // The PRs this matters MOST for are the ones the stricter fallback pushed
+  // into review_not_approved. Counting only survivors would hide exactly them.
+  test('counts PRs the stricter fallback EXCLUDED, not just candidates', async () => {
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [
+          // The fallback could not establish approval, so it is excluded --
+          // and it is precisely what the operator needs to know about.
+          pr({ prNumber: 950, reviewDecision: null, reviewDecisionFromFallback: true }),
+        ],
+        findPullRequest: async () => greenEvidence(950),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions[0]?.reason).toBe('review_not_approved');
+    expect(result.fallbackReviewDecisions).toBe(1);
+  });
+
+  test('a healthy sweep reports a zero counter', async () => {
+    const result = await discoverMergeCandidates(
+      {
+        listOpenPullRequests: async () => [pr({ prNumber: 960, headSha: 'sha-960' })],
+        findPullRequest: async () => ({ ...greenEvidence(960), headSha: 'sha-960' }),
+      },
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+
+    expect(result.fallbackReviewDecisions).toBe(0);
+  });
+
+  test('the heartbeat carries prsFallbackDecision', async () => {
+    const logged: { obj: Record<string, unknown>; msg: string }[] = [];
+    await watchOnce(
+      {
+        listRunsForWatch: async () => [],
+        listRunEvents: async () => [],
+        findPullRequest: async input => {
+          const number = input.prNumber ?? 0;
+          return { ...greenEvidence(number), headSha: `sha-${number}` };
+        },
+        mergePullRequest: async () => ({ merged: true }),
+        listOpenPullRequests: async () => [
+          pr({ prNumber: 970, headSha: 'sha-970', reviewDecisionFromFallback: true }),
+          pr({ prNumber: 971, headSha: 'sha-971' }),
+        ],
+      },
+      {
+        logger: { info: (obj, msg) => logged.push({ obj, msg }) },
+        discovery: { watchedBases: WATCHED_BASES, repos: REPOS },
+      }
+    );
+
+    const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
+    expect(heartbeat?.obj.prsFallbackDecision).toBe(1);
+    expect(heartbeat?.obj.prsEvaluated).toBe(2);
+  });
+});

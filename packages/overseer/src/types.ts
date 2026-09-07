@@ -188,6 +188,14 @@ export interface DiscoveredPullRequest {
   reviewDecision: string | null;
   /** WO id when one is recoverable from the PR, used to sharpen evidence lookup. */
   woId?: string;
+  /**
+   * True when `reviewDecision` came from the conservative REST derivation
+   * because GitHub's aggregate was unavailable for this sweep. That derivation
+   * is STRICTER than GitHub's own answer, so a PR excluded while this is set
+   * may in fact be approved -- the heartbeat counts these so a degraded gate is
+   * visible instead of looking like a quiet backlog.
+   */
+  reviewDecisionFromFallback?: boolean;
 }
 
 export interface GitHubOpenPullRequestListInput {

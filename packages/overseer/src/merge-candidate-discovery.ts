@@ -106,6 +106,14 @@ export interface MergeCandidateDiscoveryResult {
   /** How many PRs were actually looked at this tick. */
   readonly evaluated: number;
   /**
+   * How many evaluated PRs had their review decision resolved by the
+   * conservative REST fallback instead of GitHub's own aggregate. Non-zero
+   * means the merge gate is running STRICTER than GitHub would, so PRs GitHub
+   * considers approved may be sitting excluded. Surfaced on the heartbeat as
+   * `prsFallbackDecision` so that reads as a degraded gate, not a quiet backlog.
+   */
+  readonly fallbackReviewDecisions: number;
+  /**
    * True when discovery could not run at all (no dep wired, or every repo
    * lookup threw). Distinguishes "nothing to merge" from "we did not look".
    */
@@ -116,6 +124,7 @@ const EMPTY_RESULT: MergeCandidateDiscoveryResult = {
   candidates: [],
   exclusions: [],
   evaluated: 0,
+  fallbackReviewDecisions: 0,
   unavailable: true,
 };
 
@@ -454,6 +463,7 @@ export async function discoverMergeCandidates(
   const candidates: WatchedRunRecord[] = [];
   const exclusions: MergeCandidateExclusion[] = [];
   let evaluated = 0;
+  let fallbackReviewDecisions = 0;
   let anyRepoListed = false;
 
   for (const target of repos) {
@@ -475,6 +485,10 @@ export async function discoverMergeCandidates(
     for (const pr of pullRequests) {
       if (evaluated >= maxPullRequests) break;
       evaluated += 1;
+      // Counted BEFORE any exclusion `continue`: the PRs this most matters for
+      // are precisely the ones the stricter fallback pushed into
+      // `review_not_approved`. Counting only survivors would hide them.
+      if (pr.reviewDecisionFromFallback) fallbackReviewDecisions += 1;
 
       const key = pullRequestKey(pr.owner, pr.repo, pr.prNumber);
       if (alreadyCovered.has(key)) {
@@ -562,6 +576,7 @@ export async function discoverMergeCandidates(
     candidates,
     exclusions,
     evaluated,
+    fallbackReviewDecisions,
     unavailable: !anyRepoListed,
   };
 }

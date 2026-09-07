@@ -351,34 +351,161 @@ describe('fetchReviewDecisions -- GitHub aggregate over GraphQL', () => {
       { graphqlDecisions: { 1: 'APPROVED', 2: 'REVIEW_REQUIRED' } }
     );
 
-    const decisions = await fetchReviewDecisions(octokit, {
+    const lookup = await fetchReviewDecisions(octokit, {
       owner: 'thinmansoftware',
       repo: 'bdc-harness',
       prNumbers: [1, 2],
     });
 
-    expect(decisions.get(1)).toBe('APPROVED');
-    expect(decisions.get(2)).toBe('REVIEW_REQUIRED');
+    expect(lookup.decisions.get(1)).toBe('APPROVED');
+    expect(lookup.decisions.get(2)).toBe('REVIEW_REQUIRED');
+    // A clean read is NOT a degradation.
+    expect(lookup.unavailableReason).toBeNull();
   });
 
-  test('a REST-only client (no graphql) yields an empty map, not an error', async () => {
-    const decisions = await fetchReviewDecisions(octokitWith([]), {
+  test('a REST-only client (no graphql) reports graphql_client_absent', async () => {
+    const lookup = await fetchReviewDecisions(octokitWith([]), {
       owner: 'thinmansoftware',
       repo: 'bdc-harness',
       prNumbers: [1],
     });
-    expect(decisions.size).toBe(0);
+    expect(lookup.decisions.size).toBe(0);
+    expect(lookup.unavailableReason).toBe('graphql_client_absent');
   });
 
   // A GraphQL outage must fall back, never admit. An empty map sends every PR
-  // to the conservative derivation.
-  test('a GraphQL failure yields an empty map rather than an assumed approval', async () => {
-    const decisions = await fetchReviewDecisions(octokitWith([], {}, { graphqlThrows: true }), {
+  // to the conservative derivation -- and says so, with the error class.
+  test('a GraphQL failure yields an empty map and a named reason, not an assumed approval', async () => {
+    const lookup = await fetchReviewDecisions(octokitWith([], {}, { graphqlThrows: true }), {
       owner: 'thinmansoftware',
       repo: 'bdc-harness',
       prNumbers: [1],
     });
-    expect(decisions.size).toBe(0);
+    expect(lookup.decisions.size).toBe(0);
+    expect(lookup.unavailableReason).toBe('graphql_error');
+    expect(lookup.errorClass).toBe('Error');
+  });
+
+  // Asking about nothing is not a degradation; it must not fire the warn line.
+  test('an empty PR list is not reported as unavailable', async () => {
+    const lookup = await fetchReviewDecisions(octokitWith([], {}, { graphqlThrows: true }), {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumbers: [],
+    });
+    expect(lookup.unavailableReason).toBeNull();
+  });
+});
+
+/**
+ * VISIBILITY OF THE FALLBACK.
+ *
+ * The REST derivation is deliberately STRICTER than GitHub's aggregate, so a
+ * GraphQL outage -- an expired token is enough -- silently TIGHTENS the merge
+ * gate: PRs GitHub considers approved begin reading `review_not_approved` and
+ * simply stop merging. That is indistinguishable from a quiet backlog, which is
+ * the exact failure #758 exists to end. So the degradation is announced once
+ * per tick and counted on the heartbeat.
+ */
+describe('createRealListOpenPullRequests -- fallback visibility', () => {
+  function warnCapturingList(options: OctokitFakeOptions) {
+    const warnings: { obj: Record<string, unknown>; msg: string }[] = [];
+    const list = createRealListOpenPullRequests(
+      octokitWith(
+        [
+          {
+            number: 920,
+            title: 'feat: one',
+            state: 'open',
+            html_url: 'https://example.invalid/920',
+            head: { sha: 'head-a', ref: 'feat/one' },
+            base: { ref: 'dev' },
+          },
+          {
+            number: 921,
+            title: 'feat: two',
+            state: 'open',
+            html_url: 'https://example.invalid/921',
+            head: { sha: 'head-b', ref: 'feat/two' },
+            base: { ref: 'dev' },
+          },
+          // On an unwatched base: never consults reviews, so not a casualty.
+          {
+            number: 922,
+            title: 'feat: three',
+            state: 'open',
+            html_url: 'https://example.invalid/922',
+            head: { sha: 'head-c', ref: 'feat/three' },
+            base: { ref: 'main' },
+          },
+        ],
+        {
+          920: [approval(GATE, 'head-a')],
+          921: [approval(GATE, 'head-b')],
+        },
+        options
+      ),
+      { logger: { warn: (obj, msg) => warnings.push({ obj, msg }) } }
+    );
+    return { list, warnings };
+  }
+
+  test('a GraphQL error takes the fallback path AND logs one warn line per tick', async () => {
+    const { list, warnings } = warnCapturingList({ graphqlThrows: true });
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    // THE FALLBACK RAN: exact-head gate approvals still resolve to APPROVED.
+    expect(discovered.find(pr => pr.prNumber === 920)?.reviewDecision).toBe('APPROVED');
+    expect(discovered.find(pr => pr.prNumber === 921)?.reviewDecision).toBe('APPROVED');
+
+    // ...AND it is visible: ONE line for the whole tick, not one per PR.
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.msg).toBe('merge-coordinator.review_decision_graphql_unavailable');
+    expect(warnings[0]?.obj).toMatchObject({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      reason: 'graphql_error',
+      errorClass: 'Error',
+      // Only the two PRs on a watched base were asked about.
+      prsAffected: 2,
+    });
+
+    // Evaluated PRs are marked so the heartbeat can count them; the
+    // unwatched-base PR is not a fallback casualty.
+    expect(discovered.find(pr => pr.prNumber === 920)?.reviewDecisionFromFallback).toBe(true);
+    expect(discovered.find(pr => pr.prNumber === 921)?.reviewDecisionFromFallback).toBe(true);
+    expect(discovered.find(pr => pr.prNumber === 922)?.reviewDecisionFromFallback).toBeUndefined();
+  });
+
+  test('a healthy GraphQL read logs nothing and marks no fallback', async () => {
+    const { list, warnings } = warnCapturingList({
+      graphqlDecisions: { 920: 'APPROVED', 921: 'REVIEW_REQUIRED' },
+    });
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    expect(warnings).toHaveLength(0);
+    expect(discovered.find(pr => pr.prNumber === 920)?.reviewDecision).toBe('APPROVED');
+    expect(discovered.find(pr => pr.prNumber === 921)?.reviewDecision).toBe('REVIEW_REQUIRED');
+    expect(discovered.find(pr => pr.prNumber === 920)?.reviewDecisionFromFallback).toBe(false);
+  });
+
+  test('a REST-only client is reported too -- the gate is degraded either way', async () => {
+    const { list, warnings } = warnCapturingList({});
+
+    await list({ owner: 'thinmansoftware', repo: 'bdc-harness', baseBranches: ['dev'] });
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.obj).toMatchObject({ reason: 'graphql_client_absent', prsAffected: 2 });
   });
 });
 
@@ -438,6 +565,8 @@ describe('createRealListOpenPullRequests', () => {
       headSha: 'abc123',
       reviewDecision: 'APPROVED',
       woId: 'WO-HARNESS-REVIEW-01',
+      // No GraphQL client on this fake, so the conservative fallback resolved it.
+      reviewDecisionFromFallback: true,
     });
   });
 

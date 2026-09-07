@@ -972,6 +972,25 @@ interface GraphQLReviewDecisionNode {
   reviewDecision?: string | null;
 }
 
+/** Why GitHub's aggregate review decision was not usable for a sweep. */
+export type ReviewDecisionUnavailableReason =
+  | 'graphql_client_absent'
+  | 'graphql_error'
+  | 'graphql_empty_response';
+
+export interface ReviewDecisionLookup {
+  /** GitHub's aggregate decision per PR number. Empty when unavailable. */
+  readonly decisions: Map<number, string | null>;
+  /**
+   * Set when GitHub's aggregate could not be obtained for the whole batch, so
+   * every PR in it falls back to the conservative REST derivation. Null on a
+   * clean read. Named rather than boolean so the operator log says WHY.
+   */
+  readonly unavailableReason: ReviewDecisionUnavailableReason | null;
+  /** Error class (constructor name) when `unavailableReason` is 'graphql_error'. */
+  readonly errorClass?: string;
+}
+
 /**
  * Read GitHub's OWN aggregate `reviewDecision` for the listed PRs.
  *
@@ -980,16 +999,22 @@ interface GraphQLReviewDecisionNode {
  * CODEOWNERS rules -- neither of which appears anywhere in the REST reviews
  * listing, and both of which the REST derivation was silently ignoring.
  *
- * Returns a map of PR number to decision. A PR missing from the map (or a
- * wholesale failure, which returns an empty map) falls back to the conservative
- * REST derivation -- never to an assumed approval.
+ * On failure the decision map is EMPTY, which sends every PR to the
+ * conservative REST derivation -- never to an assumed approval. That fallback
+ * is safe, but it is also STRICTER than GitHub's own answer, so it can quietly
+ * hold PRs GitHub considers approved (an expired token alone would do it).
+ * `unavailableReason` therefore travels back to the caller, which logs it once
+ * per tick and counts the affected PRs in the heartbeat. A silent degradation
+ * to a stricter gate is exactly the kind of invisible stall #758 exists to end.
  */
 export async function fetchReviewDecisions(
   octokit: RealGitHubOctokitLike,
   input: { owner: string; repo: string; prNumbers: readonly number[] }
-): Promise<Map<number, string | null>> {
+): Promise<ReviewDecisionLookup> {
   const decisions = new Map<number, string | null>();
-  if (!octokit.graphql || input.prNumbers.length === 0) return decisions;
+  // Nothing to ask about is not a degradation -- there is nothing to fall back for.
+  if (input.prNumbers.length === 0) return { decisions, unavailableReason: null };
+  if (!octokit.graphql) return { decisions, unavailableReason: 'graphql_client_absent' };
 
   // One aliased field per PR: GraphQL has no "pullRequests(numbers:)" filter,
   // so aliasing is how a batch is requested in a single round trip.
@@ -1005,17 +1030,22 @@ export async function fetchReviewDecisions(
       repo: input.repo,
     })) as { repository?: Record<string, GraphQLReviewDecisionNode | null> } | null;
     const repository = response?.repository;
-    if (!repository) return decisions;
+    if (!repository) return { decisions, unavailableReason: 'graphql_empty_response' };
     for (const node of Object.values(repository)) {
       if (!node || typeof node.number !== 'number') continue;
       decisions.set(node.number, node.reviewDecision ?? null);
     }
-  } catch {
+  } catch (error) {
     // A GraphQL outage must not admit anything: an empty map means every PR
-    // falls back to the conservative derivation, which fails closed.
-    return new Map<number, string | null>();
+    // falls back to the conservative derivation, which fails closed -- but the
+    // caller is told, so the degradation is visible rather than silent.
+    return {
+      decisions: new Map<number, string | null>(),
+      unavailableReason: 'graphql_error',
+      errorClass: error instanceof Error ? error.constructor.name : typeof error,
+    };
   }
-  return decisions;
+  return { decisions, unavailableReason: null };
 }
 
 /**
@@ -1073,6 +1103,8 @@ export async function fetchAllPullRequestReviews(
 export interface RealListOpenPullRequestsOptions {
   /** Review Gate identity required among approvers. Defaults to env/Overseer bot. */
   readonly reviewGateLogin?: string;
+  /** Injectable for tests; defaults to this module's logger. */
+  readonly logger?: { warn(obj: Record<string, unknown>, msg: string): void };
 }
 
 /**
@@ -1104,6 +1136,7 @@ export function createRealListOpenPullRequests(
   return async (input: GitHubOpenPullRequestListInput) => {
     const bases = (input.baseBranches ?? []).map(base => base.trim().toLowerCase()).filter(Boolean);
     const reviewGateLogin = options.reviewGateLogin ?? resolveReviewGateLogin();
+    const logger = options.logger ?? log;
     const listed = await octokit.pulls.list({
       owner: input.owner,
       repo: input.repo,
@@ -1117,11 +1150,36 @@ export function createRealListOpenPullRequests(
     // Batch GitHub's authoritative decision for every PR we will actually
     // evaluate. PRs on unwatched bases are excluded upstream on base grounds,
     // so spending query budget on them buys nothing.
-    const graphqlDecisions = await fetchReviewDecisions(octokit, {
+    const evaluatedNumbers = listed.data
+      .filter(pr => matchesBase(pr.base?.ref ?? ''))
+      .map(pr => pr.number);
+    const lookup = await fetchReviewDecisions(octokit, {
       owner: input.owner,
       repo: input.repo,
-      prNumbers: listed.data.filter(pr => matchesBase(pr.base?.ref ?? '')).map(pr => pr.number),
+      prNumbers: evaluatedNumbers,
     });
+    const graphqlDecisions = lookup.decisions;
+
+    // ONE line per repo per tick, not one per PR. The fallback derivation is
+    // deliberately stricter than GitHub's aggregate, so a GraphQL outage (an
+    // expired token is enough) silently TIGHTENS the merge gate: PRs GitHub
+    // considers approved start reading `review_not_approved` and simply stop
+    // merging. That looks identical to a quiet backlog, which is the exact
+    // failure mode #758 exists to end -- so it is said out loud, with the error
+    // class and how many PRs it affected.
+    if (lookup.unavailableReason) {
+      logger.warn(
+        {
+          owner: input.owner,
+          repo: input.repo,
+          reason: lookup.unavailableReason,
+          errorClass: lookup.errorClass,
+          prsAffected: evaluatedNumbers.length,
+        },
+        'merge-coordinator.review_decision_graphql_unavailable'
+      );
+    }
+    const usedFallback = lookup.unavailableReason !== null;
 
     const discovered: DiscoveredPullRequest[] = [];
     for (const pr of listed.data) {
@@ -1177,6 +1235,10 @@ export function createRealListOpenPullRequests(
         headSha: pr.head.sha,
         reviewDecision,
         woId: extractWoId(pr.title, pr.body),
+        // Only meaningful for PRs whose decision was actually resolved: a PR on
+        // an unwatched base never consults reviews at all, so it is not a
+        // fallback casualty and is not counted as one.
+        reviewDecisionFromFallback: usedFallback,
       });
     }
     return discovered;

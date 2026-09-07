@@ -348,6 +348,7 @@ export async function watchOnce(
     candidates: [],
     exclusions: [],
     evaluated: 0,
+    fallbackReviewDecisions: 0,
     unavailable: true,
   };
   if (options.discoveryEnabled !== false) {
@@ -402,6 +403,12 @@ export async function watchOnce(
       prsEvaluated: discovery.evaluated,
       prCandidates: discovery.candidates.length,
       prDiscoveryUnavailable: discovery.unavailable,
+      // Non-zero means GitHub's aggregate review decision was unavailable and
+      // the stricter REST fallback ran instead, so approved PRs may be sitting
+      // excluded. Reads as a DEGRADED GATE rather than a quiet backlog; the
+      // matching per-tick warn line is
+      // 'merge-coordinator.review_decision_graphql_unavailable'.
+      prsFallbackDecision: discovery.fallbackReviewDecisions,
       exclusionsByReason: summarizeExclusions(discovery.exclusions),
       eligible: outcomes.filter(outcome => outcome.action === 'merge_ready').length,
     },
