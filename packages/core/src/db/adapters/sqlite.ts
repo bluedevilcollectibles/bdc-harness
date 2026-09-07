@@ -330,7 +330,21 @@ export class SqliteAdapter implements IDatabase {
         // Another connection may have repaired it while this one awaited the
         // writer lock. Recheck before deleting rows or creating the index.
         if (!hasHealthConflictTarget()) {
-          this.db.run(`
+          const occupiedNames = new Set(
+            (this.db.query('SELECT name FROM sqlite_schema').all() as { name: string }[]).map(row =>
+              row.name.toLowerCase()
+            )
+          );
+          const indexBase = 'tm_health_provider_unique';
+          let indexName = indexBase;
+          for (let suffix = 1; occupiedNames.has(indexName); suffix++) {
+            indexName = `${indexBase}_${String(suffix)}`;
+          }
+          // Execute the deletion separately so trigger failures reach rollback
+          // before attempting the index DDL.
+          this.db
+            .query(
+              `
             DELETE FROM tm_health AS older
             WHERE EXISTS (
               SELECT 1 FROM tm_health AS newer
@@ -338,8 +352,10 @@ export class SqliteAdapter implements IDatabase {
                 AND (newer.sampled_at > older.sampled_at
                   OR (newer.sampled_at = older.sampled_at AND newer.rowid > older.rowid))
             );
-            CREATE UNIQUE INDEX tm_health_provider_unique ON tm_health(provider);
-          `);
+          `
+            )
+            .run();
+          this.db.run(`CREATE UNIQUE INDEX "${indexName}" ON tm_health(provider)`);
         }
         this.db.run('COMMIT');
       } catch (error: unknown) {

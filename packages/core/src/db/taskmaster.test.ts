@@ -382,7 +382,7 @@ describe('tm_health DAL', () => {
     expect((await db.query('SELECT state FROM tm_health')).rows).toEqual([{ state: 'healthy' }]);
   });
 
-  test('health repair rolls back deduplication if index installation fails', async () => {
+  test('health repair preserves occupied schema names and chooses a free index name', async () => {
     await db.close();
     cleanupDb(currentDbPath);
     const old = new Database(currentDbPath);
@@ -390,23 +390,64 @@ describe('tm_health DAL', () => {
       provider TEXT NOT NULL, state TEXT NOT NULL, sampled_at TEXT NOT NULL,
       expires_at TEXT, evidence TEXT, PRIMARY KEY (provider, sampled_at)
     )`);
-    old.run('CREATE INDEX tm_health_provider_unique ON tm_health(state)');
+    old.run('CREATE TABLE other_health (id INTEGER, state TEXT)');
+    old.run('CREATE INDEX TM_HEALTH_PROVIDER_UNIQUE ON other_health(state)');
+    old.run('CREATE INDEX tm_health_provider_unique_1 ON tm_health(state)');
+    old.run('CREATE TABLE tm_health_provider_unique_2 (id INTEGER)');
     old.run("INSERT INTO tm_health VALUES ('claude','dark','2026-08-27',NULL,'old')");
     old.run("INSERT INTO tm_health VALUES ('claude','healthy','2026-08-28',NULL,'new')");
     old.close();
 
-    expect(() => new SqliteAdapter(currentDbPath)).toThrow(
-      'index tm_health_provider_unique already exists'
+    db = new SqliteAdapter(currentDbPath);
+    expect((await db.query('SELECT evidence FROM tm_health')).rows).toEqual([{ evidence: 'new' }]);
+    expect(
+      (
+        await db.query(
+          "SELECT tbl_name FROM sqlite_schema WHERE LOWER(name)='tm_health_provider_unique'"
+        )
+      ).rows
+    ).toEqual([{ tbl_name: 'other_health' }]);
+    expect((await db.query('PRAGMA index_info(tm_health_provider_unique_1)')).rows).toEqual([
+      { seqno: 0, cid: 1, name: 'state' },
+    ]);
+    expect((await db.query('PRAGMA index_info(tm_health_provider_unique_3)')).rows).toEqual([
+      { seqno: 0, cid: 0, name: 'provider' },
+    ]);
+    await upsertHealthSample({ provider: 'claude', state: 'healthy', expires_at: '2026-09-08' });
+    const before = await db.query(
+      "SELECT name FROM sqlite_schema WHERE type='index' ORDER BY name"
     );
+    await db.close();
+    db = new SqliteAdapter(currentDbPath);
+    expect(
+      (await db.query("SELECT name FROM sqlite_schema WHERE type='index' ORDER BY name")).rows
+    ).toEqual(before.rows);
+  });
+
+  test('health repair rolls back partial trigger effects when deduplication fails', async () => {
+    await db.close();
+    cleanupDb(currentDbPath);
+    const old = new Database(currentDbPath);
+    old.run(`CREATE TABLE tm_health (
+      provider TEXT NOT NULL, state TEXT NOT NULL, sampled_at TEXT NOT NULL,
+      expires_at TEXT, evidence TEXT, PRIMARY KEY (provider, sampled_at)
+    )`);
+    old.run('CREATE TABLE health_delete_audit (evidence TEXT)');
+    old.run(`CREATE TRIGGER reject_health_delete AFTER DELETE ON tm_health BEGIN
+      INSERT INTO health_delete_audit VALUES (OLD.evidence);
+      SELECT RAISE(FAIL, 'test health delete rejected'); END`);
+    old.run("INSERT INTO tm_health VALUES ('claude','dark','2026-08-27',NULL,'old')");
+    old.run("INSERT INTO tm_health VALUES ('claude','healthy','2026-08-28',NULL,'new')");
+    old.close();
+
+    expect(() => new SqliteAdapter(currentDbPath)).toThrow('test health delete rejected');
     const inspection = new Database(currentDbPath, { readonly: true });
     try {
       expect(inspection.query('SELECT evidence FROM tm_health ORDER BY sampled_at').all()).toEqual([
         { evidence: 'old' },
         { evidence: 'new' },
       ]);
-      expect(inspection.query('PRAGMA index_info(tm_health_provider_unique)').all()).toEqual([
-        { seqno: 0, cid: 1, name: 'state' },
-      ]);
+      expect(inspection.query('SELECT * FROM health_delete_audit').all()).toEqual([]);
     } finally {
       inspection.close();
     }

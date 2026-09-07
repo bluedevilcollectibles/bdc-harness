@@ -132,10 +132,12 @@ sqlite3 /opt/bdc/archon-data/archon.db "SELECT * FROM tm_control WHERE id=1"
 
 WO-HARNESS-TM-HEALTH-UPSERT-CONFLICT-FIX-01 repairs legacy on-disk `tm_health`
 tables whose composite `PRIMARY KEY (provider, sampled_at)` made every
-provider health upsert fail. On connection, `migrateColumns()` now rebuilds
-that table with `PRIMARY KEY (provider)` and retains the latest sample per
-provider, allowing `/api/taskmaster/status` headroom to reflect recorded
-spawn evidence.
+provider health upsert fail. On connection, `migrateColumns()` preserves
+the table and its schema objects, retains the latest sample per provider,
+and adds a provider-only unique index using an unoccupied schema name.
+An existing compatible unique index makes the repair a no-op. This allows
+`/api/taskmaster/status` headroom to reflect recorded spawn evidence after
+the separately governed runtime rollout.
 
 ## Kill / rollback
 
