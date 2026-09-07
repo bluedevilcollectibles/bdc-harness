@@ -305,7 +305,9 @@ describe('expectation registry tick wiring', () => {
     expect(registered).toHaveLength(1);
     expect(registered[0]?.dispatch_ref).toBe('msg-1');
     expect(registered[0]?.on_absence).toBe('escalate');
-    const digest = world.sentMessages.find(message => message.idempotency_key.startsWith('tm:digest:'));
+    const digest = world.sentMessages.find(message =>
+      message.idempotency_key.startsWith('tm:digest:')
+    );
     expect(digest?.body).toContain('pending=2, met=3, failed=4, escalated=5, given_up=6');
     expect(digest?.body).toContain('Needs priority triage: gh:thinmansoftware/bdc-harness#404');
   });
@@ -2096,9 +2098,7 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const { fetchImpl } = fakeGithubFetch({ wo: [ghIssue(44, ['wo'])] });
     const threads = await defaultListThreads(fetchImpl);
     expect(threads).toHaveLength(0);
-    expect(threads.unlabelledPriorityTriage).toEqual([
-      'gh:thinmansoftware/bdc-harness#44',
-    ]);
+    expect(threads.unlabelledPriorityTriage).toEqual(['gh:thinmansoftware/bdc-harness#44']);
     expect(priorityFromLabels(['wo'])).toBeNull();
   });
 

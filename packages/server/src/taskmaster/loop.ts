@@ -387,7 +387,9 @@ function assertGithubRateLimit(response: Response, context: string): void {
  * production callers use the tick() default. `fetchImpl` is injectable for
  * tests only.
  */
-export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promise<ListedThreadResult> {
+export async function defaultListThreads(
+  fetchImpl: typeof fetch = fetch
+): Promise<ListedThreadResult> {
   const repos = (process.env.TASKMASTER_GH_REPOS ?? 'thinmansoftware/bdc-xo')
     .split(',')
     .map(r => r.trim())
