@@ -1,0 +1,282 @@
+/**
+ * Regression tests for bdc-harness #789 -- the Overseer reviewer returned
+ * INDETERMINATE (posted as CHANGES_REQUESTED with no stated reason) on every PR
+ * whose review prompt exceeded Linux MAX_ARG_STRLEN, because the whole prompt
+ * was passed as ONE argv element and Bun.spawn raised E2BIG.
+ *
+ * Three properties are pinned here:
+ *  1. A prompt far larger than the 131,072-byte single-argument limit reaches
+ *     the model intact and produces a real verdict.
+ *  2. An E2BIG out of the model seam defers (TRANSPORT_ERROR / transport_error)
+ *     instead of posting a verdict at the head, and names the reason CODE.
+ *  3. The posted summary carries the error code and never the error detail.
+ */
+import { describe, expect, test } from 'bun:test';
+import {
+  evaluatePullRequest,
+  isTransportError,
+  resolveReviewModelTimeoutMs,
+  reviewErrorCode,
+  DEFAULT_REVIEW_MODEL_TIMEOUT_MS,
+  type PrReviewDeps,
+  type PrReviewInput,
+} from '../pr-review-evaluator.ts';
+import { buildIndeterminateSummary } from '../pr-review-wiring.ts';
+import { runAndSubmitReview, type ReviewWorkItem, type SubmitDeps } from '../pr-review-submit.ts';
+
+const HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
+
+/** Comfortably past Linux MAX_ARG_STRLEN (131,072 bytes). */
+const LARGE_DIFF = `+${'a'.repeat(200_000)}`;
+
+const input: PrReviewInput = {
+  owner: 'thinmansoftware',
+  repo: 'bdc-harness',
+  pr_number: 776,
+  head_sha: HEAD,
+};
+
+function verdictJson(): string {
+  return JSON.stringify({ verdict: 'APPROVE', findings: [], reviewed_head_sha: HEAD });
+}
+
+function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
+  return {
+    reviewer: { provider: 'cli', model: 'grok' },
+    fetchEvidence: async () => ({
+      diff: LARGE_DIFF,
+      checks: [{ name: 'test', status: 'completed', conclusion: 'success' }],
+    }),
+    fetchAcceptanceCriteria: async () => null,
+    invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout: verdictJson() }),
+    ladder: ['grok'],
+    ...overrides,
+  };
+}
+
+/** The exact error Bun.spawn raises when a single argument is too long. */
+function e2bigError(): Error {
+  const error = new Error('spawn bunx E2BIG: argument list too long') as Error & { code: string };
+  error.code = 'E2BIG';
+  return error;
+}
+
+describe('#789 -- a 200 KB diff reaches the model intact', () => {
+  test('the full diff is delivered to the model seam and yields a real verdict', async () => {
+    let observedPrompt = '';
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        invokeModel: async (_binary, prompt) => {
+          observedPrompt = prompt;
+          return { exitCode: 0, timedOut: false, stdout: verdictJson() };
+        },
+      })
+    );
+
+    // The whole diff arrived -- not truncated to fit an argument limit.
+    expect(observedPrompt).toContain(LARGE_DIFF);
+    expect(Buffer.byteLength(observedPrompt, 'utf8')).toBeGreaterThan(131_072);
+    // And it produced a REAL verdict, not the INDETERMINATE the bug produced.
+    expect(result.verdict).toBe('APPROVE');
+    expect(result.error).toBeUndefined();
+  });
+});
+
+describe('#789 -- E2BIG defers instead of blocking the PR', () => {
+  test('an E2BIG from every rung yields TRANSPORT_ERROR, not INDETERMINATE', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async () => {
+          throw e2bigError();
+        },
+      })
+    );
+
+    expect(result.verdict).toBe('TRANSPORT_ERROR');
+    expect(result.findings).toEqual([]);
+    expect(reviewErrorCode(result.error)).toBe('model_error');
+    expect(result.retry_after_ms).toBeGreaterThan(0);
+  });
+
+  test('a timeout on every rung also defers rather than judging', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 124, timedOut: true, stdout: '' }) })
+    );
+
+    expect(result.verdict).toBe('TRANSPORT_ERROR');
+    expect(reviewErrorCode(result.error)).toBe('model_timeout');
+  });
+
+  test('a later rung succeeding after an E2BIG still produces a real verdict', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async binary => {
+          if (binary === 'codex') throw e2bigError();
+          return { exitCode: 0, timedOut: false, stdout: verdictJson() };
+        },
+      })
+    );
+
+    expect(result.verdict).toBe('APPROVE');
+  });
+
+  test('a judgment failure is still terminal -- unparseable output stays INDETERMINATE', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({ invokeModel: async () => ({ exitCode: 0, timedOut: false, stdout: 'not json' }) })
+    );
+
+    // An unrecognized failure must NOT become an endless deferral loop.
+    expect(result.verdict).toBe('INDETERMINATE');
+    expect(reviewErrorCode(result.error)).toBe('model_output_invalid');
+  });
+});
+
+describe('#789 -- transport classification is conservative', () => {
+  test('recognizes spawn-class failures', () => {
+    expect(isTransportError(e2bigError())).toBe(true);
+    expect(isTransportError(new Error('spawn ENOENT'))).toBe(true);
+    expect(isTransportError(new Error('argument list too long'))).toBe(true);
+  });
+
+  test('does not treat a judgment or auth failure as transport', () => {
+    expect(isTransportError(new Error('model refused the request'))).toBe(false);
+    expect(isTransportError(new Error('401 unauthorized'))).toBe(false);
+    expect(isTransportError(undefined)).toBe(false);
+  });
+});
+
+describe('#789 -- the posted summary names the code and leaks nothing', () => {
+  test('appends the reason code to the INDETERMINATE summary', () => {
+    const summary = buildIndeterminateSummary('model_output_invalid:grok');
+    expect(summary).toContain('could not reach a determinate verdict');
+    expect(summary).toContain('model_output_invalid');
+  });
+
+  test('never carries the detail half of the error', () => {
+    const secret = 'model_error:token=super-secret-provider-detail';
+    const summary = buildIndeterminateSummary(secret);
+    expect(summary).toContain('model_error');
+    expect(summary).not.toContain('super-secret');
+    expect(summary).not.toContain('token=');
+    expect(summary).not.toContain(secret);
+  });
+
+  test('a malformed error contributes no code at all', () => {
+    expect(reviewErrorCode('no-colon-but-hyphens-and-spaces here')).toBeNull();
+    expect(reviewErrorCode('  ')).toBeNull();
+    expect(reviewErrorCode(undefined)).toBeNull();
+    expect(buildIndeterminateSummary('Bearer ghp_realtokenvalue')).not.toContain('ghp_');
+  });
+});
+
+describe('#789 -- the judge timeout is configurable', () => {
+  test('defaults to 60s and honours OVERSEER_REVIEW_MODEL_TIMEOUT_MS', () => {
+    expect(resolveReviewModelTimeoutMs({})).toBe(DEFAULT_REVIEW_MODEL_TIMEOUT_MS);
+    expect(resolveReviewModelTimeoutMs({ OVERSEER_REVIEW_MODEL_TIMEOUT_MS: '180000' })).toBe(
+      180_000
+    );
+    // Junk and non-positive values fall back rather than disabling the wall.
+    expect(resolveReviewModelTimeoutMs({ OVERSEER_REVIEW_MODEL_TIMEOUT_MS: 'soon' })).toBe(
+      DEFAULT_REVIEW_MODEL_TIMEOUT_MS
+    );
+    expect(resolveReviewModelTimeoutMs({ OVERSEER_REVIEW_MODEL_TIMEOUT_MS: '0' })).toBe(
+      DEFAULT_REVIEW_MODEL_TIMEOUT_MS
+    );
+  });
+});
+
+describe('#789 -- submit defers a transport error instead of posting', () => {
+  const work: ReviewWorkItem = {
+    correlationId: 'correlation-789',
+    messageId: 'message-789',
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    prNumber: 776,
+    headSha: HEAD,
+    author: 'contributor',
+  };
+
+  function submitDeps(overrides: Partial<SubmitDeps> = {}): {
+    deps: SubmitDeps;
+    submitted: unknown[];
+    receipts: unknown[];
+  } {
+    const submitted: unknown[] = [];
+    const receipts: unknown[] = [];
+    const base: SubmitDeps = {
+      reviewerIdentity: 'thinman-overseer[bot]',
+      runReviewer: async () => ({
+        approved: false,
+        summary: '',
+        reviewedHeadSha: HEAD,
+        transportError: true,
+        reasonCode: 'model_error',
+        retryAfterMs: 60_000,
+      }),
+      submitReview: async submission => {
+        submitted.push(submission);
+        return { submitted: true };
+      },
+      currentHeadSha: async () => HEAD,
+      recordReceipt: async receipt => {
+        receipts.push(receipt);
+      },
+      ...overrides,
+    };
+    return { deps: base, submitted, receipts };
+  }
+
+  test('posts no review and reports transport_error with the reason code', async () => {
+    const { deps: submit, submitted, receipts } = submitDeps();
+    const outcome = await runAndSubmitReview(work, submit);
+
+    expect(outcome.disposition).toBe('transport_error');
+    expect(outcome.reason).toBe('review_transport_error:model_error');
+    expect(outcome.retryAfterMs).toBe(60_000);
+    // Nothing was posted to GitHub -- the PR is not blocked by a review that
+    // never happened.
+    expect(submitted).toHaveLength(0);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({ disposition: 'transport_error' });
+  });
+
+  test('the receipt reason carries no error detail', async () => {
+    const { deps: submit } = submitDeps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: '',
+        reviewedHeadSha: HEAD,
+        transportError: true,
+        reasonCode: 'model_error',
+      }),
+    });
+    const outcome = await runAndSubmitReview(work, submit);
+
+    expect(outcome.reason).not.toContain('E2BIG:');
+    expect(outcome.reason).not.toContain('token');
+  });
+
+  test('a transport error is classified before the stale-head gate', async () => {
+    // Nothing was evaluated, so `reviewedHeadSha` is meaningless here. It must
+    // not be misreported as stale_head, which is a TERMINAL disposition.
+    const { deps: submit } = submitDeps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: '',
+        reviewedHeadSha: '',
+        transportError: true,
+        reasonCode: 'model_timeout',
+      }),
+    });
+    const outcome = await runAndSubmitReview(work, submit);
+
+    expect(outcome.disposition).toBe('transport_error');
+  });
+});
