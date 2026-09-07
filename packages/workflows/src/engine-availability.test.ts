@@ -214,6 +214,7 @@ describe('T6: resolveRouterEngine -- provider+model to router.yaml engine bridge
   it('maps codex provider (any model) to codex-subscription', () => {
     expect(resolveRouterEngine('codex', 'gpt-5.6-sol')).toBe('codex-subscription');
     expect(resolveRouterEngine('codex', undefined)).toBe('codex-subscription');
+    expect(resolveRouterEngine('codex-native-strict', 'gpt-6-astra')).toBe('codex-subscription');
   });
 
   it('returns undefined for unknown provider/model combinations rather than guessing', () => {

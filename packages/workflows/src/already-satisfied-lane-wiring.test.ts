@@ -49,7 +49,7 @@ async function runGateScript(script: string, checkOutput: string) {
 }
 
 describe('already-satisfied lane wiring', () => {
-  it('discovers the 11 affected feature-development lanes', () => {
+  it('discovers the 12 affected feature-development lanes', () => {
     // This list is the ONLY hardcoded part of this file -- LANE_FILES itself is
     // glob-derived, so the per-lane assertions below automatically cover any new
     // lane. Adding a lane therefore fails HERE and nowhere else, which is the
@@ -58,6 +58,7 @@ describe('already-satisfied lane wiring', () => {
     // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01):
     // dispatchable canaries, NOT ladder-wired until John reviews canary results.
     expect(LANE_FILES).toEqual([
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-fable.yaml',

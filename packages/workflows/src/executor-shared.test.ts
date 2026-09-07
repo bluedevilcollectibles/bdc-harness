@@ -837,6 +837,23 @@ describe('resolveAgentPersona', () => {
     expect(resolution.agentName).toBe('test-agent');
   });
 
+  it('strict Codex preserves Astra while ordinary Codex keeps its existing default behavior', () => {
+    const persona = makePersona({ model: undefined });
+    expect(resolveAgentPersona(persona, 'gpt-6-astra', 'codex-native-strict').model).toBe(
+      'gpt-6-astra'
+    );
+    expect(resolveAgentPersona(persona, 'gpt-6-astra', 'codex').model).toBeUndefined();
+    expect(resolveAgentPersona(persona, undefined, 'codex-native-strict').model).toBeUndefined();
+  });
+
+  it('strict Codex rejects persona model contamination instead of serving another model', () => {
+    for (const model of ['sonnet', 'claude-fable-5', 'gpt-5.6-sol']) {
+      expect(() =>
+        resolveAgentPersona(makePersona({ model }), 'gpt-6-astra', 'codex-native-strict')
+      ).toThrow(InfrastructureClassBlock);
+    }
+  });
+
   it('pi: passes the persona model through unchanged (codex rule does not apply)', () => {
     const persona = makePersona({ model: 'sonnet' });
     const resolution = resolveAgentPersona(persona, undefined, 'pi');

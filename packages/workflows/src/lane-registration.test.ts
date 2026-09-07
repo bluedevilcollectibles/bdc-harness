@@ -66,12 +66,13 @@ function loadLane(filename: string): LaneDef {
 }
 
 describe('lane registration and war-council-validator pin', () => {
-  it('S4: enumerates exactly the eleven governed feature lanes', () => {
+  it('S4: enumerates exactly the twelve governed feature lanes', () => {
     // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01).
     // This enumeration is deliberately hardcoded: it is the tripwire that forces a
     // new lane to be acknowledged here AND given an explicit validator-pin branch
     // in S4b below, rather than silently inheriting a default.
     expect(LANE_FILES).toEqual([
+      'bdc-feature-development-astra.yaml',
       'bdc-feature-development-codex-only.yaml',
       'bdc-feature-development-codex.yaml',
       'bdc-feature-development-fable.yaml',
@@ -146,6 +147,12 @@ describe('lane registration and war-council-validator pin', () => {
         // Grok builds; a repository-capable non-Grok judge validates.
         expect(wcv.provider).toBe('codex-opr');
         expect(wcv.model).not.toBe('x-ai/grok-4.6');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-astra.yaml') {
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-fable-5');
         return;
       }
 

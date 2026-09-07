@@ -282,6 +282,7 @@ const PROVIDER_MODEL_TO_ROUTER_ENGINE: readonly {
   { provider: 'claude', model: 'claude-haiku-*', engine: 'claude-haiku-api' },
   { provider: 'claude', model: 'haiku', engine: 'claude-haiku-api' },
   { provider: 'codex', model: '*', engine: 'codex-subscription' },
+  { provider: 'codex-native-strict', model: '*', engine: 'codex-subscription' },
 ];
 
 export function resolveRouterEngine(

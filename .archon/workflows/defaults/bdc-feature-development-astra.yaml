@@ -1,0 +1,3445 @@
+name: bdc-feature-development-astra
+description: |
+  Separate Astra build and Fable review variant of the existing Codex DAG.
+  Explicit invocation only; production activation requires its separate gate.
+  Build/planning/repair use strict gpt-6-astra; independent review uses claude-fable-5.
+
+policyFile: harness/policies/agent-behavior.md
+run_authority:
+  required: true
+  spec_repository: thinmansoftware/bdc-xo
+  spec_revision: main
+  spec_paths:
+    - docs/work-orders/{WO_ID}.md
+    - docs/superpowers/specs/{WO_ID}.md
+  allow_issue_fallback: true
+# WO1922: isolated model-binding variant; all existing lane files remain unchanged.
+provider: codex-native-strict
+model: gpt-6-astra
+
+nodes:
+  # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
+  # Anchor: 2026-05-16 engine sortie. Container-side `git push` silently failed
+  # (no GITHUB_TOKEN); downstream `|| echo` swallow patterns let the workflow
+  # report success while no commits reached origin. Catch the auth gap up front.
+  - id: preflight-github-auth
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if ! git push --dry-run origin "HEAD:refs/heads/preflight-auth-probe-$(date +%s)" 2>&1; then
+        echo "ERROR: GITHUB auth check failed -- container cannot push to origin." >&2
+        echo "Likely cause: GITHUB_TOKEN missing in executor env, or token lacks repo scope." >&2
+        exit 1
+      fi
+      echo "preflight-github-auth PASS"
+
+  - id: read-spec
+    persona: xo
+    depends_on: [preflight-github-auth]
+    bash: |
+      set -euo pipefail
+      AUTHORITY_DIR="$ARTIFACTS_DIR/authority"
+      AUTHORITY_MANIFEST="$AUTHORITY_DIR/run-authority.json"
+      AUTHORITY_SPEC="$AUTHORITY_DIR/work-order.md"
+      [ -s "$AUTHORITY_MANIFEST" ] || { echo "scope_authority_missing: run-authority.json" >&2; exit 1; }
+      [ -s "$AUTHORITY_SPEC" ] || { echo "scope_authority_missing: work-order.md" >&2; exit 1; }
+      WO_ID=$(jq -er '.woId' "$AUTHORITY_MANIFEST")
+      SPEC_PATH=$(jq -er '.specSource' "$AUTHORITY_MANIFEST")
+      SPEC_REVISION=$(jq -er '.specRevision' "$AUTHORITY_MANIFEST")
+      EXPECTED_HASH=$(jq -er '.specHash' "$AUTHORITY_MANIFEST")
+      ACTUAL_HASH="sha256:$(sha256sum "$AUTHORITY_SPEC" | awk '{print $1}')"
+      [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ] || { echo "authority_conflict: work-order.md hash mismatch" >&2; exit 1; }
+      RUN_START_SHA=$(git rev-parse --verify 'HEAD^{commit}') || { echo "scope_authority_missing: HEAD" >&2; exit 1; }
+      printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt"
+      printf 'WO_ID=%s\nSPEC_PATH=%s\nSPEC_REVISION=%s\nSPEC_HASH=%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$SPEC_REVISION" "$EXPECTED_HASH" "$RUN_START_SHA"
+      cat "$AUTHORITY_SPEC"
+      exit 0
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ]; then
+        WO_ID=$(printf '%s\n' "$USER_MESSAGE" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      if [ -z "$WO_ID" ]; then
+        echo "WO_ID missing. Provide WO_ID in environment or user message." >&2
+        exit 1
+      fi
+      # Specs live in bdc-xo (NOT the target codebase). Cross-repo fetch via gh api.
+      # Per YAML Recipe v1 Section 4 / Rule 5: try docs/work-orders/ then docs/superpowers/specs/ glob.
+      SPEC_PATH="docs/work-orders/${WO_ID}.md"
+      SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 1: docs/superpowers/specs/${WO_ID}.md direct
+        SPEC_PATH="docs/superpowers/specs/${WO_ID}.md"
+        SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null || true)
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 2: date-prefix glob in docs/superpowers/specs/
+        MATCH=$(gh api "repos/thinmansoftware/bdc-xo/contents/docs/superpowers/specs?ref=main" --template '{{range .}}{{.path}}{{"\n"}}{{end}}' 2>/dev/null | grep "${WO_ID}.md$" | head -n 1)
+        if [ -n "$MATCH" ]; then
+          SPEC_PATH="$MATCH"
+          SPEC_CONTENT=$(gh api "repos/thinmansoftware/bdc-xo/contents/${SPEC_PATH}?ref=main" --template '{{.content}}' | tr -d '\n' | base64 -d || true)
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then
+        # Fallback 4: GitHub issue body (WO-HARNESS-READ-SPEC-ISSUE-BODY-FALLBACK-01)
+        ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -n 1 | cut -d= -f2 || true)
+        if [ -z "$ISSUE_NUM" ]; then
+          ISSUE_NUM=$(gh issue list --repo thinmansoftware/bdc-xo \
+            --search "${WO_ID} in:title" --json number,title \
+            --jq '.[0].number' 2>/dev/null || true)
+        fi
+        if [ -n "$ISSUE_NUM" ] && [ "$ISSUE_NUM" != "null" ]; then
+          SPEC_CONTENT=$(gh issue view "$ISSUE_NUM" --repo thinmansoftware/bdc-xo \
+            --json body --jq .body 2>/dev/null || true)
+          [ -n "$SPEC_CONTENT" ] && SPEC_PATH="issues/${ISSUE_NUM}"
+        fi
+      fi
+      if [ -z "$SPEC_CONTENT" ]; then echo "Spec not found (tried docs/work-orders/, docs/superpowers/specs/ direct, date-prefix glob, and GitHub issue search)" >&2; exit 1; fi
+      # Fix-A (2026-05-30, Codex FINDING_1): capture an IMMUTABLE run-start base SHA of the
+      # assigned worktree BEFORE any node mutates/commits/pushes. assert-implement-produced-work
+      # compares HEAD against THIS, so a real build that checkpoint-push already committed+pushed
+      # is still detected as REAL_BUILD (post-push CHANGED/AHEAD are 0 and would misread otherwise).
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      RUN_START_SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo unknown)
+      mkdir -p "$ARTIFACTS_DIR" 2>/dev/null || true
+      printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || true
+      printf 'WO_ID=%s\nSPEC_PATH=bdc-xo:%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$RUN_START_SHA"
+      printf '%s\n' "$SPEC_CONTENT"
+
+  - id: claim-issue
+    depends_on: [read-spec]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "claim-issue: no GitHub issue resolved; skipping status:building label."
+        exit 0
+      fi
+
+      gh label create status:building --repo "$ISSUE_REPO" --color FBCA04 --description "BDC workflow is actively building" 2>/dev/null || true
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked before commit" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:building
+      echo "claim-issue: $ISSUE_REPO#$ISSUE_NUM -> status:building"
+
+  # check-already-satisfied (Fix B, 2026-05-30 -- idempotency short-circuit).
+  # Cheap read-only check BEFORE plan/implement: are the WO's deliverables ALREADY
+  # present in THIS worktree's HEAD? If clearly yes, route to the ALREADY_SATISFIED
+  # terminal (success-no-op) instead of burning a full ~7min implement pass on a
+  # re-fire of an already-done WO (anchor 04daeafc). FAILS OPEN: if unsure, proceeds to
+  # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
+  # net, this is only an optimization that must never wrongly skip real work.
+  - id: check-already-satisfied
+    provider: codex-native-strict
+    model: gpt-6-astra
+    persona: war-council-architect-opr
+    depends_on: [read-spec]
+    task_class: clerical
+    prompt: |
+      You decide ONE thing: are this WO's deliverables ALREADY fully present, such
+      that a build would produce no changes? You are READ-ONLY. First judge against
+      THIS worktree's HEAD (you are cd'd into it; use plain git and Read/Grep/Glob on
+      local files).
+
+      BASE_CHECK: if the deliverables are NOT present in this worktree, a concurrent
+      sibling run may already have merged them. Run:
+        git fetch origin ${BASE_BRANCH:-dev} --quiet
+      If the fetch fails, emit BASE_CHECK=unavailable on its own output line and fall
+      back to ALREADY_SATISFIED=false (do not hard-fail this node -- this matches
+      today's behavior). If the fetch succeeds, re-run the SAME spec-derived
+      stop-condition checks against origin/${BASE_BRANCH:-dev} instead of the
+      worktree (e.g. git show origin/<base>:<path>, git grep <token> origin/<base>).
+      If deliverables are absent locally but present and satisfying on
+      origin/<base>, emit ALREADY_SATISFIED=true, emit SATISFIED_ON_BASE=true on
+      its own output line, and set SATISFIED_EVIDENCE= to note the evidence was
+      found on origin/<base>, not locally. Do NOT rebase and
+      do NOT merge -- only report the verdict; the existing when: skip logic
+      short-circuits plan/plan-review/implement.
+
+      ## Spec
+      $read-spec.output
+
+      ## How to decide
+      - Extract the spec's Stop Point / verification commands / grep assertions / named
+        deliverable files.
+      - Check whether those deliverables ALREADY exist and satisfy the assertions IN THIS
+        worktree (the files exist with the required content; grep assertions already pass).
+      - This is a HIGH BAR. Only conclude already-satisfied if you are confident a fresh
+        implementation would change nothing. ANY doubt -> proceed (false).
+
+      ## Output (exactly one of these on its own last line)
+      - If every deliverable is already present and satisfied in this worktree:
+          ALREADY_SATISFIED=true
+        followed by: SATISFIED_EVIDENCE=<one line naming the deliverables + how verified>
+      - Otherwise (work is needed, OR you cannot confirm with high confidence):
+          ALREADY_SATISFIED=false
+      Default to false. Skipping a build that was actually needed is far worse than
+      running a redundant build that the downstream no-op guard will catch.
+
+  # gate-already-satisfied: bash gate that reads check-already-satisfied's verdict and
+  # emits a single JSON document on stdout for downstream when: conditions. Human-readable
+  # diagnostics go to stderr so condition-evaluator can parse $gate-already-satisfied.output.
+  - id: gate-already-satisfied
+    depends_on: [check-already-satisfied]
+    bash: |
+      set -uo pipefail
+      # Direct assignment (not heredoc). The executor's substituteNodeOutputRefs
+      # wraps the multi-line node output in single quotes via shellQuote, producing
+      # a valid multi-line bash assignment: CAS='line1\nline2\n...'. The previous
+      # heredoc pattern silently broke at runtime because the substituted value
+      # ARRIVED already single-quoted, embedding literal apostrophes at the start
+      # and end of the heredoc content. That made the first line
+      #   'ALREADY_SATISFIED=true
+      # which never matched grep -qE '^ALREADY_SATISFIED=true', so this gate
+      # always fell through to PRECHECK_VERDICT=needs-build and no skip ever
+      # happened. Mirrors the direct-assignment pattern that already works in
+      # the bdc-harness-*.yaml lanes.
+      CAS=$check-already-satisfied.output
+      if printf '%s\n' "$CAS" | grep -qE '^ALREADY_SATISFIED=true'; then
+        SATISFIED_EVIDENCE=$(printf '%s\n' "$CAS" | sed -n 's/^SATISFIED_EVIDENCE=//p' | head -1)
+        if printf '%s\n' "$CAS" | grep -qE '^SATISFIED_ON_BASE=true'; then
+          ALREADY_VALUE=true PRECHECK_VERDICT=already-merged-on-base SATISFIED_ON_BASE=true SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
+      import json
+      import os
+      print(json.dumps({
+          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
+          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "already-merged-on-base"),
+          "SATISFIED_EVIDENCE": os.environ.get("SATISFIED_EVIDENCE", ""),
+          "SATISFIED_ON_BASE": os.environ.get("SATISFIED_ON_BASE") == "true",
+      }, separators=(",", ":")))
+      PY
+          echo "gate-already-satisfied: WO appears already merged on origin/<base> (not in this worktree); build-only nodes will be skipped." >&2
+        else
+          ALREADY_VALUE=true PRECHECK_VERDICT=already-satisfied SATISFIED_EVIDENCE="$SATISFIED_EVIDENCE" python3 - <<'PY'
+      import json
+      import os
+      print(json.dumps({
+          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
+          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "already-satisfied"),
+          "SATISFIED_EVIDENCE": os.environ.get("SATISFIED_EVIDENCE", ""),
+      }, separators=(",", ":")))
+      PY
+          echo "gate-already-satisfied: WO appears already implemented in this worktree; build-only nodes will be skipped." >&2
+        fi
+      else
+        ALREADY_VALUE=false PRECHECK_VERDICT=needs-build python3 - <<'PY'
+      import json
+      import os
+      print(json.dumps({
+          "ALREADY_SATISFIED": os.environ.get("ALREADY_VALUE") == "true",
+          "PRECHECK_VERDICT": os.environ.get("PRECHECK_VERDICT", "needs-build"),
+      }, separators=(",", ":")))
+      PY
+      fi
+      exit 0
+
+  - id: plan
+    provider: codex-native-strict
+    model: gpt-6-astra
+    persona: war-council-architect-opr
+    # This variant binds the existing role through a lane-specific model selection.
+    depends_on: [gate-already-satisfied]
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+    task_class: medium_work
+    prompt: |
+      Read the BDC Work Order spec below and produce a concise implementation plan.
+
+      ## Idempotency note
+      Pre-check verdict (from gate-already-satisfied): $gate-already-satisfied.output
+      If PRECHECK_VERDICT=already-satisfied, the deliverables already exist in this
+      worktree. Produce a minimal plan that VERIFIES the existing state rather than
+      re-creating it; implement will correctly make no changes and emit ALREADY_SATISFIED.
+
+      ## Required Output
+      Return structured Markdown with these headings:
+      - WO ID
+      - Files to modify
+      - Files to create
+      - Files explicitly out of scope
+      - Verification commands
+      - Commit message
+      - Push policy
+      - Staging gate required
+
+      ## BDC Push Policy
+      Hardcoded Rule 20 staging-gate repos:
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
+      - thinmansoftware/shopops
+
+      For those repos, use a feature branch plus PR and require the staging gate.
+      For bdc-xo non-doctrine code and any other repo, use feature branch plus PR without staging gate.
+      Doc-only and doctrine-only WOs are out of scope for this workflow.
+
+      ## Spec
+      $read-spec.output
+
+  # plan-review: in-run self-repair loop (doctrine: self-repair-review-loops +
+  # in-run-review-loops-feature-dev, 2026-05-30). war-council-architect re-reviews and
+  # REVISES its own plan until clean or 2 repair attempts, then escalates. This is a
+  # SELF-CONTAINED loop (the executor has no cross-node loop-back); the initial plan
+  # comes from `plan`, the review-and-revise happens here. Output is the final approved
+  # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
+  # async escalation payload, and only at the irreversible-action boundary downstream.
+  - id: plan-review
+    provider: claude
+    model: claude-fable-5
+    persona: astra-plan-reviewer
+    idle_timeout: 600000
+    # This variant binds the existing role through a lane-specific model selection.
+    depends_on: [plan]
+    trigger_rule: all_done
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      # Success-only sentinel. The war-council-architect persona is READ-ONLY
+      # (tools: [Read,Grep,Glob,WebFetch] -- no Write), so this loop is STDOUT-ONLY:
+      # no until_bash, no findings file. Completion = the architect emits the
+      # PLAN_REVIEW_APPROVED token, which it is instructed to emit ONLY when the plan
+      # truly passes (never on a failing/escalation iteration). On the final iteration
+      # without approval, the loop exhausts and the run fails closed (escalation in output).
+      until: PLAN_REVIEW_APPROVED
+      max_iterations: 3
+      prompt: |
+        You are the War Council Architect doing an adversarial self-review of the
+        implementation plan, then REVISING it in place. Iteration-driven self-repair:
+        one initial pass + up to 2 repair attempts. You are READ-ONLY (no file writes,
+        no shell) -- everything you produce goes to STDOUT.
+
+        ## Prior iteration (read FIRST)
+        Your previous iteration's full output (empty on the first pass):
+        $LOOP_PREV_OUTPUT
+        If it contains findings (PLAN_REVIEW=needs_revision), you MUST resolve every one
+        in the revised plan this iteration. If a finding repeats and you cannot resolve
+        it, escalate (below) instead of looping again.
+
+        ## Inputs
+        Original plan: $plan.output
+        Pre-check verdict (from gate-already-satisfied): $gate-already-satisfied.output
+        If PRECHECK_VERDICT=already-satisfied, the deliverables already exist in this
+        worktree. Ensure the approved plan remains a minimal plan that VERIFIES the
+        existing state rather than re-creating it.
+        Spec: $read-spec.output
+
+        ## Attack the plan on these dimensions
+        1. Scope creep -- any file not justified by the spec.
+        2. Missing files -- in-scope work the plan omits.
+        3. Unsafe assumptions -- "assume X exists" without verification.
+        4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
+           shopops, plan MUST require --base staging. If not those, must NOT.
+        5. Out-of-scope list present and correct.
+
+        ## Self-repair (the point -- do not just report)
+        If you find issues AND they are plan-level fixable, REVISE the plan to resolve
+        them and emit the corrected plan in full. Do not halt for a human on anything
+        you can fix here.
+
+        ## Required STDOUT format (this is the only handoff -- emit EXACTLY this shape)
+        The blocks are fenced so downstream nodes consume ONLY the approved plan, never
+        your critique. Emit, in this order:
+
+          PLAN_REVIEW_PASS=<true|false>
+          PLAN_REVIEW_RISK=<LOW|MEDIUM|HIGH>
+
+          === APPROVED_PLAN_BEGIN ===
+          <the FINAL revised plan in full -- this and ONLY this is what implement uses>
+          === APPROVED_PLAN_END ===
+
+          === PLAN_REVIEW_FINDINGS_BEGIN ===
+          <your findings / what you changed and why, or "(none)">
+          === PLAN_REVIEW_FINDINGS_END ===
+
+        The APPROVED_PLAN block must always contain a complete, usable plan (even on a
+        passing first iteration where you changed nothing -- echo the original plan there).
+        Keep ALL critique inside the FINDINGS block; never let critique leak into the
+        APPROVED_PLAN block.
+
+        ## Completion sentinel (success ONLY)
+        If and ONLY if PLAN_REVIEW_PASS=true (scope contained, no in-scope file missing,
+        Rule 20 gate correct), emit on its OWN LINE as the LAST line:
+          PLAN_REVIEW_APPROVED
+        On a failing iteration emit instead (never the approved token):
+          PLAN_REVIEW_NEEDS_REVISION
+        Emitting PLAN_REVIEW_APPROVED is the gate that lets the run proceed to implement,
+        so emit it ONLY when PLAN_REVIEW_PASS=true.
+
+        ## Escalation (emit instead of approving; do NOT emit the approved sentinel)
+        If the spec is ambiguous/contradictory, the fix needs a new side-effect class or
+        ungranted scope, or the same finding survived a prior attempt and you cannot
+        resolve it -- set PLAN_REVIEW_PASS=false, emit PLAN_REVIEW_NEEDS_REVISION, and put
+        this block inside the FINDINGS block:
+          ESCALATION_REQUIRED=true
+          ESCALATION_REASON=<ambiguous-spec|new-side-effect-class|loop-exhausted>
+          WO_ID=<id>
+          NODE=plan-review
+          ATTEMPTS=<n>/3
+          WHAT_FAILED=<one paragraph>
+          WHAT_WAS_TRIED=<3-6 bullets>
+          LAST_REVIEW_FINDINGS=<exact bullets>
+          SINGLE_DECISION_NEEDED=<one sentence John can answer>
+          SAFE_STATE=<nothing committed/pushed; plan stage only>
+
+  - id: capture-run-scope
+    persona: major-build
+    depends_on: [plan-review]
+    trigger_rule: all_done
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "scope_authority_missing: assigned worktree unavailable" >&2
+        exit 1
+      }
+      cd "$WT"
+      DIRTY=$(git status --porcelain=v1 --untracked-files=all)
+      if [ -n "$DIRTY" ]; then
+        echo "run_scope_dirty_at_capture" >&2
+        printf '%s\n' "$DIRTY" >&2
+        exit 1
+      fi
+      # Base-lane authority early-fail (WO-HARNESS-BASE-LANE-AUTHORITY-01): the
+      # worktree MUST share history with the declared base lane. BASE_BRANCH is the
+      # single authority (the WO's declared Base branch for run-authority workflows,
+      # pinned at allocation). When origin/$BASE_BRANCH exists locally, a missing
+      # merge-base means this worktree was cut from a disjoint lane -- fail HERE,
+      # before implement, instead of at a tail node after a PR was already opened.
+      if [ -n "${BASE_BRANCH:-}" ] && git rev-parse --verify "refs/remotes/origin/${BASE_BRANCH}^{commit}" >/dev/null 2>&1; then
+        if ! git merge-base "refs/remotes/origin/${BASE_BRANCH}" HEAD >/dev/null 2>&1; then
+          echo "worktree_not_on_declared_base_lane: HEAD shares no history with origin/${BASE_BRANCH}" >&2
+          exit 1
+        fi
+      fi
+      RUN_SCOPE_SHA=$(git rev-parse --verify 'HEAD^{commit}') || {
+        echo "scope_authority_missing: HEAD is not a commit" >&2
+        exit 1
+      }
+      mkdir -p "$ARTIFACTS_DIR"
+      printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
+      echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
+
+  - id: implement
+    provider: codex-native-strict
+    model: gpt-6-astra
+    idle_timeout: 600000
+    depends_on: [capture-run-scope]
+    trigger_rule: all_done
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+    task_class: medium_work
+    wall_timeout_ms: 1800000
+    loop:
+      prompt: |
+        Implement the approved plan for this BDC feature Work Order.
+
+        ## Spec
+        $read-spec.output
+
+        ## Idempotency short-circuit -- CHECK THIS FIRST (WO-HARNESS-IMPLEMENT-SKIP-WHEN-ALREADY-SATISFIED-01)
+        Pre-check verdict from gate-already-satisfied (upstream, already decided this):
+        $gate-already-satisfied.output
+        If the line above contains PRECHECK_VERDICT=already-satisfied, do NOT run a fresh
+        investigation. On THIS iteration, verify the SATISFIED_EVIDENCE claim with a single
+        cheap check in THIS worktree, then go straight to Completion Criteria case 2
+        (ALREADY SATISFIED) below and emit its sentinel. Do not consume additional iterations.
+
+        ## Plan (approved by plan-review)
+        Use ONLY the text between the === APPROVED_PLAN_BEGIN === and
+        === APPROVED_PLAN_END === markers below as the plan. IGNORE everything outside
+        those markers (verdict headers, the PLAN_REVIEW_FINDINGS block, sentinels) --
+        that is reviewer metadata, not the plan.
+        $plan-review.output
+
+        ## WORKTREE PINNING (Fix A, 2026-05-30 -- anchor run 04daeafc)
+        You run inside ONE assigned git worktree. ALL of your work and ALL of your
+        completion judgments MUST happen inside it. Resolve it first:
+          WT=$(git rev-parse --show-toplevel)
+        Then:
+        - Make EVERY git/grep/diff/log call relative to THIS worktree (you are already
+          cd'd into it; use plain `git ...`, or `git -C "$WT" ...`).
+        - You MUST NOT read, grep, `git -C`, or judge "already done" against any OTHER
+          location: not the shared `source/` checkout, not `origin/main`, not another
+          thread's worktree (e.g. `.../worktrees/archon/thread-<other>`). Whether the WO
+          is satisfied is decided ONLY by the state of THIS worktree's HEAD + working tree.
+        - If you believe the WO is already implemented, that conclusion is only valid if
+          it is true IN THIS WORKTREE. If the work exists only on origin/main or another
+          thread, it is NOT present here -- treat the WO as needing implementation here,
+          OR emit `ALREADY_SATISFIED` (see Completion) only after confirming the
+          deliverables are reachable from THIS worktree's HEAD.
+        Anchor: run 04daeafc judged "already done" against a sibling worktree + origin/main,
+        made an empty verify-only commit on the wrong thread, and emitted a fraudulent
+        COMPLETE. The review pipeline inspected THIS worktree (correctly empty) and blocked.
+
+        ## Execution Rules
+        - Modify only the files identified as in scope by the spec.
+        - Prefer existing repo patterns and helpers.
+        - Do not reformat unrelated code.
+        - Do not deploy.
+        - Do not bypass approval gates.
+        - Do NOT use `git commit --allow-empty` or any empty/verify-only commit to
+          simulate completion. A commit must contain real, in-scope file changes.
+        - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
+
+        ## Commit-and-push BEFORE exit (Patch 2, 2026-05-16)
+        When your implementation is complete, BEFORE emitting the sentinel below, run:
+
+        ```bash
+        BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        # Re-derive WO_ID locally (don't interpolate spec output - quote-safety)
+        WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+        git add -A
+        git diff --cached --quiet || git commit -m "feat: implement ${WO_ID}
+
+        Implementation per WO spec. Self-verified within implement loop.
+        Workflow-time verify-* removed 2026-05-16 (Patch 1); PR-time gates handle validation.
+
+        Co-Authored-By: Astra (Cauldron major-build) <noreply@openai.com>"
+        git push -u origin "$BRANCH" 2>&1 || echo "WARN: push failed - operator must recover from worktree"
+        ```
+
+        Why: workflow-time verify-* gates were removed (Patch 1). Even with them gone, if any
+        downstream node fails (sentinel mismatch, war-council-validator timeout, etc.), the
+        traditional commit-and-push node may be skipped. Committing + pushing HERE makes your
+        work durable regardless of what happens after this iteration ends.
+
+        Worst case: the downstream commit-and-push node runs and is a no-op because HEAD is
+        already pushed. Best case: your work is on origin even if everything else fails.
+
+        ## Completion mailbox -- REQUIRED before your sentinel (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01)
+        Downstream bash gates NEVER read your narration; they read ONLY the file
+        $ARTIFACTS_DIR/implement.env. Immediately before emitting your completion
+        sentinel, write EXACTLY two KEY=VALUE lines to that file, for example:
+          printf 'COMPLETE=true\nALREADY_SATISFIED=no\n' > "$ARTIFACTS_DIR/implement.env"
+        Values by outcome:
+        - REAL BUILD (you made in-scope changes): COMPLETE=true, ALREADY_SATISFIED=no
+        - ALREADY SATISFIED (verified no-op): COMPLETE=true, ALREADY_SATISFIED=yes
+        - BLOCKED (cannot proceed): COMPLETE=false, ALREADY_SATISFIED=no
+        No other content, no prose, no code fences inside that file. If the file is
+        missing, assert-implement-produced-work treats your completion claim as
+        unproven and a clean worktree is classified FALSE_COMPLETE.
+
+        ## Completion Criteria + Sentinel Emission (Patch 3, 2026-05-16; Fix A 2026-05-30)
+        Before emitting any completion sentinel, run this self-check IN THIS WORKTREE:
+          WT=$(git rev-parse --show-toplevel)
+          CHANGED=$(git -C "$WT" status --porcelain | wc -l)
+          AHEAD=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null \
+                  || git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null || echo 0)
+        Then choose EXACTLY ONE ending:
+
+        1. REAL BUILD (you made in-scope changes): only if CHANGED>0 OR AHEAD>0 with real
+           file changes. Emit, each on its own line:
+             COMPLETE
+             BUILD_COMPLETE
+             <promise>COMPLETE</promise>
+
+        2. ALREADY SATISFIED (the WO's deliverables are ALREADY reachable from THIS
+           worktree's HEAD and you correctly made no changes): emit BOTH lines, each on
+           its own line:
+             ALREADY_SATISFIED: <one sentence: which deliverables already exist in this worktree HEAD>
+             COMPLETE
+           The COMPLETE line is REQUIRED here ONLY to let the until:COMPLETE loop exit -- do
+           NOT also emit BUILD_COMPLETE or <promise>COMPLETE</promise>, and do NOT make an
+           empty commit. assert-implement-produced-work re-checks the worktree: because it
+           is genuinely clean, it reclassifies this to ALREADY_SATISFIED (a verified no-op,
+           NOT a fraudulent build). This is the SINGLE no-op completion contract -- see also
+           the "Loop exit" section below, which says the same thing.
+
+        3. TRUE BLOCKER (spec ambiguous / missing source of truth / cannot proceed):
+             BLOCKED: <one-sentence reason>
+
+        ANTI-FRAUD RULE: you may emit the case-1 BUILD sentinels (BUILD_COMPLETE +
+        <promise>COMPLETE</promise>) ONLY if you made real in-scope edits (CHANGED>0 OR
+        AHEAD>0). If you did no work because it was already done, that is case 2
+        (ALREADY_SATISFIED: + a bare COMPLETE to exit the loop), NOT case 1 -- do not claim
+        a build you did not do. The downstream guard re-checks the worktree and will catch a
+        bare COMPLETE with no ALREADY_SATISFIED and no real changes as FALSE_COMPLETE.
+
+        Reason: BDC YAMLs have used different sentinel strings over time. Emitting all three
+        case-1 sentinels guarantees the loop's `until:` matcher finds one.
+
+        ## Loop exit -- the no-op contract (stated once; matches case 2 above)
+        The loop's `until:` matches COMPLETE. A real build emits the three case-1 sentinels.
+        A genuine no-op (already satisfied in THIS worktree) emits exactly:
+          ALREADY_SATISFIED: <which deliverables already exist in this worktree HEAD>
+          COMPLETE
+        That bare COMPLETE is what lets the loop exit; assert-implement-produced-work sees
+        the clean worktree + the ALREADY_SATISFIED line and reclassifies to ALREADY_SATISFIED
+        (verified no-op, not a fraudulent build). NEVER emit COMPLETE if you simply failed to
+        do needed work (no ALREADY_SATISFIED line + clean worktree => FALSE_COMPLETE).
+      until: COMPLETE
+      max_iterations: 5
+      fresh_context: true
+
+  # NOTE - verify-build / verify-types / verify-tests removed 2026-05-16 (Patch 1 of Cauldron friction sweep).
+  # Rationale: those nodes consistently killed valid implementation work on pre-existing harness rot
+  # (15+ @archon/paths failures, npm-not-found before bun sweep, scope-too-wide tsc) rather than catching
+  # real WO-introduced bugs. The implement loop now self-verifies (Rule 19 of YAML Recipe v1) and commits
+  # its own work before exit (Patch 2). Downstream PR-time gates catch real bugs at human-readable layer:
+  #   - codex-review (adversarial schema/code)
+  #   - claude-review (doctrine/architecture)
+  #   - Gitleaks (secret scan)
+  #   - e2e-smoke (CI integration test)
+  #   - Captain CI manifest contract check
+  # Workflow-time verify-* was redundant with PR-time review and high-cost-low-value. See also: WO-149
+  # (verify-scope-to-changed-files) and WO-146 (npm->bun sweep) for the deeper structural fixes.
+
+  # Cauldron resilience: commit + push WIP branch after implement loop exits.
+  # Best-effort only -- failure logged and silently tolerated (NOT load_bearing).
+  # If container restarts after this node but before backstop, work survives on origin.
+  # If nothing changed since last checkpoint, exits 0 silently.
+  # Anchor: 2026-05-24 run 07415e9f lost local commit when container restarted before backstop.
+  # WO-HARNESS-IMPLEMENT-CHECKPOINT-PUSH-01
+  - id: checkpoint-push
+    persona: overseer
+    depends_on: [implement]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+
+      # ---- BEGIN checkpoint-wo-id-derive ----
+      # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
+      # Re-derive WO_ID: env -> USER_MESSAGE -> read-spec.output. Fail closed (no wip/unknown-*).
+      WO_ID="${WO_ID:-}"
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)
+      fi
+      # Safe capture of read-spec output (heredoc+python; do not naive-interpolate).
+      _RS_OUT=$(python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)' <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        WO_ID=$(printf '%s\n' "$_RS_OUT" | sed -n 's/^WO_ID=//p' | head -1 || true)
+        WO_ID=$(printf '%s' "$WO_ID" | tr -d '\r' | head -c 200)
+      fi
+      if [ -z "$WO_ID" ] || [ "$WO_ID" = "unknown" ]; then
+        echo "ERROR: checkpoint-push cannot resolve WO_ID (would create wip/unknown-*)" >&2
+        exit 1
+      fi
+      # ---- END checkpoint-wo-id-derive ----
+      WIP_BRANCH="wip/${WO_ID}-$(date +%Y%m%d%H%M%S)"
+
+      git add -A 2>/dev/null || true
+
+      if git diff --cached --quiet 2>/dev/null; then
+        echo "checkpoint-push: nothing staged -- no commit needed"
+        exit 0
+      fi
+
+      git commit -m "wip: checkpoint after implement loop -- ${WO_ID}
+
+      Cauldron resilience checkpoint. Not the final commit.
+      Will be superseded by backstop commit-and-push node.
+
+      Co-Authored-By: Astra (Cauldron major-build) <noreply@openai.com>" \
+        2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
+
+      if git push -u origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
+        echo "checkpoint-push: WIP branch pushed -- ${WIP_BRANCH}"
+        echo "CHECKPOINT_BRANCH=${WIP_BRANCH}"
+        echo "CHECKPOINT_SHA=$(git rev-parse HEAD)"
+      else
+        echo "WARN: checkpoint push failed -- work is local only; backstop will retry" >&2
+      fi
+      exit 0
+
+  # assert-implement-produced-work (Fix A guard, 2026-05-30 -- anchor run 04daeafc).
+  # Distinguishes three post-implement states from the ASSIGNED worktree's own state:
+  #   REAL_BUILD       -- worktree has changes / commits ahead -> proceed to review chain
+  #   ALREADY_SATISFIED-- implement said ALREADY_SATISFIED + worktree genuinely clean -> emit
+  #                       BUILD_OUTCOME=ALREADY_SATISFIED so flip-notion records verified-no-op
+  #   FALSE_COMPLETE   -- implement emitted COMPLETE/BUILD_COMPLETE but worktree shows ZERO
+  #                       real changes (the fraud 04daeafc committed) -> emit
+  #                       BUILD_OUTCOME=FALSE_COMPLETE (the commit-and-push gate turns this
+  #                       into a PAUSE, not a hard fail -- see Fix D).
+  # Load-bearing: this is the truth check that the implement self-report cannot bypass.
+  - id: assert-implement-produced-work
+    persona: overseer
+    depends_on: [checkpoint-push]
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      # Artifact-mailbox (WO-HARNESS-NODE-OUTPUT-MAILBOX-ASSERT-01): implement writes
+      # KEY=VALUE lines to implement.env in the artifacts dir; this gate parses ONLY
+      # that file and never interpolates raw agent narration into shell. Anchor runs:
+      # 4fdc8d95 (exit 127, manifest lines executed as commands), 474afb2c (exit 2,
+      # apostrophes in narration).
+      IMPL_ENV="$ARTIFACTS_DIR/implement.env"
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      # Codex FINDING_1 fix: compare against the IMMUTABLE run-start SHA (captured by
+      # read-spec BEFORE checkpoint-push committed+pushed), NOT post-push upstream state.
+      # After checkpoint-push, @{upstream}..HEAD is 0 even for a real build -- that false-
+      # negative is what would have misrouted every legitimate build to BLOCKED.
+      BASE=$(cat "$ARTIFACTS_DIR/run-start-sha.txt" 2>/dev/null || echo "")
+      HEAD_NOW=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo "")
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git -C "$WT" status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
+      # commits since run start (real work this run produced, even after a checkpoint push)
+      if [ -n "$BASE" ] && [ "$BASE" != "unknown" ] && [ -n "$HEAD_NOW" ]; then
+        AHEAD_RAW=$(git -C "$WT" rev-list --count "${BASE}..HEAD" 2>/dev/null) || {
+          echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+          exit 1
+        }
+      else
+        # fallback: no base captured -> use any-uncommitted OR diff vs upstream
+        AHEAD_RAW=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null) ||
+          AHEAD_RAW=$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null) || {
+            echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+            exit 1
+          }
+      fi
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
+      HAS_WORK=false
+      if [ "$CHANGED" -gt 0 ] || [ "$AHEAD" -gt 0 ]; then HAS_WORK=true; fi
+
+      SAID_COMPLETE=false
+      SAID_ALREADY=false
+      if [ -f "$IMPL_ENV" ]; then
+        case "$(sed -n 's/^COMPLETE=//p' "$IMPL_ENV" | head -1)" in true) SAID_COMPLETE=true ;; esac
+        case "$(sed -n 's/^ALREADY_SATISFIED=//p' "$IMPL_ENV" | head -1)" in yes) SAID_ALREADY=true ;; esac
+      fi
+      GATE_ALREADY=false
+      GATE_JSON=$(cat <<'BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3'
+      $gate-already-satisfied.output
+      BDC_FEATURE_DEV_GATE_ALREADY_SATISFIED_20260713_A8E4D3
+      )
+      if [ -n "$GATE_JSON" ]; then
+        GATE_ALREADY=$(GATE_JSON="$GATE_JSON" python3 - <<'PY' 2>/dev/null || printf 'false\n'
+      import json
+      import os
+      try:
+          print('true' if json.loads(os.environ.get('GATE_JSON', '{}')).get('ALREADY_SATISFIED') is True else 'false')
+      except Exception:
+          print('false')
+      PY
+      )
+      fi
+      case "$GATE_ALREADY" in true) ;; *) GATE_ALREADY=false ;; esac
+
+      echo "WORKTREE=$WT"
+      echo "CHANGED_FILES=$CHANGED"
+      echo "COMMITS_AHEAD=$AHEAD"
+      echo "IMPL_SAID_COMPLETE=$SAID_COMPLETE"
+      echo "IMPL_SAID_ALREADY_SATISFIED=$SAID_ALREADY"
+      echo "GATE_ALREADY_SATISFIED=$GATE_ALREADY"
+
+      if [ "$HAS_WORK" = "true" ]; then
+        echo "BUILD_OUTCOME=REAL_BUILD"
+        echo "assert-implement-produced-work: real changes present -- proceeding to review chain"
+        exit 0
+      fi
+
+      # No work in this worktree. A true node-level skip leaves the mailbox file absent,
+      # so classify the already-satisfied path directly from gate-already-satisfied JSON.
+      if [ "$GATE_ALREADY" = "true" ]; then
+        echo "BUILD_OUTCOME=ALREADY_SATISFIED"
+        echo "assert-implement-produced-work: gate reported ALREADY_SATISFIED and worktree is genuinely clean -- legitimate no-op"
+        exit 0
+      fi
+
+      # Codex FINDING_3 interaction: implement now emits BOTH "ALREADY_SATISFIED:" AND
+      # COMPLETE in the genuine no-op case (COMPLETE is required to exit the until:COMPLETE
+      # loop). So ALREADY_SATISFIED WINS whenever the agent declared it AND the worktree is
+      # genuinely clean -- the clean worktree is the truth check that makes this non-fraudulent.
+      if [ "$SAID_ALREADY" = "true" ]; then
+        echo "BUILD_OUTCOME=ALREADY_SATISFIED"
+        echo "assert-implement-produced-work: implement reported ALREADY_SATISFIED and worktree is genuinely clean -- legitimate no-op"
+        exit 0
+      fi
+
+      # No work, and implement did NOT declare already-satisfied, yet it claimed COMPLETE
+      # (or emitted nothing usable): false/fraudulent completion.
+      echo "BUILD_OUTCOME=FALSE_COMPLETE"
+      echo "ERROR: implement emitted COMPLETE but produced ZERO real changes in the assigned worktree (CHANGED=$CHANGED AHEAD=$AHEAD)." >&2
+      echo "This is a false/fraudulent completion (anchor 04daeafc). Downstream gate will PAUSE for correction, not commit." >&2
+      exit 0
+
+  # ascii-autofix (WO-HARNESS-ASCII-AUTOFIX-WIRE-AND-CLEANUP-01, 2026-06-24).
+  # TOTAL fixer that runs BEFORE ascii-gate. Two tiers: SUBS (semantic map: em-dash,
+  # arrows, box-drawing, etc.) then STRIP fallback (any remaining codepoint >= 0x80
+  # is removed and logged). Output is guaranteed pure ASCII by construction, so the
+  # downstream ascii-gate becomes a verification that cannot fail on agent-leaked
+  # non-ASCII. Exit 0 always (gate is the backstop if the fixer ever has a bug).
+  # Anchor: WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01 failed the gate three times
+  # because the agent leaked U+2192 arrows + em-dashes into the YAML it was editing.
+  - id: derive-run-source-scope
+    persona: major-build
+    depends_on: [assert-implement-produced-work]
+    trigger_rule: all_done
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null) || {
+        echo "scope_authority_missing: assigned worktree unavailable" >&2
+        exit 1
+      }
+      cd "$WT"
+      SCOPE_SHA_FILE="$ARTIFACTS_DIR/run-scope-sha.txt"
+      LIST_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -s "$SCOPE_SHA_FILE" ]; then
+        echo "scope_authority_missing: run scope SHA is missing" >&2
+        exit 1
+      fi
+      SCOPE_SHA=$(cat "$SCOPE_SHA_FILE")
+      case "$SCOPE_SHA" in
+        *[!0-9a-f]*|'')
+          echo "scope_authority_missing: run scope SHA is invalid" >&2
+          exit 1
+          ;;
+      esac
+      if [ "${#SCOPE_SHA}" -ne 40 ] || ! git cat-file -e "${SCOPE_SHA}^{commit}" 2>/dev/null; then
+        echo "scope_authority_missing: run scope SHA is not a commit" >&2
+        exit 1
+      fi
+      if ! git merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
+        BASE_REF="${BASE_BRANCH:-dev}"
+        RECOVERED_SCOPE_SHA=""
+        for CANDIDATE_REF in "origin/$BASE_REF" "$BASE_REF"; do
+          if git rev-parse --verify "${CANDIDATE_REF}^{commit}" >/dev/null 2>&1; then
+            RECOVERED_SCOPE_SHA=$(git merge-base "$CANDIDATE_REF" HEAD 2>/dev/null || true)
+            if [ -n "$RECOVERED_SCOPE_SHA" ] && git cat-file -e "${RECOVERED_SCOPE_SHA}^{commit}" 2>/dev/null; then
+              break
+            fi
+          fi
+        done
+        if [ -z "$RECOVERED_SCOPE_SHA" ]; then
+          echo "scope_authority_missing: run scope SHA is not an ancestor of HEAD" >&2
+          exit 1
+        fi
+        WORK_CHECK=$(mktemp)
+        git diff --name-only --diff-filter=ACMRT "$RECOVERED_SCOPE_SHA"..HEAD > "$WORK_CHECK"
+        git diff --name-only --diff-filter=ACMRT HEAD >> "$WORK_CHECK"
+        git ls-files --others --exclude-standard >> "$WORK_CHECK"
+        if [ ! -s "$WORK_CHECK" ]; then
+          rm -f "$WORK_CHECK"
+          echo "scope_authority_missing: run scope SHA is not an ancestor of HEAD" >&2
+          exit 1
+        fi
+        rm -f "$WORK_CHECK"
+        SCOPE_SHA="$RECOVERED_SCOPE_SHA"
+        printf '%s\n' "$SCOPE_SHA" > "$SCOPE_SHA_FILE"
+        echo "scope_authority_recovered: run scope SHA replaced with worktree merge-base $SCOPE_SHA"
+      fi
+      RAW_FILE=$(mktemp)
+      LIST_TMP=$(mktemp)
+      trap 'rm -f "$RAW_FILE" "$LIST_TMP"' EXIT
+      git diff --name-only --diff-filter=ACMRT "$SCOPE_SHA"..HEAD > "$RAW_FILE"
+      git diff --name-only --diff-filter=ACMRT HEAD >> "$RAW_FILE"
+      git ls-files --others --exclude-standard >> "$RAW_FILE"
+      LC_ALL=C sort -u "$RAW_FILE" | awk '
+        /\.(js|jsx|ts|tsx|mjs|cjs|html|sh|bash|gs|yaml|yml)$/ &&
+        $0 !~ /(\.generated\.(ts|js)$|bundled-defaults\.generated\.|\/__snapshots__\/|\.snap$)/
+      ' > "$LIST_TMP"
+      mv "$LIST_TMP" "$LIST_FILE"
+      rm -f "$RAW_FILE"
+      trap - EXIT
+      COUNT=$(grep -c . "$LIST_FILE" || true)
+      echo "RUN_CHANGED_SOURCE_FILES=$COUNT"
+
+  - id: ascii-autofix
+    persona: major-build
+    depends_on: [derive-run-source-scope]
+    bash: |
+      set -uo pipefail
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      if ! command -v python3 >/dev/null 2>&1; then
+        echo "ascii-autofix: WARN -- python3 not found, skipping normalization"
+        exit 0
+      fi
+      if [ ! -f harness/scripts/ascii-autofix.py ]; then
+        echo "ascii-autofix: WARN -- autofix script not present in this repo, skipping"
+        exit 0
+      fi
+      SCOPE_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -f "$SCOPE_FILE" ]; then
+        echo "scope_authority_missing: changed-source list is missing" >&2
+        exit 1
+      fi
+      # Run the total fixer; prefix every output line for node log clarity.
+      if ! python3 harness/scripts/ascii-autofix.py --files-from "$SCOPE_FILE" 2>&1 | while IFS= read -r line; do
+        echo "ascii-autofix: $line"
+      done; then
+        echo "ascii-autofix: authoritative scope rejected" >&2
+        exit 1
+      fi
+      exit 0
+
+  # ascii-gate (Rule 13 mechanical enforcement, 2026-06-04 -- WO-HARNESS-CAULDRON-ASCII-ENFORCEMENT).
+  # WHY THIS EXISTS: the BDC ASCII-only-source rule lived only in John's personal Windows
+  # ~/.claude/CLAUDE.md + a host-side hookify rule. Neither reaches a Cauldron build agent
+  # (Linux container, no ~/.claude/CLAUDE.md, cwd is the TARGET worktree whose CLAUDE.md has
+  # no ASCII rule). The rule is now CARRIED in harness/policies/agent-behavior.md (the
+  # policyFile every node loads), but Claude/Opus leaks non-ASCII even when told not to
+  # (proven: the rule's own sentence shipped with an em-dash). So this node ENFORCES it
+  # deterministically: it FAILS the build (load_bearing, exit 1) if any changed source file
+  # contains a non-ASCII byte. Runs AFTER implement/repair confirmed real work, BEFORE the
+  # review + commit-and-push + PR chain, so a violating build never opens a PR / reaches dev.
+  # Updated 2026-06-24 (WO-HARNESS-ASCII-AUTOFIX-WIRE-AND-CLEANUP-01): now runs AFTER the
+  # ascii-autofix TOTAL fixer, so this gate is a verification that should always PASS.
+  # Kept as a cheap defense-in-depth assertion: if the fixer ever has a bug, this catches it.
+  # Anchor: a Claude-authored UI build put 87 non-ASCII chars into packages/web and merged.
+  - id: ascii-gate
+    depends_on: [ascii-autofix]
+    trigger_rule: all_done
+    persona: major-build
+    load_bearing: true
+    bash: |
+      set -uo pipefail
+      # Consume the exact path list already used by ascii-autofix. Never recompute scope.
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT"
+      SCOPE_SHA_FILE="$ARTIFACTS_DIR/run-scope-sha.txt"
+      SCOPE_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"
+      if [ ! -s "$SCOPE_SHA_FILE" ]; then
+        echo "scope_authority_missing: run scope SHA is missing" >&2
+        exit 1
+      fi
+      SCOPE_SHA=$(cat "$SCOPE_SHA_FILE")
+      case "$SCOPE_SHA" in
+        *[!0-9a-f]*|'')
+          echo "scope_authority_missing: run scope SHA is invalid" >&2
+          exit 1
+          ;;
+      esac
+      if [ "${#SCOPE_SHA}" -ne 40 ] || ! git cat-file -e "${SCOPE_SHA}^{commit}" 2>/dev/null; then
+        echo "scope_authority_missing: run scope SHA is not a commit" >&2
+        exit 1
+      fi
+      if [ ! -f "$SCOPE_FILE" ]; then
+        echo "scope_authority_missing: changed-source list is missing" >&2
+        exit 1
+      fi
+      if [ ! -s "$SCOPE_FILE" ]; then
+        echo "ascii-gate PASS (no changed source files to scan)"
+        exit 0
+      fi
+      INVALID_SCOPE=$(mktemp)
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        case "$f" in
+          /*|..|../*|*/../*) printf '%s\n' "$f" >> "$INVALID_SCOPE" ;;
+          *) [ -f "$f" ] || printf '%s\n' "$f" >> "$INVALID_SCOPE" ;;
+        esac
+      done < "$SCOPE_FILE"
+      if [ -s "$INVALID_SCOPE" ]; then
+        echo "scope_authority_missing: invalid or missing changed-source path" >&2
+        cat "$INVALID_SCOPE" >&2
+        rm -f "$INVALID_SCOPE"
+        exit 1
+      fi
+      rm -f "$INVALID_SCOPE"
+      # Portable non-ASCII detector. grep -P is not present in every build image, so probe
+      # it once and fall back to perl, then to an LC_ALL=C byte-class grep.
+      GREP_P_OK=0
+      if printf 'a\xe2\x80\x94b\n' | grep -qP "[^\x00-\x7F]" 2>/dev/null; then GREP_P_OK=1; fi
+      detect() {
+        f="$1"
+        if [ "$GREP_P_OK" = "1" ]; then
+          grep -lP "[^\x00-\x7F]" "$f" >/dev/null 2>&1 && return 1
+        elif command -v perl >/dev/null 2>&1; then
+          perl -ne 'exit 1 if /[^\x00-\x7F]/' "$f" || return 1
+        else
+          # Locale-independent: any byte >= 0x80 is non-ASCII. od is in coreutils everywhere
+          # (LC_ALL=C grep -P errors out: "-P supports only unibyte and UTF-8 locales").
+          od -An -tu1 "$f" 2>/dev/null | tr ' ' '\n' | grep -qE '^(12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])$' && return 1
+        fi
+        return 0
+      }
+      detect_text() {
+        text="$1"
+        if [ "$GREP_P_OK" = "1" ]; then
+          printf '%s\n' "$text" | grep -qP "[^\x00-\x7F]" 2>/dev/null && return 1
+        elif command -v perl >/dev/null 2>&1; then
+          printf '%s\n' "$text" | perl -ne 'exit 1 if /[^\x00-\x7F]/' || return 1
+        else
+          printf '%s\n' "$text" | od -An -tu1 2>/dev/null | tr ' ' '\n' | grep -qE '^(12[89]|1[3-9][0-9]|2[0-4][0-9]|25[0-5])$' && return 1
+        fi
+        return 0
+      }
+      report_whole_file() {
+        f="$1"
+        if [ "$GREP_P_OK" = "1" ]; then
+          grep -nP "[^\x00-\x7F]" "$f" 2>/dev/null | head -5 | sed "s|^|${f}:|" >> "$DETAILFILE"
+        elif command -v perl >/dev/null 2>&1; then
+          perl -ne 'print "'"$f"':$.: $_" if /[^\x00-\x7F]/' "$f" 2>/dev/null | head -5 >> "$DETAILFILE"
+        fi
+      }
+      scan_added_lines() {
+        f="$1"
+        base="$2"
+        current_file=''
+        new_line=0
+        git -c core.pager=cat diff -U0 --no-color --find-renames "$base" -- 2>/dev/null | while IFS= read -r line; do
+          case "$line" in
+            @@*)
+              if [ "$current_file" = "$f" ]; then
+                parsed=$(printf '%s\n' "$line" | sed -n 's/^@@ [^+]*+\([0-9][0-9]*\)\(,[0-9][0-9]*\)\? @@.*/\1/p')
+                case "$parsed" in
+                  ''|*[!0-9]*) new_line=0 ;;
+                  *) new_line=$parsed ;;
+                esac
+              else
+                new_line=0
+              fi
+              ;;
+            '+++'*)
+              current_file=${line#+++ }
+              current_file=${current_file#b/}
+              [ "$current_file" = "/dev/null" ] && current_file=''
+              ;;
+            +*)
+              [ "$current_file" = "$f" ] || continue
+              text=${line#+}
+              if ! detect_text "$text"; then
+                printf '%s\n' "$f" >> "$HITFILE"
+                printf '%s:%s:%s\n' "$f" "$new_line" "$text" >> "$DETAILFILE"
+              fi
+              if [ "$new_line" -gt 0 ] 2>/dev/null; then new_line=$((new_line + 1)); fi
+              ;;
+          esac
+        done
+      }
+      HITFILE=$(mktemp)
+      DETAILFILE=$(mktemp)
+      trap 'rm -f "$HITFILE" "$DETAILFILE"' EXIT
+      while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        if git ls-files --others --exclude-standard -- "$f" | grep -Fxq "$f"; then
+          if ! detect "$f"; then
+            printf '%s\n' "$f" >> "$HITFILE"
+            report_whole_file "$f"
+          fi
+        else
+          scan_added_lines "$f" "$SCOPE_SHA"
+        fi
+      done < "$SCOPE_FILE"
+      if [ -s "$HITFILE" ]; then
+        echo "ASCII GATE FAILED -- non-ASCII bytes in changed source file(s):" >&2
+        LC_ALL=C sort -u "$HITFILE" >&2
+        if [ -s "$DETAILFILE" ]; then
+          echo "--- offending lines (first 5 per file) ---" >&2
+          awk -F: '!seen[$1]++ { count[$1]=0 } count[$1] < 5 { print; count[$1]++ }' "$DETAILFILE" >&2
+        fi
+        echo "Fix: em-dash/en-dash -> --, smart quotes -> ' and \", ellipsis -> ..., middot -> | or -, nbsp -> space, Unicode minus -> -. No emojis in source." >&2
+        echo "See harness/policies/agent-behavior.md (Code Standards / Rule 13). This gate is load_bearing: the build fails until every changed source file is pure ASCII." >&2
+        exit 1
+      fi
+      COUNT=$(grep -c . "$SCOPE_FILE" || true)
+      echo "ascii-gate PASS (scanned $COUNT changed source file(s), all ASCII)"
+      exit 0
+  - id: war-council-validator
+    provider: claude
+    model: claude-fable-5
+    persona: astra-validator
+    # FABLE TEST SEAT (John 2026-07-02: "add fable in to one for testing for now").
+    # Trusted judge upgraded sonnet -> claude-opus-5 on this lane. Persona VARIANT
+    # required because persona model WINS over node model on provider claude
+    # (persona pin law, wiki doctrine/archon-yaml-authoring 2026-07-02).
+    # Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
+    depends_on: [ascii-gate]
+    task_class: medium_work
+    prompt: |
+      Invoke or emulate the war-council-validator review for this Work Order.
+
+      ## Validator Agent
+      war-council-validator
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan (approved -- reviewed + revised by plan-review):
+      $plan-review.output
+
+      Implementation output:
+      $implement.output
+
+      Git diff:
+      Run `git diff --stat` and `git diff --check`, then inspect the relevant changed files.
+
+      ## Required Output
+      Return either:
+      - satisfied: with evidence that the spec deliverables and stop conditions were met
+      - needs_revision: with exact file/path/behavior findings
+
+  # diff-review chain (doctrine: self-repair-review-loops + in-run-review-loops-feature-dev,
+  # 2026-05-30). Runs AFTER validation, BEFORE the irreversible commit-and-push. Three nodes,
+  # executor-honest: Codex is read-only and CANNOT write files; until_bash CANNOT prove a
+  # semantic Codex objection was fixed. So: codex reviews (stdout only) -> major-build repairs
+  # (reads codex stdout in-prompt, until_bash checks MECHANICAL invariants only) -> codex
+  # RE-REVIEWS for real and decides. Cross-model: Fable reviews Astra-authored code.
+  # capture-diff: the Codex reviewer persona is read-only [Read,Grep,Glob] with NO Bash,
+  # so it cannot run `git diff` itself (F5 fix). This bash node captures the full feature
+  # diff (merge-base..HEAD plus any unstaged working-tree changes) to an artifact the
+  # Codex review prompts read. Emits provenance so the reviewer knows exactly what it saw.
+  - id: resolve-review-base
+    depends_on: [read-spec]
+    bash: |
+      set -uo pipefail
+      SPEC_TEXT=$(cat <<'RESOLVE_REVIEW_BASE_READ_SPEC_SENTINEL'
+      $read-spec.output
+      RESOLVE_REVIEW_BASE_READ_SPEC_SENTINEL
+      )
+      # Same 3 patterns decide-push-target's Base Branch Override section already
+      # documents (plain header, markdown-bold, YAML field), in priority order.
+      DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
+      if [ -z "$DECLARED" ]; then
+        DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '\*\*Base branch:\*\*[[:space:]]*`[A-Za-z0-9_./-]+`' | sed -E 's/.*`([A-Za-z0-9_./-]+)`.*/\1/')
+      fi
+      if [ -z "$DECLARED" ]; then
+        DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^base_branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^base_branch:[[:space:]]*//')
+      fi
+      if [ -n "$DECLARED" ] && git ls-remote --exit-code origin "refs/heads/${DECLARED}" >/dev/null 2>&1; then
+        echo "REVIEW_BASE=$DECLARED"
+        echo "REVIEW_BASE_SOURCE=declared"
+      elif [ -n "${BASE_BRANCH:-}" ]; then
+        echo "REVIEW_BASE=$BASE_BRANCH"
+        echo "REVIEW_BASE_SOURCE=env-default"
+      else
+        echo "REVIEW_BASE=master"
+        echo "REVIEW_BASE_SOURCE=fallback-master"
+      fi
+
+  - id: capture-diff
+    depends_on: [war-council-validator, resolve-review-base]
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR"
+      OUT="$ARTIFACTS_DIR/diff.patch"
+      REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
+      $resolve-review-base.output
+      RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
+      )
+      REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
+      [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
+      BASE_REF="origin/$REVIEW_BASE"
+      # NF2: when there is no merge-base and no HEAD~1 (single-commit / no-base repo),
+      # fall back to the empty-tree hash, NOT HEAD. HEAD..HEAD is an EMPTY diff (reviewer
+      # sees nothing); empty-tree..HEAD shows all committed content as added (meaningful).
+      EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+      MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+      [ -n "$MB" ] || MB="$EMPTY_TREE"
+      {
+        echo "### git diff --stat ($MB..HEAD)"
+        git diff --stat "$MB"..HEAD 2>/dev/null || true
+        echo
+        echo "### git diff --name-only ($MB..HEAD)"
+        git diff --name-only "$MB"..HEAD 2>/dev/null || true
+        echo
+        echo "### committed diff ($MB..HEAD)"
+        git diff "$MB"..HEAD 2>/dev/null || true
+        echo
+        echo "### unstaged working-tree diff (HEAD..worktree)"
+        git diff HEAD 2>/dev/null || true
+      } > "$OUT"
+      echo "DIFF_BASE=$MB"
+      echo "DIFF_COMMAND=git diff $MB..HEAD (+ git diff HEAD for unstaged)"
+      echo "DIFF_ARTIFACT=$OUT"
+      echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
+
+  - id: diff-review
+    provider: claude
+    model: claude-fable-5
+    persona: astra-adversarial-reviewer
+    depends_on: [capture-diff]
+    task_class: medium_work
+    prompt: |
+      You are the Fable adversarial diff reviewer. Cross-model review of the diff that
+      major-build just produced, BEFORE it is committed. You are READ-ONLY: you inspect
+      and report. You do NOT edit, write, or run commands that mutate state.
+
+      ## Inputs
+      Spec: $read-spec.output
+      Validator verdict: $war-council-validator.output
+      Diff provenance: $capture-diff.output
+      (DIFF_BASE, DIFF_COMMAND, DIFF_ARTIFACT above tell you exactly what diff to read.)
+
+      ## Inspect the ACTUAL diff (read-only)
+      READ the captured diff at the DIFF_ARTIFACT path from $capture-diff.output (it is
+      $ARTIFACTS_DIR/diff.patch). That file IS the diff -- you have no Bash tool, so do
+      NOT try to run git yourself. Also use Read/Grep/Glob on the changed files (listed
+      under "### git diff --name-only" in the artifact) for fuller context. Focus on what
+      tests + the validator can miss:
+      1. Contract drift -- response shapes, column counts, export schemas, API signatures
+         changed in a way the spec did not authorize.
+      2. Unverified claims -- code asserts behavior that no test actually exercises.
+      3. Unsafe customer/billing/export behavior -- e.g. an export path that could emit a
+         customer-reserved unit, a billing write without an idempotency guard.
+      4. Missing tests -- in-scope behavior with no test asserting real output (not just
+         "ran without throwing").
+
+      ## Output (STDOUT only -- you cannot write files)
+      Emit exactly:
+        DIFF_REVIEW=<satisfied|needs_revision>
+        FINDINGS:
+        - <file:line> <one specific, fixable finding>   (repeat; or "(none)")
+        SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
+      Be specific: every finding cites a file and the exact problem. "Looks fine" is not
+      acceptable; "could be better" is not a finding. Only flag what must change before commit.
+
+  - id: classify-diff-review
+    depends_on: [diff-review]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_DIFF_REVIEW_20260719_002'
+      $diff-review.output
+      BDC_FEATURE_DEV_REVIEW_DIFF_REVIEW_20260719_002
+      )
+      verdict=$(printf '%s\n' "$REVIEW" | grep -oE 'DIFF_REVIEW=(satisfied|needs_revision)' | tail -n 1 | sed 's/DIFF_REVIEW=//')
+      # Fail OPEN to needs_revision: if the sentinel is missing/unparseable, run the repair
+      # loop (safer to over-repair than to skip a real finding). This is the OPPOSITE of the
+      # fail-closed classifiers -- here "unknown" must still get a repair+re-review pass.
+      [ -z "$verdict" ] && verdict=needs_revision
+      printf '{"verdict":"%s"}\n' "$verdict"
+
+  - id: diff-repair
+    provider: codex-native-strict
+    model: gpt-6-astra
+    depends_on: [diff-review, classify-diff-review, resolve-review-base]
+    when: "$classify-diff-review.output.verdict == 'needs_revision'"
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      # NF3 + schema fix: the loader REQUIRES loop.until (schemas/loop.ts:11,
+      # z.string().min(1)) -- omitting it makes the DAG invalid and the loader
+      # SILENTLY DROPS the whole workflow (anchor: 2026-05-30 the entire lane went
+      # unregistered). Completion is `sentinel OR until_bash`. To keep until_bash the
+      # SOLE real authority (so a premature text sentinel can't short-circuit the
+      # flag+debug gate), `until:` is set to a sentinel the agent is instructed to
+      # NEVER emit. Thus only until_bash (done.flag exists AND no debug prints in the
+      # feature diff) can complete the loop.
+      until: __NEVER_EMIT_USE_UNTIL_BASH__
+      max_iterations: 20
+      until_bash: |
+        set -uo pipefail
+        # MECHANICAL invariants ONLY. This does NOT prove Codex is satisfied --
+        # diff-review-final (a real re-review) does that. Complete when the repair node
+        # signalled done AND the feature diff has no obvious mechanical defects.
+        DONE="$ARTIFACTS_DIR/diff-repair-done.flag"
+        [ -f "$DONE" ] || { echo "repair not signalled done"; exit 1; }
+        # F4: implement already committed, so `git diff --cached` is empty. Check the
+        # real feature diff: merge-base..HEAD (committed) PLUS HEAD..worktree (unstaged).
+        # NF2: empty-tree fallback (not HEAD) so a single-commit/no-base repo still
+        # produces a non-empty committed diff to scan for debug prints.
+        REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
+        $resolve-review-base.output
+        RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
+        )
+        REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
+        [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
+        BASE_REF="origin/$REVIEW_BASE"
+        EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+        MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+        [ -n "$MB" ] || MB="$EMPTY_TREE"
+        DEBUG_RE='console\.log\(|debugger;|binding\.pry|import pdb'
+        if { git diff --unified=0 "$MB"..HEAD 2>/dev/null; git diff --unified=0 HEAD 2>/dev/null; } \
+             | grep -E '^\+' | grep -Eq "$DEBUG_RE"; then
+          echo "debug statement present in feature diff"; exit 1
+        fi
+        exit 0
+      prompt: |
+        You are major-build. The Fable diff reviewer raised findings on your diff.
+        Fix every fixable finding in place. You are the BUILDER; Fable does not edit.
+
+        ## Fable review verdict (read directly -- prompt substitution, not shell)
+        $diff-review.output
+
+        ## Prior repair iteration (if any)
+        $LOOP_PREV_OUTPUT
+
+        ## What to do
+        - If DIFF_REVIEW=satisfied with no findings: make no changes; just signal done.
+        - Otherwise: resolve each FINDINGS line. Add the missing test, fix the contract
+          drift, close the unsafe path. Modify only in-scope files. Do not reformat
+          unrelated code. Do not deploy.
+
+        ## NEVER FABRICATE A DIFF (Fix C, 2026-05-30 -- anchor run 04daeafc)
+        If the captured diff is empty / header-only because the WO appears already
+        implemented on origin/main or in other commits, you MUST NOT regenerate or
+        reconstruct $ARTIFACTS_DIR/diff.patch (or diff-final.patch) from those
+        already-merged commits, from origin/main, or from any other branch/worktree.
+        The diff artifact must reflect ONLY real, uncommitted-or-this-worktree changes.
+        Manufacturing a reviewable artifact from already-merged work is fraud -- it tricks
+        the final reviewer into certifying changes this run did not make.
+        If the diff is genuinely empty because there is nothing to repair (the WO is
+        already satisfied or implement produced no changes), do NOT write the done.flag
+        and do NOT fabricate -- instead write the escalation block (below) with
+        ESCALATION_REASON=already-implemented-no-diff and STOP. diff-review-final will
+        see the empty diff and the run will pause for correction (not silently pass).
+        Anchor: run 04daeafc's diff-repair tried to "regenerate diff.patch with the actual
+        implementation content from those commits" -- exactly the fraud this rule forbids.
+
+        ## Escalation (ONLY these -- else fix and let the loop continue)
+        Write the escalation block to $ARTIFACTS_DIR/diff-repair-escalation.txt and STOP if:
+        - a finding requires a new side-effect class / scope the lane was not granted
+        - a finding requires human-only authority (deploy, prod write, customer comms,
+          irreversible/destructive op) where safe behavior is not already encoded
+        - the spec is ambiguous about the correct fix
+        - the same finding survived a prior repair attempt and you cannot resolve it
+        Escalation block (exact keys):
+          ESCALATION_REQUIRED=true
+          ESCALATION_REASON=<new-side-effect-class|human-only-authority|ambiguous-spec|loop-exhausted|already-implemented-no-diff>
+          WO_ID=<id>
+          NODE=diff-repair
+          ATTEMPTS=<n>/3
+          WHAT_FAILED=<one paragraph>
+          WHAT_WAS_TRIED=<3-6 bullets>
+          LAST_REVIEW_FINDINGS=<exact Fable findings>
+          SINGLE_DECISION_NEEDED=<one sentence John can answer>
+          SAFE_STATE=<work is local in the worktree; nothing committed or pushed yet>
+
+        ## Signal done (the FLAG is the only gate -- there is NO completion token)
+        The loop completes ONLY via until_bash, which checks that the done.flag exists
+        AND the feature diff has no debug prints. There is NO text sentinel that finishes
+        this loop (loop.until is set to a token you must NEVER emit) -- do not try to
+        emit one. When you have addressed every fixable finding (or there were none) AND
+        introduced no debug prints:
+          - Write an empty file at $ARTIFACTS_DIR/diff-repair-done.flag   (the ONLY signal)
+        If you escalated or could not resolve a finding, do NOT write the flag: the loop
+        will exhaust max_iterations and fail closed, and diff-review-final adjudicates the
+        unresolved state. The flag means "repair pass complete", not "semantically
+        certified" -- diff-review-final re-checks semantics next.
+
+  # capture-diff-final: refresh the diff artifact AFTER repair so the final reviewer sees
+  # the repaired tree, not the pre-repair diff. trigger_rule all_done so it runs even if
+  # diff-repair failed/exhausted (F6) -- the final reviewer must still adjudicate.
+  - id: capture-diff-final
+    depends_on: [diff-repair, resolve-review-base]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      mkdir -p "$ARTIFACTS_DIR"
+      OUT="$ARTIFACTS_DIR/diff-final.patch"
+      REVIEW_BASE_OUTPUT=$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL'
+      $resolve-review-base.output
+      RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
+      )
+      REVIEW_BASE=$(printf '%s\n' "$REVIEW_BASE_OUTPUT" | sed -n 's/^REVIEW_BASE=//p' | head -n 1)
+      [ -n "$REVIEW_BASE" ] || REVIEW_BASE="${BASE_BRANCH:-master}"
+      BASE_REF="origin/$REVIEW_BASE"
+      # NF2: when there is no merge-base and no HEAD~1 (single-commit / no-base repo),
+      # fall back to the empty-tree hash, NOT HEAD. HEAD..HEAD is an EMPTY diff (reviewer
+      # sees nothing); empty-tree..HEAD shows all committed content as added (meaningful).
+      EMPTY_TREE=$(git hash-object -t tree /dev/null 2>/dev/null || echo 4b825dc642cb6eb9a060e54bf8d69288fbee4904)
+      MB=$(git merge-base HEAD "$BASE_REF" 2>/dev/null || git rev-parse HEAD~1 2>/dev/null || echo "$EMPTY_TREE")
+      [ -n "$MB" ] || MB="$EMPTY_TREE"
+      {
+        echo "### committed diff ($MB..HEAD)"
+        git diff "$MB"..HEAD 2>/dev/null || true
+        echo
+        echo "### unstaged working-tree diff (HEAD..worktree)"
+        git diff HEAD 2>/dev/null || true
+      } > "$OUT"
+      echo "DIFF_FINAL_BASE=$MB"
+      echo "DIFF_FINAL_ARTIFACT=$OUT"
+      echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
+
+  - id: diff-review-final
+    provider: claude
+    model: claude-fable-5
+    persona: astra-adversarial-reviewer
+    depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
+    trigger_rule: all_done
+    task_class: medium_work
+    prompt: |
+      You are the Fable adversarial reviewer doing the FINAL re-review after repair.
+      Read-only. This node decides whether any semantic finding remains before commit --
+      the mechanical repair gate did NOT prove your earlier objections were fixed.
+
+      ## Inputs
+      Spec: $read-spec.output
+      Plan review terminal outcome: $plan-review.output
+      If this output does not contain PLAN_REVIEW_APPROVED, fail closed with
+      DIFF_REVIEW_FINAL=needs_revision. Do not certify a diff after rejected or
+      escalated plan-review output.
+      Your original findings: $diff-review.output
+      Classifier verdict: $classify-diff-review.output
+      Repair pass output: $diff-repair.output
+      Refreshed diff provenance: $capture-diff-final.output
+      (Read the repaired diff at DIFF_FINAL_ARTIFACT = $ARTIFACTS_DIR/diff-final.patch.
+      You have no Bash tool -- do not run git; read that file.)
+
+      ## Branch on the repair outcome FIRST (check the SATISFIED FAST PATH before anything else)
+      - SATISFIED FAST PATH: if your original review verdict was DIFF_REVIEW=satisfied
+        (Classifier verdict above is {"verdict":"satisfied"}), then diff-repair was
+        correctly SKIPPED by its `when:` guard because there were no findings to fix.
+        An empty $diff-repair.output and a missing done.flag are EXPECTED on this path,
+        NOT a failure. Re-inspect the captured diff once more to confirm no new unsafe
+        behavior was introduced between the original review and now (e.g., scope creep,
+        unrelated edits). If the diff is still clean, emit DIFF_REVIEW_FINAL=satisfied
+        with UNRESOLVED: (none). Do NOT treat the skipped repair as failed repair.
+      - If the original verdict was needs_revision AND diff-repair FAILED or exhausted
+        iterations (its output is empty, shows ESCALATION_REQUIRED=true, or the done.flag
+        was never written): do NOT certify. Emit DIFF_REVIEW_FINAL=needs_revision,
+        summarize the unresolved repair state in UNRESOLVED, and carry through any
+        escalation reason. Never PASS on failed repair.
+      - Otherwise (original verdict was needs_revision AND diff-repair signalled done):
+        re-inspect the repaired diff. For EACH finding you raised originally, verify it
+        is actually resolved in the current tree -- not merely claimed resolved.
+
+      ## Output (STDOUT only)
+        DIFF_REVIEW_FINAL=<satisfied|needs_revision>
+        UNRESOLVED:
+        - <file:line> <finding still open>   (repeat; or "(none)")
+        SEMANTIC_RISK=<LOW|MEDIUM|HIGH>
+      DIFF_REVIEW_FINAL=satisfied ONLY if every original finding is genuinely resolved and
+      no new unsafe behavior was introduced by the repair.
+
+  # ===== Fix D (2026-05-30): pause-not-fail + Opus-tier on a blocked irreversible gate =====
+  # Replaces commit-and-push's old `exit 1` dead-end. A blocked run must NOT terminate as
+  # "failed"; it goes: classify -> Opus auto-repair (one pass) -> re-classify -> PAUSE
+  # (resumable approval) -> human corrects+resumes OR rejects. A clean run PROCEEDs with no
+  # human gate. An already-satisfied no-op resolves as success. (doctrine: fail-closed-must-
+  # pause-not-fail + self-repair-review-loops autonomy ladder.)
+  #
+  # block-classify: emit ONE JSON line so downstream `when:` can read $block-classify.output.status
+  # (condition-evaluator parses $node.output.field as JSON). status one of:
+  #   PROCEED           -- diff-review-final=satisfied AND real build -> commit/PR
+  #   ALREADY_SATISFIED -- no work needed, worktree clean, legitimately done -> success no-op
+  #   BLOCKED           -- false-completion OR diff-review-final=needs_revision -> repair/pause
+  - id: block-classify
+    depends_on: [diff-review-final]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003'
+      $diff-review-final.output
+      BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_003
+      )
+      BUILD=$(cat <<'BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004'
+      $assert-implement-produced-work.output
+      BDC_FEATURE_DEV_BUILD_ASSERT_IMPLEMENT_PRODUCED_WORK_20260719_004
+      )
+      PRECHECK=$(cat <<'BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005'
+      $gate-already-satisfied.output
+      BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005
+      )
+      final_ok=false
+      # Anchor-free parse: diff-review-final is Codex prose; sentinel appears inline,
+      # not at column 0. Take LAST occurrence so the final verdict always wins.
+      final_verdict=$(printf '%s\n' "$DIFF_FINAL" \
+        | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | tail -n 1)
+      if [ "$final_verdict" = "DIFF_REVIEW_FINAL=satisfied" ]; then final_ok=true; fi
+      outcome=$(printf '%s\n' "$BUILD" | sed -n 's/^BUILD_OUTCOME=//p' | head -1)
+
+      # Codex FINDING_2: PROCEED requires BOTH a real build AND a satisfied final review.
+      # A missing/unparseable BUILD_OUTCOME must NOT slip through as PROCEED.
+      if [ "$outcome" = "ALREADY_SATISFIED" ]; then
+        STATUS=ALREADY_SATISFIED
+      elif [ "$outcome" = "REAL_BUILD" ] && [ "$final_ok" = "true" ]; then
+        STATUS=PROCEED
+      else
+        # FALSE_COMPLETE, unknown outcome, or final review not satisfied -> block.
+        STATUS=BLOCKED
+      fi
+      # single JSON line = the entire stdout, so $block-classify.output.status parses
+      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}"
+
+  # opus-repair: one harder AUTONOMOUS fix pass by the Opus overseer when BLOCKED, BEFORE
+  # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
+  # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
+  - id: opus-repair
+    provider: codex-native-strict
+    model: gpt-6-astra
+    depends_on: [block-classify]
+    when: "$block-classify.output.status == 'BLOCKED'"
+    prompt: |
+      The bdc-feature-development run is BLOCKED before the irreversible commit. Before a
+      human is paused, you get ONE autonomous repair pass. Diagnose and, if you can,
+      resolve it so the build can proceed safely.
+
+      ## Why blocked
+      block-classify: $block-classify.output
+      diff-review-final: $diff-review-final.output
+      assert-implement-produced-work: $assert-implement-produced-work.output
+      Original Fable findings: $diff-review.output
+
+      ## Your job
+      - If the block is FALSE_COMPLETE (implement claimed done but produced no real changes
+        in THIS worktree): determine whether the WO genuinely needs work here. If it does and
+        you can make the in-scope changes, make them in the assigned worktree (you have the
+        tools). If the WO is genuinely already implemented in this worktree, say so.
+      - If the block is diff-review-final=needs_revision: make the specific fix the final
+        reviewer named, in scope, in this worktree.
+      - Judge ONLY against this worktree (no origin/main, no sibling worktrees). NEVER
+        fabricate a diff from already-merged commits.
+
+      ## Output (last lines)
+      - If you resolved it (real in-scope changes now exist in this worktree):
+          OPUS_REPAIR=fixed
+      - If it is genuinely already-satisfied (no work needed in this worktree):
+          OPUS_REPAIR=already-satisfied
+      - If you could NOT resolve it and a human must decide:
+          OPUS_REPAIR=needs-human
+          REASON=<one sentence>
+
+  # classify-opus-repair: bash classifier -- converts the plain-text OPUS_REPAIR=fixed
+  # sentinel to {"fixed":"true|false"} so opus-rereview can gate on
+  # $classify-opus-repair.output.fixed == 'true'. Mirrors classify-apply-review idiom.
+  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01)
+  - id: classify-opus-repair
+    depends_on: [opus-repair]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      OPUS=$(cat <<'BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_006'
+      $opus-repair.output
+      BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_006
+      )
+      if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed'; then
+        printf '{"fixed":"true"}\n'
+      else
+        printf '{"fixed":"false"}\n'
+      fi
+
+  # opus-rereview: autonomous Claude adversarial re-review of the opus-repair diff.
+  # Only runs when classify-opus-repair reports fixed=true. Mirrors apply-diff-review-final.
+  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01) -- this is the AUTONOMOUS rung of the
+  # autonomy ladder: a passing re-review here lets block-reclassify emit PROCEED so the
+  # repaired build can land as a normal feature-branch PR instead of dead-ending at a
+  # terminal-BLOCKED on a non-interactive run.
+  - id: opus-rereview
+    provider: claude
+    model: claude-fable-5
+    persona: astra-adversarial-reviewer
+    depends_on: [classify-opus-repair]
+    trigger_rule: all_done
+    when: "$classify-opus-repair.output.fixed == 'true'"
+    prompt: |
+      opus-repair just made autonomous in-scope changes to resolve a BLOCKED build. Re-review
+      ONLY the current worktree diff (the post-repair state). Read-only. Judge ONLY this worktree
+      (no origin/main, no sibling worktrees; never fabricate a diff from already-merged commits).
+      Confirm the build now satisfies the WO and introduces no regression or unsafe behavior.
+
+      ## What opus-repair reported
+      $opus-repair.output
+
+      ## Original block reason
+      $block-classify.output
+      $diff-review-final.output
+
+      ## Output (STDOUT only, last lines)
+        OPUS_REREVIEW=<satisfied|needs_revision>
+        UNRESOLVED:
+        - <finding still open>   (or "(none)")
+
+  # classify-opus-rereview: grep the OPUS_REREVIEW sentinel out of opus-rereview's
+  # multi-line Codex prose and emit ONE JSON line so block-reclassify can read
+  # $classify-opus-rereview.output.verdict. Mirrors classify-apply-review exactly.
+  # Fail CLOSED: missing/unparseable sentinel -> needs_revision, never satisfied.
+  # (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01)
+  - id: classify-opus-rereview
+    depends_on: [opus-rereview]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007'
+      $opus-rereview.output
+      BDC_FEATURE_DEV_REVIEW_OPUS_REREVIEW_20260719_007
+      )
+      verdict=$(printf '%s\n' "$REVIEW" \
+        | grep -oE 'OPUS_REREVIEW=(satisfied|needs_revision)' \
+        | tail -n 1 \
+        | sed 's/OPUS_REREVIEW=//')
+      if [ -z "$verdict" ]; then
+        verdict=needs_revision
+      fi
+      printf '{"verdict":"%s"}\n' "$verdict"
+
+  # block-reclassify: after the Opus pass + autonomous re-review (or skip if it wasn't
+  # BLOCKED), re-emit the JSON status. trigger_rule all_done so it runs whether or not
+  # opus-repair / opus-rereview ran. WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01 added
+  # classify-opus-rereview to depends_on and replaced the prior dead-end terminal with a
+  # verdict-gated split: satisfied -> PROCEED (opus-repaired-and-rereviewed-satisfied),
+  # needs_revision -> BLOCKED (opus-made-changes-rereview-failed).
+  - id: block-reclassify
+    depends_on: [block-classify, opus-repair, classify-opus-rereview]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      PRIOR=$(cat <<'BDC_FEATURE_DEV_PRIOR_BLOCK_CLASSIFY_20260719_008'
+      $block-classify.output
+      BDC_FEATURE_DEV_PRIOR_BLOCK_CLASSIFY_20260719_008
+      )
+      OPUS=$(cat <<'BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_009'
+      $opus-repair.output
+      BDC_FEATURE_DEV_OPUS_OPUS_REPAIR_20260719_009
+      )
+      REREVIEW=$(cat <<'BDC_FEATURE_DEV_REREVIEW_CLASSIFY_OPUS_REREVIEW_20260719_010'
+      $classify-opus-rereview.output
+      BDC_FEATURE_DEV_REREVIEW_CLASSIFY_OPUS_REREVIEW_20260719_010
+      )
+      prior_status=$(printf '%s\n' "$PRIOR" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+
+      # If it wasn't blocked, keep the prior status unchanged.
+      if [ "$prior_status" != "BLOCKED" ]; then
+        printf '{"status":"%s"}\n' "${prior_status:-BLOCKED}"
+        exit 0
+      fi
+
+      # It was blocked: did Opus fix it? Re-check the worktree for real work.
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git -C "$WT" status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
+      AHEAD_RAW=$(git -C "$WT" rev-list --count "@{upstream}..HEAD" 2>/dev/null) ||
+        AHEAD_RAW=$(git -C "$WT" rev-list --count HEAD --not --remotes 2>/dev/null) || {
+          echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+          exit 1
+        }
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
+
+      if printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=fixed' && { [ "${CHANGED:-0}" -gt 0 ] || [ "${AHEAD:-0}" -gt 0 ]; }; then
+        # Opus made real changes. The autonomous re-review verdict decides the path:
+        # satisfied -> PROCEED (normal commit/PR); anything else -> BLOCKED (salvage
+        # net + human gate own it). Fail CLOSED: missing/unparseable verdict -> BLOCKED.
+        rereview_verdict=$(printf '%s\n' "$REREVIEW" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
+        if [ "$rereview_verdict" = "satisfied" ]; then
+          printf '{"status":"PROCEED","note":"opus-repaired-and-rereviewed-satisfied"}\n'
+        else
+          printf '{"status":"BLOCKED","note":"opus-made-changes-rereview-failed"}\n'
+        fi
+      elif printf '%s\n' "$OPUS" | grep -q '^OPUS_REPAIR=already-satisfied'; then
+        printf '{"status":"ALREADY_SATISFIED","note":"opus-confirmed-already-satisfied"}\n'
+      else
+        printf '{"status":"BLOCKED","note":"opus-could-not-resolve"}\n'
+      fi
+
+  # noninteractive-salvage (WO-HARNESS-OPUS-REPAIR-REREVIEW-AND-NONINTERACTIVE-SALVAGE-01, 2026-06-25):
+  # Defect B fix. When a run is BLOCKED but the worktree holds REAL work (e.g. an opus-repair commit),
+  # and the run is NON-INTERACTIVE (CAULDRON_INTERACTIVE != true so pause-gate auto-skips and never
+  # collects a human decision), commit-and-push refuses and the good commit STRANDS in the worktree --
+  # then gets GC'd and lost (anchor: d601ad7 + c0166f9 stranded+lost 2026-06-25). This node preserves
+  # that work by pushing the branch + opening a PR + leaving a FALLBACK note, instead of dead-ending.
+  # Purely ADDITIVE: it reads block-reclassify, never blocks the existing pause-gate / commit-and-push
+  # path (trigger_rule all_done; no-ops on interactive runs and on runs with nothing to salvage).
+  - id: noninteractive-salvage
+    depends_on: [block-reclassify]
+    trigger_rule: all_done
+    bash: |
+      set -uo pipefail
+      RECLASS=$(cat <<'BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_011'
+      $block-reclassify.output
+      BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_011
+      )
+      STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      # Only act on a BLOCKED status.
+      [ "$STATUS" = "BLOCKED" ] || { echo "SALVAGE=skip (status=$STATUS)"; exit 0; }
+      # Interactive runs use pause-gate; leave them alone.
+      if [ "${CAULDRON_INTERACTIVE:-}" = "true" ]; then echo "SALVAGE=skip (interactive; pause-gate owns this)"; exit 0; fi
+      WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+      cd "$WT" || { echo "SALVAGE=skip (no worktree)"; exit 0; }
+      validate_implementation_counter() {
+        case "$2" in
+          ''|*[!0-9]*)
+            echo "ERROR: invalid implementation counter $1: expected exactly one digits-only line" >&2
+            return 1
+            ;;
+        esac
+      }
+      STATUS_RAW=$(git status --porcelain 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter CHANGED: git status failed" >&2
+        exit 1
+      }
+      CHANGED_RAW=$(printf '%s\n' "$STATUS_RAW" | grep -c . || true)
+      validate_implementation_counter CHANGED "$CHANGED_RAW" || exit 1
+      CHANGED=$CHANGED_RAW
+      AHEAD_RAW=$(git rev-list --count HEAD --not --remotes 2>/dev/null) || {
+        echo "ERROR: invalid implementation counter AHEAD: git rev-list failed" >&2
+        exit 1
+      }
+      validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
+      AHEAD=$AHEAD_RAW
+      if [ "$CHANGED" -eq 0 ] && [ "$AHEAD" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
+      # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
+      BR="salvage/opus-repair-$(basename "$WT")-$$"
+      git add -A 2>/dev/null || true
+      if ! git diff --cached --quiet 2>/dev/null; then
+        git -c user.name='cauldron-salvage' -c user.email='noreply@bluedevilcollectibles.com' \
+          commit -m "salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)" 2>&1 | tail -1 || true
+      fi
+      if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
+        REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
+        PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
+          --title "FALLBACK: opus-repaired build needs human review" \
+          --body "FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason." \
+          2>&1 | tail -1 || true)
+        echo "SALVAGE=pushed branch ${BR}; PR=${PR_URL}"
+      else
+        echo "SALVAGE=push-failed (work remains in worktree ${WT})"
+      fi
+
+  # findings-consolidate: decompose every review finding into a structured ledger row so the
+  # human approval gate can show resolution + a concrete suggested fix per UNRESOLVED finding.
+  # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
+  # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
+  - id: findings-consolidate
+    provider: claude
+    model: claude-fable-5
+    persona: astra-findings-reviewer
+    depends_on: [block-reclassify]
+    trigger_rule: all_done
+    task_class: clerical
+    prompt: |
+      Build the human-facing findings ledger for the approval gate. Read every review output
+      below and emit ONE JSON object. Do not invent findings; only consolidate what the reviews
+      and the repair tier already reported.
+
+      ## Inputs
+      plan-review findings (unstructured prose between sentinels):
+      $plan-review.output
+
+      diff-review verdict + findings:
+      $diff-review.output
+
+      diff-review-final verdict + UNRESOLVED list:
+      $diff-review-final.output
+
+      block-classify / block-reclassify status:
+      $block-reclassify.output
+
+      opus-repair result (REASON= names any fix the self-repair tier deferred):
+      $opus-repair.output
+
+      ## Output: STRICT JSON only. No prose. No code fences.
+      {
+        "summary": "<one line: N findings, M unresolved>",
+        "findings": [
+          {
+            "id": "<stable-kebab-id, e.g. locg-migration>",
+            "source": "plan-review | diff-review | diff-review-final | opus-repair",
+            "severity": "LOW | MEDIUM | HIGH",
+            "title": "<one line>",
+            "resolution": "FIXED-BY-LOOP | UNRESOLVED",
+            "suggested_fix": {
+              "diagnosis": "<the loop's own diagnosis, verbatim where available>",
+              "proposed_action": "<concrete, e.g. add migration 20260609_identity_connector_accounts_add_locg.sql ALTERing the connector CHECK constraint to include lunar/locg/prh>",
+              "fix_class": "CODE-EDIT | NEW-SCHEMA-MIGRATION | CONFIG | OTHER",
+              "boundary_flag": true
+            }
+          }
+        ]
+      }
+
+      Rules:
+      - Include EVERY finding: FIXED-BY-LOOP (for transparency) AND UNRESOLVED.
+      - Emit "suggested_fix" ONLY for UNRESOLVED rows; omit it on FIXED-BY-LOOP rows.
+      - Set boundary_flag=true exactly when fix_class == "NEW-SCHEMA-MIGRATION" (the loop will
+        NOT write that itself; it requires APPROVE-WITH-FIX).
+      - If there are zero unresolved findings, "findings" still lists the fixed ones and
+        "summary" says "0 unresolved".
+
+  # pause-gate: the human approval gate. Fires on BLOCKED (AI tiers could not resolve)
+  # AND on PROCEED (clean builds -- final confirmation before the irreversible commit).
+  # Non-interactive runs (CAULDRON_INTERACTIVE != true) auto-proceed without pausing;
+  # only Mission Control sessions with the flag set actually present this gate.
+  # Three graded choices: APPROVE-AS-IS, APPROVE-WITH-FIX, REJECT.
+  - id: pause-gate
+    depends_on: [findings-consolidate]
+    when: "$block-reclassify.output.status == 'BLOCKED' || $block-reclassify.output.status == 'PROCEED'"
+    approval:
+      message: |
+        REVIEW FINDINGS LEDGER (every finding; unresolved ones include a suggested fix):
+        $findings-consolidate.output
+
+        Choose:
+        - APPROVE-AS-IS  -> proceed; any unresolved findings stay unresolved and are logged.
+        - APPROVE-WITH-FIX -> authorize the loop to apply the named suggested fix(es), including a
+          new schema migration the self-repair loop deferred; a second review runs before commit.
+        - REJECT -> halt; the worktree is preserved.
+
+        SAFE STATE: no commit, no push, no PR, no Notion write has happened yet.
+
+        (BLOCKED runs: the AI tiers could not fully resolve this. PROCEED runs: reviews passed;
+        this is the final confirmation before the irreversible commit.)
+      choices: [approve_as_is, approve_with_fix, reject]
+      capture_response: true
+      on_reject:
+        prompt: |
+          The operator rejected the blocked run. Summarize what was blocked, what the AI
+          tiers tried, and what a human must change before re-running. Do not commit or fire.
+          Output: OPERATOR_REJECTED: <reason from approval response>
+        max_attempts: 2
+
+  # apply-suggested-fix: runs ONLY when the operator chose APPROVE-WITH-FIX at the gate.
+  # Authorizes overseer-opus to apply the named suggested fix(es) -- including writing a NEW
+  # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
+  # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
+  - id: apply-suggested-fix
+    provider: codex-native-strict
+    model: gpt-6-astra
+    persona: major-build-opr
+    effort: xhigh
+    context: fresh
+    depends_on: [pause-gate]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    prompt: |
+      The operator authorized specific fixes at the approval gate. Apply ONLY the fixes whose
+      ids appear in authorized_fix_ids. Do NOT apply any other finding.
+
+      ## The full ledger (each finding has an id + suggested_fix)
+      $findings-consolidate.output
+
+      ## Operator decision (AUTHORITATIVE -- authorized_fix_ids lives here)
+      $pause-gate.output
+
+      ## Rules
+      - Apply ONLY fixes whose id is in the operator's authorized_fix_ids. If authorized_fix_ids
+        is empty or missing, make NO changes and emit APPLY_SUGGESTED_FIX=nothing-authorized.
+      - For an AUTHORIZED NEW-SCHEMA-MIGRATION fix (its id is in authorized_fix_ids): create the
+        migration file named in proposed_action. Check it does not already exist before writing
+        (idempotent create). NEVER write a migration for a finding whose id is not in
+        authorized_fix_ids -- that is the loop boundary; only an explicit operator authorization
+        may cross it.
+      - Make the minimal change. Do NOT reformat unrelated code (agent-behavior policy).
+      - Work only in the assigned worktree.
+
+      ## Output (last lines)
+        APPLY_SUGGESTED_FIX=<applied|nothing-authorized>
+        FILES_CHANGED:
+        - <path>   (repeat; or "(none)")
+
+  # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
+  # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
+  - id: apply-diff-review-final
+    provider: claude
+    model: claude-fable-5
+    persona: astra-adversarial-reviewer
+    depends_on: [apply-suggested-fix]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    prompt: |
+      Re-review ONLY the changes apply-suggested-fix just made (especially any new schema
+      migration). Read-only. Verify the fix matches the operator-authorized proposed_action and
+      introduces no regression or unsafe behavior.
+
+      ## What was applied
+      $apply-suggested-fix.output
+
+      ## The authorized ledger
+      $findings-consolidate.output
+
+      ## Output (STDOUT only)
+        APPLY_DIFF_REVIEW_FINAL=<satisfied|needs_revision>
+        UNRESOLVED:
+        - <finding still open>   (or "(none)")
+
+  # classify-apply-review: grep the APPLY_DIFF_REVIEW_FINAL sentinel out of
+  # apply-diff-review-final's multi-line Codex prose and emit ONE JSON line so
+  # the condition-evaluator can use $classify-apply-review.output.verdict without
+  # JSON.parse failing on multi-line output. Mirrors block-classify's bash idiom.
+  # trigger_rule all_done + same when: as apply-diff-review-final so it runs
+  # exactly when that node ran, skips otherwise.
+  - id: classify-apply-review
+    depends_on: [apply-diff-review-final]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    bash: |
+      set -uo pipefail
+      REVIEW=$(cat <<'BDC_FEATURE_DEV_REVIEW_APPLY_DIFF_REVIEW_FINAL_20260719_012'
+      $apply-diff-review-final.output
+      BDC_FEATURE_DEV_REVIEW_APPLY_DIFF_REVIEW_FINAL_20260719_012
+      )
+      verdict=$(printf '%s\n' "$REVIEW" \
+        | grep -oE 'APPLY_DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | tail -n 1 \
+        | sed 's/APPLY_DIFF_REVIEW_FINAL=//')
+      if [ -z "$verdict" ]; then
+        verdict=needs_revision
+      fi
+      printf '{"verdict":"%s"}\n' "$verdict"
+
+  - id: decide-push-target
+    provider: codex-native-strict
+    model: gpt-6-astra
+    persona: major-build-opr
+    depends_on: [pause-gate, classify-apply-review]
+    trigger_rule: all_done
+    when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
+    task_class: clerical
+    prompt: |
+      Decide the push target for this BDC feature Work Order.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Validator:
+      $war-council-validator.output
+
+      ## Branch Name Derivation Rules (F-6A prevention)
+      Anchor incidents 2026-05-18: agents emitted branch names that embedded the
+      current worktree thread suffix, producing double-suffixed targets like
+      "archon/thread-9772643d-thread-9772643d" or
+      "feat/WO-AUTH-RETIRE-GAS-PATH-02-thread-feat/WO-AUTH-RETIRE-GAS-PATH-02".
+      The engine ALREADY appends a unique "-thread-<hash>" suffix at push time
+      (UNIQUE_BRANCH in commit-and-push). Your job is to emit the BASE branch
+      name only.
+
+      - Derive the branch name from the WO ID ONLY. Do NOT copy the current
+        git branch name. If running on archon/thread-9772643d, do NOT emit
+        that value or any variant of it as push_target.
+      - Use prefix feat/, fix/, or wip/ followed by the WO ID in lowercase
+        with hyphens. Example: WO-FOO-BAR-01 -> feat/wo-foo-bar-01
+      - The branch MUST NOT start with archon/thread- or contain -thread-
+        anywhere.
+      - The branch MUST NOT embed the current worktree thread hash anywhere
+        in its name.
+      - Valid examples: feat/wo-auth-retire-gas-path-02, fix/wo-bugs-01, wip/wo-draft-01
+      - commit-and-push validates the emitted branch against this allowlist
+        regex: ^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$
+        and fails closed with "Malformed branch name" on mismatch.
+
+      ## Required Repo Policy
+      Extract the target repository from the spec content. Look for any of these patterns (in priority order):
+      1. `target_repo: <owner>/<repo>` (YAML field)
+      2. `**Target repo:** \`<owner>/<repo>\`` (Markdown bold)
+      3. `Target repo: <owner>/<repo>` (plain header)
+      4. `**Target Repo:** \`<owner>/<repo>\`` (Markdown bold, capital R)
+
+      ## Base Branch Override
+      Before consulting the hardcoded staging-gate list below, check whether the spec
+      declares an explicit PR base branch override. Look for any of these patterns
+      (in priority order):
+      1. `Base branch: <branch-name>` (plain header, canonical form)
+      2. `**Base branch:** `<branch-name>`` (Markdown bold)
+      3. `base_branch: <branch-name>` (YAML field)
+
+      If a Base branch override is declared, first finish resolving the target repo
+      using the Required Repo Policy above, including the origin fallback below when
+      needed. Then verify that the named branch exists on the resolved target repo's
+      remote, not the worktree's origin. Use the same git ls-remote mechanism used
+      elsewhere in this workflow, pointed at the explicit repo URL:
+        git ls-remote https://github.com/<owner>/<repo>.git refs/heads/<branch-name>
+
+      If the branch exists, output exactly:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: false
+      base_branch_override: <declared-override-branch>
+      repo: <owner>/<repo>
+
+      In this success case, stop there and do not continue into the staging-gate
+      list. The push_target branch is the WO feature branch derived by the Branch
+      Name Derivation Rules above; base_branch_override is the PR target/base branch
+      declared by the spec. These are distinct values and must not be conflated.
+
+      If the spec declares a Base branch override but the named branch does not
+      exist on the target repo's remote, fail closed and output exactly:
+      out_of_scope: true
+      reason: Base branch override '<branch-name>' declared in spec does not exist on <owner>/<repo>
+      repo: <owner>/<repo>
+
+      Do not fall through to the staging-gate list or to main when a declared
+      override branch is missing. If no `Base branch:` line is present, fall through
+      to the staging-gate list below unchanged.
+
+      The target repo is where the PR must be opened (NOT the worktree's git origin - Rule 29).
+
+      Match the extracted repo against this hardcoded staging-gate list:
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
+      - thinmansoftware/shopops
+
+      If the repo matches one of those entries, output:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: true
+      repo: <owner>/<repo>
+
+      If the repo is bdc-xo non-doctrine code or another code repo, output:
+      push_target: feature-branch:<spec-derived-branch-name>
+      pr_required: true
+      staging_gate_required: false
+      repo: <owner>/<repo>
+
+      If this is doc-only or doctrine-only, output:
+      out_of_scope: true
+      reason: use bdc-doctrine-update.yaml
+      repo: unknown
+
+      CRITICAL: You MUST emit a `repo:` line in every output case. If no target_repo is
+      parseable from the spec, emit `repo: unknown` and a WARNING line explaining what is missing.
+
+  # load_bearing: true (WO-167 doctrine, WO-169 anchor)
+  # 2026-05-16 engine sortie: container-side `git push` silently failed; downstream
+  # `|| echo "STATUS=*_failed"` swallow patterns let the workflow report success
+  # while no commits reached origin. Push retry is now real (3 attempts, exponential
+  # backoff) and node fails closed if all attempts fail.
+  - id: commit-and-push
+    persona: overseer
+    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview]
+    trigger_rule: all_done
+    when: "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied' || $classify-opus-rereview.output.verdict == 'satisfied'"
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      # 2026-05-16 quote-fix: substituteNodeOutputRefs with escapedForBash=true wraps
+      # the output in single quotes. Wrapping the substitution in double quotes here
+      # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes - line 2+ of
+      # the agent output becomes bare commands. Assign directly to bash vars, then
+      # quote the var reference. Engine-level fix tracked in WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
+      DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013'
+      $decide-push-target.output
+      BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013
+      )
+      # plan-review emits a fenced output. Extract ONLY the approved-plan block so the
+      # changed-file allowlist + commit message never ingest reviewer critique (F8 fix).
+      # Must be the revised plan (not pre-review) or a plan-review scope change would be
+      # rejected by the allowlist. FAIL CLOSED if the fence is absent (NF1): never fall
+      # back to raw output, or PLAN_REVIEW_FINDINGS critique would poison the allowlist.
+      PLAN_REVIEW_RAW=$(cat <<'BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014'
+      $plan-review.output
+      BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014
+      )
+      # Extract APPROVED_PLAN (single-line-safe; open-model canary 3604d5bcc7b2).
+      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | python3 -c 'import sys,re;t=sys.stdin.read();m=re.search(r"===\s*APPROVED_PLAN_BEGIN\s*===(.*?)===\s*APPROVED_PLAN_END\s*===",t,re.S|re.I);body=(m.group(1).strip() if m else "");body=re.sub(r"(?<!\n)(##)",r"\n\1",body);body=re.sub(r"(?<!\n)(```)",r"\n\1",body);print(body)')
+      if [ -z "$PLAN_OUTPUT" ]; then
+        echo "ERROR: plan-review output missing the APPROVED_PLAN fence -- cannot extract the approved plan (NF1 fail-closed)." >&2
+        echo "--- raw plan-review output (for debugging) ---" >&2
+        printf '%s\n' "$PLAN_REVIEW_RAW" >&2
+        exit 1
+      fi
+      DIFF_FINAL=$(cat <<'BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_015'
+      $diff-review-final.output
+      BDC_FEATURE_DEV_DIFF_FINAL_DIFF_REVIEW_FINAL_20260719_015
+      )
+      RECLASS=$(cat <<'BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_016'
+      $block-reclassify.output
+      BDC_FEATURE_DEV_RECLASS_BLOCK_RECLASSIFY_20260719_016
+      )
+      PAUSE_GATE=$(cat <<'BDC_FEATURE_DEV_PAUSE_GATE_PAUSE_GATE_20260719_017'
+      $pause-gate.output
+      BDC_FEATURE_DEV_PAUSE_GATE_PAUSE_GATE_20260719_017
+      )
+      APPLY_REVIEW=$(cat <<'BDC_FEATURE_DEV_APPLY_REVIEW_CLASSIFY_APPLY_REVIEW_20260719_018'
+      $classify-apply-review.output
+      BDC_FEATURE_DEV_APPLY_REVIEW_CLASSIFY_APPLY_REVIEW_20260719_018
+      )
+      OPUS_REREVIEW_CLASS=$(cat <<'BDC_FEATURE_DEV_OPUS_REREVIEW_CLASS_CLASSIFY_OPUS_REREVIEW_20260719_019'
+      $classify-opus-rereview.output
+      BDC_FEATURE_DEV_OPUS_REREVIEW_CLASS_CLASSIFY_OPUS_REREVIEW_20260719_019
+      )
+      echo "$DECIDE_OUTPUT"
+      if printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^out_of_scope: true'; then
+        echo "Out of scope for bdc-feature-development; failing closed." >&2
+        exit 1
+      fi
+      # Irreversible-action gate (Fix D, 2026-05-30): the BLOCK/PAUSE decision now lives
+      # upstream in block-classify -> opus-repair -> block-reclassify -> pause-gate. This
+      # node only runs `when: $block-reclassify.output.status == 'PROCEED'`. We keep a
+      # belt-and-suspenders re-check here (defense in depth) but it must NEVER be the place
+      # a block surfaces as a raw failure -- if status isn't PROCEED we should not be here.
+      RECLASS_STATUS=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      RECLASS_NOTE=$(printf '%s\n' "$RECLASS" | sed -n 's/.*"note":"\([a-z0-9_-]*\)".*/\1/p' | head -1)
+      # Approve-with-fix bridge: a BLOCKED run may legitimately commit if the operator chose
+      # APPROVE-WITH-FIX at the gate AND the post-fix re-review (apply-diff-review-final,
+      # classified by classify-apply-review) came back satisfied. Read both from node outputs.
+      GATE_VERB=$(printf '%s\n' "$PAUSE_GATE" | sed -n 's/.*"decision_verb":"\([a-z_]*\)".*/\1/p' | head -1)
+      APPLY_VERDICT=$(printf '%s\n' "$APPLY_REVIEW" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
+      APPROVE_WITH_FIX_OK=false
+      if [ "$GATE_VERB" = "approve_with_fix" ] && [ "$APPLY_VERDICT" = "satisfied" ]; then
+        APPROVE_WITH_FIX_OK=true
+      fi
+      # Opus autonomous re-review bridge (WO-HARNESS-OPUS-REPAIR-AUTONOMOUS-REREVIEW-01,
+      # Codex revision 2026-06-26): a BLOCKED run that opus-repair fixed AND classify-opus-rereview
+      # marked satisfied causes block-reclassify to emit PROCEED with note
+      # "opus-repaired-and-rereviewed-satisfied". In that path diff-review-final is still
+      # needs_revision (it is what triggered the block in the first place) and approve-with-fix
+      # is not used. Authorize commit here by reading the opus rereview verdict directly --
+      # mirrors the approve-with-fix bridge above. Fail CLOSED: missing/unparseable verdict
+      # never grants authorization.
+      OPUS_REREVIEW_VERDICT=$(printf '%s\n' "$OPUS_REREVIEW_CLASS" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p' | head -1)
+      OPUS_REREVIEW_OK=false
+      if [ "$OPUS_REREVIEW_VERDICT" = "satisfied" ] && [ "$RECLASS_NOTE" = "opus-repaired-and-rereviewed-satisfied" ]; then
+        OPUS_REREVIEW_OK=true
+      fi
+      if [ "$RECLASS_STATUS" != "PROCEED" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$OPUS_REREVIEW_OK" != "true" ]; then
+        echo "ERROR: commit-and-push reached with status='$RECLASS_STATUS' and no satisfied approve-with-fix or opus-rereview authorization. Refusing to commit." >&2
+        exit 1
+      fi
+      # Final-review sanity (still required for a real build): diff-review-final must be satisfied,
+      # OR an explicit downstream authorization (approve-with-fix re-review satisfied, or opus
+      # autonomous re-review satisfied) overrides it. Anchor-free parse (defense-in-depth mirror
+      # of block-classify). Fail-closed: anything other than an explicit satisfied leaves the
+      # gate refusing unless one of the two downstream bridges is true.
+      final_verdict_cap=$(printf '%s\n' "$DIFF_FINAL" \
+        | grep -oE 'DIFF_REVIEW_FINAL=(satisfied|needs_revision)' \
+        | tail -n 1)
+      if [ "$final_verdict_cap" != "DIFF_REVIEW_FINAL=satisfied" ] && [ "$APPROVE_WITH_FIX_OK" != "true" ] && [ "$OPUS_REREVIEW_OK" != "true" ]; then
+        echo "ERROR: neither diff-review-final, a satisfied approve-with-fix re-review, nor a satisfied opus autonomous re-review authorizes this commit -- refusing (defense in depth)." >&2
+        exit 1
+      fi
+      # Defect 1 (WO-HARNESS-CAULDRON-DEFECT-CLEANUP-01): tolerate leading whitespace
+      # and code-fence indentation. The strict ^ anchor broke when an agent emitted
+      # push_target inside an indented ```text fence (PR #165 anchor run 9069e99c).
+      # WO-HARNESS-PUSH-TARGET-EXTRACTION-HARDENING-01: tolerant multi-strategy
+      # push_target extraction. The old line-anchored sed broke a 2nd time
+      # (run e5110df1, fable tier, 2026-08-01) after PR #165's first whitespace
+      # patch -- the ^...$ anchor requires the WHOLE line to be exactly
+      # "push_target: feature-branch: <token>", so any markdown fence, list
+      # bullet, blockquote, backtick, or trailing prose a model tier adds makes
+      # BRANCH come back empty and the node exit 1 with a message that lied
+      # ("absent" when the field was present but merely styled differently).
+      # Fix: pre-strip backticks, then (1) fast path -- the exact
+      # whitespace-tolerant anchor (unchanged behavior for well-formed output,
+      # zero regression); (2) fallback -- scan ANYWHERE for
+      # "push_target: feature-branch: <token>", stopping at the first whitespace
+      # so trailing prose is tolerated. Failure now distinguishes "field absent"
+      # from "field present but unparseable". Extraction is a pure read of the
+      # decide output (no state mutation), so re-running the node is
+      # side-effect-free. BRANCH_PATTERN validation below is unchanged and still
+      # runs after extraction.
+      DECIDE_OUTPUT_CLEAN=$(printf '%s\n' "$DECIDE_OUTPUT" | tr -d '`')
+      BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*push_target:[[:space:]]*feature-branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
+      if [ -z "$BRANCH" ]; then
+        BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" \
+          | { grep -oE 'push_target:[[:space:]]*feature-branch:[[:space:]]*[^[:space:]]+' || true; } \
+          | head -n 1 \
+          | sed -E 's/^.*feature-branch:[[:space:]]*//')
+      fi
+      if [ -z "$BRANCH" ]; then
+        # Bare-form fallback (anchor run ce394492, zero-open tier, 2026-08-07):
+        # open-tier models emit "push_target: feat/<name>" WITHOUT the
+        # feature-branch: prefix. Accept the bare form LAST. Safe: the extracted
+        # token still must pass BRANCH_PATTERN below, so this admits nothing the
+        # strict form would not.
+        BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | { grep -oE 'push_target:[[:space:]]*(feat|fix|wip)/[A-Za-z0-9_-]+' || true; } | head -n 1 | sed -E 's/^push_target:[[:space:]]*//')
+      fi
+      if [ -z "$BRANCH" ]; then
+        if printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep -q 'push_target'; then
+          PUSH_TARGET_EXCERPT=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | grep 'push_target' | head -n 1 | cut -c1-200)
+          echo "push_target field present but unparseable: ${PUSH_TARGET_EXCERPT}" >&2
+        else
+          echo "push_target field absent from decide-push-target output." >&2
+        fi
+        exit 1
+      fi
+      # F-6A: Validate BRANCH against allowlist regex BEFORE constructing UNIQUE_BRANCH.
+      # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (anchor 2026-05-18: three WOs hit
+      # double-suffix branch names like archon/thread-9772643d-thread-9772643d).
+      # The engine appends -thread-<hash> at push time, so the agent must emit a
+      # clean feat/|fix/|wip/ prefix only. archon/thread- prefix is rejected here
+      # because it would produce a double-suffix UNIQUE_BRANCH.
+      BRANCH_PATTERN='^(feat/[A-Za-z0-9_-]+|fix/[A-Za-z0-9_-]+|wip/[A-Za-z0-9_-]+)$'
+      if ! printf '%s\n' "$BRANCH" | grep -Eq "$BRANCH_PATTERN"; then
+        echo "Malformed branch name: $BRANCH does not match required pattern feat/|fix/|wip/|archon/thread-" >&2
+        exit 1
+      fi
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01
+      # Engine already provides a unique archon/thread-<hash> branch per run.
+      # Derive a unique remote push target from it instead of clobbering a shared name.
+      # DEFECT FIX 2026-07-27 (anchor: WO-CRM-SUPABASE-CONVERGENCE-01, run d982e84e).
+      # The old line was:
+      #   THREAD_ID=$(git rev-parse --abbrev-ref HEAD | sed 's|archon/thread-||')
+      # That sed only strips a PREFIX. When HEAD is NOT archon/thread-<hash> -- e.g. a run
+      # resumed on an existing feature branch, as happens when a WO converges an existing
+      # PR -- nothing is stripped and THREAD_ID becomes the ENTIRE branch name, producing
+      # a nested double-suffix ref like:
+      #   feat/wo-crm-supabase-convergence-01-thread-feat/wo-xo-crm-minimum-complete-journey-01
+      # which then opened a SECOND, spurious PR. BRANCH is validated; THREAD_ID never was.
+      CURRENT_REF=$(git rev-parse --abbrev-ref HEAD)
+      case "$CURRENT_REF" in
+        archon/thread-*)
+          THREAD_ID=${CURRENT_REF#archon/thread-}
+          ;;
+        *)
+          THREAD_ID=$(git rev-parse --short=8 HEAD 2>/dev/null || echo "nohead")
+          echo "commit-and-push: HEAD is '${CURRENT_REF}' (not archon/thread-*); using commit-derived THREAD_ID=${THREAD_ID}" >&2
+          ;;
+      esac
+      if ! printf '%s\n' "$THREAD_ID" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+        echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
+        exit 1
+      fi
+      UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
+      git status --short
+      DIRTY=$(git status --porcelain)
+      if [ -z "$DIRTY" ]; then
+        # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: do NOT exit 0 here on the
+        # "HEAD matches origin" heuristic. The only invariant that matters is
+        # origin/${UNIQUE_BRANCH} == local HEAD, verified by ls-remote at the END
+        # of this node (after the push loop). A clean tree that already matches
+        # origin simply makes the push a no-op + the verify a pass. Falling
+        # through (instead of exit 0) guarantees every path hits the final verify.
+        # WO-HARNESS-COMMIT-AND-PUSH-BACKSTOP-FALSE-NEGATIVE-01: a clean working
+        # tree does NOT mean the implement loop skipped work - it may have committed
+        # and left the tree clean. Count COMMITS_AHEAD to distinguish true no-op
+        # from pre-committed work that still needs pushing.
+        if git rev-parse --quiet --verify "origin/${UNIQUE_BRANCH}" >/dev/null 2>&1; then
+          COMMITS_AHEAD=$(git rev-list --count "origin/${UNIQUE_BRANCH}..HEAD" 2>/dev/null || echo 0)
+        else
+          COMMITS_AHEAD=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)
+        fi
+        if [ "$COMMITS_AHEAD" = "0" ]; then
+          # F-7C: origin/${UNIQUE_BRANCH} may be missing because the implement
+          # loop already pushed to a different remote branch (e.g. the engine's
+          # archon/thread-<hash> ref). Search git ls-remote origin for any ref
+          # whose HEAD SHA matches local HEAD; if found, retarget UNIQUE_BRANCH
+          # to that name and proceed (push will be a no-op).
+          # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (anchor 2026-05-18:
+          # WO-HARNESS-OVERSEER-FAILURE-CLASSES-EXPANSION-01 12:03 UTC, commit
+          # 2d5f6ac0 on origin/archon/thread-9772643d but UNIQUE_BRANCH was
+          # archon/thread-9772643d-thread-9772643d).
+          LOCAL_HEAD=$(git rev-parse HEAD)
+          RECOVERED=$(git ls-remote origin 2>/dev/null \
+            | awk -v sha="$LOCAL_HEAD" '$1 == sha {sub(/^refs\/heads\//, "", $2); print $2}' \
+            | head -1)
+          if [ -n "$RECOVERED" ]; then
+            echo "Recovered push target from remote: $RECOVERED"
+            # DEFECT FIX 2026-07-27 (anchor: bdc-crm PR #4, run f8ef4b92).
+            # This recovery block adopts ANY remote ref whose HEAD SHA matches local HEAD.
+            # If a PRIOR run pushed a malformed branch name, this block finds it, adopts it,
+            # and pushes to it again -- propagating the corruption forward and opening a new
+            # spurious PR each time. The bug feeds on its own output. Observed names:
+            #   feat/wo-crm-supabase-convergence-01-thread-wo-crm-supabase-convergence-01'
+            # (note the nested WO id AND the trailing quote). Validate before adopting.
+            if printf '%s\n' "$RECOVERED" | grep -Eq '^(feat|fix|wip)/[A-Za-z0-9_-]+-thread-[A-Za-z0-9_-]+$'; then
+              UNIQUE_BRANCH="$RECOVERED"
+            else
+              echo "WARN: recovered remote ref '${RECOVERED}' is malformed -- refusing to adopt it; keeping ${UNIQUE_BRANCH}" >&2
+            fi
+          else
+            echo "No changed files and no commits ahead of origin/${UNIQUE_BRANCH} -- implement loop did not produce work" >&2
+            exit 1
+          fi
+        else
+          echo "Backstop: $COMMITS_AHEAD commit(s) ahead of origin -- pushing pre-committed work."
+        fi
+      else
+        # Dirty working tree: stage + validate against plan + commit
+        CHANGED_FILES=$(printf '%s\n' "$DIRTY" | awk '{print substr($0,4)}')
+        # Auto-tolerated files: dependency lockfiles + standard auto-regenerated
+        # artifacts managed by package managers during the implement loop.
+        # Without this allowlist, adding a dependency causes bun.lock regeneration
+        # which trips the strict-allowlist check.
+        AUTO_TOLERATED='^(bun\.lock|package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.bun-tag|node_modules/)$'
+        printf '%s\n' "$CHANGED_FILES" | while IFS= read -r path; do
+          if [ -z "$path" ]; then
+            continue
+          fi
+          # Skip allowlist check for auto-managed files; just stage them.
+          if printf '%s\n' "$path" | grep -Eq "$AUTO_TOLERATED"; then
+            echo "Auto-tolerated change (lockfile/managed): $path"
+            git add -- "$path"
+            continue
+          fi
+          if ! printf '%s\n' "$PLAN_OUTPUT" | grep -F -- "$path" >/dev/null; then
+            # WO-HARNESS-COMMIT-PLAN-DEVIATION-WARN-NOT-FAIL-01 (2026-06-21): the plan
+            # node is a PREDICTION, not a perfection contract. Legitimate builds routinely
+            # touch a file the plan did not pre-name (scope discovered during implement).
+            # This was an exit-1 hard-fail that killed otherwise-good builds AFTER they had
+            # already passed war-council-validator + diff-review -- both of which review the
+            # FULL captured diff (capture-diff: git diff $MB..HEAD + git diff HEAD), so an
+            # unplanned file is already REVIEWED, just not pre-declared. The fraud concern
+            # (silent unrelated commits) is covered by that upstream full-diff review, so
+            # warn loudly + commit instead of failing closed. The warning is greppable for
+            # audit (PLAN_DEVIATION) and surfaces in the manifest.
+            echo "PLAN_DEVIATION: changed file not pre-listed in plan (reviewed upstream, committing): $path" >&2
+          fi
+          git add -- "$path"
+        done
+        if git diff --cached --quiet; then
+          echo "No changes staged; nothing for backstop to commit." >&2
+          exit 0
+        fi
+        COMMIT_MESSAGE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+        if [ -z "$COMMIT_MESSAGE" ]; then
+          # Re-derive WO_ID locally - see post-started for rationale
+          WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+          COMMIT_MESSAGE="feat: ${WO_ID} implementation"
+        fi
+        git commit -m "$COMMIT_MESSAGE"
+      fi
+
+      # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
+      # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
+      # so the local archon/thread-<hash> branch lands on a unique remote name
+      # (UNIQUE_BRANCH) and does not collide with other parallel runs.
+      PUSH_OK=false
+      for attempt in 1 2 3; do
+        if git push origin HEAD:"${UNIQUE_BRANCH}" 2>&1; then
+          PUSH_OK=true
+          break
+        fi
+        echo "WARN: push attempt $attempt failed; retrying after $((attempt * 5))s..." >&2
+        sleep $((attempt * 5))
+      done
+      if [ "$PUSH_OK" = "false" ]; then
+        echo "ERROR: git push failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        exit 1
+      fi
+      # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: the ONLY success invariant.
+      # Clean-tree / commits-ahead-0 / HEAD-reachable-from-some-remote are NOT
+      # valid proxies. The canonical PR branch MUST be on origin at local HEAD
+      # before open-pr-if-needed runs, or work is lost when the worktree is cleaned
+      # (anchors: Lane A runs ac2777a3 + f6e24ac2, 2026-05-25 -- both lost the
+      # report at open-pr because the branch was never durably on origin).
+      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+      if [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ]; then
+        echo "FATAL: canonical branch ${UNIQUE_BRANCH} not durably pushed (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})" >&2
+        exit 1
+      fi
+      echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
+      echo "unique_branch=${UNIQUE_BRANCH}"
+
+  # load_bearing: true (WO-167 doctrine, WO-169 anchor)
+  - id: open-pr-if-needed
+    persona: major-build
+    depends_on: [commit-and-push]
+    task_class: clerical
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      # 2026-05-16 quote-fix: see commit-and-push for rationale.
+      DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
+      # Extract ONLY the approved-plan block for the PR title/body (F8 fix) -- keep
+      # reviewer critique out of the customer-visible PR. FAIL CLOSED if the fence is
+      # absent (NF1): never put raw critique-bearing output in the PR body.
+      PLAN_REVIEW_RAW=$(cat <<'BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_021'
+      $plan-review.output
+      BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_021
+      )
+      # Extract APPROVED_PLAN (single-line-safe; open-model canary 3604d5bcc7b2).
+      PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | python3 -c 'import sys,re;t=sys.stdin.read();m=re.search(r"===\s*APPROVED_PLAN_BEGIN\s*===(.*?)===\s*APPROVED_PLAN_END\s*===",t,re.S|re.I);body=(m.group(1).strip() if m else "");body=re.sub(r"(?<!\n)(##)",r"\n\1",body);body=re.sub(r"(?<!\n)(```)",r"\n\1",body);print(body)')
+      if [ -z "$PLAN_OUTPUT" ]; then
+        echo "ERROR: plan-review output missing the APPROVED_PLAN fence -- cannot build PR body (NF1 fail-closed)." >&2
+        exit 1
+      fi
+      IMPLEMENT_OUTPUT=$(cat <<'BDC_FEATURE_DEV_IMPLEMENT_OUTPUT_IMPLEMENT_20260719_022'
+      $implement.output
+      BDC_FEATURE_DEV_IMPLEMENT_OUTPUT_IMPLEMENT_20260719_022
+      )
+      VALIDATOR_OUTPUT=$(cat <<'BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023'
+      $war-council-validator.output
+      BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023
+      )
+      COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
+      if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
+        echo "PR not required; skipping."
+        exit 0
+      fi
+      # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: read the unique
+      # remote branch the commit-and-push node pushed to; gh pr create must use
+      # --head to target that branch rather than the (local) archon/thread-<hash>.
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      if [ -z "$UNIQUE_BRANCH" ]; then
+        echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
+        exit 1
+      fi
+      # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
+      # then re-push and re-verify before failing the PR-open precondition.
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+
+      wait_match() {
+        local attempt remote
+        for attempt in 1 2 3 4 5 6; do
+          remote="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+          if [ -n "$remote" ] && [ "$remote" = "$LOCAL_HEAD" ]; then
+            echo "ORIGIN_PRECONDITION_OK: origin/${UNIQUE_BRANCH} == ${LOCAL_HEAD} (attempt ${attempt})"
+            return 0
+          fi
+          echo "WARN: origin precondition miss attempt ${attempt} (origin=${remote:-<absent>} local=${LOCAL_HEAD}); waiting..." >&2
+          sleep $((attempt * 2))
+        done
+        return 1
+      }
+
+      if ! wait_match; then
+        echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
+        PUSH_OK=false
+        for attempt in 1 2 3; do
+          if git push origin "HEAD:${UNIQUE_BRANCH}" 2>&1; then
+            PUSH_OK=true
+            break
+          fi
+          echo "WARN: re-push attempt ${attempt} failed; retrying..." >&2
+          sleep $((attempt * 5))
+        done
+        if [ "$PUSH_OK" = "false" ]; then
+          echo "FATAL: open-pr re-push failed -- ${UNIQUE_BRANCH} not durable on origin (local=${LOCAL_HEAD})" >&2
+          exit 1
+        fi
+        if ! wait_match; then
+          REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+          echo "FATAL: open-pr precondition failed after wait+re-push -- ${UNIQUE_BRANCH} not on origin at HEAD (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})." >&2
+          exit 1
+        fi
+      fi
+      # Rule 29: extract explicit repo from decide-push-target output.
+      # Never let gh default to the worktree's origin -- it may be bdc-harness
+      # even when the spec targets bdc-xo or lspro-react.
+      REPO=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^repo: //p' | head -n 1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: decide-push-target did not emit a valid 'repo: <owner>/<repo>'." >&2
+        echo "Fix the spec to include 'target_repo:' or '**Target repo:**' and re-run." >&2
+        exit 1
+      fi
+      # F-8C: Rule 20 staging-gate repos (lspro-react, shopops-storefront, shopops)
+      # require PRs to target staging instead of the repo default branch.
+      # decide-push-target emits "staging_gate_required: true|false"; when true,
+      # this node passes --base staging to gh pr create (otherwise it omits --base
+      # and lets gh use the repo default).
+      # WO-HARNESS-PUSH-CORRECTNESS-HARDENING-01 (closes Rule 20 bypass hole 2026-05-18).
+      STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      BASE_BRANCH_OVERRIDE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      STAGING_GATE="${STAGING_GATE:-0}"
+      if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+        case "$BASE_BRANCH_OVERRIDE" in
+          unknown|UNKNOWN|"<"*">"*|*"e.g."*)
+            echo "ERROR: decide-push-target emitted an invalid base_branch_override value: ${BASE_BRANCH_OVERRIDE}" >&2
+            exit 1
+            ;;
+        esac
+        if printf '%s' "$BASE_BRANCH_OVERRIDE" | grep -q '[[:space:]]'; then
+          echo "ERROR: decide-push-target emitted an invalid base_branch_override value with whitespace: ${BASE_BRANCH_OVERRIDE}" >&2
+          exit 1
+        fi
+        if ! git check-ref-format --branch "$BASE_BRANCH_OVERRIDE" >/dev/null 2>&1; then
+          echo "ERROR: decide-push-target emitted an invalid base branch override ref name: ${BASE_BRANCH_OVERRIDE}" >&2
+          exit 1
+        fi
+        if ! git ls-remote --exit-code "https://github.com/${REPO}.git" "refs/heads/${BASE_BRANCH_OVERRIDE}" >/dev/null 2>&1; then
+          echo "ERROR: base branch override ${BASE_BRANCH_OVERRIDE} does not exist on ${REPO}; refusing to open PR against an unverified base." >&2
+          exit 1
+        fi
+        BASE_BRANCH="$BASE_BRANCH_OVERRIDE"
+      elif [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+        BASE_BRANCH="staging"
+      else
+        BASE_BRANCH=""
+      fi
+      TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
+      if [ -z "$TITLE" ]; then
+        TITLE="BDC feature Work Order implementation"
+      fi
+      BODY_FILE=$(mktemp)
+      {
+        echo "## Summary"
+        echo "$PLAN_OUTPUT"
+        echo
+        echo "## Validation"
+        echo "Workflow-time verify-* nodes were removed 2026-05-16 (Patch 1) - agent self-verifies in implement loop;"
+        echo "real validation gates run at PR time (codex-review + claude-review + Gitleaks + e2e-smoke + Captain CI)."
+        echo "See implement output below for what the builder verified locally."
+        echo
+        if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+          echo "## Base branch override"
+          echo "Base branch override applied: PR targets \`$BASE_BRANCH_OVERRIDE\` per spec-declared \`Base branch:\` field (not the default staging gate)."
+          echo
+        fi
+        echo "## Implement output"
+        echo "$IMPLEMENT_OUTPUT"
+        echo
+        echo "## Validator"
+        echo "$VALIDATOR_OUTPUT"
+      } > "$BODY_FILE"
+      # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
+      # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
+      # Defect 2 (WO-HARNESS-CAULDRON-DEFECT-CLEANUP-01): check-first design.
+      # The old retry-first loop reported a false failure when the PR already
+      # existed (created by a parallel implement-loop worktree) or when gh pr
+      # create succeeded but returned non-zero (gh CLI quirk). PR #167 anchor
+      # run a0dae1f8. Now: look for an existing PR BEFORE attempting create, and
+      # re-check after each create attempt so a non-zero-exit-but-created PR is
+      # caught instead of triggering a spurious failure.
+      PR_OK=false
+      EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+        --json url --jq '.[0].url // empty' 2>/dev/null || true)
+      if [ -n "$EXIST" ]; then
+        echo "PR_URL=$EXIST"
+        echo "PR already exists (no create needed)."
+        PR_OK=true
+      else
+        for attempt in 1 2 3; do
+          if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
+            PR_OK=true
+            break
+          fi
+          # Re-check: gh pr create may have created the PR but returned non-zero.
+          EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
+            --json url --jq '.[0].url // empty' 2>/dev/null || true)
+          if [ -n "$EXIST" ]; then
+            echo "PR_URL=$EXIST"
+            echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
+            PR_OK=true
+            break
+          fi
+          echo "WARN: gh pr create attempt $attempt failed AND no PR found on origin; retrying after $((attempt * 5))s..." >&2
+          sleep $((attempt * 5))
+        done
+      fi
+      if [ "$PR_OK" = "false" ]; then
+        # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: gh pr create failed, but the
+        # canonical branch was VERIFIED on origin at HEAD above (precondition guard
+        # + commit-and-push verify). So the work is NOT lost -- the operator can open
+        # the PR manually from the pushed branch. Emit a salvage manifest line so the
+        # branch + SHA survive in the run output even though the worktree is cleaned.
+        echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=${REPO} branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
+        echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} ${BASE_BRANCH:+--base ${BASE_BRANCH}}" >&2
+        exit 1
+      fi
+
+  - id: build-manifest
+    persona: major-build
+    provider: claude
+    model: opus[1m]
+    depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
+    trigger_rule: all_done
+    task_class: clerical
+    evidence:
+      kind: manifest_v2
+      required_gates: [plan-review, block-reclassify, open-pr-if-needed]
+    legacy_prompt: |
+      Construct the Captain CI completion manifest for this BDC feature Work Order.
+
+      ## Outcome branch (Fix D, 2026-05-30) -- read this FIRST
+      block-reclassify status: $block-reclassify.output
+      - If status=PROCEED: a real build was committed + a PR opened. Build the full v2
+        manifest below (this is the normal case).
+      - If status=ALREADY_SATISFIED: the WO was already implemented in this worktree; no
+        commit/PR. Emit a SHORT manifest: WO ID, OUTCOME=ALREADY_SATISFIED, the evidence
+        from check-already-satisfied, VALIDATION: PASS (verified no-op). Do NOT claim a PR.
+      - If status=BLOCKED: the run paused for human correction (pause-gate). Emit
+        OUTCOME=BLOCKED, the block reason, what the AI tiers tried, VALIDATION: BLOCKED.
+        Do NOT claim a PR or DONE.
+
+      ## Inputs
+      Spec:
+      $read-spec.output
+
+      Plan (approved -- reviewed + revised by plan-review; use the APPROVED_PLAN block):
+      $plan-review.output
+
+      Implementation:
+      $implement.output
+
+      Commit and push evidence (ground truth for HEAD/branch):
+      $commit-and-push.output
+
+      PR evidence (ground truth PR URL/state):
+      $open-pr-if-needed.output
+
+      Verification:
+      (Workflow-time verify-build/types/tests removed 2026-05-16 - agent self-verifies in
+      implement loop, PR-time gates handle real validation. See implement output above.)
+
+      Validator:
+      $war-council-validator.output
+
+      Plan review verdict (self-repair loop -- record PLAN_REVIEW_PASS + RISK as evidence):
+      $plan-review.output
+      VALIDATION: PASS requires this output to contain PLAN_REVIEW_APPROVED. If plan-review
+      rejected, escalated, or exhausted without that token, emit VALIDATION: BLOCKED.
+
+      Diff review (Fable, initial):
+      $diff-review.output
+
+      Diff review (Fable, final after repair):
+      $diff-review-final.output
+
+      ## Required Manifest Fields -- v2 labels (validator-compatible)
+      Emit these labels verbatim at the top of the manifest (one per line):
+        WO: <WO ID from spec>
+        Builder: <persona>
+        Files created: <comma-separated list -- ONLY files added in the diff; or "none">
+        Files modified: <comma-separated list -- ONLY files changed in the diff; or "none">
+        Tests: <N passing / N total> or N/A (<reason>)
+        PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
+        Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
+        Grep assertions: one line; value is a ';'-separated list of sub-assertions, each EXACTLY "<command> => <count>" with a bare integer count -- NO prose after the count, and NO assertion about pre-change state (never write "=> 0" for a path this diff creates -- it is false by construction once the file exists); or "N/A (<reason>)". Each <command> MUST be a single read-only inspection built only from grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test, optionally piped ('|') to one of those; it MUST NOT contain a literal ';' or any shell chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>' '<') -- verify-manifest-assertions splits the value on ';' and DROPS (unexecuted) any command not on that read-only allowlist. verify-manifest-assertions executes each surviving sub-assertion and rewrites wrong counts, so emit your best honest count.
+        Runtime verification: <evidence> or N/A (<reason>); for model-access or live-model probe stop conditions, include the exact in-container probe output or an explicit [UNVERIFIED-DEFERRED] note with the deferral reason
+        VALIDATION: PASS   <- only when all in-run reviews passed
+      NOTE: derive Files created/modified from the git diff -- do NOT list preserved/unchanged
+      files. If no files changed (ALREADY_SATISFIED), emit "Files created: none" only.
+
+      ## In-run review evidence (record as evidence, NOT vibes -- doctrine
+      self-repair-review-loops)
+      - plan-review verdict (PLAN_REVIEW_PASS + RISK)
+      - diff-review-final verdict (DIFF_REVIEW_FINAL)
+      - diff-review provider/model used (claude/claude-fable-5, independent of Astra;
+        any substitution or unverified served identity must be disclosed)
+      If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
+
+
+  - id: verify-manifest-assertions
+    persona: major-build
+    load_bearing: true
+    depends_on: [build-manifest]
+    trigger_rule: all_done
+    task_class: clerical
+    # WO-HARNESS-BUILD-MANIFEST-ASSERTION-EXECUTE-01: build-manifest COMPOSES grep
+    # assertions but never runs them, in a prose format the CI validator rejects.
+    # This deterministic node EXECUTES every emitted assertion in the run worktree
+    # and rewrites the manifest so only proven, bare "<command> => <count>" claims
+    # reach patch-pr-body -> the PR body -> bdc-ci validate-pr-manifest.sh.
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN vma core (byte-identical across lanes; extracted by unit test) ----
+      # allow_cmd <command>
+      #   Fail-closed allowlist gate for the assertion command executed via the
+      #   bash -c below. build-manifest COMPOSES these commands, so they are
+      #   AI-authored, UNTRUSTED input executed inside the run worktree (WO
+      #   Section 7 item 2 -- accepted, now guarded). A command is allowed ONLY
+      #   when every pipe ('|') segment starts with a read-only inspection tool
+      #   (grep/egrep/fgrep/rg/wc/find/cat/head/tail/sort/uniq/test). Any shell
+      #   chaining/redirection/substitution metacharacter (';' '&' '`' '$(' '>'
+      #   '<' newline) or a mutating find primary (-delete/-exec/-ok/-fprint*/
+      #   -fls) drops the assertion UNEXECUTED. This is also the fail-closed
+      #   backstop for a command that legitimately contained a ';': it is
+      #   fragmented by the ';'-split below and each fragment fails this gate
+      #   rather than executing.
+      allow_cmd() {
+        local c="$1" seg first
+        case "$c" in
+          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) return 1 ;;
+          *' -delete'*|*' -exec'*|*' -ok'*|*' -fprint'*|*' -fls'*) return 1 ;;
+        esac
+        local IFS='|'
+        local -a segs
+        read -ra segs <<<"$c"
+        for seg in "${segs[@]}"; do
+          seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//')"
+          first="${seg%%[[:space:]]*}"
+          case "$first" in
+            grep|egrep|fgrep|rg|wc|find|cat|head|tail|sort|uniq|test) ;;
+            *) return 1 ;;
+          esac
+        done
+        return 0
+      }
+      # vma_process_assertions <grep-value> <files-created-csv>
+      #   Splits the Grep-assertions value on ';', executes each "<command> => <count>"
+      #   sub-assertion in the CWD, and applies the Mode Behavior Matrix:
+      #     - executes, count matches   -> kept unchanged
+      #     - executes, count differs   -> count rewritten to ACTUAL (logged)
+      #     - prose after the count     -> stripped to bare "<command> => <count>"
+      #     - command errors / no count -> dropped (logged)
+      #     - "=> 0" of a path this diff CREATES -> dropped (logged; false by construction)
+      #   Bare "N/A (...)" sub-assertions pass through. Emits the corrected value on
+      #   stdout, diagnostics on stderr. If nothing survives, emits a single "N/A (...)".
+      vma_process_assertions() {
+        local val="$1" files_created="$2"
+        local out="" sub cmd rest expected actual raw rawtrim rc f base forbidden trimmed
+        local -a subs created
+        # A pure "N/A (...)" value is the whole-list alternative to a set of
+        # assertions -- pass it through intact (its reason text may contain ';',
+        # so it must NOT be split into sub-assertions).
+        trimmed="$(printf '%s' "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        if printf '%s' "$trimmed" | grep -qiE '^N/A'; then
+          printf '%s' "$trimmed"
+          return 0
+        fi
+        IFS=';' read -ra subs <<<"$val"
+        for sub in "${subs[@]}"; do
+          sub="$(printf '%s' "$sub" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          [ -z "$sub" ] && continue
+          if printf '%s' "$sub" | grep -qiE '^N/A'; then
+            out="${out:+$out; }$sub"
+            continue
+          fi
+          if ! printf '%s' "$sub" | grep -Fq '=>'; then
+            echo "verify-manifest-assertions: DROP (no '=>' delimiter): $sub" >&2
+            continue
+          fi
+          cmd="${sub%%=>*}"
+          rest="${sub#*=>}"
+          cmd="$(printf '%s' "$cmd" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          rest="$(printf '%s' "$rest" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+          expected="$(printf '%s' "$rest" | grep -oE '[0-9]+' | head -1 || true)"
+          if [ -z "$cmd" ] || [ -z "$expected" ]; then
+            echo "verify-manifest-assertions: DROP (unparseable command or count): $sub" >&2
+            continue
+          fi
+          forbidden=0
+          if [ "$expected" = "0" ] && [ -n "$files_created" ] && [ "$files_created" != "none" ]; then
+            IFS=',' read -ra created <<<"$files_created"
+            for f in "${created[@]}"; do
+              f="$(printf '%s' "$f" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/ (deleted)$//')"
+              [ -z "$f" ] && continue
+              base="$(basename "$f")"
+              # Match on WORD/PATH boundaries (-w), not bare substring: a created
+              # file 'index.ts' must NOT forbid an assertion about 'index.tsx'
+              # (its basename is a literal substring of the longer name).
+              if printf '%s' "$cmd" | grep -Fwq "$f" || printf '%s' "$cmd" | grep -Fwq "$base"; then
+                forbidden=1
+                break
+              fi
+            done
+          fi
+          if [ "$forbidden" = "1" ]; then
+            echo "verify-manifest-assertions: DROP (FORBIDDEN pre-create absence; asserts \"=> 0\" of a path this diff creates): $sub" >&2
+            continue
+          fi
+          if ! allow_cmd "$cmd"; then
+            echo "verify-manifest-assertions: DROP (command not on read-only allowlist; not executed): $sub" >&2
+            continue
+          fi
+          raw="$(bash -c "$cmd" 2>/dev/null)"; rc=$?
+          rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
+          if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
+            # Command printed a single integer (the "| wc -l" / "grep -c" form).
+            actual="$rawtrim"
+          elif [ -z "$rawtrim" ]; then
+            # No output: a clean no-match (grep rc<=1) is a real 0; a harder
+            # failure (bad path/regex, command-not-found -> rc>=2) is an error.
+            if [ "$rc" -le 1 ]; then
+              actual="0"
+            else
+              echo "verify-manifest-assertions: DROP (command errored, rc=$rc): $sub" >&2
+              continue
+            fi
+          else
+            # Multi-line / non-numeric output (grep -rn matches, grep -rln paths):
+            # the count is the number of non-empty output lines.
+            actual="$(printf '%s\n' "$raw" | grep -c . || true)"
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "verify-manifest-assertions: CORRECT ($expected -> $actual): $cmd" >&2
+          fi
+          out="${out:+$out; }$cmd => $actual"
+        done
+        if [ -z "$out" ]; then
+          out="N/A (all emitted grep assertions dropped during execution; see verify-manifest-assertions log)"
+        fi
+        printf '%s' "$out"
+      }
+
+      # vma_process <files-created-csv>   (reads full manifest on stdin -> stdout)
+      #   Passes a short manifest with no "Grep assertions:" line through untouched
+      #   (the ALREADY_SATISFIED / BLOCKED branches). Otherwise rewrites only that
+      #   one line with the corrected value; every other line is preserved verbatim.
+      vma_process() {
+        local files_created="$1" manifest grep_val corrected
+        manifest="$(cat)"
+        if ! printf '%s\n' "$manifest" | grep -qE '^Grep assertions:'; then
+          printf '%s\n' "$manifest"
+          return 0
+        fi
+        grep_val="$(printf '%s\n' "$manifest" | grep -E '^Grep assertions:' | head -1 | sed 's/^Grep assertions:[[:space:]]*//')"
+        corrected="$(vma_process_assertions "$grep_val" "$files_created")"
+        printf '%s\n' "$manifest" | REPL="Grep assertions: ${corrected}" awk '
+          !seen && /^Grep assertions:/ { print ENVIRON["REPL"]; seen=1; next }
+          { print }
+        '
+      }
+      # ---- END vma core ----
+
+      MANIFEST_OUT="$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )"
+      FILES_CREATED="$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^Files created:' | head -1 | sed 's/^Files created:[[:space:]]*//' || true)"
+      printf '%s\n' "$MANIFEST_OUT" | vma_process "$FILES_CREATED"
+
+  - id: stamp-manifest-pr
+    persona: major-build
+    load_bearing: true
+    depends_on: [verify-manifest-assertions, open-pr-if-needed, block-reclassify]
+    trigger_rule: all_done
+    task_class: clerical
+    # WO-HARNESS-MANIFEST-PR-FIELD-MECHANICAL-01: build-manifest prose is not
+    # authoritative for the load-bearing PRs: field. Stamp it from the same
+    # mechanical open-pr-if-needed evidence consumed by manifest-consistency-check.
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN stamp-manifest-pr core (byte-identical across lanes; extracted by unit test) ----
+      # smp_process <status> <pr-url>   (reads full manifest on stdin -> stdout)
+      #   When block-reclassify says PROCEED and open-pr-if-needed resolved a PR,
+      #   mechanically overwrite the first PRs: line with that URL. Non-PROCEED
+      #   paths and genuine open-pr failures pass through unchanged.
+      smp_process() {
+        local status="$1" pr_url="$2" manifest
+        manifest="$(cat)"
+        if [ "$status" = "PROCEED" ] && [ -n "$pr_url" ]; then
+          if printf '%s\n' "$manifest" | grep -qE '^PRs:'; then
+            printf '%s\n' "$manifest" | REPL="PRs: ${pr_url}" awk '
+              !seen && /^PRs:/ { print ENVIRON["REPL"]; seen=1; next }
+              { print }
+            '
+          else
+            printf '%s\n' "$manifest"
+            printf 'PRs: %s\n' "$pr_url"
+          fi
+          return 0
+        fi
+        printf '%s\n' "$manifest"
+      }
+      # ---- END stamp-manifest-pr core ----
+
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
+      fi
+
+      MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $verify-manifest-assertions.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+      printf '%s\n' "$MANIFEST_OUT" | smp_process "$STATUS" "$PR_URL"
+
+  - id: manifest-consistency-check
+    persona: major-build
+    load_bearing: true
+    depends_on: [build-manifest, verify-manifest-assertions, stamp-manifest-pr, open-pr-if-needed, block-reclassify]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
+      fi
+
+      MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $stamp-manifest-pr.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+      extract() {
+        { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
+      }
+      PRS_LINE=$(extract "PRs")
+
+      if [ "$STATUS" = "PROCEED" ] && [ -n "$PR_URL" ]; then
+        PRS_LOWER=$(printf '%s\n' "$PRS_LINE" | tr '[:upper:]' '[:lower:]')
+        if printf '%s\n' "$PRS_LOWER" | grep -Eq 'no commit|no pr|not opened|n/a' \
+          && ! printf '%s\n' "$PRS_LINE" | grep -Fq "$PR_URL"; then
+          WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+          HEAD_SHA=$(git -C "$WT" rev-parse HEAD 2>/dev/null || echo unknown)
+          RUN_START_SHA=$(cat "${ARTIFACTS_DIR:-}/run-start-sha.txt" 2>/dev/null || echo unknown)
+          BRANCH=$(git -C "$WT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
+          ORIGIN_HEAD=$(git -C "$WT" log -1 --format=%H "origin/${BRANCH}" 2>/dev/null || echo unknown)
+          PR_STATE=$(gh pr view "$PR_URL" --json state,number --jq '"#" + (.number|tostring) + " " + .state' 2>/dev/null || echo unknown)
+          echo "SELF_CONSISTENCY_ERROR: build-manifest claims \"${PRS_LINE}\" but block-reclassify=PROCEED and open-pr-if-needed resolved PR_URL=${PR_URL} (HEAD=${HEAD_SHA}, RUN_START_SHA=${RUN_START_SHA}, origin/${BRANCH}=${ORIGIN_HEAD}, PR=${PR_STATE})" >&2
+          exit 1
+        fi
+      fi
+
+      # ---- BEGIN manifest-pr-content-check ----
+      # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
+      # Fail closed when build-manifest claims paths absent from the real PR file list.
+      if [ -n "$PR_URL" ]; then
+        FILES_CREATED_LINE=$(extract "Files created")
+        FILES_MODIFIED_LINE=$(extract "Files modified")
+        CLAIMED_RAW=$(printf '%s\n%s\n' "$FILES_CREATED_LINE" "$FILES_MODIFIED_LINE")
+        CLAIMED_PATHS=$(printf '%s\n' "$CLAIMED_RAW" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9_./-]+' | grep -v -E '^(none|n/a|N/A|no files|already.satisfied|ALREADY_SATISFIED|BLOCKED)$' | sed -E 's|^([A-Za-z0-9_./-]+).*|\1|' || true)
+        SKIP_PR_FILES=false
+        COMBINED_LOWER=$(printf '%s\n' "$CLAIMED_RAW" "$PRS_LINE" "$MANIFEST_OUT" | tr '[:upper:]' '[:lower:]')
+        if printf '%s\n' "$COMBINED_LOWER" | grep -Eq 'already_satisfied|already satisfied|no files|files created: none|files modified: none|outcome: blocked|blocked'; then
+          if [ -z "$CLAIMED_PATHS" ]; then
+            SKIP_PR_FILES=true
+          fi
+        fi
+        if [ "$SKIP_PR_FILES" = "false" ]; then
+          REPO=$(printf '%s\n' "$PR_URL" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p' | head -1)
+          PR_NUM=$(printf '%s\n' "$PR_URL" | sed -n 's|.*/pull/\([0-9][0-9]*\).*|\1|p' | head -1)
+          if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
+            PR_FILES=$(gh pr view "$PR_NUM" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null || true)
+            if [ -z "$PR_FILES" ]; then
+              PR_FILES=$(gh pr view "$PR_URL" --json files --jq '.files[].path' 2>/dev/null || true)
+            fi
+            if [ -n "$CLAIMED_PATHS" ]; then
+              MISSING=""
+              MATCH=0
+              while IFS= read -r p; do
+                [ -z "$p" ] && continue
+                if printf '%s\n' "$PR_FILES" | grep -Fxq "$p"; then
+                  MATCH=$((MATCH + 1))
+                else
+                  MISSING="${MISSING}${p} "
+                fi
+              done < <(printf '%s\n' "$CLAIMED_PATHS")
+              if [ -n "$MISSING" ]; then
+                echo "PR_CONTENT_ERROR: claimed path(s) absent from PR file list: ${MISSING}" >&2
+                echo "PR_URL=${PR_URL}" >&2
+                echo "PR_FILES=$(printf '%s' "$PR_FILES" | tr '\n' ' ')" >&2
+                exit 1
+              fi
+              if [ -n "$PR_FILES" ] && [ "$MATCH" -eq 0 ]; then
+                echo "PR_CONTENT_ERROR: PR has files but zero claimed manifest paths match (wrong-content PR)." >&2
+                echo "PR_URL=${PR_URL}" >&2
+                exit 1
+              fi
+            fi
+          fi
+        fi
+      fi
+      # ---- END manifest-pr-content-check ----
+
+      printf 'OK\n'
+
+  # WO-HARNESS-CAULDRON-PR-MANIFEST-AUTOFILL-01: write the v2-label manifest INTO
+  # the PR body so the manifest-validate CI gate (bdc-ci/scripts/validate-pr-manifest.sh)
+  # finds it. The PR is opened BEFORE the manifest is built, so the stub body must be
+  # patched after build-manifest runs. Publishing nodes are explicitly gated by
+  # manifest-consistency-check so a contradictory AI-composed manifest cannot be
+  # written to the PR body or Notion under trigger_rule: all_done.
+  - id: patch-pr-body
+    persona: major-build
+    depends_on: [build-manifest, verify-manifest-assertions, stamp-manifest-pr, manifest-consistency-check]
+    when: "$manifest-consistency-check.output == 'OK'"
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        # Node output refs are substituted before bash runs. Capturing them via a
+        # quoted heredoc keeps raw backticks, quotes, and $() literal; the Python
+        # shim also normalizes the current executor's shell-quoted substitution.
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # -- Outcome guard: only patch on PROCEED (a real PR was opened).
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "PROCEED" ]; then
+        echo "patch-pr-body: status=$STATUS -- skipping PR body patch (no real PR on this path)."
+        exit 0
+      fi
+
+      # -- Resolve PR URL from open-pr-if-needed output.
+      # gh pr create success path prints a bare URL line; the race-recovery path
+      # emits "PR_URL=<url>". Handle both.
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
+      fi
+      if [ -z "$PR_URL" ]; then
+        echo "ERROR: could not resolve PR URL from open-pr-if-needed output -- cannot patch body." >&2
+        exit 1
+      fi
+
+      # -- Resolve REPO from decide-push-target output (Rule 29: never let gh
+      #    default to the worktree's origin).
+      DECIDE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_DECIDE'
+      $decide-push-target.output
+      BDC_NODE_OUTPUT_DECIDE
+      )
+      REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "ERROR: REPO not resolved from decide-push-target output." >&2
+        exit 1
+      fi
+
+      # -- Derive base branch from the ACTUAL PR (gh pr view), not from a guess.
+      #    open-pr-if-needed passes --base staging for staging-gate repos and
+      #    otherwise omits --base, so gh uses each repo's default branch (which
+      #    may be 'main' on some repos and 'dev' on others). Asking the PR for
+      #    its baseRefName is the only reliable source.
+      PR_BASE=$(gh pr view "$PR_URL" --repo "$REPO" --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "")
+      if [ -z "$PR_BASE" ]; then
+        echo "ERROR: could not read baseRefName from $PR_URL (gh pr view failed) -- cannot derive file lists." >&2
+        exit 1
+      fi
+      BASE_REF="origin/${PR_BASE}"
+      # Make sure the local ref is fresh enough to diff against -- in container
+      # runs the worktree may not have fetched the latest base.
+      git fetch --quiet origin "${PR_BASE}" 2>/dev/null || true
+
+      # If origin/<base> is not present in this (possibly sparse) worktree, fall back so the
+      # diff is computed against a real ref instead of silently returning empty (which used to
+      # trip the grep/pipefail abort and skip the manifest entirely).
+      EMPTY_TREE_FALLBACK=0
+      if ! git rev-parse --verify --quiet "${BASE_REF}" >/dev/null 2>&1; then
+        if git rev-parse --verify --quiet FETCH_HEAD >/dev/null 2>&1; then
+          BASE_REF="FETCH_HEAD"
+        else
+          # Empty-tree sha (git's well-known empty tree object). Diffing HEAD against it lists
+          # every tracked file as added -- a safe last resort for a fresh branch.
+          # NOTE: git's three-dot symmetric-diff syntax (BASE...HEAD) requires BOTH endpoints
+          # to be commit-ish; a tree object is rejected. The two-arg form (BASE HEAD) accepts
+          # a tree on the left and produces the same "every tracked file added" listing we want.
+          BASE_REF="$(git hash-object -t tree /dev/null)"
+          EMPTY_TREE_FALLBACK=1
+        fi
+      fi
+
+      # -- Derive file lists from git diff --name-status (the #307 lesson: NEVER
+      #    list preserved/unchanged files -- the validator's sparse checkout
+      #    cannot see them and CHECK 2 will fail). Map every status the validator
+      #    understands so deletion-only and rename-only PRs do not emit 'none':
+      #      A         -> Files created
+      #      M         -> Files modified
+      #      D         -> Files modified, annotated "(deleted)"  (validator
+      #                   CHECK 2 confirms via `git log --diff-filter=D`)
+      #      R<score>  -> rename: new path -> Files created;
+      #                   old path -> Files modified "(deleted)"
+      #      C<score>  -> copy:   new path -> Files created (source untouched)
+      if [ "$EMPTY_TREE_FALLBACK" = "1" ]; then
+        # Two-arg form: compares the empty tree object directly against HEAD and lists every
+        # tracked file as added. Symmetric-diff (...) would silently fail here because a tree
+        # is not commit-ish, and the `|| true` would mask the failure as an empty NAME_STATUS.
+        NAME_STATUS=$(git diff --name-status "${BASE_REF}" HEAD 2>/dev/null || true)
+      else
+        NAME_STATUS=$(git diff --name-status "${BASE_REF}...HEAD" 2>/dev/null || true)
+      fi
+      FILES_CREATED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
+        $1=="A"           { print $2 }
+        $1 ~ /^R[0-9]*$/  { print $3 }
+        $1 ~ /^C[0-9]*$/  { print $3 }
+      ' | awk 'NF' | paste -sd ',' -)
+      FILES_MODIFIED=$(printf '%s\n' "$NAME_STATUS" | awk -F'\t' '
+        $1=="M"           { print $2 }
+        $1=="D"           { printf "%s (deleted)\n", $2 }
+        $1 ~ /^R[0-9]*$/  { printf "%s (deleted)\n", $2 }
+      ' | awk 'NF' | paste -sd ',' -)
+      [ -z "$FILES_CREATED" ] && FILES_CREATED="none"
+      [ -z "$FILES_MODIFIED" ] && FILES_MODIFIED="none"
+
+      # -- Extract structured fields from mechanically stamped manifest output.
+      MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $stamp-manifest-pr.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+      extract() {
+        # pipefail-safe: grep exits 1 when the field line is absent; under
+        # set -euo pipefail that would abort the whole node mid-manifest. The
+        # `|| true` makes a missing field yield empty (the [ -z ] guards below
+        # supply the fallback) instead of killing patch-pr-body. (Hotfix
+        # 2026-06-26: second grep/pipefail trap in this node, same class as the
+        # file-list awk-NF fix.)
+        { printf '%s\n' "$MANIFEST_OUT" | grep -E "^${1}:" | head -1 | sed "s/^${1}:[[:space:]]*//"; } || true
+      }
+      WO_LINE=$(extract "WO")
+      BUILDER_LINE=$(extract "Builder")
+      TESTS_LINE=$(extract "Tests")
+      PRS_LINE=$(extract "PRs")
+      if [ -z "$PRS_LINE" ]; then
+        PRS_LINE="$PR_URL"
+      fi
+      MERGE_ANCS=$(extract "Merge ancestors")
+      if [ -z "$MERGE_ANCS" ]; then
+        MB=$(git merge-base "$BASE_REF" HEAD 2>/dev/null || echo "")
+        HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+        BEHIND=$(git rev-list --count "HEAD..${BASE_REF}" 2>/dev/null || echo "0")
+        if [ -n "$MB" ] && [ -n "$HEAD_SHA" ]; then
+          MERGE_ANCS="${MB}...${HEAD_SHA} (behind_by=${BEHIND})"
+        else
+          MERGE_ANCS="N/A"
+        fi
+      fi
+      GREP_ASSERT=$(extract "Grep assertions")
+      [ -z "$GREP_ASSERT" ] && GREP_ASSERT="N/A (manifest auto-generated; see Tests)"
+      RT_VERIFY=$(extract "Runtime verification")
+      [ -z "$RT_VERIFY" ] && RT_VERIFY="N/A (deploy via sync-workflows.sh; see workflow run)"
+      # -- Validation line: extract the explicit VALIDATION (or INFRA VALIDATION)
+      #    marker emitted by build-manifest. Fail CLOSED if it is missing -- per
+      #    Rule 14 the manifest MUST include a validation line, and silently
+      #    defaulting to "VALIDATION: PASS" would let an unvalidated build
+      #    slip past Captain CI (the #321 hazard).
+      VALIDATION_LINE=$(printf '%s\n' "$MANIFEST_OUT" | grep -E '^(INFRA )?VALIDATION:' | head -1 || true)
+      if [ -z "$VALIDATION_LINE" ]; then
+        VALIDATION_LINE="VALIDATION: NOT_EMITTED -- build-manifest did not include a VALIDATION line; Captain CI must reject"
+      fi
+
+      # -- Resolve the source GitHub issue and append a closing keyword to the PR
+      #    body. This is deliberately added only to the PR body (not issue status),
+      #    so GitHub closes the issue on merge rather than during the build.
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC_FOR_ISSUE'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC_FOR_ISSUE
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+
+      # -- Assemble v2 manifest block. Use printf (not heredoc) so the bash
+      #    source stays indented inside the YAML block scalar.
+      MANIFEST_BLOCK=$(printf '%s\n' \
+        "WO: ${WO_LINE}" \
+        "Builder: ${BUILDER_LINE}" \
+        "Files created: ${FILES_CREATED}" \
+        "Files modified: ${FILES_MODIFIED}" \
+        "Tests: ${TESTS_LINE}" \
+        "PRs: ${PRS_LINE}" \
+        "Merge ancestors: ${MERGE_ANCS}" \
+        "Grep assertions: ${GREP_ASSERT}" \
+        "Runtime verification: ${RT_VERIFY}" \
+        "${VALIDATION_LINE}")
+
+      # -- Build new PR body. Fetch current body, strip any prior manifest block
+      #    using a unique sentinel (HTML comment) so we never accidentally cut
+      #    legitimate "---" rules out of the prose. Idempotent: a re-run starts
+      #    from a stub body OR a previously-patched body and yields a single block.
+      CURRENT_BODY=$(gh pr view "$PR_URL" --repo "$REPO" --json body --jq '.body' 2>/dev/null || echo "")
+      PROSE=$(printf '%s\n' "$CURRENT_BODY" | awk '/^<!-- bdc-manifest-start -->$/{exit} {print}')
+      CLOSING_LINE=""
+      if [ -n "$ISSUE_NUM" ] && ! printf '%s\n' "$PROSE" | grep -qiE "^(Fixes|Closes|Resolves)[[:space:]]+(${ISSUE_REPO//\//\\/}#|#)${ISSUE_NUM}([[:space:]]|$|[.,;])"; then
+        CLOSING_LINE="Closes ${ISSUE_REPO}#${ISSUE_NUM}"
+      fi
+
+      BODY_FILE=$(mktemp)
+      {
+        printf '%s\n' "$PROSE"
+        if [ -n "$CLOSING_LINE" ]; then
+          echo ""
+          printf '%s\n' "$CLOSING_LINE"
+        fi
+        echo ""
+        echo "<!-- bdc-manifest-start -->"
+        printf '%s\n' "$MANIFEST_BLOCK"
+        echo "<!-- bdc-manifest-end -->"
+      } > "$BODY_FILE"
+
+      # -- Patch the PR body.
+      gh pr edit "$PR_URL" --repo "$REPO" --body-file "$BODY_FILE"
+      echo "patch-pr-body: PR body updated with v2 manifest."
+      echo "PR_URL=$PR_URL"
+
+  - id: review-issue
+    depends_on: [build-manifest, patch-pr-body]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "PROCEED" ] && [ "$STATUS" != "ALREADY_SATISFIED" ]; then
+        echo "review-issue: status=$STATUS -- not marking issue status:review."
+        exit 0
+      fi
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "review-issue: no GitHub issue resolved; skipping status:review label."
+        exit 0
+      fi
+
+      gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:review
+      echo "review-issue: $ISSUE_REPO#$ISSUE_NUM -> status:review"
+
+  - id: blocked-issue
+    depends_on: [block-reclassify]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -euo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "BLOCKED" ]; then
+        echo "blocked-issue: status=$STATUS -- not marking issue status:blocked."
+        exit 0
+      fi
+
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "blocked-issue: no GitHub issue resolved; skipping status:blocked label."
+        exit 0
+      fi
+
+      gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description "BDC workflow is blocked before commit" 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:review 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked
+      echo "blocked-issue: $ISSUE_REPO#$ISSUE_NUM -> status:blocked"
+
+  # WO-HARNESS-WO-COMPLETION-COUNTER-01: record a WO completion CANDIDATE after the
+  # PR is opened + its body patched. Design (a) from the WO: bounded `gh pr checks`
+  # poll, then hand a per-WO pending JSON file off to the bdc-xo reconciler, which is
+  # the SINGLE writer of metrics/wo-completions.jsonl (the green-only gate + dedupe on
+  # wo_id+pr_url live there, in one code path). This node NEVER appends to the ledger
+  # directly. It is deliberately fail-soft and NOT load_bearing: a counter outage (gh
+  # flake, still-running checks, or a missing cross-repo write credential) must never
+  # block a WO's own PR pipeline, so every failure path WARNs and exits 0.
+  # UNVERIFIED runtime assumption: a bdc-harness run's gh token may lack write access
+  # to the *different* repo bdc-xo. If the contents PUT is denied, the node WARNs and
+  # exits 0 -- it must not be reported as confirmed-working without a live probe.
+  - id: record-wo-completion-candidate
+    persona: major-build
+    depends_on: [patch-pr-body]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      # No `set -e`: this node is fail-soft (see node comment). `gh pr checks` exits
+      # non-zero for pending/failing checks BY DESIGN, and a counter outage must never
+      # abort the WO pipeline. We keep `-u` (node-output refs are captured via the
+      # quoted-heredoc shim, so they cannot be unbound) and pipefail, branch on exit
+      # codes explicitly, and ALWAYS exit 0.
+      set -uo pipefail
+
+      LANE="bdc-feature-development-codex"
+      LEDGER_REPO="thinmansoftware/bdc-xo"
+      PENDING_DIR="metrics/wo-completions-pending"
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # -- Guard: only record on a real, proceeding build (a PR was actually opened).
+      #    Any other outcome (ALREADY_SATISFIED / BLOCKED / run died before PR) records
+      #    nothing -- matches the WO Mode Matrix "Run dies before PR opens -> nothing".
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" != "PROCEED" ]; then
+        echo "record-wo-completion-candidate: status=${STATUS:-<none>} -- no PR to count; nothing recorded."
+        exit 0
+      fi
+
+      # -- Resolve WO_ID (read-spec first, USER_MESSAGE fallback).
+      READ_SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      WO_ID=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+      [ -z "$WO_ID" ] && WO_ID=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -1 || true)
+      if [ -z "$WO_ID" ]; then
+        echo "WARN: record-wo-completion-candidate: could not resolve WO_ID -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Resolve REPO the PR was opened against (Rule 29: never assume worktree origin).
+      DECIDE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_DECIDE'
+      $decide-push-target.output
+      BDC_NODE_OUTPUT_DECIDE
+      )
+      REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
+      if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+        echo "WARN: record-wo-completion-candidate: REPO unresolved -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Resolve PR URL from open-pr-if-needed (ground truth per manifest-consistency-check).
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1)
+      if [ -z "$PR_URL" ]; then
+        PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1)
+      fi
+      if [ -z "$PR_URL" ]; then
+        echo "WARN: record-wo-completion-candidate: no PR_URL resolved -- nothing recorded (exit 0)." >&2
+        exit 0
+      fi
+
+      # -- Run id: derive from ARTIFACTS_DIR basename. Do NOT use $WORKFLOW_ID under
+      #    set -u (Archon-YAML rule: it is not reliably bound inside bash blocks).
+      RUN_ID=$(basename "${ARTIFACTS_DIR:-}" 2>/dev/null || true)
+      [ -z "$RUN_ID" ] && RUN_ID="unknown"
+
+      # -- PR number (for the pending filename + payload). Derive from the
+      #    already-resolved PR_URL trailing path segment (gh emits .../pull/<n>,
+      #    ground truth per manifest-consistency-check) so a flaky `gh pr view`
+      #    cannot collapse the pending filename to ${WO_ID}__0.json. Fall back to
+      #    a gh lookup only when the URL has no numeric tail, and to "0" last.
+      PR_NUMBER="${PR_URL##*/}"
+      case "$PR_NUMBER" in
+        ''|*[!0-9]*)
+          PR_NUMBER=$(gh pr view "$PR_URL" --repo "$REPO" --json number --jq '.number' 2>/dev/null || true)
+          ;;
+      esac
+      [ -z "$PR_NUMBER" ] && PR_NUMBER="0"
+
+      # -- Single immediate PR-check observation. `gh pr checks` exit codes:
+      #    0=all green, 8=pending, other=fail. The old 10x60s bounded poll could
+      #    exceed this bash node's own timeout, and the bdc-xo reconciler
+      #    RE-VERIFIES independently as the authoritative green-only gate. This
+      #    node records only a hint, so polling here bought no authoritative value.
+      CHECK_STATUS="pending_checks"
+      GREEN_AT=""
+      gh pr checks "$PR_URL" --repo "$REPO" >/dev/null 2>&1
+      RC=$?
+      if [ "$RC" -eq 0 ]; then
+        CHECK_STATUS="green_pending_reconcile"
+        GREEN_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      elif [ "$RC" -eq 8 ]; then
+        CHECK_STATUS="pending_checks"
+      else
+        CHECK_STATUS="failed"
+      fi
+      echo "record-wo-completion-candidate: WO=${WO_ID} PR=${PR_URL} check_status=${CHECK_STATUS}"
+
+      # -- Build the pending JSON. Values are controlled (WO_ID is [A-Z0-9-], REPO is
+      #    owner/repo, URL/ints/timestamps are safe) but we still escape strings.
+      #    counted_at is intentionally NOT set here -- the reconciler stamps it when it
+      #    appends the ledger line (single source of the counted_at truth).
+      esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+      OBSERVED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      if [ -n "$GREEN_AT" ]; then GREEN_FIELD=$(printf '"%s"' "$GREEN_AT"); else GREEN_FIELD="null"; fi
+      JSON=$(printf '{"wo_id":"%s","repo":"%s","pr_url":"%s","pr_number":%s,"lane":"%s","run_id":"%s","status":"%s","pr_merged_or_green_at":%s,"observed_at":"%s"}' \
+        "$(esc "$WO_ID")" "$(esc "$REPO")" "$(esc "$PR_URL")" "$PR_NUMBER" "$(esc "$LANE")" "$(esc "$RUN_ID")" "$CHECK_STATUS" "$GREEN_FIELD" "$OBSERVED_AT")
+
+      # -- Write the pending file to bdc-xo via the contents API. Race-safe across
+      #    concurrent runs: GET the current sha (if the file exists), PUT with
+      #    retry-on-409 (3 attempts). CROSS-REPO write (bdc-harness run -> bdc-xo); if
+      #    the run's gh token lacks write access it fails -- we WARN and exit 0.
+      PENDING_PATH="${PENDING_DIR}/${WO_ID}__${PR_NUMBER}.json"
+      CONTENT_B64=$(printf '%s' "$JSON" | base64 -w0 2>/dev/null || printf '%s' "$JSON" | base64 | tr -d '\n')
+      COMMIT_MSG="chore(wo-counter): ${CHECK_STATUS} candidate ${WO_ID} PR#${PR_NUMBER}"
+      WROTE=false
+      for attempt in 1 2 3; do
+        SHA=$(gh api "repos/${LEDGER_REPO}/contents/${PENDING_PATH}?ref=main" --jq '.sha' 2>/dev/null || true)
+        if [ -n "$SHA" ]; then
+          gh api -X PUT "repos/${LEDGER_REPO}/contents/${PENDING_PATH}" \
+            -f message="$COMMIT_MSG" -f content="$CONTENT_B64" -f branch=main -f sha="$SHA" >/dev/null 2>&1 && WROTE=true && break
+        else
+          gh api -X PUT "repos/${LEDGER_REPO}/contents/${PENDING_PATH}" \
+            -f message="$COMMIT_MSG" -f content="$CONTENT_B64" -f branch=main >/dev/null 2>&1 && WROTE=true && break
+        fi
+        echo "WARN: record-wo-completion-candidate: contents PUT attempt ${attempt} failed (409/perm/flake); retrying..." >&2
+        sleep $((attempt * 3))
+      done
+
+      if [ "$WROTE" = "true" ]; then
+        echo "record-wo-completion-candidate: wrote ${LEDGER_REPO}:${PENDING_PATH} (status=${CHECK_STATUS})."
+      else
+        echo "WARN: record-wo-completion-candidate: could NOT write pending file to ${LEDGER_REPO} (cross-repo write access unverified/denied, or gh flake). WO=${WO_ID} PR=${PR_URL} status=${CHECK_STATUS}. Counter skipped; pipeline NOT failed." >&2
+      fi
+      exit 0

@@ -34,7 +34,7 @@
     "@archon/paths": "workspace:*",
     "@mariozechner/pi-ai": "^0.67.5",
     "@mariozechner/pi-coding-agent": "^0.67.5",
-    "@openai/codex-sdk": "0.144.5",
+    "@openai/codex-sdk": "0.153.3",
     "@sinclair/typebox": "^0.34.41",
     "openai": "^6.45.0"
   },

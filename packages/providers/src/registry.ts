@@ -144,6 +144,14 @@ export function registerBuiltinProviders(): void {
       builtIn: true,
     },
     {
+      // Minimal reuse from PR #655, head 20847cd4e6a59b6c2b61060c348ff58d3e9fdab3.
+      id: 'codex-native-strict',
+      displayName: 'Codex Native Strict',
+      factory: () => new CodexProvider({ failbackProviderFactory: null }),
+      capabilities: CODEX_CAPABILITIES,
+      builtIn: true,
+    },
+    {
       id: 'codex-opr',
       displayName: 'Codex with OpenRouter failback',
       factory: () =>
