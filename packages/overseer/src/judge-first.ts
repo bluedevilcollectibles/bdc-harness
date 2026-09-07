@@ -348,7 +348,10 @@ export async function judgeTerminalRun(
       try {
         await (options.recordOutcome ?? recordSpawnOutcome)(binary, result, 'judge-first');
       } catch (error) {
-        log.error({ binary, error }, 'overseer.judge_first.resource_health_record_failed');
+        log.error(
+          { binary, err: error as Error },
+          'overseer.judge_first.resource_health_record_failed'
+        );
       }
       if (result.timedOut || result.exitCode !== 0) {
         log.error(
@@ -392,7 +395,7 @@ export async function judgeTerminalRun(
           );
         } catch (recordError) {
           log.error(
-            { binary, error: recordError },
+            { binary, err: recordError as Error },
             'overseer.judge_first.resource_health_record_failed'
           );
         }
