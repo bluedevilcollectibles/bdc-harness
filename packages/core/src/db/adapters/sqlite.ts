@@ -173,6 +173,15 @@ export class SqliteAdapter implements IDatabase {
     // on Windows this makes rmSync on the db directory fail with EBUSY until a
     // collection runs. Force one so close() means closed. (Verified 2026-07-13:
     // rm fails after close(), succeeds after Bun.gc(true).)
+    //
+    // DO NOT remove this to chase a slow-CI hook timeout. Measured 2026-09-07
+    // while diagnosing the windows-latest taskmaster flake: this forced GC costs
+    // ~3ms per close (2.3ms at a 3.5MB heap, 3.8ms at 17MB), against ~82ms for
+    // the constructor's initSchema() in the same cycle. It is not the cost, and
+    // dropping it re-opens the EBUSY class above. The flake's actual cause was
+    // filesystem contention from running many sqlite-backed test files
+    // concurrently in one `bun test` invocation -- fixed in this package's
+    // "test" script, not here.
     if (typeof Bun !== 'undefined' && typeof Bun.gc === 'function') {
       Bun.gc(true);
     }
