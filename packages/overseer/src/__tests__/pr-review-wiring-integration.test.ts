@@ -58,6 +58,9 @@ const {
 const { AUTO_REREVIEW_REASON_PREFIX, MAX_REREVIEW_ATTEMPTS, ingestPullRequestEvent } =
   await import('../pr-review-ingest.ts');
 const { createHmac } = await import('crypto');
+// Imported dynamically, after mock.module above, so it binds the mocked
+// connection and therefore the per-test SqliteAdapter.
+const dispatchModule = await import('@archon/core/db/dispatch');
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -930,5 +933,193 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     );
     expect(rows.rows[0]?.repeat_reason ?? null).toBeNull();
     expect(rows.rows[0]?.repeat_reason ?? '').not.toContain(neighbourHeadSha);
+  });
+
+  /**
+   * Review finding (coordinator, PR #772): the first version of the legacy
+   * fallback scanned a single `listMessages` page. That page is hard-capped at
+   * 500 rows and has no offset or cursor, while the live store holds ~2,700
+   * queued operator rows (bdc-harness #761 backlog) plus completed ones. A
+   * genuinely old CHANGES_REQUESTED receipt therefore falls outside the
+   * window -- defeating the fallback exactly where it matters most, on the
+   * oldest PRs it exists to repair.
+   *
+   * This test buries the legacy receipt behind MORE than 500 newer, unrelated
+   * operator rows. It passes only because the prefix match runs in SQL.
+   */
+  test('a legacy receipt survives a backlog of 600 newer unrelated operator rows', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const prNumber = 761;
+
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: prNumber,
+        pull_request: {
+          number: prNumber,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = 'a'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-backlog-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: first.correlationId ?? '',
+        messageId: first.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber,
+        headSha: firstHeadSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
+
+    // Legacy shape: no subject_key, correlation_id intact. Pinned to a
+    // timestamp strictly NEWER than every backlog row below. An unfiltered
+    // listMessages orders OLDEST-first, so this receipt sorts last -- past the
+    // 500-row page cap, and therefore unreachable by a client-side scan. The
+    // DAL query orders newest-first and finds it immediately.
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET subject_key = NULL, created_at = '2026-06-01T00:00:00.000Z'
+       WHERE task_type = 'run_report' AND body LIKE '%pr_review_submit_receipt%'`,
+      []
+    );
+
+    // 600 newer operator rows -- more than listMessages can return in one
+    // page. These are ordinary run_report traffic for other subjects, exactly
+    // what the #761 backlog looks like.
+    const BACKLOG_ROWS = 600;
+    for (let index = 0; index < BACKLOG_ROWS; index += 1) {
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at)
+         VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', $4, 'queued', $5)`,
+        [
+          `backlog-${index}`,
+          `unrelated-correlation:${index}`,
+          `backlog-idem-${index}`,
+          JSON.stringify({ kind: 'unrelated_report', index }),
+          `2026-01-01T00:00:${String(index % 60).padStart(2, '0')}.${String(index).padStart(3, '0')}Z`,
+        ]
+      );
+    }
+
+    // The backlog genuinely exceeds a single page, and the legacy receipt is
+    // NOT in it -- so the previous client-side scan could not have found it.
+    // listMessages caps limit at 500 and exposes no offset, so there is no
+    // second page to ask for.
+    const page = await dispatchModule.listMessages({ recipient: 'operator', limit: 500 });
+    expect(page.length).toBe(500);
+    expect(page.some(message => message.body.includes('pr_review_submit_receipt'))).toBe(false);
+
+    const secondHeadSha = 'b'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-backlog-2',
+      },
+      deps
+    );
+
+    // Found despite the backlog: the prefix filter runs in SQL.
+    expect(second.disposition).toBe('queued');
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages WHERE id = $1`,
+      [second.messageId]
+    );
+    const reason = rows.rows[0]?.repeat_reason ?? '';
+    expect(reason.startsWith(AUTO_REREVIEW_REASON_PREFIX)).toBe(true);
+    expect(reason).toContain('changes_requested verdict');
+    expect(reason).toContain(firstHeadSha);
+    expect(reason).toContain(secondHeadSha);
+  });
+
+  test('the correlation-prefix DAL query is scoped, escaped and newest-first', async () => {
+    // Direct DAL coverage: the wiring test above proves the end-to-end path,
+    // this pins the query contract the fallback depends on.
+    const rows: [string, string, string | null][] = [
+      ['dal-a', 'pr-review:thinmansoftware/bdc-harness#800@aaa', null],
+      ['dal-b', 'pr-review:thinmansoftware/bdc-harness#800@bbb', null],
+      // Same prefix but already indexed by subject_key -- excluded, because
+      // the indexed query already reaches it.
+      [
+        'dal-c',
+        'pr-review:thinmansoftware/bdc-harness#800@ccc',
+        'gh:thinmansoftware/bdc-harness#800',
+      ],
+      // A different PR whose number merely STARTS with 800.
+      ['dal-d', 'pr-review:thinmansoftware/bdc-harness#8001@ddd', null],
+      // A different repo.
+      ['dal-e', 'pr-review:thinmansoftware/shopops#800@eee', null],
+    ];
+    for (const [index, [id, correlationId, subjectKey]] of rows.entries()) {
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, subject_key)
+         VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', '{}', 'queued', $4, $5)`,
+        [id, correlationId, `dal-idem-${id}`, `2026-02-0${index + 1}T00:00:00.000Z`, subjectKey]
+      );
+    }
+
+    const found = await dispatchModule.listMessagesByCorrelationPrefixWithoutSubjectKey({
+      recipient: 'operator',
+      correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#800@',
+    });
+
+    // Only the two subject_key-less rows for THIS pr, newest-first.
+    expect(found.map(message => message.id)).toEqual(['dal-b', 'dal-a']);
+  });
+
+  test('an underscore in a repo name is matched literally, not as a wildcard', async () => {
+    // '_' is a single-character LIKE wildcard. Without escaping, a prefix for
+    // repo 'a_c' would also match repo 'abc' and leak a foreign verdict.
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at)
+       VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', '{}', 'queued', $4)`,
+      [
+        'wildcard-decoy',
+        'pr-review:thinmansoftware/abc#1@aaa',
+        'wildcard-idem',
+        '2026-03-01T00:00:00.000Z',
+      ]
+    );
+
+    const found = await dispatchModule.listMessagesByCorrelationPrefixWithoutSubjectKey({
+      recipient: 'operator',
+      correlationPrefix: 'pr-review:thinmansoftware/a_c#1@',
+    });
+    expect(found).toHaveLength(0);
   });
 });

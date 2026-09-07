@@ -501,6 +501,56 @@ export async function listMessages(filters: {
   return result.rows.map(normalizeMessage);
 }
 
+/**
+ * Escapes LIKE metacharacters so a caller-supplied prefix matches literally.
+ * Pairs with the `ESCAPE '\'` clause on every LIKE built from this helper.
+ */
+function escapeLikeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, character => `\\${character}`);
+}
+
+/**
+ * Messages whose correlation_id starts with `prefix` and that carry NO
+ * subject_key, newest-first.
+ *
+ * EXISTS FOR THE LEGACY-RECEIPT FALLBACK. subject_key was added to Overseer
+ * submit receipts in 2026-09; every receipt written before that is
+ * subject_key-less and therefore invisible to a subject_key query, even though
+ * it still carries a correlation_id that identifies its pull request.
+ *
+ * Filtering in SQL rather than paging `listMessages` is load-bearing, not an
+ * optimization: `listMessages` hard-caps `limit` at 500 and exposes no offset
+ * or cursor, so a client-side scan can neither see past the first page nor
+ * page beyond it. With ~2,700 queued operator rows in the live store
+ * (bdc-harness #761 backlog) a genuinely old receipt sits far outside that
+ * window -- exactly the receipt the fallback needs to find.
+ *
+ * `subject_key IS NULL` is part of the predicate on purpose: rows that DO have
+ * a subject_key are already reachable by the indexed query, so excluding them
+ * here keeps this strictly a legacy path and keeps the result set small.
+ */
+export async function listMessagesByCorrelationPrefixWithoutSubjectKey(filters: {
+  recipient: string;
+  correlationPrefix: string;
+  limit?: number;
+}): Promise<DispatchMessage[]> {
+  const limit = Math.max(1, Math.min(filters.limit ?? 200, 1000));
+  const result = await getDatabase().query<DispatchMessageRow>(
+    `SELECT * FROM agent_dispatch_messages
+     WHERE recipient = $1
+       AND subject_key IS NULL
+       AND correlation_id LIKE $2 ESCAPE '\\'
+     ORDER BY created_at DESC, id DESC
+     LIMIT $3`,
+    [
+      canonicalizePrincipal(filters.recipient),
+      `${escapeLikeLiteral(filters.correlationPrefix)}%`,
+      limit,
+    ]
+  );
+  return result.rows.map(normalizeMessage);
+}
+
 export async function resolveDispatchRecipient(recipient: string): Promise<
   | {
       ok: true;

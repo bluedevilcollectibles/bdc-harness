@@ -210,22 +210,24 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
       //
       // Legacy receipts do carry `correlation_id`
       // (`pr-review:owner/repo#N@<head>`), so they are still attributable to a
-      // PR. Only pay for this scan when the indexed query left work
+      // PR. Only pay for this lookup when the indexed query left work
       // unexplained, and never let it override a subject_key-bearing receipt
       // (collectVerdicts keeps the first entry per message).
+      //
+      // The prefix match runs IN SQL. A client-side scan of a listMessages
+      // page cannot work here: listMessages hard-caps limit at 500 and offers
+      // no offset or cursor, while the live store holds ~2,700 queued operator
+      // rows (bdc-harness #761 backlog) plus completed ones. A genuinely old
+      // CHANGES_REQUESTED receipt therefore sits well outside any single page
+      // -- which is precisely the receipt this fallback exists to find.
       const needsLegacyLookup = messages.some(message => !verdictByMessageId.has(message.id));
       if (needsLegacyLookup) {
-        const prefix = reviewCorrelationPrefix(input.owner, input.repo, input.prNumber);
-        const legacy = await dispatch.listMessages({ recipient: 'operator', limit: 500 });
-        // Unlike the subject_key query, an unfiltered listMessages returns
-        // OLDEST-first. Reverse to restore the newest-first contract
-        // collectVerdicts depends on.
-        const legacyForThisPr = legacy
-          .filter(
-            receipt => receipt.subject_key == null && receipt.correlation_id.startsWith(prefix)
-          )
-          .reverse();
-        collectVerdicts(legacyForThisPr, verdictByMessageId);
+        // Already newest-first from the DAL, as collectVerdicts requires.
+        const legacy = await dispatch.listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: 'operator',
+          correlationPrefix: reviewCorrelationPrefix(input.owner, input.repo, input.prNumber),
+        });
+        collectVerdicts(legacy, verdictByMessageId);
       }
 
       return messages
