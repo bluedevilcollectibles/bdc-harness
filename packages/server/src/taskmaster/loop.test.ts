@@ -270,6 +270,47 @@ function ruling(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
   };
 }
 
+describe('expectation registry tick wiring', () => {
+  test('checks expectations, reports counts, and registers ordinary dispatch proof', async () => {
+    const world = makeWorld();
+    const checkedAt: Date[] = [];
+    const registered: Array<{ dispatch_ref: string; on_absence: string }> = [];
+    const deps = makeDeps(world, {
+      checkExpectations: async now => {
+        checkedAt.push(now);
+      },
+      listThreads: async () =>
+        Object.assign([], {
+          unlabelledPriorityTriage: ['gh:thinmansoftware/bdc-harness#404'],
+        }),
+    });
+    deps.db = {
+      ...deps.db!,
+      getExpectationCounts: async () => ({
+        pending: 2,
+        met: 3,
+        failed: 4,
+        escalated: 5,
+        given_up: 6,
+      }),
+      registerExpectation: async data => {
+        registered.push(data);
+        return 'expectation-digest';
+      },
+    };
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(checkedAt).toEqual([new Date(T0)]);
+    expect(registered).toHaveLength(1);
+    expect(registered[0]?.dispatch_ref).toBe('msg-1');
+    expect(registered[0]?.on_absence).toBe('escalate');
+    const digest = world.sentMessages.find(message => message.idempotency_key.startsWith('tm:digest:'));
+    expect(digest?.body).toContain('pending=2, met=3, failed=4, escalated=5, given_up=6');
+    expect(digest?.body).toContain('Needs priority triage: gh:thinmansoftware/bdc-harness#404');
+  });
+});
+
 describe('scenario 1: undelivered ruling is delivered exactly once (dedupe proven)', () => {
   test('two ticks produce one deliver_ruling row and one send; a third tick adds nothing', async () => {
     const world = makeWorld();
@@ -509,6 +550,14 @@ describe('fire_cauldron loop', () => {
           return record;
         }) as NonNullable<TaskmasterDeps['runCascade']>,
       });
+      const registered: Array<{ dispatch_ref: string; evidence_json: string }> = [];
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async data => {
+          registered.push(data);
+          return 'expectation-fire';
+        },
+      };
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
       await tick(state, deps);
@@ -517,6 +566,9 @@ describe('fire_cauldron loop', () => {
       expect(fires).toHaveLength(1);
       expect(fires[0]?.outcome).toBe('sent');
       expect(fires[0]?.proposal_json).toContain('cascade-501');
+      expect(registered).toHaveLength(1);
+      expect(registered[0]?.dispatch_ref).toBe('cascade-501');
+      expect(registered[0]?.evidence_json).toContain('remote_agent_workflow_runs');
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
@@ -2044,6 +2096,9 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const { fetchImpl } = fakeGithubFetch({ wo: [ghIssue(44, ['wo'])] });
     const threads = await defaultListThreads(fetchImpl);
     expect(threads).toHaveLength(0);
+    expect(threads.unlabelledPriorityTriage).toEqual([
+      'gh:thinmansoftware/bdc-harness#44',
+    ]);
     expect(priorityFromLabels(['wo'])).toBeNull();
   });
 

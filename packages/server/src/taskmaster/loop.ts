@@ -157,7 +157,7 @@ export interface TaskmasterDeps {
     data: CreateAuthenticatedMessageData
   ) => ReturnType<typeof createAuthenticatedMessage>;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
-  listThreads?: () => Promise<ThreadSnapshot[]>;
+  listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
   headroom?: () => Promise<HeadroomReading>;
   /** External-SOR check: does a dispatch row exist for this key, and when was it sent? */
   findEffectByIdempotencyKey?: (
@@ -251,8 +251,6 @@ export function priorityFromLabels(labels: string[]): ThreadPriority | null {
   }
   return null;
 }
-
-let unlabelledPriorityTriage: string[] = [];
 
 interface GithubIssue {
   number: number;
@@ -359,6 +357,8 @@ export interface ListedThread extends ThreadSnapshot {
   labels?: string[];
 }
 
+export type ListedThreadResult = ListedThread[] & { unlabelledPriorityTriage: string[] };
+
 export interface AdoptionRefreshResult {
   ran: boolean;
   failed: boolean;
@@ -387,14 +387,14 @@ function assertGithubRateLimit(response: Response, context: string): void {
  * production callers use the tick() default. `fetchImpl` is injectable for
  * tests only.
  */
-export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promise<ListedThread[]> {
+export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promise<ListedThreadResult> {
   const repos = (process.env.TASKMASTER_GH_REPOS ?? 'thinmansoftware/bdc-xo')
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ListedThread[] = [];
-  unlabelledPriorityTriage = [];
+  const unlabelledPriorityTriage: string[] = [];
   for (const repo of repos) {
     const seen = new Set<number>();
     for (const label of WORK_LABELS) {
@@ -455,7 +455,7 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
       }
     }
   }
-  return threads;
+  return Object.assign(threads, { unlabelledPriorityTriage });
 }
 
 interface GithubIssueDetail extends GithubIssue {
@@ -638,7 +638,8 @@ export async function defaultGetGithubIssueEvidence(
 function digestProposal(
   actions24h: taskmasterDb.TmJournalEntry[],
   nowMs: number,
-  expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>
+  expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
+  unlabelledPriorityTriage: string[] = []
 ): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
   const counts: Record<string, number> = {};
@@ -1157,6 +1158,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   let rulings: ThreadSnapshot[] = [];
   let threads: ThreadSnapshot[] = [];
+  let unlabelledPriorityTriage: string[] = [];
   try {
     rulings = await (deps.listUndeliveredRulings ?? defaultListUndeliveredRulings)();
   } catch (error) {
@@ -1164,7 +1166,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     log.warn({ err: error as Error }, 'taskmaster.rulings_read_failed');
   }
   try {
-    threads = await (deps.listThreads ?? defaultListThreads)();
+    const listed = await (deps.listThreads ?? defaultListThreads)();
+    threads = listed;
+    unlabelledPriorityTriage =
+      'unlabelledPriorityTriage' in listed ? listed.unlabelledPriorityTriage : [];
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.threads_read_failed');
@@ -1314,7 +1319,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
   }
-  const digest = digestProposal(actions24h, nowMs, expectationCounts);
+  const digest = digestProposal(actions24h, nowMs, expectationCounts, unlabelledPriorityTriage);
   proposals.push(digest);
 
   // Exceptions first so the per-tick budget can never starve them.

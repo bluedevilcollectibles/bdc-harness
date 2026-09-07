@@ -39,6 +39,8 @@ import {
   markMet,
   incrementRetry,
   markEscalated,
+  markGivenUp,
+  getExpectationCounts,
   setPauseState,
   updateActionOutcome,
   upsertAdoptionRow,
@@ -89,6 +91,24 @@ describe('tm_expectations DAL', () => {
       retries: 1,
       evidence_pointer: 'dispatch:escalation',
     });
+  });
+
+  test('give-up transition and aggregate counts include every status', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-give-up',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'give_up',
+      max_retries: 0,
+    });
+    await markGivenUp(id, 'deadline elapsed');
+    const counts = await getExpectationCounts();
+    expect(counts.given_up).toBe(1);
+    expect(counts.pending).toBe(0);
+    expect(counts.met).toBe(0);
+    expect(counts.failed).toBe(0);
+    expect(counts.escalated).toBe(0);
   });
 });
 

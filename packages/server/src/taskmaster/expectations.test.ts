@@ -48,6 +48,29 @@ describe('expectation evidence', () => {
 });
 
 describe('expectation supervisor', () => {
+  test('missing original dispatch gives up instead of remaining perpetually due', async () => {
+    const calls: string[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [base],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => calls.push('failed'),
+      getMessage: async () => null,
+      markGivenUp: async (_id, reason) => calls.push(`given_up:${reason}`),
+    });
+    expect(calls).toEqual(['failed', 'given_up:original dispatch missing: original']);
+  });
+
+  test('give_up policy records a terminal state at the deadline', async () => {
+    const calls: string[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [{ ...base, on_absence: 'give_up' }],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => calls.push('failed'),
+      markGivenUp: async (_id, reason) => calls.push(`given_up:${reason}`),
+    });
+    expect(calls).toEqual(['failed', 'given_up:evidence absent at deadline']);
+  });
+
   test('expectation_absent_evidence_fails_and_acts', async () => {
     const calls: string[] = [];
     const keys: string[] = [];

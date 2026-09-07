@@ -189,6 +189,10 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       const original = await (deps.getMessage ?? getMessage)(expectation.dispatch_ref);
       if (!original) {
         log.error({ expectationId: expectation.id }, 'taskmaster.expectation_dispatch_missing');
+        await (deps.markGivenUp ?? taskmasterDb.markGivenUp)(
+          expectation.id,
+          `original dispatch missing: ${expectation.dispatch_ref}`
+        );
         continue;
       }
       const key = `tm:expectation:${expectation.id}:retry:${expectation.retries + 1}:${randomUUID()}`;
