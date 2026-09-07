@@ -85,7 +85,11 @@ describe('tm_journal DAL', () => {
         recipient: 'duty-officer',
         body: 'Taskmaster paused; reset guidance.',
       },
-      { taskmasterPausedEpoch: paused.epoch }
+      {
+        taskmasterPausedEpoch: paused.epoch,
+        taskmasterPausedState: 'PAUSED',
+        taskmasterPausedScope: 'effects',
+      }
     );
     expect(notice).toBeNull();
     expect(
@@ -109,7 +113,7 @@ describe('tm_journal DAL', () => {
     let controlReadObserved = false;
     db.query = async <T>(sql: string, params?: unknown[]) => {
       const result = await originalQuery<T>(sql, params);
-      if (sql.startsWith('SELECT pause_state, epoch FROM tm_control')) {
+      if (sql.startsWith('SELECT pause_state, pause_scope, epoch FROM tm_control')) {
         controlReadObserved = true;
         try {
           other.run("UPDATE tm_control SET pause_state='RUNNING', epoch=epoch+1 WHERE id=1");
@@ -130,7 +134,11 @@ describe('tm_journal DAL', () => {
       const notice = await createAuthenticatedMessage(
         { kind: 'system', sender: 'taskmaster' },
         data,
-        { taskmasterPausedEpoch: paused.epoch }
+        {
+          taskmasterPausedEpoch: paused.epoch,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
       );
       expect(controlReadObserved).toBe(true);
       expect(String(competingResetError)).toContain('locked');
@@ -139,7 +147,11 @@ describe('tm_journal DAL', () => {
       const retry = await createAuthenticatedMessage(
         { kind: 'system', sender: 'taskmaster' },
         data,
-        { taskmasterPausedEpoch: paused.epoch }
+        {
+          taskmasterPausedEpoch: paused.epoch,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
       );
       expect(retry?.id).toBe(notice?.id);
       expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
@@ -147,6 +159,8 @@ describe('tm_journal DAL', () => {
       expect(
         await createAuthenticatedMessage({ kind: 'system', sender: 'taskmaster' }, data, {
           taskmasterPausedEpoch: paused.epoch,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
         })
       ).toBeNull();
     } finally {
@@ -164,8 +178,8 @@ describe('tm_journal DAL', () => {
     db.query = <T>(sql: string, params?: unknown[]) =>
       originalQuery<T>(
         sql.replace(
-          'SELECT pause_state, epoch FROM tm_control',
-          'SELECT pause_state, CAST(epoch AS TEXT) AS epoch FROM tm_control'
+          'SELECT pause_state, pause_scope, epoch FROM tm_control',
+          'SELECT pause_state, pause_scope, CAST(epoch AS TEXT) AS epoch FROM tm_control'
         ),
         params
       );
@@ -179,7 +193,11 @@ describe('tm_journal DAL', () => {
           recipient: 'duty-officer',
           body: 'valid paused notice',
         },
-        { taskmasterPausedEpoch: paused.epoch }
+        {
+          taskmasterPausedEpoch: paused.epoch,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
       );
       expect(notice?.status).toBe('queued');
       expect(
@@ -189,6 +207,105 @@ describe('tm_journal DAL', () => {
     } finally {
       db.query = originalQuery;
     }
+  });
+
+  test('notice fence refuses a concurrent HARD_PAUSE at the authorized epoch', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'noise floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    // A hard pause is an escalation, not a reset: it does NOT bump the epoch,
+    // so an epoch-only fence would still let the notice escape it.
+    await db.query("UPDATE tm_control SET pause_state='HARD_PAUSE' WHERE id=1");
+    expect(
+      (await db.query<{ epoch: number }>('SELECT epoch FROM tm_control WHERE id=1')).rows[0]
+    ).toEqual({ epoch: paused.epoch });
+    const notice = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: 'hard-pause-notice',
+        idempotency_key: `tm:self-pause:${paused.epoch}`,
+        task_type: 'agent_message',
+        recipient: 'duty-officer',
+        body: 'must not escape a hard pause',
+      },
+      {
+        taskmasterPausedEpoch: paused.epoch,
+        taskmasterPausedState: 'PAUSED',
+        taskmasterPausedScope: 'effects',
+      }
+    );
+    expect(notice).toBeNull();
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM agent_dispatch_messages WHERE correlation_id='hard-pause-notice'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  test('notice fence refuses a concurrent re-pause onto a different scope', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'noise floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    // Re-pausing onto a wider scope at the same epoch: the caller's exemption
+    // decision was made against 'effects' and no longer holds.
+    await db.query("UPDATE tm_control SET pause_scope='all' WHERE id=1");
+    const notice = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: 'scope-change-notice',
+        idempotency_key: `tm:self-pause:${paused.epoch}`,
+        task_type: 'agent_message',
+        recipient: 'duty-officer',
+        body: 'must not escape a wider scope',
+      },
+      {
+        taskmasterPausedEpoch: paused.epoch,
+        taskmasterPausedState: 'PAUSED',
+        taskmasterPausedScope: 'effects',
+      }
+    );
+    expect(notice).toBeNull();
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM agent_dispatch_messages WHERE correlation_id='scope-change-notice'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  test('notice fence rejects a fence that does not name the authorized PAUSED state', async () => {
+    await expect(
+      createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: 'hard-pause-fence-arg',
+          idempotency_key: 'tm:self-pause:0',
+          task_type: 'agent_message',
+          recipient: 'duty-officer',
+          body: 'fence must name PAUSED',
+        },
+        {
+          taskmasterPausedEpoch: 0,
+          taskmasterPausedState: 'HARD_PAUSE' as unknown as 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
+      )
+    ).rejects.toThrow('taskmaster_notice_fence_invalid');
   });
 
   test('notice fence cannot be used by a different system sender', async () => {
@@ -202,7 +319,11 @@ describe('tm_journal DAL', () => {
           recipient: 'duty-officer',
           body: 'not Taskmaster',
         },
-        { taskmasterPausedEpoch: 0 }
+        {
+          taskmasterPausedEpoch: 0,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
       )
     ).rejects.toThrow('taskmaster_notice_fence_invalid');
   });

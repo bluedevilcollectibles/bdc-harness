@@ -130,7 +130,7 @@ test('PostgreSQL notice fence rejects a reset that won before enqueue', async ()
       recipient: 'duty-officer',
       body: 'obsolete pause',
     },
-    { taskmasterPausedEpoch: 7 }
+    { taskmasterPausedEpoch: 7, taskmasterPausedState: 'PAUSED', taskmasterPausedScope: 'all' }
   );
   expect(notice).toBeNull();
   expect(
@@ -146,7 +146,7 @@ test('PostgreSQL paused notice queues once with BIGINT epoch and holds its row l
     originalTransaction(async query =>
       fn(async <T>(sql: string, params?: unknown[]) => {
         const result = await query<T>(sql, params);
-        if (sql.startsWith('SELECT pause_state, epoch FROM tm_control')) {
+        if (sql.startsWith('SELECT pause_state, pause_scope, epoch FROM tm_control')) {
           checkedLock = true;
           try {
             await secondary.withTransaction(q =>
@@ -170,7 +170,7 @@ test('PostgreSQL paused notice queues once with BIGINT epoch and holds its row l
     const notice = await createAuthenticatedMessage(
       { kind: 'system', sender: 'taskmaster' },
       data,
-      { taskmasterPausedEpoch: 7 }
+      { taskmasterPausedEpoch: 7, taskmasterPausedState: 'PAUSED', taskmasterPausedScope: 'all' }
     );
     expect(checkedLock).toBe(true);
     expect((competingWriterError as { code?: string })?.code).toBe('55P03');
@@ -178,6 +178,8 @@ test('PostgreSQL paused notice queues once with BIGINT epoch and holds its row l
     primary.withTransaction = originalTransaction;
     const retry = await createAuthenticatedMessage({ kind: 'system', sender: 'taskmaster' }, data, {
       taskmasterPausedEpoch: 7,
+      taskmasterPausedState: 'PAUSED',
+      taskmasterPausedScope: 'all',
     });
     expect(retry?.id).toBe(notice?.id);
     expect((await primary.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);

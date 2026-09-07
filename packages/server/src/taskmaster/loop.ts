@@ -1134,14 +1134,20 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           // against reset using the expected paused epoch, not this snapshot.
           const noticeControl = await dal.getPauseState();
           if (
-            noticeControl.pause_state !== 'RUNNING' &&
+            noticeControl.pause_state === 'PAUSED' &&
             noticeControl.epoch === control.epoch &&
             isPauseEffectsExempt('self_pause_notice', noticeControl.pause_scope)
           ) {
             await createTask(
               { kind: 'system', sender: 'taskmaster' },
               buildSelfPauseNotice(pauseReason, control.epoch),
-              { taskmasterPausedEpoch: control.epoch }
+              {
+                taskmasterPausedEpoch: control.epoch,
+                // Carry the exact state the exemption was decided against so
+                // Dispatch can re-assert it inside its locked transaction.
+                taskmasterPausedState: 'PAUSED',
+                taskmasterPausedScope: noticeControl.pause_scope,
+              }
             );
           }
         } catch (error) {

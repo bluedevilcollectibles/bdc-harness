@@ -359,12 +359,19 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     createTask: (async (
       _context: unknown,
       data: { idempotency_key: string; recipient: string; body: string },
-      fence?: { taskmasterPausedEpoch: number }
+      fence?: {
+        taskmasterPausedEpoch: number;
+        taskmasterPausedState?: string;
+        taskmasterPausedScope?: string | null;
+      }
     ) => {
-      // Fake the Dispatch boundary; its real SQLite/PG transaction has DAL tests.
+      // Fake the Dispatch boundary; its real SQLite/PG transaction has DAL
+      // tests. Mirror the real fence exactly: the notice is refused unless the
+      // live control row still matches the authorized state, scope and epoch.
       if (
         fence &&
-        (world.control.pause_state === 'RUNNING' ||
+        (world.control.pause_state !== fence.taskmasterPausedState ||
+          (world.control.pause_scope ?? null) !== (fence.taskmasterPausedScope ?? null) ||
           world.control.epoch !== fence.taskmasterPausedEpoch)
       ) {
         return null;
