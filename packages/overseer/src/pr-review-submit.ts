@@ -73,11 +73,18 @@ export type SubmitDisposition =
   | 'submission_failed'
   | 'checks_pending'
   /**
-   * NON-TERMINAL (#777 review finding). The head under evaluation was
-   * superseded before a required-contexts BLOCK could be recorded. Released and
-   * requeued for the new head, exactly like `checks_pending` -- never terminal,
-   * because terminating here would retire the work item for a head nobody
-   * reviewed and leave the new head with no review at all.
+   * TERMINAL for THIS work item (#777 review finding, second pass). The head
+   * under evaluation was superseded before a required-contexts BLOCK could be
+   * recorded, so the block is suppressed -- it must never land on a head the
+   * reviewer did not judge. But the item itself is finished: its payload is
+   * bound to the now-dead SHA and nothing rewrites it, so releasing it would
+   * make every later tick re-evaluate the same stale SHA and return
+   * `superseded_head` again forever.
+   *
+   * The new head is NOT left unreviewed: ingest cancels every in-flight item
+   * bound to a different SHA and enqueues a fresh item bound to the exact new
+   * head. Unlike `checks_pending`, whose bound head is still live and therefore
+   * worth retrying, there is nothing here left to retry.
    */
   | 'superseded_head'
   /**
@@ -209,8 +216,9 @@ export async function runAndSubmitReview(
   // the work item for a head nobody reviewed (#777 review finding). Every
   // terminal branch, approving or not, passes both gates first.
   if (verdict.reviewedHeadSha !== work.headSha) {
-    // A stale evaluator result must never terminate the bound head via the
-    // blocked path; report it as superseded so the item is requeued.
+    // A stale evaluator result must never record a BLOCK against the bound
+    // head. Report it as superseded: the block is suppressed, this item
+    // finishes, and ingest's fresh item covers the head that is actually live.
     if (verdict.requiredContextsUnavailable) {
       return finish(deps, work, work.headSha, {
         disposition: 'superseded_head',
@@ -240,11 +248,11 @@ export async function runAndSubmitReview(
   }
   if (liveHead !== work.headSha) {
     // The PR moved while we were evaluating. For a required-contexts BLOCK this
-    // matters more than for an ordinary verdict: blocking is terminal, so
-    // landing it here would retire the item for head A and leave the new head B
-    // with no review at all. Report it as superseded so the worker requeues and
-    // re-evaluates against B, rather than closing the book on a head nobody
-    // judged.
+    // matters more than for an ordinary verdict: a BLOCK is a lasting verdict,
+    // and landing it here would record it against head A while head B is what
+    // the PR now is. Report it as superseded so the block is suppressed. This
+    // item still finishes -- head B is covered by the item ingest enqueues for
+    // it, not by re-running this one against a SHA that no longer exists.
     if (verdict.requiredContextsUnavailable) {
       return finish(deps, work, work.headSha, {
         disposition: 'superseded_head',

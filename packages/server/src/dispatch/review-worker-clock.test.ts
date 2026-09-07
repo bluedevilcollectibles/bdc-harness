@@ -175,11 +175,12 @@ describe('review worker clock', () => {
     }
   );
 
-  // #777 review finding: a head superseded before a required-contexts BLOCK is
-  // NON-terminal. It must be released and requeued for the new head, never
-  // posted as a terminal result -- posting would retire the work item for a
-  // head nobody reviewed.
-  test('releases (never posts) a superseded-head item so the new head is reviewed', async () => {
+  // #777 review finding (second pass): a superseded-head item is bound to a SHA
+  // that is no longer live, and nothing rewrites that payload. Releasing it back
+  // to the queue made every later tick re-evaluate the same dead SHA and return
+  // superseded_head again -- an indefinite retry loop. It must TERMINATE; ingest
+  // separately enqueues a fresh item bound to the exact new head.
+  test('terminates a superseded-head item instead of releasing it back to the queue', async () => {
     const deps = fakeDeps([message('superseded', 'exact-head')], () => ({
       disposition: 'superseded_head',
       reason: 'head_advanced_before_required_contexts_block',
@@ -187,13 +188,37 @@ describe('review worker clock', () => {
 
     await tickReviewWorkerClock(CONFIG, deps);
 
-    expect(deps.releaseMessage).toHaveBeenCalledTimes(1);
-    const releaseArg = (deps.releaseMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
-      id: string;
-    };
-    expect(releaseArg.id).toBe('superseded');
-    // Not terminal: nothing is posted, so the item stays claimable for head B.
-    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'superseded',
+        fencing_token: 1,
+        status: 'done',
+        task_outcome: 'succeeded',
+      })
+    );
+    // Releasing an item whose bound head is dead is what created the loop.
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  // The loop the finding names is only visible across TWO ticks: the first tick
+  // disposes of the item, the second must not evaluate it again.
+  test('does not re-evaluate a superseded-head item on the next tick', async () => {
+    const deps = fakeDeps([message('superseded', 'exact-head')], () => ({
+      disposition: 'superseded_head',
+      reason: 'head_advanced_before_required_contexts_block',
+    }));
+
+    await tickReviewWorkerClock(CONFIG, deps);
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    // One evaluation total: the stale SHA is never judged twice.
+    expect(deps.runAndSubmitReview).toHaveBeenCalledTimes(1);
+    expect(deps.runAndSubmitReview).toHaveBeenCalledWith(
+      expect.objectContaining({ headSha: 'exact-head', messageId: 'superseded' }),
+      expect.anything()
+    );
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
   });
 
   // WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01: a checks-pending item is
