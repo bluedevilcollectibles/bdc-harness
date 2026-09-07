@@ -3,6 +3,7 @@ import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority';
 import type { QueryResult } from './adapters/types';
+import { withOverseerControlPlaneImmediateTransaction } from './overseer-control-plane-sqlite';
 import {
   DispatchNonSystemCapability,
   resolveDispatchSenderCapability,
@@ -330,13 +331,55 @@ function bindSenderContext(context: DispatchSenderContext): {
   return resolveDispatchSenderCapability(context);
 }
 
-export async function createAuthenticatedMessage(
+export interface TaskmasterNoticeFence {
+  taskmasterPausedEpoch: number;
+}
+
+export function createAuthenticatedMessage(
   context: DispatchSenderContext,
   data: CreateAuthenticatedMessageData
-): Promise<DispatchMessage> {
+): Promise<DispatchMessage>;
+export function createAuthenticatedMessage(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData,
+  fence: TaskmasterNoticeFence
+): Promise<DispatchMessage | null>;
+export async function createAuthenticatedMessage(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData,
+  fence?: TaskmasterNoticeFence
+): Promise<DispatchMessage | null> {
   if ('supersedes_id' in data) throw new Error('dispatch_supersedes_guarded_path_required');
   const bound = bindSenderContext(context);
   const db = getDatabase();
+  if (fence !== undefined) {
+    if (
+      bound.sender_principal_id !== 'system:taskmaster' ||
+      !Number.isSafeInteger(fence.taskmasterPausedEpoch) ||
+      fence.taskmasterPausedEpoch < 0 ||
+      data.task_type !== 'agent_message' ||
+      data.recipient !== 'duty-officer' ||
+      !data.idempotency_key.startsWith('tm:self-pause:')
+    ) {
+      throw new Error('taskmaster_notice_fence_invalid');
+    }
+    const enqueue = async (query: DispatchQueryExecutor): Promise<DispatchMessage | null> => {
+      // Serialize with resetTaskmaster, through the actual queue insertion.
+      // PostgreSQL uses one pinned connection and locks the same singleton.
+      const control = await query<{ pause_state: string; epoch: number }>(
+        'SELECT pause_state, epoch FROM tm_control WHERE id = 1' +
+          (db.dialect === 'postgres' ? ' FOR UPDATE' : '')
+      );
+      const row = control.rows[0];
+      if (!row || row.pause_state === 'RUNNING' || row.epoch !== fence.taskmasterPausedEpoch) {
+        return null;
+      }
+      return createAuthenticatedMessageWithQuery(query, { bound, data });
+    };
+    return db.dialect === 'sqlite'
+      ? withOverseerControlPlaneImmediateTransaction(db, enqueue)
+      : db.withTransaction(enqueue);
+  }
   return createAuthenticatedMessageWithQuery((sql, params) => db.query(sql, params), {
     bound,
     data,

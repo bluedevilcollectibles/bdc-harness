@@ -11,6 +11,7 @@ let secondary: PostgresAdapter;
 let active: PostgresAdapter;
 mock.module('./connection', () => ({ getDatabase: () => active }));
 const { resetTaskmaster, upsertHealthSample } = await import('./taskmaster');
+const { createAuthenticatedMessage } = await import('./dispatch');
 const healthMigration = readFileSync(
   resolve(import.meta.dir, '../../../../migrations/046_tm_health_provider_pk.sql'),
   'utf8'
@@ -99,6 +100,25 @@ test('PostgreSQL already-running reset preserves the epoch-start timestamp', asy
   expect(result.control.updated_at).toBe(epochStart);
   expect(result.expiredProposals).toBe(1);
   expect(JSON.parse(result.audit.proposal_json).transitioned).toBe(false);
+});
+
+test('PostgreSQL notice fence rejects a reset that won before enqueue', async () => {
+  await resetTaskmaster({ actor: 'operator', reason: 'race before enqueue' });
+  const notice = await createAuthenticatedMessage(
+    { kind: 'system', sender: 'taskmaster' },
+    {
+      correlation_id: 'pg-notice-race',
+      idempotency_key: 'tm:self-pause:7',
+      task_type: 'agent_message',
+      recipient: 'duty-officer',
+      body: 'obsolete pause',
+    },
+    { taskmasterPausedEpoch: 7 }
+  );
+  expect(notice).toBeNull();
+  expect(
+    (await primary.query('SELECT pause_state, epoch FROM tm_control WHERE id=1')).rows
+  ).toEqual([{ pause_state: 'RUNNING', epoch: 8 }]);
 });
 
 test('PostgreSQL audit failure rolls back control and pending expiration', async () => {

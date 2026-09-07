@@ -23,7 +23,6 @@ import {
   listMessages,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
-  type DispatchSenderContext,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -148,10 +147,7 @@ export interface GithubIssueEvidence {
 export interface TaskmasterDeps {
   now?: () => Date;
   db?: TaskmasterDal;
-  createTask?: (
-    context: DispatchSenderContext,
-    data: CreateAuthenticatedMessageData
-  ) => ReturnType<typeof createAuthenticatedMessage>;
+  createTask?: typeof createAuthenticatedMessage;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
   listThreads?: () => Promise<ThreadSnapshot[]>;
   headroom?: () => Promise<HeadroomReading>;
@@ -1134,8 +1130,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           pause_actor: 'taskmaster:useful-rate-floor',
         });
         try {
-          // Apply the explicit monitoring exemption and re-check the epoch;
-          // do not announce an obsolete pause after a concurrent reset.
+          // Apply the monitoring exemption; Dispatch atomically fences enqueue
+          // against reset using the expected paused epoch, not this snapshot.
           const noticeControl = await dal.getPauseState();
           if (
             noticeControl.pause_state !== 'RUNNING' &&
@@ -1144,7 +1140,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           ) {
             await createTask(
               { kind: 'system', sender: 'taskmaster' },
-              buildSelfPauseNotice(pauseReason, control.epoch)
+              buildSelfPauseNotice(pauseReason, control.epoch),
+              { taskmasterPausedEpoch: control.epoch }
             );
           }
         } catch (error) {

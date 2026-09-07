@@ -126,7 +126,7 @@ describe('Taskmaster reset visibility and canary', () => {
     expect(notice?.body).toContain('M-155 useful-rate floor auto-pause');
   });
 
-  test.each(['epoch', 'pause state'] as const)(
+  test.each(['epoch', 'pause state', 'enqueue'] as const)(
     'a changed control %s prevents a stale self-pause notice',
     async change => {
       const world = makeWorld();
@@ -148,15 +148,28 @@ describe('Taskmaster reset visibility and canary', () => {
       }
       const deps = makeDeps(world);
       const originalSetPauseState = deps.db!.setPauseState;
-      deps.db!.setPauseState = async data => {
-        const paused = await originalSetPauseState(data);
-        const snapshot = { ...paused };
-        world.control =
-          change === 'epoch'
-            ? { ...paused, epoch: paused.epoch + 1 }
-            : { ...paused, pause_state: 'RUNNING' };
-        return snapshot;
-      };
+      if (change === 'enqueue') {
+        const originalCreate = deps.createTask!;
+        deps.createTask = (async (context, data, fence) => {
+          if (data.idempotency_key.startsWith('tm:self-pause:')) {
+            world.control = {
+              ...world.control,
+              pause_state: 'RUNNING',
+              epoch: world.control.epoch + 1,
+            };
+          }
+          return fence ? originalCreate(context, data, fence) : originalCreate(context, data);
+        }) as TaskmasterDeps['createTask'];
+      } else
+        deps.db!.setPauseState = async data => {
+          const paused = await originalSetPauseState(data);
+          const snapshot = { ...paused };
+          world.control =
+            change === 'epoch'
+              ? { ...paused, epoch: paused.epoch + 1 }
+              : { ...paused, pause_state: 'RUNNING' };
+          return snapshot;
+        };
       await tick(createTaskmasterState(60_000), deps);
       expect(
         world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:self-pause:'))
@@ -345,8 +358,17 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     headroom: async () => okHeadroom,
     createTask: (async (
       _context: unknown,
-      data: { idempotency_key: string; recipient: string; body: string }
+      data: { idempotency_key: string; recipient: string; body: string },
+      fence?: { taskmasterPausedEpoch: number }
     ) => {
+      // Fake the Dispatch boundary; its real SQLite/PG transaction has DAL tests.
+      if (
+        fence &&
+        (world.control.pause_state === 'RUNNING' ||
+          world.control.epoch !== fence.taskmasterPausedEpoch)
+      ) {
+        return null;
+      }
       world.sentMessages.push({
         idempotency_key: data.idempotency_key,
         recipient: data.recipient,

@@ -64,6 +64,113 @@ afterEach(async () => {
 }, SQLITE_HOOK_TIMEOUT_MS);
 
 describe('tm_journal DAL', () => {
+  test('reset winning before notice enqueue rejects the obsolete paused epoch', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'noise floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    // Reproduce reset committing after the loop read but before Dispatch enqueue.
+    await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+    const notice = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: 'taskmaster-self-pause-race',
+        idempotency_key: `tm:self-pause:${paused.epoch}`,
+        task_type: 'agent_message',
+        recipient: 'duty-officer',
+        body: 'Taskmaster paused; reset guidance.',
+      },
+      { taskmasterPausedEpoch: paused.epoch }
+    );
+    expect(notice).toBeNull();
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM agent_dispatch_messages WHERE correlation_id = 'taskmaster-self-pause-race'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  test('notice enqueue holds the SQLite writer fence across control read and insert', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects' });
+    const other = new Database(currentDbPath);
+    other.run('PRAGMA busy_timeout=0');
+    const originalQuery = db.query.bind(db);
+    let competingResetError: unknown;
+    let controlReadObserved = false;
+    db.query = async <T>(sql: string, params?: unknown[]) => {
+      const result = await originalQuery<T>(sql, params);
+      if (sql.startsWith('SELECT pause_state, epoch FROM tm_control')) {
+        controlReadObserved = true;
+        try {
+          other.run("UPDATE tm_control SET pause_state='RUNNING', epoch=epoch+1 WHERE id=1");
+        } catch (error) {
+          competingResetError = error;
+        }
+      }
+      return result;
+    };
+    const data = {
+      correlation_id: 'notice-writer-fence',
+      idempotency_key: `tm:self-pause:${paused.epoch}`,
+      task_type: 'agent_message' as const,
+      recipient: 'duty-officer',
+      body: 'Paused; reset guidance.',
+    };
+    try {
+      const notice = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        data,
+        { taskmasterPausedEpoch: paused.epoch }
+      );
+      expect(controlReadObserved).toBe(true);
+      expect(String(competingResetError)).toContain('locked');
+      expect(notice?.status).toBe('queued');
+      db.query = originalQuery;
+      const retry = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        data,
+        { taskmasterPausedEpoch: paused.epoch }
+      );
+      expect(retry?.id).toBe(notice?.id);
+      expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
+      await resetTaskmaster({ actor: 'operator', reason: 'after valid enqueue' });
+      expect(
+        await createAuthenticatedMessage({ kind: 'system', sender: 'taskmaster' }, data, {
+          taskmasterPausedEpoch: paused.epoch,
+        })
+      ).toBeNull();
+    } finally {
+      db.query = originalQuery;
+      other.close();
+    }
+  });
+
+  test('notice fence cannot be used by a different system sender', async () => {
+    await expect(
+      createAuthenticatedMessage(
+        { kind: 'system', sender: 'overseer' },
+        {
+          correlation_id: 'invalid-notice',
+          idempotency_key: 'tm:self-pause:0',
+          task_type: 'agent_message',
+          recipient: 'duty-officer',
+          body: 'not Taskmaster',
+        },
+        { taskmasterPausedEpoch: 0 }
+      )
+    ).rejects.toThrow('taskmaster_notice_fence_invalid');
+  });
+
   test('records one distinct reset audit row per invocation', async () => {
     const first = await recordResetAudit({
       actor: 'operator',
