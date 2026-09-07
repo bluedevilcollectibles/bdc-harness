@@ -4,6 +4,7 @@ import {
   AUTO_REREVIEW_REASON_PREFIX,
   MAX_REREVIEW_ATTEMPTS,
   buildRereviewReason,
+  findAuthorizingPriorReview,
   ingestPullRequestEvent,
   isAutoRereviewReason,
   type IngestDeps,
@@ -209,5 +210,123 @@ describe('auto re-review marker recognition', () => {
     expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
       'rereview_attempts_exhausted'
     );
+  });
+});
+
+/**
+ * Review finding (Overseer, PR #772): re-review authorization examined only
+ * the FIRST prior row on a different head. Prior work arrives newest-first and
+ * a row exists from the moment it is queued -- before any verdict. So a fast
+ * push sequence hid the verdict behind a newer, verdict-less row and the
+ * automatic re-review died with repeat_reason_required.
+ */
+describe('verdict-bearing prior selection', () => {
+  const MID_HEAD = 'c'.repeat(40);
+
+  // Newest-first, matching the listPriorReviewWork contract: head B was queued
+  // after head A was reviewed, then cancelled when head C arrived.
+  function headMovedTwice(): PriorReviewWork[] {
+    return [
+      work({
+        messageId: 'review-b',
+        headSha: MID_HEAD,
+        status: 'cancelled',
+        verdict: null,
+        verdictId: null,
+      }),
+      work({ messageId: 'review-a', headSha: OLD_HEAD, verdict: 'changes_requested' }),
+    ];
+  }
+
+  test('a verdict-less newer row does not hide the standing verdict', () => {
+    const selected = findAuthorizingPriorReview(headMovedTwice(), NEW_HEAD);
+    expect(selected?.messageId).toBe('review-a');
+    expect(selected?.verdict).toBe('changes_requested');
+  });
+
+  test('head A CHANGES_REQUESTED -> head B queued -> head C enqueues with A reason', async () => {
+    const fake = deps(headMovedTwice());
+    const result = await ingestPullRequestEvent(request(), fake.value);
+
+    // Pre-fix this was 'enqueue_failed:repeat_reason_required': row B was
+    // selected, carried no verdict, and no reason was built.
+    expect(result.disposition).toBe('queued');
+    const reason = fake.enqueued[0]?.repeatReason ?? '';
+    expect(reason).toBe(buildRereviewReason('verdict-1', OLD_HEAD, NEW_HEAD));
+    // The reason traces to the head that was actually reviewed, not the
+    // intermediate head that never produced a verdict.
+    expect(reason).toContain(OLD_HEAD);
+    expect(reason).not.toContain(MID_HEAD);
+    expect(isAutoRereviewReason(reason)).toBe(true);
+  });
+
+  test('a queued (not yet cancelled) intermediate row is skipped the same way', async () => {
+    const fake = deps([
+      work({
+        messageId: 'review-b',
+        headSha: MID_HEAD,
+        status: 'queued',
+        verdict: null,
+        verdictId: null,
+      }),
+      work({ messageId: 'review-a', headSha: OLD_HEAD }),
+    ]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+    expect(fake.enqueued[0]?.repeatReason).toContain(OLD_HEAD);
+  });
+
+  test('a newer APPROVED verdict still withholds authorization', async () => {
+    // Selection skips verdict-less rows only. A real newer verdict remains
+    // authoritative, so an older changes_requested cannot reach past it.
+    const fake = deps([
+      work({ messageId: 'review-b', headSha: MID_HEAD, verdict: 'approved' }),
+      work({ messageId: 'review-a', headSha: OLD_HEAD, verdict: 'changes_requested' }),
+    ]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
+      'enqueue_failed:repeat_reason_required'
+    );
+    expect(fake.enqueued[0]?.repeatReason).toBeNull();
+  });
+
+  test('a verdict on the CURRENT head never authorizes a repeat', () => {
+    const selected = findAuthorizingPriorReview(
+      [work({ messageId: 'same-head', headSha: NEW_HEAD, verdict: 'changes_requested' })],
+      NEW_HEAD
+    );
+    expect(selected).toBeUndefined();
+  });
+
+  test('no verdict-bearing row at any other head selects nothing', () => {
+    expect(
+      findAuthorizingPriorReview(
+        [work({ messageId: 'review-b', headSha: MID_HEAD, verdict: null, verdictId: null })],
+        NEW_HEAD
+      )
+    ).toBeUndefined();
+  });
+
+  test('the cap still counts auto attempts hidden behind verdict-less rows', async () => {
+    const attempts = Array.from({ length: MAX_REREVIEW_ATTEMPTS }, (_, index) =>
+      work({
+        messageId: `auto-${index}`,
+        headSha: String(index + 1).repeat(40),
+        isAutoRereview: true,
+      })
+    );
+    const fake = deps([
+      work({
+        messageId: 'review-b',
+        headSha: MID_HEAD,
+        status: 'cancelled',
+        verdict: null,
+        verdictId: null,
+      }),
+      work(),
+      ...attempts,
+    ]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
+      'rereview_attempts_exhausted'
+    );
+    expect(fake.enqueued).toHaveLength(0);
   });
 });

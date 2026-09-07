@@ -720,4 +720,215 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     );
     expect(Number(count.rows[0]?.n ?? 0)).toBe(1);
   });
+
+  /**
+   * Review finding (Overseer, PR #772): verdict discovery queries receipts by
+   * subject_key, but subject_key on submit receipts is NEW in this change --
+   * recordReceipt did not persist it before. Every receipt written prior to
+   * deployment is therefore invisible to that query, so the completed
+   * CHANGES_REQUESTED reviews that exist today -- exactly the historical cases
+   * this change intends to repair -- could not authorize an automatic
+   * re-review at all.
+   */
+  test('a legacy receipt with no subject_key still authorizes the re-review', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const prNumber = 771;
+
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: prNumber,
+        pull_request: {
+          number: prNumber,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = '3'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-receipt-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: first.correlationId ?? '',
+        messageId: first.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber,
+        headSha: firstHeadSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
+
+    // Rewrite the receipt into the PRE-DEPLOYMENT shape: no subject_key, which
+    // is precisely what every receipt on disk today looks like. correlation_id
+    // is left intact because legacy receipts do carry it.
+    const stripped = await db.query(
+      `UPDATE agent_dispatch_messages
+       SET subject_key = NULL
+       WHERE task_type = 'run_report' AND body LIKE '%pr_review_submit_receipt%'`,
+      []
+    );
+    expect(stripped.rowCount).toBeGreaterThan(0);
+    const remaining = await db.query<{ count: number }>(
+      `SELECT COUNT(*) AS count
+       FROM agent_dispatch_messages
+       WHERE task_type = 'run_report'
+         AND subject_key IS NOT NULL
+         AND body LIKE '%pr_review_submit_receipt%'`,
+      []
+    );
+    // Proves the subject_key query below genuinely has nothing to find.
+    expect(Number(remaining.rows[0]?.count ?? 0)).toBe(0);
+
+    const secondHeadSha = '4'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-receipt-2',
+      },
+      deps
+    );
+
+    // Pre-fix: the subject_key query returned nothing, the prior verdict was
+    // null, no reason was built, and Dispatch refused the enqueue.
+    expect(second.disposition).toBe('queued');
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages WHERE id = $1`,
+      [second.messageId]
+    );
+    const reason = rows.rows[0]?.repeat_reason ?? '';
+    expect(reason.startsWith(AUTO_REREVIEW_REASON_PREFIX)).toBe(true);
+    expect(reason).toContain('changes_requested verdict');
+    expect(reason).toContain(firstHeadSha);
+    expect(reason).toContain(secondHeadSha);
+  });
+
+  test('a legacy receipt belonging to a DIFFERENT pr does not authorize a re-review', async () => {
+    // The fallback scans operator receipts without a subject_key filter, so it
+    // must discriminate by correlation prefix. A neighbouring PR's legacy
+    // changes_requested receipt must not leak across.
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+
+    const payloadFor = (
+      action: 'opened' | 'synchronize',
+      prNumber: number,
+      headSha: string
+    ): string =>
+      JSON.stringify({
+        action,
+        number: prNumber,
+        pull_request: {
+          number: prNumber,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    // A neighbouring PR reaches changes_requested, and its receipt is legacy.
+    const neighbourHeadSha = '5'.repeat(40);
+    const neighbourPayload = payloadFor('opened', 900, neighbourHeadSha);
+    const neighbour = await ingestPullRequestEvent(
+      {
+        rawBody: neighbourPayload,
+        signature: sign(neighbourPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-neighbour-1',
+      },
+      deps
+    );
+    expect(neighbour.disposition).toBe('queued');
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: neighbour.correlationId ?? '',
+        messageId: neighbour.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 900,
+        headSha: neighbourHeadSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET subject_key = NULL
+       WHERE task_type = 'run_report' AND body LIKE '%pr_review_submit_receipt%'`,
+      []
+    );
+
+    // The PR under test has been reviewed once with NO verdict recorded.
+    const firstHeadSha = '7'.repeat(40);
+    const firstPayload = payloadFor('opened', 901, firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-neighbour-2',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    const secondPayload = payloadFor('synchronize', 901, '8'.repeat(40));
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-neighbour-3',
+      },
+      deps
+    );
+
+    // The PR under test has no verdict of its own, so NO re-review reason may
+    // be built. The neighbour's legacy changes_requested receipt must not leak
+    // across: the fallback scans operator receipts unfiltered by subject_key,
+    // so correlation-prefix discrimination is the only thing separating them.
+    // (The prior row was still queued, so it is cancelled as stale and the
+    // enqueue itself succeeds -- Dispatch only demands a reason once a prior
+    // row is terminal. The load-bearing assertion is the null reason.)
+    expect(second.disposition).toBe('superseded_head');
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages WHERE id = $1`,
+      [second.messageId]
+    );
+    expect(rows.rows[0]?.repeat_reason ?? null).toBeNull();
+    expect(rows.rows[0]?.repeat_reason ?? '').not.toContain(neighbourHeadSha);
+  });
 });

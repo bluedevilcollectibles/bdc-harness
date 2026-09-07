@@ -117,6 +117,62 @@ export function reviewSubjectKey(owner: string, repo: string, prNumber: number):
 }
 
 /**
+ * Head-independent prefix of every review correlation id for one PR.
+ *
+ * `reviewCorrelationId` produces `pr-review:owner/repo#N@<head>`; trimming the
+ * head yields the group key. This is the ONLY identifier legacy submit
+ * receipts carry that ties them to a pull request, which is what makes the
+ * fallback below possible.
+ */
+export function reviewCorrelationPrefix(owner: string, repo: string, prNumber: number): string {
+  return `pr-review:${owner}/${repo}#${prNumber}@`;
+}
+
+interface PriorVerdict {
+  verdict: PriorReviewWork['verdict'];
+  verdictId: string;
+}
+
+function classifyVerdict(disposition: string | undefined): PriorReviewWork['verdict'] {
+  if (disposition === 'approved') return 'approved';
+  if (disposition === 'changes_requested') return 'changes_requested';
+  return 'other';
+}
+
+/**
+ * Folds submit receipts into a messageId -> verdict map.
+ *
+ * `receipts` MUST arrive newest-first: the first receipt seen for a message
+ * wins, so an older failed attempt cannot overwrite a later, authoritative
+ * submission verdict. Entries already present are never replaced, which also
+ * makes the legacy pass below strictly additive -- a subject_key-bearing
+ * receipt always outranks a legacy one for the same message.
+ */
+function collectVerdicts(
+  receipts: { id: string; body: string }[],
+  into: Map<string, PriorVerdict>
+): Map<string, PriorVerdict> {
+  for (const receipt of receipts) {
+    try {
+      const body = JSON.parse(receipt.body) as {
+        kind?: string;
+        messageId?: string;
+        disposition?: string;
+      };
+      if (body.kind !== 'pr_review_submit_receipt' || !body.messageId) continue;
+      if (into.has(body.messageId)) continue;
+      into.set(body.messageId, {
+        verdict: classifyVerdict(body.disposition),
+        verdictId: receipt.id,
+      });
+    } catch {
+      // Malformed and unrelated reports are not verdict evidence.
+    }
+  }
+  return into;
+}
+
+/**
  * Binds the pure ingest dependencies to the live dispatch queue.
  *
  * Reuses `agent_dispatch_messages` with `task_type: 'run_review'`. Its UNIQUE
@@ -137,39 +193,41 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         recipient: REVIEW_RECIPIENT,
         subject_key: subjectKey,
       });
+      // listMessages orders subject_key queries newest-first, which is what
+      // collectVerdicts requires.
       const receipts = await dispatch.listMessages({
         recipient: 'operator',
         subject_key: subjectKey,
       });
-      const verdictByMessageId = new Map<
-        string,
-        { verdict: PriorReviewWork['verdict']; verdictId: string }
-      >();
-      for (const receipt of receipts) {
-        try {
-          const body = JSON.parse(receipt.body) as {
-            kind?: string;
-            messageId?: string;
-            disposition?: string;
-          };
-          if (body.kind !== 'pr_review_submit_receipt' || !body.messageId) continue;
-          // listMessages returns newest-first. Keep the first receipt for a
-          // message so an older failed attempt cannot overwrite a later,
-          // authoritative submission verdict.
-          if (verdictByMessageId.has(body.messageId)) continue;
-          verdictByMessageId.set(body.messageId, {
-            verdict:
-              body.disposition === 'approved'
-                ? 'approved'
-                : body.disposition === 'changes_requested'
-                  ? 'changes_requested'
-                  : 'other',
-            verdictId: receipt.id,
-          });
-        } catch {
-          // Malformed and unrelated reports are not verdict evidence.
-        }
+      const verdictByMessageId = collectVerdicts(receipts, new Map<string, PriorVerdict>());
+
+      // LEGACY FALLBACK. Review finding (Overseer, PR #772): subject_key on
+      // submit receipts is NEW in this change -- recordReceipt did not persist
+      // it before. So every receipt written prior to deployment is invisible
+      // to the query above, and the completed CHANGES_REQUESTED reviews that
+      // exist today -- precisely the historical cases this change intends to
+      // repair -- could not authorize an automatic re-review at all.
+      //
+      // Legacy receipts do carry `correlation_id`
+      // (`pr-review:owner/repo#N@<head>`), so they are still attributable to a
+      // PR. Only pay for this scan when the indexed query left work
+      // unexplained, and never let it override a subject_key-bearing receipt
+      // (collectVerdicts keeps the first entry per message).
+      const needsLegacyLookup = messages.some(message => !verdictByMessageId.has(message.id));
+      if (needsLegacyLookup) {
+        const prefix = reviewCorrelationPrefix(input.owner, input.repo, input.prNumber);
+        const legacy = await dispatch.listMessages({ recipient: 'operator', limit: 500 });
+        // Unlike the subject_key query, an unfiltered listMessages returns
+        // OLDEST-first. Reverse to restore the newest-first contract
+        // collectVerdicts depends on.
+        const legacyForThisPr = legacy
+          .filter(
+            receipt => receipt.subject_key == null && receipt.correlation_id.startsWith(prefix)
+          )
+          .reverse();
+        collectVerdicts(legacyForThisPr, verdictByMessageId);
       }
+
       return messages
         .map(message => {
           const body = parseReviewWorkBody(message.body);

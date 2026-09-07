@@ -139,6 +139,43 @@ export function buildRereviewReason(
   return `${AUTO_REREVIEW_REASON_PREFIX}${newHeadSha} changes_requested verdict ${priorVerdictId} reviewed head ${priorHeadSha}; re-review new head ${newHeadSha}`;
 }
 
+/**
+ * Selects the prior review whose verdict authorizes (or refuses) an automatic
+ * re-review of `headSha`.
+ *
+ * Review finding (Overseer, PR #772): the previous `prior.find(work =>
+ * work.headSha !== headSha)` took the FIRST row on a different head.
+ * `listPriorReviewWork` returns newest-first, and a row is created the moment
+ * work is queued -- long before any verdict exists. So a rapid push sequence
+ * lost the verdict entirely:
+ *
+ *   1. head A is reviewed -> CHANGES_REQUESTED (row A carries the verdict)
+ *   2. head B arrives -> row B is queued, verdict null
+ *   3. head C arrives before B completes -> B is cancelled (verdict still
+ *      null), and `find` selects row B because it is newer than A
+ *
+ * At step 3 the selected row's verdict is null, so no repeat reason was built,
+ * and Dispatch rejected the enqueue with `repeat_reason_required` -- the
+ * automatic re-review silently died exactly when the author was pushing
+ * fastest. The verdict on A was still the live, unaddressed one.
+ *
+ * The fix is to skip rows that carry no verdict (queued, claimed, or cancelled
+ * before completion) and select the most recent VERDICT-BEARING row on a
+ * different head. That row is the standing review state of the PR.
+ *
+ * Rows on the CURRENT head are still excluded: a verdict on this exact head is
+ * a duplicate delivery, not a supersession, and must not authorize a repeat.
+ * A verdict of `approved` or `other` is deliberately still selected rather
+ * than skipped, so an approval continues to withhold authorization instead of
+ * letting an older changes_requested row reach back past it.
+ */
+export function findAuthorizingPriorReview(
+  prior: PriorReviewWork[],
+  headSha: string
+): PriorReviewWork | undefined {
+  return prior.find(work => work.headSha !== headSha && work.verdict !== null);
+}
+
 export interface IngestDeps {
   /** Shared webhook secret. Empty/absent means the route must fail closed. */
   webhookSecret: string;
@@ -417,7 +454,7 @@ export async function ingestPullRequestEvent(
     return result;
   }
 
-  const priorAtDifferentHead = prior.find(work => work.headSha !== headSha);
+  const priorAtDifferentHead = findAuthorizingPriorReview(prior, headSha);
   let repeatReason: string | null = null;
   if (priorAtDifferentHead?.verdict === 'changes_requested') {
     const rereviewAttempts = prior.filter(work => work.isAutoRereview).length;
