@@ -89,6 +89,18 @@ test('independent PostgreSQL pools serialize overlapping resets with one transit
   expect(audits.rowCount).toBe(12);
 });
 
+test('PostgreSQL already-running reset preserves the epoch-start timestamp', async () => {
+  const epochStart = new Date(Date.now() - 3_600_000).toISOString();
+  await primary.query("UPDATE tm_control SET pause_state='RUNNING', updated_at=$1 WHERE id=1", [
+    epochStart,
+  ]);
+  const result = await resetTaskmaster({ actor: 'operator', reason: 'repeat' });
+  expect(result.control.epoch).toBe(7);
+  expect(result.control.updated_at).toBe(epochStart);
+  expect(result.expiredProposals).toBe(1);
+  expect(JSON.parse(result.audit.proposal_json).transitioned).toBe(false);
+});
+
 test('PostgreSQL audit failure rolls back control and pending expiration', async () => {
   const before = await primary.query('SELECT * FROM tm_control WHERE id=1');
   await primary.query(`CREATE OR REPLACE FUNCTION reject_reset_audit_fn() RETURNS trigger AS $$

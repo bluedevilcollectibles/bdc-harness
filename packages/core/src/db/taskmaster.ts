@@ -248,14 +248,17 @@ export async function resetTaskmaster(data: { actor: string; reason: string | nu
       "UPDATE tm_journal SET outcome = 'expired' WHERE outcome IN ('parked', 'pending')"
     );
     const transition = await query(
-      `UPDATE tm_control SET pause_state = 'RUNNING', epoch = epoch + 1
-       WHERE id = 1 AND pause_state <> 'RUNNING'`
+      `UPDATE tm_control SET pause_state = 'RUNNING', epoch = epoch + 1, updated_at = $1
+       WHERE id = 1 AND pause_state <> 'RUNNING'`,
+      [new Date().toISOString()]
     );
     const transitioned = transition.rowCount === 1;
+    // updated_at bounds the useful-rate epoch window. A repeated RUNNING
+    // reset must not move it forward and discard accumulated grade evidence.
     await query(
       `UPDATE tm_control SET pause_scope = NULL, pause_reason = NULL,
-       pause_actor = $1, updated_at = $2 WHERE id = 1`,
-      [data.actor, new Date().toISOString()]
+       pause_actor = $1 WHERE id = 1`,
+      [data.actor]
     );
     const current = await query<TmControlRow>('SELECT * FROM tm_control WHERE id = 1');
     const currentRow = current.rows[0];
@@ -386,9 +389,9 @@ export async function getPauseState(): Promise<TmControlState> {
 }
 
 /**
- * Set the pause state. incrementEpoch is used by resume (and by auto-circuit
- * transitions) so in-flight proposals confirmed under the old epoch expire
- * instead of replaying.
+ * Set pause state for direct control/circuit callers. An explicit epoch
+ * increment invalidates older in-flight proposals. The resume endpoint uses
+ * resetTaskmaster instead to atomically transition, expire and audit.
  */
 export async function setPauseState(data: {
   pause_state: TmPauseState;

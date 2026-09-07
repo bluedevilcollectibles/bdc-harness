@@ -117,6 +117,31 @@ describe('tm_journal DAL', () => {
     expect(Number(audits.rows[0]?.cnt)).toBe(2);
   });
 
+  test('already-running reset preserves the epoch window and accumulated noise grades', async () => {
+    const epochStart = new Date(Date.now() - 3_600_000).toISOString();
+    const evidenceAt = new Date(Date.now() - 1_800_000).toISOString();
+    await db.query(
+      "UPDATE tm_control SET pause_state='RUNNING', epoch=7, updated_at=$1 WHERE id=1",
+      [epochStart]
+    );
+    for (let i = 0; i < 20; i++) {
+      const action = await recordAction({
+        thread_ref: `gh:test/noise#${String(i)}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        outcome: 'sent',
+      });
+      await gradeAction(action.id, 'noise');
+    }
+    await db.query('UPDATE tm_journal SET created_at=$1', [evidenceAt]);
+    const reset = await resetTaskmaster({ actor: 'operator', reason: 'repeat' });
+    expect(reset.control.epoch).toBe(7);
+    expect(reset.control.updated_at).toBe(epochStart);
+    expect(JSON.parse(reset.audit.proposal_json).transitioned).toBe(false);
+    const window = await getActionsSince(reset.control.updated_at);
+    expect(window.filter(row => row.grade === 'noise')).toHaveLength(20);
+  });
+
   test('concurrent resets increment the epoch once and report their own atomic audit', async () => {
     await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects', pause_actor: 'test' });
     const before = await getPauseState();
