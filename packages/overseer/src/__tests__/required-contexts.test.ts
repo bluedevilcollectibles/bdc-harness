@@ -9,12 +9,16 @@
  */
 import { describe, expect, test, beforeEach } from 'bun:test';
 import {
+  ATTEMPT_COUNTER_MAX_ENTRIES,
+  ATTEMPT_COUNTER_TTL_MS,
   DEFAULT_MAX_ATTEMPTS,
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
   REQUIRED_CONTEXTS_OVERRIDE_ENV,
   isBranchNotProtectedError,
   isPermissionFailure,
   parseRequiredContextsOverride,
+  peekRequiredContextsAttempts,
+  requiredContextsAttemptCounterSize,
   resetRequiredContextsAttemptCounters,
   resetRequiredContextsSourceLog,
   resolveMaxAttempts,
@@ -429,6 +433,124 @@ describe('resolveRequiredContexts -- bounded deferral ESCALATES, never downgrade
     // The PR comment tells a human whether to grant a scope or wait it out, so
     // the two causes must not be collapsed.
     if (blocked.state === 'exhausted') expect(blocked.failureKind).toBe('transient');
+  });
+});
+
+/**
+ * #777 review finding: the counter was keyed by owner/repo@base and merely
+ * STORED a head, so two PRs on one base shared a slot. The review worker
+ * interleaves their ticks, each arrival reset the slot to 1, and neither head
+ * ever reached the bound -- reinstating the forever-defer this module bounds.
+ */
+describe('resolveRequiredContexts -- concurrent PRs on one base keep separate bounds', () => {
+  const HEAD_A = 'a'.repeat(40);
+  const HEAD_B = 'b'.repeat(40);
+
+  function failingFor(headSha: string, baseRef: string = BASE) {
+    return baseInput({
+      headSha,
+      baseRef,
+      fetchWithAppClient: async () => {
+        throw appPermissionError();
+      },
+    });
+  }
+
+  test('32 interleaved heads on one base each reach the bound independently', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '3' };
+    // Alternating ticks, exactly as the review worker produces them. Under the
+    // per-branch key this loop never exhausted either head.
+    expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('unknown');
+    expect((await resolveRequiredContexts(failingFor(HEAD_B), env)).state).toBe('unknown');
+    expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('unknown');
+    expect((await resolveRequiredContexts(failingFor(HEAD_B), env)).state).toBe('unknown');
+
+    const exhaustedA = await resolveRequiredContexts(failingFor(HEAD_A), env);
+    expect(exhaustedA.state).toBe('exhausted');
+    if (exhaustedA.state === 'exhausted') expect(exhaustedA.attempts).toBe(3);
+
+    const exhaustedB = await resolveRequiredContexts(failingFor(HEAD_B), env);
+    expect(exhaustedB.state).toBe('exhausted');
+    if (exhaustedB.state === 'exhausted') expect(exhaustedB.attempts).toBe(3);
+  });
+
+  test('33 processing another head does NOT reset this head counter', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '5' };
+    await resolveRequiredContexts(failingFor(HEAD_A), env);
+    await resolveRequiredContexts(failingFor(HEAD_A), env);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(2);
+
+    // A sibling PR's whole lifecycle -- deferrals AND a success -- must leave
+    // head A's progress untouched.
+    await resolveRequiredContexts(failingFor(HEAD_B), env);
+    await resolveRequiredContexts(
+      baseInput({ headSha: HEAD_B, fetchWithAppClient: async () => ({ data: ['test'] }) }),
+      env
+    );
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(2);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_B)).toBe(0);
+
+    // Head A therefore still exhausts on its own third, fourth and fifth ticks.
+    expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('unknown');
+    expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('unknown');
+    expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('exhausted');
+  });
+
+  test('34 a success clears only that head, across the bases it targets', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '5' };
+    await resolveRequiredContexts(failingFor(HEAD_A), env);
+    await resolveRequiredContexts(failingFor(HEAD_A, 'main'), env);
+    await resolveRequiredContexts(failingFor(HEAD_B), env);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(1);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, 'main', HEAD_A)).toBe(1);
+
+    await resolveRequiredContexts(
+      baseInput({ headSha: HEAD_A, fetchWithAppClient: async () => ({ data: ['test'] }) }),
+      env
+    );
+    // Head A is clear everywhere; head B, which never succeeded, is not touched.
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(0);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, 'main', HEAD_A)).toBe(0);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_B)).toBe(1);
+  });
+
+  test('35 the same head on different bases is bounded separately', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '2' };
+    expect((await resolveRequiredContexts(failingFor(HEAD_A, BASE), env)).state).toBe('unknown');
+    // A different base is a different question about the same commit; its first
+    // lookup must not inherit the other base's count.
+    expect((await resolveRequiredContexts(failingFor(HEAD_A, 'main'), env)).state).toBe('unknown');
+    expect((await resolveRequiredContexts(failingFor(HEAD_A, BASE), env)).state).toBe('exhausted');
+  });
+
+  test('36 stale counters are pruned by age, not by another head arriving', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '5' };
+    const realNow = Date.now;
+    try {
+      let clock = realNow();
+      Date.now = () => clock;
+      await resolveRequiredContexts(failingFor(HEAD_A), env);
+      expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(1);
+
+      // Past the TTL, an abandoned head's counter is retired on the next write.
+      clock += ATTEMPT_COUNTER_TTL_MS + 1;
+      await resolveRequiredContexts(failingFor(HEAD_B), env);
+      expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(0);
+      expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_B)).toBe(1);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test('37 retained counters stay under the ceiling as heads churn', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '99' };
+    for (let index = 0; index < ATTEMPT_COUNTER_MAX_ENTRIES + 25; index += 1) {
+      await resolveRequiredContexts(failingFor(index.toString(16).padStart(40, '0')), env);
+    }
+    expect(requiredContextsAttemptCounterSize()).toBeLessThanOrEqual(ATTEMPT_COUNTER_MAX_ENTRIES);
+    // The newest head is the one that must survive the eviction.
+    const newest = (ATTEMPT_COUNTER_MAX_ENTRIES + 24).toString(16).padStart(40, '0');
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, newest)).toBe(1);
   });
 });
 

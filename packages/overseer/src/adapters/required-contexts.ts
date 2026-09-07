@@ -43,6 +43,15 @@
  *    disposition `blocked_required_contexts_unavailable`, and an operator
  *    escalation -- never an approval.
  *
+ *    The counter is keyed by BOTH branch AND head. Keying it by branch alone
+ *    (the first cut of this fix, caught in review on #777) reinstated the
+ *    forever-defer it was written to bound: several PRs normally target the same
+ *    base, the review worker interleaves their ticks, and each head's arrival
+ *    reset the single per-branch slot back to 1. Two such PRs could then defer
+ *    forever without either ever reaching the bound. Per-head keys make
+ *    exhaustion independent, and stale keys are pruned on their own schedule
+ *    (see `pruneAttemptCounters`) rather than by being overwritten.
+ *
  *    EXHAUSTED deliberately does NOT fall back to the reported-checks
  *    heuristic. A silent downgrade would turn "we cannot see what CI is
  *    required" into "whatever CI reported is good enough", which is the
@@ -139,8 +148,10 @@ export interface ResolveRequiredContextsInput extends UnprotectedBranchProbes {
   repo: string;
   baseRef: string | null | undefined;
   /**
-   * Head SHA under review. Only used to key the consecutive-attempt counter, so
-   * a new push starts the bound over rather than inheriting a stale count.
+   * Head SHA under review. Only used to key the consecutive-attempt counter.
+   * It is part of the KEY (not a value stored under a per-branch key), so a new
+   * push starts the bound over rather than inheriting a stale count, AND a
+   * sibling PR on the same base cannot reset this head's count.
    */
   headSha: string;
   /** App-identity fetcher. Absent when the client cannot answer at all. */
@@ -149,23 +160,100 @@ export interface ResolveRequiredContextsInput extends UnprotectedBranchProbes {
   fetchWithPatClient?: StatusCheckContextsFetcher;
 }
 
+/**
+ * How long an untouched attempt counter survives before it is pruned. A head
+ * that stops being reviewed (merged, closed, force-pushed away) never clears
+ * its own counter, so time is the only thing that can retire it.
+ */
+export const ATTEMPT_COUNTER_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Hard ceiling on retained counters. TTL alone is not a bound: a repo churning
+ * heads faster than the TTL would grow the map without limit. On overflow the
+ * least-recently-touched entries go first.
+ */
+export const ATTEMPT_COUNTER_MAX_ENTRIES = 512;
+
 interface AttemptCounterEntry {
-  headSha: string;
   attempts: number;
+  /** Epoch ms of the last write, used solely for staleness pruning. */
+  touchedAt: number;
 }
 
 /**
- * Consecutive-UNKNOWN counts, keyed by owner/repo@base and holding the head the
- * count belongs to. MODULE scope on purpose: `createRealSubmitDeps` (and with
- * it the evidence fetcher closure) is constructed fresh for every claimed
- * message by the review worker, so a closure-local counter would reset on every
- * tick and the bound would never be reached.
+ * Consecutive-UNKNOWN counts, keyed by owner/repo@base#head.
+ *
+ * MODULE scope on purpose: `createRealSubmitDeps` (and with it the evidence
+ * fetcher closure) is constructed fresh for every claimed message by the review
+ * worker, so a closure-local counter would reset on every tick and the bound
+ * would never be reached.
+ *
+ * PER-HEAD keys on purpose: the review worker interleaves PRs, and several PRs
+ * routinely target the same base. A per-branch key holding a single head made
+ * each PR's tick reset the other's count, so neither reached the bound -- the
+ * exact forever-defer this module exists to prevent (#777 review). Keys are
+ * therefore never reused across heads, and stale ones are retired by
+ * `pruneAttemptCounters` instead.
  */
 const unknownAttempts = new Map<string, AttemptCounterEntry>();
 
 /** Test seam: drop all attempt state. */
 export function resetRequiredContextsAttemptCounters(): void {
   unknownAttempts.clear();
+}
+
+/** Test seam: the live counter for one branch+head, or 0 when none is held. */
+export function peekRequiredContextsAttempts(
+  owner: string,
+  repo: string,
+  baseRef: string,
+  headSha: string
+): number {
+  return unknownAttempts.get(attemptKey(branchKey(owner, repo, baseRef), headSha))?.attempts ?? 0;
+}
+
+/** Test seam: how many counters are currently retained. */
+export function requiredContextsAttemptCounterSize(): number {
+  return unknownAttempts.size;
+}
+
+/**
+ * Retire counters that no live review can still be incrementing: first anything
+ * past the TTL, then -- if still over the ceiling -- the oldest entries.
+ *
+ * Deliberately separate from the counting path. Cleanup that happens by
+ * OVERWRITING a shared slot is what let one PR erase another's progress; expiry
+ * has to be driven by staleness, never by another head showing up.
+ */
+function pruneAttemptCounters(now: number, incomingKey: string): void {
+  for (const [key, entry] of unknownAttempts) {
+    if (now - entry.touchedAt >= ATTEMPT_COUNTER_TTL_MS) unknownAttempts.delete(key);
+  }
+  // Leave room for the write that follows, unless it is an update in place, so
+  // the ceiling holds AFTER the insert rather than one entry past it.
+  const budget = unknownAttempts.has(incomingKey)
+    ? ATTEMPT_COUNTER_MAX_ENTRIES
+    : ATTEMPT_COUNTER_MAX_ENTRIES - 1;
+  if (unknownAttempts.size <= budget) return;
+  const oldestFirst = [...unknownAttempts.entries()].sort(
+    (a, b) => a[1].touchedAt - b[1].touchedAt
+  );
+  const excess = unknownAttempts.size - budget;
+  for (let index = 0; index < excess; index += 1) {
+    unknownAttempts.delete(oldestFirst[index][0]);
+  }
+}
+
+/**
+ * Forget every counter for one head across all base branches. Called when a
+ * lookup finally succeeds: that head's deferrals are over, whichever base it
+ * targets. Scoped to the head so a sibling PR's in-flight count survives.
+ */
+function clearAttemptsForHead(headSha: string): void {
+  const suffix = `#${headSha}`;
+  for (const key of unknownAttempts.keys()) {
+    if (key.endsWith(suffix)) unknownAttempts.delete(key);
+  }
 }
 
 /**
@@ -182,6 +270,14 @@ export function resetRequiredContextsSourceLog(): void {
 
 function branchKey(owner: string, repo: string, baseRef: string): string {
   return `${owner}/${repo}@${baseRef}`;
+}
+
+/**
+ * Counter key. The head is part of the key, not a value stored beside it, so
+ * two PRs on one base cannot share -- and therefore cannot reset -- a slot.
+ */
+function attemptKey(branch: string, headSha: string): string {
+  return `${branch}#${headSha}`;
 }
 
 function normalizeContexts(data: unknown): string[] | null {
@@ -348,7 +444,7 @@ export async function resolveRequiredContexts(
   // "nothing is required", and treating it as absent would send a deliberately
   // unblocked branch back to the API that could not answer.
   if (overrideContexts !== undefined) {
-    unknownAttempts.delete(key);
+    clearAttemptsForHead(headSha);
     logSourceOnce(
       `override:${key}`,
       { owner, repo, baseRef, contexts: overrideContexts, source: 'env_override' },
@@ -378,7 +474,7 @@ export async function resolveRequiredContexts(
         failureKind = 'transient';
         continue;
       }
-      unknownAttempts.delete(key);
+      clearAttemptsForHead(headSha);
       logSourceOnce(
         `${attempt.source}:${key}`,
         { owner, repo, baseRef, contexts, source: attempt.source },
@@ -412,7 +508,7 @@ export async function resolveRequiredContexts(
   // that to UNKNOWN is what parked its PRs forever. An authoritative EMPTY set
   // is a real answer, not a fallback: it says "nothing is required here".
   if (await hasPositiveUnprotectedEvidence(input, baseRef)) {
-    unknownAttempts.delete(key);
+    clearAttemptsForHead(headSha);
     logSourceOnce(
       `unprotected:${key}`,
       { owner, repo, baseRef, source: 'unprotected_branch', lastReason },
@@ -425,8 +521,12 @@ export async function resolveRequiredContexts(
 }
 
 /**
- * Fail closed (DEFER) until the consecutive-UNKNOWN bound for this head is
- * passed, then report EXHAUSTED so the reviewer can BLOCK visibly.
+ * Fail closed (DEFER) until the consecutive-UNKNOWN bound for this branch+head
+ * is passed, then report EXHAUSTED so the reviewer can BLOCK visibly.
+ *
+ * The counter lives under a key that includes the head, so a new head starts at
+ * 1 (its predecessor's failures say nothing about it) and, critically, a SIBLING
+ * PR on the same base has its own slot and cannot reset this one.
  *
  * EXHAUSTED never carries a set of contexts and never routes to the heuristic:
  * the caller must treat it as a terminal, non-approving outcome.
@@ -439,16 +539,16 @@ function deferOrBlock(
   env: NodeJS.ProcessEnv
 ): RequiredContextsResolution {
   const maxAttempts = resolveMaxAttempts(env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]);
-  const existing = unknownAttempts.get(key);
-  // A new head restarts the bound: the previous head's failures say nothing
-  // about this one, and inheriting them would block a fresh PR immediately.
-  const attempts = existing?.headSha === headSha ? existing.attempts + 1 : 1;
-  unknownAttempts.set(key, { headSha, attempts });
+  const now = Date.now();
+  const counterKey = attemptKey(key, headSha);
+  pruneAttemptCounters(now, counterKey);
+  const attempts = (unknownAttempts.get(counterKey)?.attempts ?? 0) + 1;
+  unknownAttempts.set(counterKey, { attempts, touchedAt: now });
 
   if (attempts >= maxAttempts) {
     log.error(
       {
-        key,
+        key: counterKey,
         headSha,
         attempts,
         maxAttempts,
@@ -467,7 +567,7 @@ function deferOrBlock(
   }
 
   log.warn(
-    { key, headSha, attempts, maxAttempts, reason, failureKind },
+    { key: counterKey, headSha, attempts, maxAttempts, reason, failureKind },
     'overseer.required_contexts.unknown_deferring_review'
   );
   return { state: 'unknown', reason, failureKind };
