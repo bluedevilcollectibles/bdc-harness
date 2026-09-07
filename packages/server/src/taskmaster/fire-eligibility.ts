@@ -27,15 +27,20 @@ export interface FireEligibilityDeps {
   fetchImpl?: typeof fetch;
   now?: () => Date;
   codebases?: () => Promise<readonly { name: string; repository_url: string | null }[]>;
+  /** Overrides GITHUB_TOKEN/GH_TOKEN resolution; canonical reads are never anonymous. */
+  githubToken?: string;
 }
 
 const WO_ID_RE = /\b(WO-[A-Z][A-Z0-9-]*-\d+)\b/;
 
-function headers(): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+function githubToken(): string | undefined {
+  return process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+}
+
+function headers(token: string): Record<string, string> {
   return {
     accept: 'application/vnd.github+json',
-    ...(token ? { authorization: `Bearer ${token}` } : {}),
+    authorization: `Bearer ${token}`,
   };
 }
 
@@ -63,6 +68,12 @@ export async function checkFireEligibility(
   const woId = WO_ID_RE.exec(issueTitle)?.[1];
   if (!woId) return { eligible: false, reason: 'wo_id_missing' };
   const fetchImpl = deps.fetchImpl ?? fetch;
+  // Injecting a fetcher bypasses the fail-closed authentication guard inside
+  // resolveWorkOrderSource, so the token is resolved and asserted here instead.
+  // Unauthenticated canonical reads would break private-repo access and burn
+  // the 60/hr anonymous rate limit.
+  const token = deps.githubToken ?? githubToken();
+  if (!token) return { eligible: false, reason: 'github_auth_missing' };
   let frozen;
   try {
     // Restrictive subset of the current lane authority policy. The runtime
@@ -78,6 +89,7 @@ export async function checkFireEligibility(
       },
       woId,
       {
+        githubToken: token,
         fetcher: (async (input, init) => {
           const response = await fetchImpl(input, init);
           assertRateLimit(response);
@@ -118,7 +130,7 @@ export async function checkFireEligibility(
   // enforcing a WO token boundary to avoid generic-title substring matches.
   const searchResponse = await fetchImpl(
     `https://api.github.com/search/issues?q=${encodeURIComponent(`${woId} repo:${targetRepo} is:pr`)}`,
-    { headers: headers() }
+    { headers: headers(token) }
   );
   assertRateLimit(searchResponse);
   if (!searchResponse.ok)
