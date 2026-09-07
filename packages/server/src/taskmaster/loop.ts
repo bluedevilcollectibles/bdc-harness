@@ -55,6 +55,8 @@ const log = createLogger('taskmaster/loop');
 
 /** Ratified Q1 budgets. */
 export const MAX_EFFECTS_PER_TICK = 10;
+/** Conservative faucet bound for newly eligible work, within the shared cap. */
+export const MAX_FIRES_PER_TICK = 3;
 
 /**
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
@@ -409,6 +411,7 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
             ['status:building', 'status:review'].includes(label)
           );
           const ownerLogin = issue.assignees?.[0]?.login ?? null;
+          const isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
           threads.push({
             ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
             priority,
@@ -417,8 +420,9 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
             isBlocked: normalizedLabels.some(label =>
               ['blocked', 'status:blocked'].includes(label)
             ),
-            isUnclaimedP0:
-              priority === 'P0' && (issue.assignees ?? []).length === 0 && !hasClaimStatus,
+            isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
+            isUnclaimed,
+            isUnclaimedP0: priority === 'P0' && isUnclaimed,
             recipient: resolveRecipient(ownerLogin),
             title: issue.title ?? null,
             ownerLogin,
@@ -1200,7 +1204,9 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (
       resolveFireVerbEnabled() &&
       backoff.kind === 'ready' &&
-      item.isUnclaimedP0 &&
+      (item.isUnclaimed ?? item.isUnclaimedP0) &&
+      !item.isBlocked &&
+      !item.isHeld &&
       typeof (item as ListedThread).title === 'string'
     ) {
       try {
@@ -1223,7 +1229,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
-      fireEligible: fireResult.eligible,
+      fireEligible: fireResult.eligible && Boolean(fireResult.evidence?.expectedSpec),
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
@@ -1264,10 +1270,26 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   proposals.push(digest);
 
   // Exceptions first so the per-tick budget can never starve them.
-  proposals.sort((a, b) => Number(b.actsImmediately) - Number(a.actsImmediately));
+  const priorityByRef = new Map([...rulings, ...threads].map(item => [item.ref, item.priority]));
+  const priorityRank: Record<ThreadPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+  const proposalRank = (proposal: ActionProposal): number => {
+    if (proposal.type === 'deliver_ruling') return 0;
+    if (proposal.type === 'escalate_p0') return 1;
+    if (proposal.type === 'fire_cauldron') {
+      return 2 + priorityRank[priorityByRef.get(proposal.threadRef) ?? 'P3'];
+    }
+    if (proposal.type === 'nudge') return 6;
+    return 7;
+  };
+  proposals.sort((a, b) => {
+    const immediate = Number(b.actsImmediately) - Number(a.actsImmediately);
+    if (immediate !== 0) return immediate;
+    return proposalRank(a) - proposalRank(b);
+  });
   result.proposals = proposals.length;
 
   const touchedThisTick = new Set<string>();
+  let firesThisTick = 0;
 
   for (const proposal of proposals) {
     let existingAction =
@@ -1354,7 +1376,11 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
     // Budgets: max 10 effects/tick, 1 effect/item/tick. Overflow is
     // journaled as deferred, not dropped.
-    if (result.effects >= MAX_EFFECTS_PER_TICK || touchedThisTick.has(proposal.threadRef)) {
+    if (
+      result.effects >= MAX_EFFECTS_PER_TICK ||
+      (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
+      touchedThisTick.has(proposal.threadRef)
+    ) {
       result.deferred += 1;
       if (!existingAction) {
         existingAction = await dal.recordAction({
@@ -1429,6 +1455,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         });
         const cascadePromise = executeCascade({
           woId: proposal.fireEvidence.woId,
+          expectedSpec: proposal.fireEvidence.expectedSpec,
           project: proposal.fireEvidence.project,
           dispatchId: proposal.idempotencyKey,
           token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
@@ -1467,6 +1494,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       journalRow.outcome = 'sent';
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
+      if (proposal.type === 'fire_cauldron') firesThisTick += 1;
       log.info(
         {
           actionType: proposal.type,

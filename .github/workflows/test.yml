@@ -68,6 +68,7 @@ jobs:
           --health-retries 10
     env:
       DISPATCH_POSTGRES_PHASE15_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/phase15
+      TASKMASTER_POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/phase15
     steps:
       - uses: actions/checkout@v4
       - name: Setup Bun
@@ -78,6 +79,8 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Phase 1.5 PostgreSQL integration
         run: bun test packages/core/src/db/dispatch.postgres.test.ts
+      - name: Taskmaster health PostgreSQL migration integration
+        run: bun test packages/core/src/db/taskmaster.postgres.test.ts
 
   docker-build:
     runs-on: ubuntu-latest

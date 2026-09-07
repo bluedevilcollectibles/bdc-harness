@@ -115,6 +115,36 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
   };
 }
 
+test('cascade preserves the eligibility identity on every attempted lane', async () => {
+  const expectedSpec = {
+    specSource: 'github:org/repo:docs/WO-TEST-001.md',
+    specRevision: 'a'.repeat(40),
+    specHash: `sha256:${'b'.repeat(64)}`,
+  };
+  const messages: string[] = [];
+  await runCascade(
+    baseOpts({
+      expectedSpec,
+      deps: {
+        findWoClaim: async () => null,
+        fire: async options => {
+          messages.push(options.message);
+          return makeFireOk('run-bound');
+        },
+        poll: async () => makePollResult(),
+        judge: async () => makePassVerdict(),
+        writeRecord: async () => {},
+      },
+    })
+  );
+  expect(messages.length).toBeGreaterThan(0);
+  for (const message of messages) {
+    const encoded = message.split('\n')[0].split(' --expected-spec=')[1];
+    expect(encoded).toBeDefined();
+    expect(JSON.parse(Buffer.from(encoded, 'base64url').toString())).toEqual(expectedSpec);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Auth/project binding guards
 // ---------------------------------------------------------------------------

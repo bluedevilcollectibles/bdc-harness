@@ -396,7 +396,52 @@ describe('scenario 3: pause scope=effects withholds ALL effects (P0 escalation n
   });
 });
 
+const EXPECTED_SPEC = {
+  specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+  specRevision: 'a'.repeat(40),
+  specHash: `sha256:${'b'.repeat(64)}`,
+};
 describe('fire_cauldron loop', () => {
+  test('legacy eligibility without immutable identity never dispatches a cascade', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [
+            makeListedThread({ isUnclaimed: true, title: 'WO-HARNESS-EXAMPLE-01', priority: 'P1' }),
+          ],
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-01',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              noOpenOrMergedPr: true,
+              specVerifiedAt: new Date(T0).toISOString(),
+            },
+          }),
+          runCascade: async options => {
+            admissions++;
+            const record = { cascadeId: 'bad', status: 'running' } as never;
+            options.onAdmission?.(record, true);
+            return record;
+          },
+        })
+      );
+      expect(admissions).toBe(0);
+      expect(
+        world.journal.some(row => row.action_type === 'fire_cauldron' && row.outcome === 'sent')
+      ).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
   test('fire backoff still delivers an outstanding ruling for the P0', async () => {
     const world = makeWorld();
     seedDigestSent(world);
@@ -424,7 +469,7 @@ describe('fire_cauldron loop', () => {
     expect(world.journal.some(row => row.action_type === 'deliver_ruling')).toBe(true);
   });
 
-  test('qualified unclaimed P0 admits exactly one cascade and journals its run id', async () => {
+  test('qualified fresh unclaimed P1 admits exactly one cascade and journals its run id', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
     try {
@@ -432,9 +477,9 @@ describe('fire_cauldron loop', () => {
       seedDigestSent(world);
       const item: ListedThread = {
         ref: 'gh:thinmansoftware/bdc-harness#501',
-        priority: 'P0',
+        priority: 'P1',
         lastActivityAt: new Date(T0 - 3_600_000).toISOString(),
-        isUnclaimedP0: true,
+        isUnclaimed: true,
         recipient: 'xo',
         title: 'WO-HARNESS-EXAMPLE-01 urgent build',
       };
@@ -453,10 +498,12 @@ describe('fire_cauldron loop', () => {
             project: 'bdc-harness',
             specVerifiedAt: new Date(T0).toISOString(),
             noOpenOrMergedPr: true,
+            expectedSpec: EXPECTED_SPEC,
           },
         }),
         runCascade: (async options => {
           admissions += 1;
+          expect(options.expectedSpec).toEqual(EXPECTED_SPEC);
           options.onAdmission?.(record, true);
           return record;
         }) as NonNullable<TaskmasterDeps['runCascade']>,
@@ -470,6 +517,195 @@ describe('fire_cauldron loop', () => {
       expect(fires[0]?.outcome).toBe('sent');
       expect(fires[0]?.proposal_json).toContain('cascade-501');
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('hold-labeled unclaimed work is refused fire even when its blocker names a seat', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const item = makeListedThread({
+        ref: 'gh:thinmansoftware/bdc-harness#509',
+        priority: 'P1',
+        isUnclaimed: true,
+        isBlocked: true,
+        labels: ['wo', 'status:hold'],
+        title: 'WO-HARNESS-EXAMPLE-509 held build',
+      });
+      let admissions = 0;
+      await tick(
+        createTaskmasterState(60_000),
+        makeDeps(world, {
+          listThreads: async () => [item],
+          getGithubIssueEvidence: async () =>
+            makeEvidence({
+              latestMarkerKind: 'BLOCKED',
+              latestMarkerText: 'major-build must resolve the hold',
+            }),
+          checkFireEligibility: async () => ({
+            eligible: true,
+            evidence: {
+              woId: 'WO-HARNESS-EXAMPLE-509',
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+              specSource: 'issue-body',
+            },
+          }),
+          runCascade: (async () => {
+            admissions += 1;
+            return { cascadeId: 'unexpected', status: 'running' } as never;
+          }) as NonNullable<TaskmasterDeps['runCascade']>,
+        })
+      );
+      expect(admissions).toBe(0);
+      expect(world.journal.some(row => row.action_type === 'fire_cauldron')).toBe(false);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('mixed immediate proposals keep exceptions ahead of priority-ordered fires', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const events: string[] = [];
+      const threads = [
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#523',
+          priority: 'P3',
+          isUnclaimed: true,
+          title: 'WO-HARNESS-EXAMPLE-523 build',
+        }),
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#520',
+          priority: 'P0',
+          isUnclaimed: true,
+          isUnclaimedP0: true,
+          title: 'WO-HARNESS-EXAMPLE-520 no spec',
+        }),
+        makeListedThread({
+          ref: 'gh:thinmansoftware/bdc-harness#521',
+          priority: 'P1',
+          isUnclaimed: true,
+          title: 'WO-HARNESS-EXAMPLE-521 build',
+        }),
+      ];
+      const deps = makeDeps(world, {
+        listUndeliveredRulings: async () => [ruling()],
+        listThreads: async () => threads,
+        checkFireEligibility: async title => {
+          const woId = title.split(' ')[0]!;
+          if (woId.endsWith('-520')) return { eligible: false, reason: 'missing_spec' };
+          return {
+            eligible: true,
+            evidence: {
+              woId,
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+              specSource: 'repo-path',
+            },
+          };
+        },
+        createTask: (async (_context, data) => {
+          events.push(data.body.includes('Ratified ruling') ? 'deliver_ruling' : 'escalate_p0');
+          return { id: `msg-${events.length}`, status: 'queued' } as never;
+        }) as TaskmasterDeps['createTask'],
+        runCascade: (async options => {
+          events.push(`fire:${options.woId}`);
+          const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      await tick(createTaskmasterState(60_000), deps);
+      expect(events).toEqual([
+        'deliver_ruling',
+        'escalate_p0',
+        'fire:WO-HARNESS-EXAMPLE-521',
+        'fire:WO-HARNESS-EXAMPLE-523',
+      ]);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
+  test('fire cap dispatches P0 through P2 first and defers overflow for the next tick', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const world = makeWorld();
+      seedDigestSent(world);
+      const threads = [
+        ['P3', 513],
+        ['P2', 512],
+        ['P0', 510],
+        ['P3', 514],
+        ['P1', 511],
+      ].map(([priority, number]) =>
+        makeListedThread({
+          ref: `gh:thinmansoftware/bdc-harness#${number}`,
+          priority: priority as ThreadSnapshot['priority'],
+          isUnclaimed: true,
+          isUnclaimedP0: priority === 'P0',
+          title: `WO-HARNESS-EXAMPLE-${number} build`,
+          lastActivityAt: new Date(T0).toISOString(),
+        })
+      );
+      const admitted: string[] = [];
+      const deps = makeDeps(world, {
+        listThreads: async () => threads,
+        checkFireEligibility: async title => {
+          const woId = title.split(' ')[0]!;
+          return {
+            eligible: true,
+            evidence: {
+              woId,
+              targetRepo: 'thinmansoftware/bdc-harness',
+              project: 'bdc-harness',
+              specVerifiedAt: new Date(T0).toISOString(),
+              noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
+              specSource: 'repo-path',
+            },
+          };
+        },
+        runCascade: (async options => {
+          admitted.push(options.woId);
+          const record = { cascadeId: `cascade-${options.woId}`, status: 'running' } as never;
+          options.onAdmission?.(record, true);
+          return record;
+        }) as NonNullable<TaskmasterDeps['runCascade']>,
+      });
+      const state = createTaskmasterState(60_000);
+      await tick(state, deps);
+      expect(admitted).toEqual([
+        'WO-HARNESS-EXAMPLE-510',
+        'WO-HARNESS-EXAMPLE-511',
+        'WO-HARNESS-EXAMPLE-512',
+      ]);
+      expect(world.journal.filter(row => row.outcome === 'deferred')).toHaveLength(2);
+
+      world.nowMs += 60_000;
+      await tick(state, deps);
+      expect(admitted.slice(3).sort()).toEqual([
+        'WO-HARNESS-EXAMPLE-513',
+        'WO-HARNESS-EXAMPLE-514',
+      ]);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
@@ -522,6 +758,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async options => {
@@ -595,6 +832,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async options => {
@@ -677,6 +915,7 @@ describe('fire_cauldron loop', () => {
               project: 'bdc-harness',
               specVerifiedAt: new Date(T0).toISOString(),
               noOpenOrMergedPr: true,
+              expectedSpec: EXPECTED_SPEC,
             },
           }),
           runCascade: (async () => {
@@ -1769,6 +2008,7 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     ]);
     const p0 = threads.find(t => t.ref.endsWith('#3'));
     expect(p0?.priority).toBe('P0');
+    expect(p0?.isUnclaimed).toBe(true);
     expect(p0?.isUnclaimedP0).toBe(true);
   });
 
@@ -1782,6 +2022,8 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
         ghIssue(14, ['wo', 'priority-ish:p1']),
         ghIssue(15, ['wo', 'P0', 'status:blocked']),
         ghIssue(16, ['wo', 'P0', 'status:review']),
+        ghIssue(17, ['wo', 'P2', 'status:hold']),
+        ghIssue(18, ['wo', 'P3', 'status:building']),
       ],
     });
 
@@ -1792,6 +2034,9 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     expect(byNumber.get(14)?.priority).toBe('P2');
     expect(byNumber.get(15)?.isBlocked).toBe(true);
     expect(byNumber.get(16)?.isUnclaimedP0).toBe(false);
+    expect(byNumber.get(17)?.isBlocked).toBe(false);
+    expect(byNumber.get(17)?.isHeld).toBe(true);
+    expect(byNumber.get(18)?.isUnclaimed).toBe(false);
   });
 
   test('defaults to bdc-xo when TASKMASTER_GH_REPOS is unset', async () => {
