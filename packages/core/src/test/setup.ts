@@ -62,7 +62,36 @@ afterAll(() => {
 // under this setting). So the sqlite suites' hooks already have this same 30s
 // budget, and per-file hook-timeout arguments are belt-and-braces, not the
 // thing standing between them and a green Windows run.
+//
+// THIS PRELOAD ALONE IS NOT ENOUGH -- see the --timeout note below.
 setDefaultTimeout(30_000);
+
+// PRELOAD setDefaultTimeout IS DEFEATED BY MULTI-FILE INVOCATIONS (2026-09-07).
+//
+// Measured, and reproducible in any package that has this preload:
+//   bun test <one-file>              -> a 7s test PASSES  (30s default applied)
+//   bun test <file-a> <file-b>       -> the same test FAILS at 5000ms
+//   bun test <a> <b> --timeout 30000 -> PASSES again
+//
+// Bun runs the files of one invocation concurrently, and the preload's
+// process-global setDefaultTimeout() does not reliably reach every
+// concurrently-loaded file -- so those files silently fall back to bun's stock
+// 5000ms. Every package here HAS a bunfig preload, so "the package is missing a
+// preload" is the wrong diagnosis; the invocation shape is what decides.
+//
+// This is what actually broke Windows CI on three different surfaces at once:
+//   - packages/overseer  refresh-rebase (real `git` subprocesses) at 5031ms and
+//     7344ms, inside a 50-file invocation
+//   - scripts/dispatch-worker  dispatch-migration-smoke at 5015ms -- it is
+//     statically imported by packages/core/src/db/adapters/sqlite.test.ts, so it
+//     runs inside core's big multi-file invocation and inherits the fallback
+//   - packages/core  the sqlite hook timeouts (also contention -- see below)
+//
+// Fix: every `bun test` in every package's "test" script (and overseer's
+// "pretest") passes `--timeout 30000` explicitly. The CLI flag is
+// per-invocation and cannot be defeated by file count or concurrency, so the
+// budget no longer depends on preload timing. Keep the flag when adding a new
+// `bun test` command anywhere in the repo.
 
 // WINDOWS SQLITE HOOK-TIMEOUT CLASS (anchor: 2026-09-07, sighted on run
 // 34119038672 / PR #777 -- tm_control DAL setPauseState + HARD_PAUSE failing at
