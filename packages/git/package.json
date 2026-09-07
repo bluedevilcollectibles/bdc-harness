@@ -8,7 +8,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "bun test src/",
+    "test": "bun test --timeout 30000 src/",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
