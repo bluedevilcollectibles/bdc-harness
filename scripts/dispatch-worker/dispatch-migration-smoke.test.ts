@@ -1,10 +1,32 @@
 import { Database, constants } from 'bun:sqlite';
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { link, lstat, mkdtemp, readFile, readdir, rm, symlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
+
+// WINDOWS CI TIMEOUT CLASS -- file-local restatement of the repo-wide default.
+//
+// packages/core/src/test/setup.ts raises the default per-test timeout to 30s
+// via setDefaultTimeout() in the bunfig preload. That covers tests declared by
+// files bun discovers directly, but this file is NOT one of them: it lives
+// under scripts/ (outside every bunfig `root`) and is registered only through
+// the cross-package `await import(...)` at the top of
+// packages/core/src/db/adapters/sqlite.test.ts. On the Bun version CI pins
+// (1.3.11) the preload's raised default does not reach tests registered across
+// that import boundary, so they silently fall back to Bun's 5000ms default --
+// while a local Bun 1.3.13 run applies it and passes, hiding the gap.
+//
+// Every test here spawns a real child process and does real filesystem IO, so
+// on a slow windows-latest runner several land just past 5000ms (observed:
+// 5015ms/5016ms against siblings measuring 4391ms, 2984ms and 2484ms). Ubuntu
+// was always green: this is runner speed, not a product defect.
+//
+// Restating the default here makes this file honest under any invocation --
+// the pinned `bun test:dispatch-migration-smoke`, the core package suite, or a
+// direct run -- and independent of the Bun version in play.
+setDefaultTimeout(30_000);
 
 const temporaryDirectories: string[] = [];
 const scriptPath = join(import.meta.dir, 'dispatch-migration-smoke.ts');

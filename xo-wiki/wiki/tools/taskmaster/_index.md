@@ -160,8 +160,11 @@ curl -s -X POST -H "x-archon-operator-token: $ARCHON_OPERATOR_TOKEN" \
   http://localhost:3090/api/taskmaster/resume
 ```
 
-Resume increments the pause epoch and EXPIRES stale parked/pending proposals
-rather than replaying them (response includes `expired_proposals`).
+Resume increments the pause epoch only when leaving PAUSED or HARD_PAUSE.
+Every successful invocation EXPIRES stale parked/pending proposals rather
+than replaying them and writes its own audit (response includes
+`expired_proposals` and `audit_id`). An already-RUNNING reset preserves the
+epoch-start timestamp, so accumulated useful/noise grades remain in scope.
 
 ## Journal queries (on archon-app-1)
 

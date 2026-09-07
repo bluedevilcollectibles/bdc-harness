@@ -33,6 +33,8 @@ import {
   getPauseState,
   gradeAction,
   recordAction,
+  recordResetAudit,
+  resetTaskmaster,
   recordUsageSample,
   registerExpectation,
   listDueExpectations,
@@ -303,6 +305,395 @@ afterEach(async () => {
 }, SQLITE_HOOK_TIMEOUT_MS);
 
 describe('tm_journal DAL', () => {
+  test('reset winning before notice enqueue rejects the obsolete paused epoch', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'noise floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    // Reproduce reset committing after the loop read but before Dispatch enqueue.
+    await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+    const notice = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: 'taskmaster-self-pause-race',
+        idempotency_key: `tm:self-pause:${paused.epoch}`,
+        task_type: 'agent_message',
+        recipient: 'duty-officer',
+        body: 'Taskmaster paused; reset guidance.',
+      },
+      {
+        taskmasterPausedEpoch: paused.epoch,
+        taskmasterPausedState: 'PAUSED',
+        taskmasterPausedScope: 'effects',
+      }
+    );
+    expect(notice).toBeNull();
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM agent_dispatch_messages WHERE correlation_id = 'taskmaster-self-pause-race'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  test('notice enqueue holds the SQLite writer fence across control read and insert', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects' });
+    const other = new Database(currentDbPath);
+    other.run('PRAGMA busy_timeout=0');
+    const originalQuery = db.query.bind(db);
+    let competingResetError: unknown;
+    let controlReadObserved = false;
+    db.query = async <T>(sql: string, params?: unknown[]) => {
+      const result = await originalQuery<T>(sql, params);
+      if (sql.startsWith('SELECT pause_state, pause_scope, epoch FROM tm_control')) {
+        controlReadObserved = true;
+        try {
+          other.run("UPDATE tm_control SET pause_state='RUNNING', epoch=epoch+1 WHERE id=1");
+        } catch (error) {
+          competingResetError = error;
+        }
+      }
+      return result;
+    };
+    const data = {
+      correlation_id: 'notice-writer-fence',
+      idempotency_key: `tm:self-pause:${paused.epoch}`,
+      task_type: 'agent_message' as const,
+      recipient: 'duty-officer',
+      body: 'Paused; reset guidance.',
+    };
+    try {
+      const notice = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        data,
+        {
+          taskmasterPausedEpoch: paused.epoch,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
+      );
+      expect(controlReadObserved).toBe(true);
+      expect(String(competingResetError)).toContain('locked');
+      expect(notice?.status).toBe('queued');
+      db.query = originalQuery;
+      const retry = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        data,
+        {
+          taskmasterPausedEpoch: paused.epoch,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
+      );
+      expect(retry?.id).toBe(notice?.id);
+      expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
+      await resetTaskmaster({ actor: 'operator', reason: 'after valid enqueue' });
+      expect(
+        await createAuthenticatedMessage({ kind: 'system', sender: 'taskmaster' }, data, {
+          taskmasterPausedEpoch: paused.epoch,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        })
+      ).toBeNull();
+    } finally {
+      db.query = originalQuery;
+      other.close();
+    }
+  });
+
+  test('notice fence accepts a paused epoch returned as text by the database driver', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects' });
+    const originalQuery = db.query.bind(db);
+    db.query = <T>(sql: string, params?: unknown[]) =>
+      originalQuery<T>(
+        sql.replace(
+          'SELECT pause_state, pause_scope, epoch FROM tm_control',
+          'SELECT pause_state, pause_scope, CAST(epoch AS TEXT) AS epoch FROM tm_control'
+        ),
+        params
+      );
+    try {
+      const notice = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: 'text-epoch',
+          idempotency_key: `tm:self-pause:${paused.epoch}`,
+          task_type: 'agent_message',
+          recipient: 'duty-officer',
+          body: 'valid paused notice',
+        },
+        {
+          taskmasterPausedEpoch: paused.epoch,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
+      );
+      expect(notice?.status).toBe('queued');
+      expect(
+        (await db.query("SELECT id FROM agent_dispatch_messages WHERE correlation_id='text-epoch'"))
+          .rowCount
+      ).toBe(1);
+    } finally {
+      db.query = originalQuery;
+    }
+  });
+
+  test('notice fence refuses a concurrent HARD_PAUSE at the authorized epoch', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'noise floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    // A hard pause is an escalation, not a reset: it does NOT bump the epoch,
+    // so an epoch-only fence would still let the notice escape it.
+    await db.query("UPDATE tm_control SET pause_state='HARD_PAUSE' WHERE id=1");
+    expect(
+      (await db.query<{ epoch: number }>('SELECT epoch FROM tm_control WHERE id=1')).rows[0]
+    ).toEqual({ epoch: paused.epoch });
+    const notice = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: 'hard-pause-notice',
+        idempotency_key: `tm:self-pause:${paused.epoch}`,
+        task_type: 'agent_message',
+        recipient: 'duty-officer',
+        body: 'must not escape a hard pause',
+      },
+      {
+        taskmasterPausedEpoch: paused.epoch,
+        taskmasterPausedState: 'PAUSED',
+        taskmasterPausedScope: 'effects',
+      }
+    );
+    expect(notice).toBeNull();
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM agent_dispatch_messages WHERE correlation_id='hard-pause-notice'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  test('notice fence refuses a concurrent re-pause onto a different scope', async () => {
+    await db.query(`INSERT INTO dispatch_principals
+      (principal_id, display_name, delivery_mode, active)
+      VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', 1)`);
+    const paused = await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'noise floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    // Re-pausing onto a wider scope at the same epoch: the caller's exemption
+    // decision was made against 'effects' and no longer holds.
+    await db.query("UPDATE tm_control SET pause_scope='all' WHERE id=1");
+    const notice = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: 'scope-change-notice',
+        idempotency_key: `tm:self-pause:${paused.epoch}`,
+        task_type: 'agent_message',
+        recipient: 'duty-officer',
+        body: 'must not escape a wider scope',
+      },
+      {
+        taskmasterPausedEpoch: paused.epoch,
+        taskmasterPausedState: 'PAUSED',
+        taskmasterPausedScope: 'effects',
+      }
+    );
+    expect(notice).toBeNull();
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM agent_dispatch_messages WHERE correlation_id='scope-change-notice'"
+        )
+      ).rows
+    ).toEqual([]);
+  });
+
+  test('notice fence rejects a fence that does not name the authorized PAUSED state', async () => {
+    await expect(
+      createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: 'hard-pause-fence-arg',
+          idempotency_key: 'tm:self-pause:0',
+          task_type: 'agent_message',
+          recipient: 'duty-officer',
+          body: 'fence must name PAUSED',
+        },
+        {
+          taskmasterPausedEpoch: 0,
+          taskmasterPausedState: 'HARD_PAUSE' as unknown as 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
+      )
+    ).rejects.toThrow('taskmaster_notice_fence_invalid');
+  });
+
+  test('notice fence cannot be used by a different system sender', async () => {
+    await expect(
+      createAuthenticatedMessage(
+        { kind: 'system', sender: 'overseer' },
+        {
+          correlation_id: 'invalid-notice',
+          idempotency_key: 'tm:self-pause:0',
+          task_type: 'agent_message',
+          recipient: 'duty-officer',
+          body: 'not Taskmaster',
+        },
+        {
+          taskmasterPausedEpoch: 0,
+          taskmasterPausedState: 'PAUSED',
+          taskmasterPausedScope: 'effects',
+        }
+      )
+    ).rejects.toThrow('taskmaster_notice_fence_invalid');
+  });
+
+  test('records one distinct reset audit row per invocation', async () => {
+    const first = await recordResetAudit({
+      actor: 'operator',
+      reason: 'recover Taskmaster',
+      previousEpoch: 1,
+      newEpoch: 2,
+      transitioned: true,
+    });
+    const second = await recordResetAudit({
+      actor: 'operator',
+      reason: 'recover Taskmaster',
+      previousEpoch: 2,
+      newEpoch: 2,
+      transitioned: false,
+    });
+    expect(first.id).not.toBe(second.id);
+    const audits = await db.query<{ proposal_json: string }>(
+      "SELECT proposal_json FROM tm_journal WHERE thread_ref = 'taskmaster:reset'"
+    );
+    expect(audits.rows).toHaveLength(2);
+    expect(JSON.parse(audits.rows[1]!.proposal_json).transitioned).toBe(false);
+  });
+
+  test('reset is safe twice: expires once, increments once, and audits both calls', async () => {
+    await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'floor',
+      pause_actor: 'taskmaster:useful-rate-floor',
+    });
+    const before = await getPauseState();
+    await recordAction({
+      thread_ref: 'gh:test/repo#1',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'parked',
+    });
+
+    const first = await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+    const second = await resetTaskmaster({ actor: 'operator', reason: 'recover' });
+
+    expect(first.control.pause_state).toBe('RUNNING');
+    expect(first.control.epoch).toBe(before.epoch + 1);
+    expect(first.expiredProposals).toBe(1);
+    expect(second.control.epoch).toBe(first.control.epoch);
+    expect(second.expiredProposals).toBe(0);
+    expect(first.audit.id).not.toBe(second.audit.id);
+    const audits = await db.query<{ cnt: number | string }>(
+      "SELECT COUNT(*) AS cnt FROM tm_journal WHERE thread_ref = 'taskmaster:reset'"
+    );
+    expect(Number(audits.rows[0]?.cnt)).toBe(2);
+  });
+
+  test('already-running reset preserves the epoch window and accumulated noise grades', async () => {
+    const epochStart = new Date(Date.now() - 3_600_000).toISOString();
+    const evidenceAt = new Date(Date.now() - 1_800_000).toISOString();
+    await db.query(
+      "UPDATE tm_control SET pause_state='RUNNING', epoch=7, updated_at=$1 WHERE id=1",
+      [epochStart]
+    );
+    for (let i = 0; i < 20; i++) {
+      const action = await recordAction({
+        thread_ref: `gh:test/noise#${String(i)}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        outcome: 'sent',
+      });
+      await gradeAction(action.id, 'noise');
+    }
+    await db.query('UPDATE tm_journal SET created_at=$1', [evidenceAt]);
+    const reset = await resetTaskmaster({ actor: 'operator', reason: 'repeat' });
+    expect(reset.control.epoch).toBe(7);
+    expect(reset.control.updated_at).toBe(epochStart);
+    expect(JSON.parse(reset.audit.proposal_json).transitioned).toBe(false);
+    const window = await getActionsSince(reset.control.updated_at);
+    expect(window.filter(row => row.grade === 'noise')).toHaveLength(20);
+  });
+
+  test('concurrent resets increment the epoch once and report their own atomic audit', async () => {
+    await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects', pause_actor: 'test' });
+    const before = await getPauseState();
+    await recordAction({
+      thread_ref: 'gh:test/repo#1',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'parked',
+    });
+    const results = await Promise.all([
+      resetTaskmaster({ actor: 'first', reason: 'recover' }),
+      resetTaskmaster({ actor: 'second', reason: 'recover' }),
+    ]);
+    expect((await getPauseState()).epoch).toBe(before.epoch + 1);
+    expect(results.map(result => result.expiredProposals).sort()).toEqual([0, 1]);
+    const audits = results.map(result => JSON.parse(result.audit.proposal_json));
+    expect(audits.filter(audit => audit.transitioned)).toHaveLength(1);
+    expect(audits.map(audit => audit.new_epoch)).toEqual([before.epoch + 1, before.epoch + 1]);
+    expect(new Set(results.map(result => result.audit.id)).size).toBe(2);
+    expect(results[0]!.control.pause_actor).toBe('first');
+    expect(results[1]!.control.pause_actor).toBe('second');
+  });
+
+  test('audit insertion failure rolls back reset state and proposal expiration', async () => {
+    await setPauseState({ pause_state: 'PAUSED', pause_scope: 'effects', pause_actor: 'test' });
+    const before = await getPauseState();
+    const action = await recordAction({
+      thread_ref: 'gh:test/repo#1',
+      action_type: 'nudge',
+      proposal_json: '{}',
+      outcome: 'parked',
+    });
+    await db.query(`CREATE TRIGGER reject_reset_audit BEFORE INSERT ON tm_journal
+      WHEN NEW.thread_ref = 'taskmaster:reset'
+      BEGIN SELECT RAISE(ABORT, 'test reset audit failure'); END`);
+    await expect(resetTaskmaster({ actor: 'operator', reason: 'recover' })).rejects.toThrow(
+      'test reset audit failure'
+    );
+    expect(await getPauseState()).toEqual(before);
+    expect(
+      (await db.query('SELECT outcome FROM tm_journal WHERE id = $1', [action.id])).rows
+    ).toEqual([{ outcome: 'parked' }]);
+    expect(
+      (await db.query("SELECT id FROM tm_journal WHERE thread_ref = 'taskmaster:reset'")).rows
+    ).toEqual([]);
+  });
+
   test('fire_cauldron is accepted by the fresh SQLite CHECK', async () => {
     const row = await recordAction({
       thread_ref: 'gh:thinmansoftware/bdc-harness#99',

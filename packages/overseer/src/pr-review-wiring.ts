@@ -21,6 +21,7 @@ import {
   createRealOctokitClient,
   createRealSubmitPullRequestReview,
 } from './adapters/github-real-deps';
+import { isAutoRereviewReason } from './pr-review-ingest';
 import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
 import {
   configuredReviewIdentity,
@@ -116,6 +117,62 @@ export function reviewSubjectKey(owner: string, repo: string, prNumber: number):
 }
 
 /**
+ * Head-independent prefix of every review correlation id for one PR.
+ *
+ * `reviewCorrelationId` produces `pr-review:owner/repo#N@<head>`; trimming the
+ * head yields the group key. This is the ONLY identifier legacy submit
+ * receipts carry that ties them to a pull request, which is what makes the
+ * fallback below possible.
+ */
+export function reviewCorrelationPrefix(owner: string, repo: string, prNumber: number): string {
+  return `pr-review:${owner}/${repo}#${prNumber}@`;
+}
+
+interface PriorVerdict {
+  verdict: PriorReviewWork['verdict'];
+  verdictId: string;
+}
+
+function classifyVerdict(disposition: string | undefined): PriorReviewWork['verdict'] {
+  if (disposition === 'approved') return 'approved';
+  if (disposition === 'changes_requested') return 'changes_requested';
+  return 'other';
+}
+
+/**
+ * Folds submit receipts into a messageId -> verdict map.
+ *
+ * `receipts` MUST arrive newest-first: the first receipt seen for a message
+ * wins, so an older failed attempt cannot overwrite a later, authoritative
+ * submission verdict. Entries already present are never replaced, which also
+ * makes the legacy pass below strictly additive -- a subject_key-bearing
+ * receipt always outranks a legacy one for the same message.
+ */
+function collectVerdicts(
+  receipts: { id: string; body: string }[],
+  into: Map<string, PriorVerdict>
+): Map<string, PriorVerdict> {
+  for (const receipt of receipts) {
+    try {
+      const body = JSON.parse(receipt.body) as {
+        kind?: string;
+        messageId?: string;
+        disposition?: string;
+      };
+      if (body.kind !== 'pr_review_submit_receipt' || !body.messageId) continue;
+      if (into.has(body.messageId)) continue;
+      into.set(body.messageId, {
+        verdict: classifyVerdict(body.disposition),
+        verdictId: receipt.id,
+      });
+    } catch {
+      // Malformed and unrelated reports are not verdict evidence.
+    }
+  }
+  return into;
+}
+
+/**
  * Binds the pure ingest dependencies to the live dispatch queue.
  *
  * Reuses `agent_dispatch_messages` with `task_type: 'run_review'`. Its UNIQUE
@@ -136,6 +193,43 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         recipient: REVIEW_RECIPIENT,
         subject_key: subjectKey,
       });
+      // listMessages orders subject_key queries newest-first, which is what
+      // collectVerdicts requires.
+      const receipts = await dispatch.listMessages({
+        recipient: 'operator',
+        subject_key: subjectKey,
+      });
+      const verdictByMessageId = collectVerdicts(receipts, new Map<string, PriorVerdict>());
+
+      // LEGACY FALLBACK. Review finding (Overseer, PR #772): subject_key on
+      // submit receipts is NEW in this change -- recordReceipt did not persist
+      // it before. So every receipt written prior to deployment is invisible
+      // to the query above, and the completed CHANGES_REQUESTED reviews that
+      // exist today -- precisely the historical cases this change intends to
+      // repair -- could not authorize an automatic re-review at all.
+      //
+      // Legacy receipts do carry `correlation_id`
+      // (`pr-review:owner/repo#N@<head>`), so they are still attributable to a
+      // PR. Only pay for this lookup when the indexed query left work
+      // unexplained, and never let it override a subject_key-bearing receipt
+      // (collectVerdicts keeps the first entry per message).
+      //
+      // The prefix match runs IN SQL. A client-side scan of a listMessages
+      // page cannot work here: listMessages hard-caps limit at 500 and offers
+      // no offset or cursor, while the live store holds ~2,700 queued operator
+      // rows (bdc-harness #761 backlog) plus completed ones. A genuinely old
+      // CHANGES_REQUESTED receipt therefore sits well outside any single page
+      // -- which is precisely the receipt this fallback exists to find.
+      const needsLegacyLookup = messages.some(message => !verdictByMessageId.has(message.id));
+      if (needsLegacyLookup) {
+        // Already newest-first from the DAL, as collectVerdicts requires.
+        const legacy = await dispatch.listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: 'operator',
+          correlationPrefix: reviewCorrelationPrefix(input.owner, input.repo, input.prNumber),
+        });
+        collectVerdicts(legacy, verdictByMessageId);
+      }
+
       return messages
         .map(message => {
           const body = parseReviewWorkBody(message.body);
@@ -143,6 +237,14 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
             messageId: message.id,
             headSha: body?.headSha ?? '',
             status: message.status,
+            verdict: verdictByMessageId.get(message.id)?.verdict ?? null,
+            verdictId: verdictByMessageId.get(message.id)?.verdictId ?? null,
+            // Only a reason THIS module stamped counts toward the attempt cap.
+            // repeat_reason is shared free text (legacy `review_exact_head:`
+            // rows, Taskmaster nudges, hand-written operator requests), so
+            // `!== null` would exhaust the budget on rows that were never
+            // automatic re-reviews. See AUTO_REREVIEW_REASON_PREFIX.
+            isAutoRereview: isAutoRereviewReason(message.repeat_reason),
           };
         })
         .filter((work): work is PriorReviewWork => work.headSha !== '');
@@ -199,7 +301,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           recipient: REVIEW_RECIPIENT,
           body: JSON.stringify(body),
           subject_key: subjectKey,
-          repeat_reason: `review_exact_head:${input.headSha}`,
+          repeat_reason: input.repeatReason,
         }
       );
       return { messageId: message.id, alreadyExisted };
@@ -329,6 +431,8 @@ export function createRealSubmitDeps(
           idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
           task_type: 'run_report',
           recipient: 'operator',
+          subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+          repeat_reason: `review_verdict_receipt:${input.messageId}:${input.disposition}`,
           body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
         }
       );

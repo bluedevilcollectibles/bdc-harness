@@ -3,6 +3,7 @@ import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority';
 import type { QueryResult } from './adapters/types';
+import { withOverseerControlPlaneImmediateTransaction } from './overseer-control-plane-sqlite';
 import {
   DispatchNonSystemCapability,
   resolveDispatchSenderCapability,
@@ -330,13 +331,80 @@ function bindSenderContext(context: DispatchSenderContext): {
   return resolveDispatchSenderCapability(context);
 }
 
-export async function createAuthenticatedMessage(
+export interface TaskmasterNoticeFence {
+  taskmasterPausedEpoch: number;
+  /**
+   * The exact pause state the notice was authorized against. The self-pause
+   * notice escapes a soft PAUSED only; a concurrent transition to HARD_PAUSE
+   * must refuse the send even at the same epoch.
+   */
+  taskmasterPausedState: 'PAUSED';
+  /**
+   * The exact pause scope the notice was authorized against. A concurrent
+   * re-pause onto a different scope at the same epoch must refuse the send,
+   * because the caller's exemption decision was made against this scope.
+   */
+  taskmasterPausedScope: string | null;
+}
+
+export function createAuthenticatedMessage(
   context: DispatchSenderContext,
   data: CreateAuthenticatedMessageData
-): Promise<DispatchMessage> {
+): Promise<DispatchMessage>;
+export function createAuthenticatedMessage(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData,
+  fence: TaskmasterNoticeFence
+): Promise<DispatchMessage | null>;
+export async function createAuthenticatedMessage(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData,
+  fence?: TaskmasterNoticeFence
+): Promise<DispatchMessage | null> {
   if ('supersedes_id' in data) throw new Error('dispatch_supersedes_guarded_path_required');
   const bound = bindSenderContext(context);
   const db = getDatabase();
+  if (fence !== undefined) {
+    if (
+      bound.sender_principal_id !== 'system:taskmaster' ||
+      !Number.isSafeInteger(fence.taskmasterPausedEpoch) ||
+      fence.taskmasterPausedEpoch < 0 ||
+      fence.taskmasterPausedState !== 'PAUSED' ||
+      data.task_type !== 'agent_message' ||
+      data.recipient !== 'duty-officer' ||
+      !data.idempotency_key.startsWith('tm:self-pause:')
+    ) {
+      throw new Error('taskmaster_notice_fence_invalid');
+    }
+    const enqueue = async (query: DispatchQueryExecutor): Promise<DispatchMessage | null> => {
+      // Serialize with resetTaskmaster, through the actual queue insertion.
+      // PostgreSQL uses one pinned connection and locks the same singleton.
+      const control = await query<{
+        pause_state: string;
+        pause_scope: string | null;
+        epoch: number | string;
+      }>(
+        'SELECT pause_state, pause_scope, epoch FROM tm_control WHERE id = 1' +
+          (db.dialect === 'postgres' ? ' FOR UPDATE' : '')
+      );
+      const row = control.rows[0];
+      // Assert the EXACT state this notice was authorized against, not merely
+      // "not RUNNING". A concurrent setPauseState to HARD_PAUSE, or a re-pause
+      // onto a different scope, does not increment the epoch, so epoch equality
+      // alone would let the notice escape a pause it was never authorized for.
+      if (
+        row?.pause_state !== fence.taskmasterPausedState ||
+        (row.pause_scope ?? null) !== (fence.taskmasterPausedScope ?? null) ||
+        Number(row.epoch) !== fence.taskmasterPausedEpoch
+      ) {
+        return null;
+      }
+      return createAuthenticatedMessageWithQuery(query, { bound, data });
+    };
+    return db.dialect === 'sqlite'
+      ? withOverseerControlPlaneImmediateTransaction(db, enqueue)
+      : db.withTransaction(enqueue);
+  }
   return createAuthenticatedMessageWithQuery((sql, params) => db.query(sql, params), {
     bound,
     data,
@@ -497,6 +565,56 @@ export async function listMessages(filters: {
   const result = await getDatabase().query<DispatchMessageRow>(
     `SELECT * FROM agent_dispatch_messages ${where} ${order} LIMIT $${params.length}`,
     params
+  );
+  return result.rows.map(normalizeMessage);
+}
+
+/**
+ * Escapes LIKE metacharacters so a caller-supplied prefix matches literally.
+ * Pairs with the `ESCAPE '\'` clause on every LIKE built from this helper.
+ */
+function escapeLikeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, character => `\\${character}`);
+}
+
+/**
+ * Messages whose correlation_id starts with `prefix` and that carry NO
+ * subject_key, newest-first.
+ *
+ * EXISTS FOR THE LEGACY-RECEIPT FALLBACK. subject_key was added to Overseer
+ * submit receipts in 2026-09; every receipt written before that is
+ * subject_key-less and therefore invisible to a subject_key query, even though
+ * it still carries a correlation_id that identifies its pull request.
+ *
+ * Filtering in SQL rather than paging `listMessages` is load-bearing, not an
+ * optimization: `listMessages` hard-caps `limit` at 500 and exposes no offset
+ * or cursor, so a client-side scan can neither see past the first page nor
+ * page beyond it. With ~2,700 queued operator rows in the live store
+ * (bdc-harness #761 backlog) a genuinely old receipt sits far outside that
+ * window -- exactly the receipt the fallback needs to find.
+ *
+ * `subject_key IS NULL` is part of the predicate on purpose: rows that DO have
+ * a subject_key are already reachable by the indexed query, so excluding them
+ * here keeps this strictly a legacy path and keeps the result set small.
+ */
+export async function listMessagesByCorrelationPrefixWithoutSubjectKey(filters: {
+  recipient: string;
+  correlationPrefix: string;
+  limit?: number;
+}): Promise<DispatchMessage[]> {
+  const limit = Math.max(1, Math.min(filters.limit ?? 200, 1000));
+  const result = await getDatabase().query<DispatchMessageRow>(
+    `SELECT * FROM agent_dispatch_messages
+     WHERE recipient = $1
+       AND subject_key IS NULL
+       AND correlation_id LIKE $2 ESCAPE '\\'
+     ORDER BY created_at DESC, id DESC
+     LIMIT $3`,
+    [
+      canonicalizePrincipal(filters.recipient),
+      `${escapeLikeLiteral(filters.correlationPrefix)}%`,
+      limit,
+    ]
   );
   return result.rows.map(normalizeMessage);
 }
