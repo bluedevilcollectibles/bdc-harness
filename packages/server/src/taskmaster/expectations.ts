@@ -43,11 +43,17 @@ export interface ExpectationDeps {
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters
   query?: <T>(sql: string, params?: unknown[]) => Promise<{ rows: readonly T[] }>;
   listDueExpectations?: typeof taskmasterDb.listDueExpectations;
-  markMet?: typeof taskmasterDb.markMet;
-  markFailed?: typeof taskmasterDb.markFailed;
+  /**
+   * The transition hooks report whether THIS caller won the conditional UPDATE.
+   * `undefined` is accepted so a double that does not model contention still
+   * compiles; only an explicit `false` is treated as a lost race, so an
+   * unmodelled double behaves as the sole writer it is.
+   */
+  markMet?: (id: string, evidencePointer: string) => Promise<boolean | undefined>;
+  markFailed?: (id: string) => Promise<boolean | undefined>;
   claimRedispatchAttempt?: typeof taskmasterDb.claimRedispatchAttempt;
-  markEscalated?: typeof taskmasterDb.markEscalated;
-  markGivenUp?: typeof taskmasterDb.markGivenUp;
+  markEscalated?: (id: string, evidencePointer?: string) => Promise<boolean | undefined>;
+  markGivenUp?: (id: string, reason: string) => Promise<boolean | undefined>;
   getMessage?: (id: string) => Promise<DispatchMessage | null>;
   createTask?: typeof createAuthenticatedMessage;
   checkEvidence?: (spec: EvidenceSpec) => Promise<EvidenceResult>;
@@ -205,11 +211,27 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       continue;
     }
     if (evidence.ok) {
-      await (deps.markMet ?? taskmasterDb.markMet)(expectation.id, evidence.pointer ?? 'verified');
+      const closed = await (deps.markMet ?? taskmasterDb.markMet)(
+        expectation.id,
+        evidence.pointer ?? 'verified'
+      );
+      // Evidence observed twice is not an error, but only one tick closes the
+      // row. The loser must not re-close it.
+      if (closed === false)
+        log.warn({ expectationId: expectation.id }, 'taskmaster.expectation_met_transition_lost');
       continue;
     }
     if (now.getTime() < Date.parse(expectation.due_at)) continue;
-    await (deps.markFailed ?? taskmasterDb.markFailed)(expectation.id);
+    // EVERY follow-on action below is gated on winning this transition. A tick
+    // that loses it is stale: another tick has already marked this expectation
+    // met, escalated or given up, and acting on a snapshot taken before that
+    // would regress a terminal state and fire an external action (a redispatch
+    // or an operator escalation) for work that is already closed.
+    const claimedFailure = await (deps.markFailed ?? taskmasterDb.markFailed)(expectation.id);
+    if (claimedFailure === false) {
+      log.warn({ expectationId: expectation.id }, 'taskmaster.expectation_failed_transition_lost');
+      continue;
+    }
     if (expectation.on_absence === 'give_up') {
       await (deps.markGivenUp ?? taskmasterDb.markGivenUp)(
         expectation.id,
@@ -248,19 +270,16 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         return key;
       };
 
-      // Recover the previous attempt first. If a crash landed between its claim
-      // and its send, this replays it under its own deterministic key; if it
-      // did send, the dispatch DAL returns the existing row and nothing new is
-      // created. Either way the retry budget is not spent twice.
-      if (expectation.retries > 0) await sendAttempt(expectation.retries);
-
       const dueAt = new Date(
         now.getTime() + (deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)
       ).toISOString();
-      // CLAIM BEFORE SEND. The counter advances atomically, bounded by
-      // max_retries, under a compare-and-set on the retry count this tick
-      // observed. An overlapping tick finds the counter already advanced, loses
-      // the claim, and must not send.
+      // CLAIM BEFORE ANY SEND. The counter advances atomically, bounded by
+      // max_retries, under a compare-and-set on BOTH the retry count and the
+      // active status this tick observed. An overlapping tick finds the counter
+      // already advanced -- or the row already closed as met -- loses the
+      // claim, and must not send. The claim precedes the recovery replay below
+      // for exactly that reason: a tick that has lost the race must not put a
+      // message on the wire at all, not even a replayed one.
       const attempt = await (deps.claimRedispatchAttempt ?? taskmasterDb.claimRedispatchAttempt)(
         expectation.id,
         expectation.retries,
@@ -273,6 +292,13 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         );
         continue;
       }
+
+      // Recover the previous attempt. If a crash landed between its claim and
+      // its send, this replays it under its own deterministic key; if it did
+      // send, the dispatch DAL returns the existing row and nothing new is
+      // created. Either way the retry budget is not spent twice.
+      if (expectation.retries > 0) await sendAttempt(expectation.retries);
+
       const key = await sendAttempt(attempt);
       log.warn(
         { expectationId: expectation.id, idempotencyKey: key, attempt },
@@ -291,10 +317,17 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         body: `Taskmaster expectation exhausted: ${JSON.stringify(expectation)}`,
       }
     );
-    await (deps.markEscalated ?? taskmasterDb.markEscalated)(
+    const escalated = await (deps.markEscalated ?? taskmasterDb.markEscalated)(
       expectation.id,
       `dispatch:${escalation.id}`
     );
+    if (escalated === false) {
+      log.warn(
+        { expectationId: expectation.id },
+        'taskmaster.expectation_escalated_transition_lost'
+      );
+      continue;
+    }
     log.error({ expectationId: expectation.id }, 'taskmaster.expectation_escalated');
   }
 }

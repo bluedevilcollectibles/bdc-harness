@@ -37,7 +37,7 @@ import {
   registerExpectation,
   listDueExpectations,
   markMet,
-  incrementRetry,
+  markFailed,
   claimRedispatchAttempt,
   markEscalated,
   markGivenUp,
@@ -81,8 +81,8 @@ describe('tm_expectations DAL', () => {
       on_absence: 'redispatch',
       max_retries: 2,
     });
-    await incrementRetry(id, new Date().toISOString());
-    await markEscalated(id, 'dispatch:escalation');
+    expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBe(1);
+    expect(await markEscalated(id, 'dispatch:escalation')).toBe(true);
     const row = await db.query<{ status: string; retries: number; evidence_pointer: string }>(
       'SELECT status, retries, evidence_pointer FROM tm_expectations WHERE id = $1',
       [id]
@@ -127,8 +127,8 @@ describe('tm_expectations DAL', () => {
       claimRedispatchAttempt(id, 0, dueAt),
       claimRedispatchAttempt(id, 0, dueAt),
     ]);
-    // Fails on the old behaviour: incrementRetry had no CAS, so both ticks
-    // advanced the counter and both sent.
+    // Fails on the old behaviour: the retry advance was an unconditional
+    // UPDATE ... WHERE id = $1, so both ticks advanced the counter and sent.
     expect([a, b].filter(value => value !== null)).toEqual([1]);
     const row = await db.query<{ retries: number }>(
       'SELECT retries FROM tm_expectations WHERE id = $1',
@@ -158,6 +158,109 @@ describe('tm_expectations DAL', () => {
     expect(row.rows[0]?.status).toBe('failed');
     // A tick that still believes retries=0 cannot re-claim attempt 1.
     expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBeNull();
+  });
+
+  test('two ticks race met vs failed: exactly one transition wins', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-race-met-failed',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    // Tick A verified the evidence; tick B saw the deadline pass. Both act on
+    // the same pending snapshot.
+    const [met, failed] = await Promise.all([markMet(id, 'https://example/proof'), markFailed(id)]);
+    // Fails on the old behaviour: both were blind UPDATE ... WHERE id = $1, so
+    // both "succeeded" and the later write silently won.
+    expect([met, failed].filter(Boolean)).toHaveLength(1);
+    const row = await db.query<{ status: string; evidence_pointer: string | null }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    // Whichever won, a terminal met must never be regressed to failed.
+    if (met) {
+      expect(row.rows[0]?.status).toBe('met');
+      expect(row.rows[0]?.evidence_pointer).toBe('https://example/proof');
+    } else {
+      expect(row.rows[0]?.status).toBe('failed');
+    }
+  });
+
+  test('a terminal met is never regressed by a stale worker', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-no-regress',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await markMet(id, 'https://example/proof')).toBe(true);
+    // Every other transition a stale tick could attempt must now be refused.
+    expect(await markFailed(id)).toBe(false);
+    expect(await markEscalated(id, 'dispatch:late')).toBe(false);
+    expect(await markGivenUp(id, 'late')).toBe(false);
+    expect(await markMet(id, 'https://example/second-observer')).toBe(false);
+    const row = await db.query<{ status: string; evidence_pointer: string | null }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('met');
+    expect(row.rows[0]?.evidence_pointer).toBe('https://example/proof');
+  });
+
+  test('two ticks race claim vs met: a verified expectation is never redispatched', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-race-claim-met',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    const [met, claimed] = await Promise.all([
+      markMet(id, 'https://example/proof'),
+      claimRedispatchAttempt(id, 0, new Date().toISOString()),
+    ]);
+    // Exactly one wins. The retry-counter CAS alone did NOT prevent this --
+    // the active-status predicate on the claim is what closes it.
+    expect([met, claimed !== null].filter(Boolean)).toHaveLength(1);
+    const row = await db.query<{ status: string; retries: number }>(
+      'SELECT status, retries FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    if (met) {
+      expect(claimed).toBeNull();
+      expect(row.rows[0]?.status).toBe('met');
+      expect(Number(row.rows[0]?.retries)).toBe(0);
+    } else {
+      expect(claimed).toBe(1);
+      expect(row.rows[0]?.status).toBe('failed');
+    }
+  });
+
+  test('a claim against an already-met expectation is refused outright', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-claim-after-met',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await markMet(id, 'https://example/proof')).toBe(true);
+    // The retry count is still 0 and under the cap, so the pre-repair CAS --
+    // which checked only retries -- would have claimed and redispatched work
+    // that had already succeeded.
+    expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBeNull();
+    const row = await db.query<{ status: string; retries: number }>(
+      'SELECT status, retries FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('met');
+    expect(Number(row.rows[0]?.retries)).toBe(0);
   });
 
   test('the claim refuses to exceed max_retries', async () => {

@@ -180,40 +180,86 @@ export async function listDueExpectations(_now: string): Promise<TmExpectation[]
   return result.rows.map(normalizeExpectation);
 }
 
-async function updateExpectation(
+/**
+ * The only statuses an expectation can be transitioned OUT of.
+ *
+ * `met`, `escalated` and `given_up` are TERMINAL: once a tick has closed an
+ * expectation, no other tick may reopen or overwrite it. Every transition below
+ * names this set (or a narrower one) in its WHERE clause, so a stale worker
+ * cannot regress a closed row -- and, because each returns rowCount, cannot
+ * silently proceed to the external action that transition was gating either.
+ */
+const ACTIVE_EXPECTATION_STATUSES = ['pending', 'failed'] as const;
+
+/**
+ * Conditional state transition. The prior status is named in the WHERE clause
+ * and the affected-row count IS the answer: true means this caller owns the
+ * transition, false means another tick got there first and the caller must not
+ * perform whatever external action the transition was gating.
+ *
+ * A plain `UPDATE ... WHERE id = $1` (the pre-repair shape) let two overlapping
+ * ticks stamp conflicting statuses onto the same row -- one verifying evidence
+ * and marking it met, the other stamping failed over the top and redispatching
+ * work that had already succeeded.
+ */
+async function transitionExpectation(
   id: string,
   status: TmExpectationStatus,
+  fromStatuses: readonly TmExpectationStatus[],
   evidencePointer?: string | null
-): Promise<void> {
-  await getDatabase().query(
-    'UPDATE tm_expectations SET status = $1, evidence_pointer = $2, updated_at = $3 WHERE id = $4',
-    [status, evidencePointer ?? null, new Date().toISOString(), id]
+): Promise<boolean> {
+  const placeholders = fromStatuses.map((_, index) => `$${String(index + 4)}`).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET status = $1, evidence_pointer = $2, updated_at = $3
+      WHERE id = $${String(fromStatuses.length + 4)}
+        AND status IN (${placeholders})`,
+    [status, evidencePointer ?? null, new Date().toISOString(), ...fromStatuses, id]
   );
+  return result.rowCount === 1;
 }
 
-export async function markMet(id: string, evidencePointer: string): Promise<void> {
-  await updateExpectation(id, 'met', evidencePointer);
+/**
+ * Close an expectation as met. Returns false when another tick already closed
+ * it -- evidence arriving twice is not an error, but the second observer must
+ * not re-close the row.
+ */
+export async function markMet(id: string, evidencePointer: string): Promise<boolean> {
+  return transitionExpectation(id, 'met', ACTIVE_EXPECTATION_STATUSES, evidencePointer);
 }
-export async function markFailed(id: string): Promise<void> {
-  await updateExpectation(id, 'failed');
+
+/**
+ * Record that the deadline passed with no evidence. Conditioned on the row
+ * still being active, so a concurrent tick that has already marked it met (or
+ * escalated it, or given up on it) cannot be overwritten with `failed`.
+ * Returns false when the row was already closed; the caller MUST then skip the
+ * redispatch/escalate work that follows.
+ */
+export async function markFailed(id: string): Promise<boolean> {
+  return transitionExpectation(id, 'failed', ACTIVE_EXPECTATION_STATUSES);
 }
-export async function incrementRetry(id: string, dueAt: string): Promise<void> {
-  await getDatabase().query(
-    "UPDATE tm_expectations SET status = 'failed', retries = retries + 1, due_at = $1, updated_at = $2 WHERE id = $3",
-    [dueAt, new Date().toISOString(), id]
-  );
-}
+
+// NOTE: there is deliberately no unconditional incrementRetry(). It existed
+// until this repair and was exactly the unsafe primitive the review flagged --
+// a blind `WHERE id = $1` that let a stale tick advance the counter on a row
+// another tick had already closed. claimRedispatchAttempt() is the only way to
+// advance retries, and it is a compare-and-set. Do not reintroduce a
+// non-conditional variant.
 
 /**
  * Atomically CLAIM the next redispatch attempt (WO review finding: redispatch
  * was neither atomic nor idempotent).
  *
- * The counter is advanced BEFORE the send, under a compare-and-set on the
- * retry count the caller observed, and bounded by max_retries in the same
- * statement. Consequences the caller relies on:
+ * The counter is advanced BEFORE the send, under a compare-and-set on BOTH the
+ * retry count and the active status the caller observed, and bounded by
+ * max_retries in the same statement. Consequences the caller relies on:
  *
  *  - Two overlapping ticks: only one UPDATE matches `retries = $expected`;
  *    the loser gets null and MUST NOT send. No double-dispatch.
+ *  - A tick that raced a successful verification: the row is already `met`, so
+ *    it is no longer in the active set, no row matches, and no redispatch is
+ *    sent for work that has already succeeded. The retry-counter CAS alone did
+ *    NOT prevent this -- the status predicate is what closes it.
  *  - A crash after the claim and before the send: the count is already
  *    advanced, so the budget can never be exceeded and the count is never
  *    lost. The caller replays the attempt under its deterministic
@@ -241,19 +287,36 @@ export async function claimRedispatchAttempt(
   // two writers and the loser's `retries = $expected` predicate no longer
   // matches; on the single-connection sqlite adapter the statement is atomic by
   // construction. rowCount is 1 for the winner and 0 for everyone else.
+  const activePlaceholders = ACTIVE_EXPECTATION_STATUSES.map(
+    (_, index) => `$${String(index + 5)}`
+  ).join(', ');
   const result = await getDatabase().query(
     `UPDATE tm_expectations
         SET status = 'failed', retries = retries + 1, due_at = $1, updated_at = $2
-      WHERE id = $3 AND retries = $4 AND retries < max_retries`,
-    [dueAt, new Date().toISOString(), id, expectedRetries]
+      WHERE id = $3
+        AND retries = $4
+        AND retries < max_retries
+        AND status IN (${activePlaceholders})`,
+    [dueAt, new Date().toISOString(), id, expectedRetries, ...ACTIVE_EXPECTATION_STATUSES]
   );
   return result.rowCount === 1 ? expectedRetries + 1 : null;
 }
-export async function markEscalated(id: string, evidencePointer?: string): Promise<void> {
-  await updateExpectation(id, 'escalated', evidencePointer);
+/**
+ * Close an expectation as escalated to a human. Conditioned on the row still
+ * being active so a tick cannot escalate an expectation another tick has
+ * already verified as met. Returns false when the row was already closed.
+ */
+export async function markEscalated(id: string, evidencePointer?: string): Promise<boolean> {
+  return transitionExpectation(id, 'escalated', ACTIVE_EXPECTATION_STATUSES, evidencePointer);
 }
-export async function markGivenUp(id: string, reason: string): Promise<void> {
-  await updateExpectation(id, 'given_up', reason);
+
+/**
+ * Close an expectation as abandoned, with the reason as the pointer.
+ * Conditioned on the row still being active for the same reason as
+ * markEscalated. Returns false when the row was already closed.
+ */
+export async function markGivenUp(id: string, reason: string): Promise<boolean> {
+  return transitionExpectation(id, 'given_up', ACTIVE_EXPECTATION_STATUSES, reason);
 }
 
 export async function getExpectationCounts(): Promise<Record<TmExpectationStatus, number>> {

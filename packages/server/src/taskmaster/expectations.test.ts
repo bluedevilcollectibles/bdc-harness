@@ -325,6 +325,84 @@ describe('expectation supervisor', () => {
     expect(retries).toBe(1);
   });
 
+  test('losing the failed transition skips the redispatch entirely', async () => {
+    const keys: string[] = [];
+    const claims: number[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [base],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      // Another tick already closed this row as met between the snapshot and
+      // now, so the conditional UPDATE matches nothing.
+      markFailed: async () => false,
+      claimRedispatchAttempt: async () => {
+        claims.push(1);
+        return 1;
+      },
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    } as never);
+    // Fails on the old behaviour: markFailed returned void, its result was
+    // ignored, and the tick redispatched work that had already succeeded.
+    expect(keys).toEqual([]);
+    expect(claims).toEqual([]);
+  });
+
+  test('losing the failed transition skips the escalation too', async () => {
+    const keys: string[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [{ ...base, on_absence: 'escalate', max_retries: 0 }],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => false,
+      markEscalated: async () => true,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    } as never);
+    // No operator blocker for an expectation another tick already verified.
+    expect(keys).toEqual([]);
+  });
+
+  test('losing the met transition does not throw or double-close', async () => {
+    const closes: string[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [base],
+      checkEvidence: async () => ({ ok: true, pointer: 'https://example/proof' }),
+      markMet: async (_id: string, pointer: string) => {
+        closes.push(pointer);
+        return false;
+      },
+      retryDelayMs: 0,
+    } as never);
+    expect(closes).toEqual(['https://example/proof']);
+  });
+
+  test('a stale tick that loses the claim sends nothing, not even a replay', async () => {
+    const keys: string[] = [];
+    await checkExpectations(new Date(), {
+      // retries=1 means the recovery replay would fire if the claim were not
+      // checked first.
+      listDueExpectations: async () => [{ ...base, retries: 1 }],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      claimRedispatchAttempt: async () => null,
+      retryDelayMs: 0,
+    } as never);
+    // The claim is checked BEFORE the replay, so a tick that lost the race puts
+    // no message on the wire at all.
+    expect(keys).toEqual([]);
+  });
+
   test('a crash between the claim and the send is recovered under the same key', async () => {
     const keys: string[] = [];
     // The prior tick claimed attempt 1 and died before sending: retries=1 is
