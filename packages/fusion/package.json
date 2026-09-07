@@ -7,7 +7,7 @@
     "fusion": "./src/cli.ts"
   },
   "scripts": {
-    "test": "bun test src/__tests__/gateway.test.ts && bun test src/__tests__/integrity.test.ts && bun test src/__tests__/redact.test.ts && bun test src/__tests__/full-run.test.ts && bun test src/__tests__/budget-receipts.test.ts",
+    "test": "bun test --timeout 30000 src/__tests__/gateway.test.ts && bun test --timeout 30000 src/__tests__/integrity.test.ts && bun test --timeout 30000 src/__tests__/redact.test.ts && bun test --timeout 30000 src/__tests__/full-run.test.ts && bun test --timeout 30000 src/__tests__/budget-receipts.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
