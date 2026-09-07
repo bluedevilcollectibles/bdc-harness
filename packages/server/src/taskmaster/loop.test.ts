@@ -19,6 +19,7 @@ import {
   resolveRecipient,
   MAX_EFFECTS_PER_TICK,
   OWNER_RECIPIENT_MAP,
+  isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
   type TaskmasterDeps,
   type ListedThread,
@@ -37,6 +38,145 @@ import type {
   TmJournalEntry,
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
+
+describe('Taskmaster reset visibility and canary', () => {
+  test('only the two WO-authorized monitoring signals escape an effects pause', () => {
+    expect(isPauseEffectsExempt('canary', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('digest', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('escalate_p0', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('nudge', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('fire_cauldron', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('deliver_ruling', 'effects')).toBe(false);
+  });
+
+  test('paused daily canary reaches duty-officer once and carries reset guidance', async () => {
+    const world = makeWorld();
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.control.pause_reason = 'operator safety pause';
+    const deps = makeDeps(world);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    await tick(state, deps);
+
+    const canaries = world.sentMessages.filter(m => m.idempotency_key === `tm:digest:${TODAY_KEY}`);
+    expect(canaries).toHaveLength(1);
+    expect(canaries[0]?.recipient).toBe('duty-officer');
+    expect(canaries[0]?.body).toContain('operator safety pause');
+    expect(canaries[0]?.body).toContain('scripts/taskmaster/reset.sh');
+  });
+
+  test('healthy quiet day still sends a daily canary', async () => {
+    const world = makeWorld();
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.sentMessages).toHaveLength(1);
+    expect(world.sentMessages[0]?.recipient).toBe('duty-officer');
+    expect(world.sentMessages[0]?.body).toContain('no proposals today');
+  });
+
+  test('reset audit does not inflate a quiet daily canary outcome count', async () => {
+    const world = makeWorld();
+    world.journal.push({
+      id: 'reset-audit',
+      created_at: new Date(world.nowMs).toISOString(),
+      thread_ref: 'taskmaster:reset',
+      action_type: 'digest',
+      proposal_json: JSON.stringify({ audit_type: 'taskmaster_reset' }),
+      idempotency_key: null,
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.sentMessages).toHaveLength(1);
+    expect(world.sentMessages[0]?.body).toContain('sent=0, parked=0, rejected=0');
+    expect(world.sentMessages[0]?.body).toContain('no proposals today');
+  });
+
+  test('post-resume noise pauses and sends the Duty Officer reset notice', async () => {
+    const world = makeWorld();
+    for (let i = 0; i < 20; i += 1) {
+      world.journal.push({
+        id: `noise-${i}`,
+        created_at: new Date(T0 + i + 1).toISOString(),
+        thread_ref: `gh:test/repo#${i}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: `noise-${i}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: new Date(T0 + i + 1).toISOString(),
+        grade: 'noise',
+      });
+    }
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.control.pause_state).toBe('PAUSED');
+    const notice = world.sentMessages.find(m => m.idempotency_key.startsWith('tm:self-pause:'));
+    expect(notice?.recipient).toBe('duty-officer');
+    expect(notice?.body).toContain('scripts/taskmaster/reset.sh');
+    expect(notice?.body).toContain('M-155 useful-rate floor auto-pause');
+  });
+
+  test.each(['epoch', 'pause state', 'enqueue'] as const)(
+    'a changed control %s prevents a stale self-pause notice',
+    async change => {
+      const world = makeWorld();
+      for (let i = 0; i < 20; i += 1) {
+        world.journal.push({
+          id: `noise-fenced-${i}`,
+          created_at: new Date(T0 + i + 1).toISOString(),
+          thread_ref: `gh:test/repo#${i}`,
+          action_type: 'nudge',
+          proposal_json: '{}',
+          idempotency_key: `noise-fenced-${i}`,
+          before_hash: null,
+          proof_predicate: null,
+          proof_deadline_at: null,
+          outcome: 'sent',
+          graded_at: new Date(T0 + i + 1).toISOString(),
+          grade: 'noise',
+        });
+      }
+      const deps = makeDeps(world);
+      const originalSetPauseState = deps.db!.setPauseState;
+      if (change === 'enqueue') {
+        const originalCreate = deps.createTask!;
+        deps.createTask = (async (context, data, fence) => {
+          if (data.idempotency_key.startsWith('tm:self-pause:')) {
+            world.control = {
+              ...world.control,
+              pause_state: 'RUNNING',
+              epoch: world.control.epoch + 1,
+            };
+          }
+          return fence ? originalCreate(context, data, fence) : originalCreate(context, data);
+        }) as TaskmasterDeps['createTask'];
+      } else
+        deps.db!.setPauseState = async data => {
+          const paused = await originalSetPauseState(data);
+          const snapshot = { ...paused };
+          world.control =
+            change === 'epoch'
+              ? { ...paused, epoch: paused.epoch + 1 }
+              : { ...paused, pause_state: 'RUNNING' };
+          return snapshot;
+        };
+      await tick(createTaskmasterState(60_000), deps);
+      expect(
+        world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:self-pause:'))
+      ).toHaveLength(0);
+    }
+  );
+});
 
 const T0 = Date.parse('2026-08-07T12:00:00.000Z');
 const TODAY_KEY = new Date(T0).toISOString().slice(0, 10);
@@ -218,8 +358,24 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     headroom: async () => okHeadroom,
     createTask: (async (
       _context: unknown,
-      data: { idempotency_key: string; recipient: string; body: string }
+      data: { idempotency_key: string; recipient: string; body: string },
+      fence?: {
+        taskmasterPausedEpoch: number;
+        taskmasterPausedState?: string;
+        taskmasterPausedScope?: string | null;
+      }
     ) => {
+      // Fake the Dispatch boundary; its real SQLite/PG transaction has DAL
+      // tests. Mirror the real fence exactly: the notice is refused unless the
+      // live control row still matches the authorized state, scope and epoch.
+      if (
+        fence &&
+        (world.control.pause_state !== fence.taskmasterPausedState ||
+          (world.control.pause_scope ?? null) !== (fence.taskmasterPausedScope ?? null) ||
+          world.control.epoch !== fence.taskmasterPausedEpoch)
+      ) {
+        return null;
+      }
       world.sentMessages.push({
         idempotency_key: data.idempotency_key,
         recipient: data.recipient,

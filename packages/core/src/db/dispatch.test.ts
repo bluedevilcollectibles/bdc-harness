@@ -37,6 +37,7 @@ import {
   heartbeatWorker,
   listEligibleXoEscalations,
   listMessages,
+  listMessagesByCorrelationPrefixWithoutSubjectKey,
   listUnroutableQueuedMessages,
   listWorkers,
   postResult,
@@ -2212,6 +2213,107 @@ describe('dispatch db', () => {
       now: new Date().toISOString(),
     });
     expect(claimedAuth?.id).toBe(authed.id);
+  });
+  /**
+   * listMessagesByCorrelationPrefixWithoutSubjectKey exists for the Overseer
+   * legacy-receipt fallback (PR #772). subject_key was added to submit
+   * receipts in 2026-09; receipts written before that carry only a
+   * correlation_id, and `listMessages` cannot reach them -- it caps limit at
+   * 500 and exposes no offset, while the live store holds thousands of
+   * operator rows.
+   */
+  describe('listMessagesByCorrelationPrefixWithoutSubjectKey', () => {
+    async function legacyReceipt(id: string, correlationId: string): Promise<string> {
+      const message = await createMessage({
+        correlation_id: correlationId,
+        idempotency_key: `idem-${id}`,
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: `legacy receipt ${id}`,
+      });
+      return message.id;
+    }
+
+    test('returns only subject_key-less rows matching the prefix, newest-first', async () => {
+      const first = await legacyReceipt('a', 'pr-review:thinmansoftware/bdc-harness#800@aaa');
+      const second = await legacyReceipt('b', 'pr-review:thinmansoftware/bdc-harness#800@bbb');
+      // Same prefix but already indexed by subject_key: the indexed query
+      // reaches it, so the legacy path must not also return it.
+      await createMessage({
+        correlation_id: 'pr-review:thinmansoftware/bdc-harness#800@ccc',
+        idempotency_key: 'idem-c',
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: 'indexed receipt',
+        subject_key: 'gh:thinmansoftware/bdc-harness#800',
+      });
+      // A PR whose number merely STARTS with 800, and a different repo.
+      await legacyReceipt('d', 'pr-review:thinmansoftware/bdc-harness#8001@ddd');
+      await legacyReceipt('e', 'pr-review:thinmansoftware/shopops#800@eee');
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#800@',
+      });
+
+      expect(found.map(message => message.id)).toEqual([second, first]);
+    });
+
+    test('reaches a row far beyond the listMessages page cap', async () => {
+      // listMessages caps limit at 500 and has no offset, so a client-side
+      // scan cannot see this row. The SQL predicate can.
+      for (let index = 0; index < 520; index += 1) {
+        await createMessage({
+          correlation_id: `unrelated:${index}`,
+          idempotency_key: `idem-noise-${index}`,
+          task_type: 'run_report',
+          sender: 'overseer',
+          recipient: 'operator',
+          body: `noise ${index}`,
+        });
+      }
+      const buried = await legacyReceipt('buried', 'pr-review:thinmansoftware/bdc-harness#761@aaa');
+
+      const page = await listMessages({ recipient: 'operator', limit: 500 });
+      expect(page.length).toBe(500);
+      expect(page.some(message => message.id === buried)).toBe(false);
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#761@',
+      });
+      expect(found.map(message => message.id)).toEqual([buried]);
+    });
+
+    test('treats LIKE metacharacters in the prefix as literals', async () => {
+      // '_' is a single-character LIKE wildcard and '%' matches anything.
+      // Unescaped, a prefix for repo 'a_c' would also match repo 'abc' and
+      // leak a foreign PR verdict into the re-review decision.
+      await legacyReceipt('decoy', 'pr-review:thinmansoftware/abc#1@aaa');
+      expect(
+        await listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: 'operator',
+          correlationPrefix: 'pr-review:thinmansoftware/a_c#1@',
+        })
+      ).toHaveLength(0);
+      expect(
+        await listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: 'operator',
+          correlationPrefix: '%',
+        })
+      ).toHaveLength(0);
+    });
+
+    test('is scoped to the requested recipient', async () => {
+      await legacyReceipt('operator-row', 'pr-review:thinmansoftware/bdc-harness#900@aaa');
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'grok',
+        correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#900@',
+      });
+      expect(found).toHaveLength(0);
+    });
   });
 });
 
