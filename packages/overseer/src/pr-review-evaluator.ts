@@ -1,7 +1,27 @@
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
+import { classifyRateLimitError, type RateLimitClassification } from './github-rate-limit';
 
-export type PrReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES' | 'INDETERMINATE' | 'CHECKS_PENDING';
+/**
+ * RATE_LIMITED (#782 part 2) is NON-TERMINAL and NON-JUDGING: the GitHub client
+ * exhausted its rate budget mid-review, so no evidence could be read and no
+ * verdict formed. It is distinct from INDETERMINATE (terminal -- the reviewer
+ * looked and could not decide) and from CHECKS_PENDING (CI is still running).
+ *
+ * The distinction is the bug: a rate limit used to fall into the generic
+ * evidence-error branch and become INDETERMINATE, a TERMINAL non-approving
+ * verdict that retired the review and left the PR's stale verdict standing
+ * forever. Observed live 2026-09-07 on bdc-harness #776 @c3935e09 (two
+ * INDETERMINATE verdicts, the second during a per-user rate-limit exhaustion).
+ * A rate limit is "come back at T", so it carries a retry instant and the work
+ * item re-enters the queue then.
+ */
+export type PrReviewVerdict =
+  | 'APPROVE'
+  | 'REQUEST_CHANGES'
+  | 'INDETERMINATE'
+  | 'CHECKS_PENDING'
+  | 'RATE_LIMITED';
 
 export interface PrReviewInput {
   owner: string;
@@ -24,6 +44,16 @@ export interface PrReviewResult {
   reviewer: ReviewAgentIdentity;
   acceptance_criteria_available: boolean;
   error?: string;
+  /**
+   * Set only on RATE_LIMITED. Absolute instant (ISO-8601) the GitHub budget is
+   * expected to have refilled, taken from the response's `retry-after` or
+   * `x-ratelimit-reset` header. The worker uses it verbatim as the work item's
+   * `not_before`, so the review resumes exactly when it can succeed rather than
+   * spinning against a limit that is still exhausted (#774).
+   */
+  retry_after?: string;
+  /** Milliseconds until `retry_after`, for callers that prefer a duration. */
+  retry_after_ms?: number;
 }
 
 export interface PrReviewModelResult {
@@ -213,6 +243,33 @@ export function checksAreTerminal(
   return checks.length > 0 && allReportedCompleted;
 }
 
+/**
+ * Build the non-terminal RATE_LIMITED result.
+ *
+ * `findings` is empty and `approved` is never derived from this verdict: a rate
+ * limit says nothing about the code. The submit path must not collapse it into
+ * `approved: false`, which would post REQUEST_CHANGES on rate-limit grounds --
+ * the same class of bug as the CHECKS_PENDING collapse this codebase already
+ * fixed.
+ */
+function rateLimited(
+  input: PrReviewInput,
+  deps: PrReviewDeps,
+  classification: RateLimitClassification,
+  stage: string
+): PrReviewResult {
+  return {
+    verdict: 'RATE_LIMITED',
+    findings: [],
+    reviewed_head_sha: input.head_sha,
+    reviewer: deps.reviewer,
+    acceptance_criteria_available: false,
+    error: `rate_limited:${stage}:${classification.kind}:${classification.source}`,
+    retry_after: classification.retryAfter,
+    retry_after_ms: classification.retryAfterMs,
+  };
+}
+
 function checksPending(input: PrReviewInput, deps: PrReviewDeps): PrReviewResult {
   return {
     verdict: 'CHECKS_PENDING',
@@ -236,6 +293,15 @@ export async function evaluatePullRequest(
   try {
     evidence = await deps.fetchEvidence(input);
   } catch (error) {
+    // RATE LIMIT IS A DEFERRAL, NOT A VERDICT (#782 part 2). Checked BEFORE the
+    // generic evidence-error branch: a 403/429 carrying rate-limit headers used
+    // to fall through to INDETERMINATE, which is TERMINAL -- the review was
+    // retired and the PR kept whatever stale verdict it had, with nothing ever
+    // retrying (#776 @c3935e09, 2026-09-07). An unrecognized error still maps to
+    // INDETERMINATE, so a genuine permission failure cannot become an endless
+    // deferral loop (#774).
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimited(input, deps, rateLimit, 'fetch_evidence');
     return indeterminate(input, deps, false, `evidence_error:${errorMessage(error)}`);
   }
 
@@ -295,6 +361,12 @@ export async function evaluatePullRequest(
         acceptance_criteria_available: acceptanceCriteriaAvailable,
       };
     } catch (error) {
+      // A rate limit raised by the model seam (the judge CLIs read GitHub too)
+      // is the same deferral, and must abandon the ladder immediately: walking
+      // to the next binary would spend more of a budget that is already
+      // exhausted and end at INDETERMINATE anyway.
+      const rateLimit = classifyRateLimitError(error);
+      if (rateLimit) return rateLimited(input, deps, rateLimit, `invoke_model:${binary}`);
       lastError = `model_error:${errorMessage(error)}`;
     }
   }

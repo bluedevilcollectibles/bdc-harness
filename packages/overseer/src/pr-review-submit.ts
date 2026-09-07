@@ -22,6 +22,7 @@ import type {
   SubmitPullRequestReviewResult,
 } from './adapters/github-real-deps.ts';
 import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
+import { classifyRateLimitError } from './github-rate-limit';
 import { resolveMergeManagerMode } from './merge-manager';
 
 /** What the governed reviewer returns. */
@@ -40,6 +41,19 @@ export interface ReviewerVerdict {
    * fixes). The worker releases and retries the item on a later tick.
    */
   checksPending?: boolean;
+  /**
+   * True when the GitHub client exhausted its rate budget mid-review, so no
+   * evidence could be read and no verdict formed (#782 part 2). NON-TERMINAL,
+   * exactly like `checksPending`: the item is released with a backoff and
+   * retried. It must never collapse into `approved: false` (REQUEST_CHANGES on
+   * rate-limit grounds) nor into a terminal reviewer_failed, which is what
+   * retired the review on #776 @c3935e09 on 2026-09-07.
+   */
+  rateLimited?: boolean;
+  /** Absolute instant (ISO-8601) the budget refills; from the reset header. */
+  retryAfter?: string;
+  /** Milliseconds until `retryAfter`. */
+  retryAfterMs?: number;
 }
 
 export interface ReviewWorkItem {
@@ -61,12 +75,24 @@ export type SubmitDisposition =
   | 'stale_head'
   | 'reviewer_failed'
   | 'submission_failed'
-  | 'checks_pending';
+  | 'checks_pending'
+  /**
+   * NON-TERMINAL (#782 part 2). The GitHub rate budget was exhausted mid-review.
+   * Released with a backoff derived from the reset header and retried, exactly
+   * like `checks_pending` -- never terminal, because terminating here retires a
+   * review that was never actually performed and leaves the PR's stale verdict
+   * standing with nothing to clear it.
+   */
+  | 'rate_limited';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
   reason?: string;
   event?: OverseerReviewEvent;
+  /** Set only on `rate_limited`: when the item should become claimable again. */
+  retryAfter?: string;
+  /** Set only on `rate_limited`: milliseconds until `retryAfter`. */
+  retryAfterMs?: number;
 }
 
 export interface SubmitDeps {
@@ -158,9 +184,35 @@ export async function runAndSubmitReview(
   try {
     verdict = await deps.runReviewer(work);
   } catch (error) {
+    // A rate limit thrown out of the reviewer seam is a deferral, not a failure
+    // (#782 part 2). Classified BEFORE `reviewer_failed`, which is terminal and
+    // would retire a review that never ran.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'rate_limited',
+        reason: `rate_limited:reviewer_threw:${rateLimit.kind}:${rateLimit.source}`,
+        retryAfter: rateLimit.retryAfter,
+        retryAfterMs: rateLimit.retryAfterMs,
+      });
+    }
     return finish(deps, work, work.headSha, {
       disposition: 'reviewer_failed',
       reason: `reviewer_error:${errorCode(error)}`,
+    });
+  }
+
+  // RATE LIMITED: no evidence was read and no verdict formed. Submit nothing;
+  // the worker releases the claim with the reset-derived backoff so the review
+  // resumes when the budget refills. Checked BEFORE the exact-head gates on
+  // purpose: nothing was evaluated, so there is no reviewed head to compare and
+  // a stale-head classification here would be false.
+  if (verdict.rateLimited) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'rate_limited',
+      reason: 'github_rate_limited',
+      ...(verdict.retryAfter ? { retryAfter: verdict.retryAfter } : {}),
+      ...(typeof verdict.retryAfterMs === 'number' ? { retryAfterMs: verdict.retryAfterMs } : {}),
     });
   }
 
@@ -278,5 +330,7 @@ async function finish(
   } catch {
     // Receipt failure never converts a classified outcome into a throw.
   }
+  // The retry instant is part of the outcome, not the receipt: the worker reads
+  // it off the return value to schedule the deferral.
   return outcome;
 }

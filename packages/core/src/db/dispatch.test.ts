@@ -42,6 +42,8 @@ import {
   postResult,
   reconcileDispatchOutcomeNotices,
   registerWorker,
+  deferMessage,
+  listMessagesByCorrelationId,
   releaseDispatchEscalationClaim,
   releaseMessage,
   renewMessageLease,
@@ -1402,6 +1404,114 @@ describe('dispatch db', () => {
     const reclaim = await claimMessage({ id: message.id, worker_id: 'worker-b' });
     expect(reclaim?.status).toBe('claimed');
     expect(reclaim?.fencing_token).toBe(2);
+  });
+
+  // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Test 3 (fenced dispatch
+  // deferral), asserted through the WO's own function name.
+  test('deferMessage requeues with a future clock, preserves the exact-head body, refuses a stale fence, and bumps only on the next claim', async () => {
+    await registerWorker({
+      worker_id: 'worker-a',
+      host: 'host-a',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    await registerWorker({
+      worker_id: 'worker-b',
+      host: 'host-b',
+      capabilities: { providers: ['grok'] },
+      max_concurrency: 1,
+    });
+    const body = JSON.stringify({ owner: 'thinmansoftware', repo: 'bdc-harness', headSha: 'abc' });
+    const message = await createMessage({
+      correlation_id: 'corr-defer',
+      idempotency_key: 'idem-defer',
+      task_type: 'agent_message',
+      sender: 'xo',
+      recipient: 'grok',
+      body,
+    });
+
+    const claim = await claimMessage({ id: message.id, worker_id: 'worker-a' });
+    expect(claim?.fencing_token).toBe(1);
+
+    // A stale worker/fence combination cannot defer the row.
+    expect(
+      await deferMessage({
+        id: message.id,
+        worker_id: 'worker-b',
+        fencing_token: 1,
+        defer_until: new Date(Date.now() + 60_000).toISOString(),
+      })
+    ).toBeNull();
+    expect(
+      await deferMessage({
+        id: message.id,
+        worker_id: 'worker-a',
+        fencing_token: 99,
+        defer_until: new Date(Date.now() + 60_000).toISOString(),
+      })
+    ).toBeNull();
+
+    const deferUntil = new Date(Date.now() + 60_000).toISOString();
+    const deferred = await deferMessage({
+      id: message.id,
+      worker_id: 'worker-a',
+      fencing_token: claim?.fencing_token ?? 0,
+      defer_until: deferUntil,
+    });
+    expect(deferred?.status).toBe('queued');
+    expect(deferred?.not_before).toBe(deferUntil);
+    expect(deferred?.lease_owner).toBeNull();
+    expect(deferred?.completed_at).toBeNull();
+    expect(deferred?.task_outcome).toBeNull();
+    // The exact-head body and identity survive the deferral untouched.
+    expect(deferred?.body).toBe(body);
+    expect(deferred?.idempotency_key).toBe('idem-defer');
+    // The fence is bumped by the NEXT claim, not by the deferral.
+    expect(deferred?.fencing_token).toBe(1);
+
+    // Not reclaimable before the clock, and invisible to the queued listing.
+    expect(await claimMessage({ id: message.id, worker_id: 'worker-b' })).toBeNull();
+    const queued = await listMessages({ recipient: 'grok', status: 'queued' });
+    expect(queued.some(item => item.id === message.id)).toBe(false);
+  });
+
+  // bdc-harness #782: the recheck ingest reads the standing verdict by the
+  // exact head-bound correlation id, because those receipts carry no
+  // subject_key on this lineage and sit far outside any listMessages page.
+  test('listMessagesByCorrelationId returns only the exact correlation, newest first', async () => {
+    const wanted = 'pr-review:thinmansoftware/bdc-harness#777@5ac93b76';
+    await createMessage({
+      correlation_id: wanted,
+      idempotency_key: 'idem-corr-1',
+      task_type: 'run_report',
+      sender: 'xo',
+      recipient: 'operator',
+      body: JSON.stringify({ kind: 'pr_review_submit_receipt', disposition: 'changes_requested' }),
+    });
+    await createMessage({
+      correlation_id: `${wanted}-other`,
+      idempotency_key: 'idem-corr-2',
+      task_type: 'run_report',
+      sender: 'xo',
+      recipient: 'operator',
+      body: 'unrelated',
+    });
+
+    const rows = await listMessagesByCorrelationId({
+      correlationId: wanted,
+      recipient: 'operator',
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.correlation_id).toBe(wanted);
+
+    // A prefix is not a match: the head is part of the identity.
+    expect(
+      await listMessagesByCorrelationId({
+        correlationId: 'pr-review:thinmansoftware/bdc-harness#777@',
+        recipient: 'operator',
+      })
+    ).toHaveLength(0);
   });
 
   test('releaseMessage with a future not_before defers reclaim and queued visibility', async () => {

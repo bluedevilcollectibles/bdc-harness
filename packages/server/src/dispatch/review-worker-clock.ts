@@ -1,5 +1,6 @@
 import {
   claimMessage,
+  deferMessage,
   heartbeatWorker,
   listMessages,
   postResult,
@@ -7,6 +8,11 @@ import {
   releaseMessage,
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
+import {
+  createRealStaleVerdictSweepDeps,
+  resolveStaleSweepMax,
+  runStaleVerdictSweep,
+} from './stale-verdict-sweep-wiring';
 import { createLogger } from '@archon/paths';
 import {
   createRealSubmitDeps,
@@ -40,8 +46,20 @@ export interface ReviewWorkerDeps {
   claimMessage: typeof claimMessage;
   postResult: typeof postResult;
   releaseMessage: typeof releaseMessage;
+  /**
+   * Fenced claimed->queued deferral with a future clock. Named per
+   * WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7; delegates to
+   * `releaseMessage`, which already carries the required fencing guards.
+   */
+  deferMessage: typeof deferMessage;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
+  /**
+   * Backstop for lost check-completion deliveries (#782 part 3). Optional so a
+   * test double can omit it; when absent the sweep simply does not run and the
+   * primary review path is untouched.
+   */
+  staleVerdictSweep?: (config: ReviewRouteConfig) => Promise<unknown>;
 }
 
 interface ResultMapping {
@@ -50,7 +68,7 @@ interface ResultMapping {
 }
 
 function mapSubmitOutcome(
-  disposition: Exclude<SubmitDisposition, 'checks_pending'>
+  disposition: Exclude<SubmitDisposition, 'checks_pending' | 'rate_limited'>
 ): ResultMapping {
   switch (disposition) {
     case 'approved':
@@ -78,8 +96,11 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     claimMessage,
     postResult,
     releaseMessage,
+    deferMessage,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
+    staleVerdictSweep: config =>
+      runStaleVerdictSweep(createRealStaleVerdictSweepDeps(config), resolveStaleSweepMax()),
   };
 }
 
@@ -127,11 +148,38 @@ export async function tickReviewWorkerClock(
         // a backoff so the item is retried on a later tick once CI concludes,
         // rather than orphaned or re-polled every tick.
         if (outcome.disposition === 'checks_pending') {
-          await deps.releaseMessage({
+          // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7 names this
+          // transition `deferMessage`; it is the same fenced claimed->queued
+          // transition, called by its WO name.
+          await deps.deferMessage({
             id: claimed.id,
             worker_id: REVIEW_WORKER_ID,
             fencing_token: claimed.fencing_token,
-            not_before: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
+            defer_until: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
+          });
+          continue;
+        }
+        // RATE LIMITED (#782 part 2) is non-terminal for the same reason, but
+        // its backoff comes from GitHub's own reset clock rather than a fixed
+        // interval: retrying before the budget refills would just burn another
+        // request and re-defer (#774's spin). A response with no usable clock
+        // falls back to the checks-pending interval so the wait is always
+        // finite.
+        if (outcome.disposition === 'rate_limited') {
+          const deferUntil =
+            outcome.retryAfter ??
+            new Date(
+              Date.now() + (outcome.retryAfterMs ?? CHECKS_PENDING_BACKOFF_MS)
+            ).toISOString();
+          log.warn(
+            { messageId: claimed.id, reason: outcome.reason, deferUntil },
+            'overseer_review_rate_limited_deferred'
+          );
+          await deps.deferMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            defer_until: deferUntil,
           });
           continue;
         }
@@ -145,6 +193,18 @@ export async function tickReviewWorkerClock(
         });
       } catch (error) {
         log.error({ err: error, messageId: message.id }, 'overseer_review_work_item_failed');
+      }
+    }
+
+    // STALE-VERDICT SWEEP (#782 part 3). Runs AFTER the queue is drained so a
+    // sweep-enqueued re-review is picked up on the NEXT tick rather than
+    // extending this one, and so a sweep failure can never delay the primary
+    // review path. It is internally bounded and never throws.
+    if (deps.staleVerdictSweep) {
+      try {
+        await deps.staleVerdictSweep(config);
+      } catch (error) {
+        log.error({ err: error }, 'overseer_stale_verdict_sweep_failed');
       }
     }
   } catch (error) {

@@ -298,6 +298,24 @@ export function createRealSubmitDeps(
           checksPending: true,
         };
       }
+      // RATE_LIMITED (#782 part 2) is a deferral for the same reason
+      // CHECKS_PENDING is: no verdict was formed, so it must NOT be collapsed
+      // into `approved: false` (a de facto REQUEST_CHANGES on rate-limit
+      // grounds) nor into the INDETERMINATE summary below, which is terminal.
+      // The retry instant travels with it so the worker can requeue at exactly
+      // the time the budget refills instead of spinning (#774).
+      if (result.verdict === 'RATE_LIMITED') {
+        return {
+          approved: false,
+          summary: '',
+          reviewedHeadSha: result.reviewed_head_sha,
+          rateLimited: true,
+          ...(result.retry_after ? { retryAfter: result.retry_after } : {}),
+          ...(typeof result.retry_after_ms === 'number'
+            ? { retryAfterMs: result.retry_after_ms }
+            : {}),
+        };
+      }
       const summary =
         result.findings.length > 0
           ? result.findings

@@ -444,6 +444,46 @@ export async function getMessage(id: string): Promise<DispatchMessage | null> {
   return row ? normalizeMessage(row) : null;
 }
 
+/**
+ * Messages carrying an EXACT correlation_id, newest-first.
+ *
+ * EXISTS FOR THE OVERSEER RECHECK PATH (bdc-harness #782). To decide whether a
+ * completed check authorizes an automatic re-review, the ingest must read the
+ * standing submit receipt for one exact PR head. Those receipts are written to
+ * the `operator` recipient with `correlation_id` = the head-bound review
+ * correlation id and (on this lineage) no subject_key, so neither the
+ * subject_key query nor a `listMessages` page can find them: `listMessages`
+ * hard-caps `limit` at 500 with no offset or cursor, while the live store holds
+ * thousands of queued operator rows (#761 backlog). A genuinely older receipt
+ * -- exactly the one a stale CHANGES_REQUESTED verdict lives in -- sits well
+ * outside any single page.
+ *
+ * Equality, not a prefix: the caller already knows the exact head it is asking
+ * about, so an indexed exact match is both cheaper and narrower than a scan.
+ */
+export async function listMessagesByCorrelationId(filters: {
+  correlationId: string;
+  recipient?: string;
+  limit?: number;
+}): Promise<DispatchMessage[]> {
+  const limit = Math.max(1, Math.min(filters.limit ?? 50, 500));
+  const params: unknown[] = [filters.correlationId];
+  let where = 'correlation_id = $1';
+  if (filters.recipient) {
+    params.push(canonicalizePrincipal(filters.recipient));
+    where += ` AND recipient = $${params.length}`;
+  }
+  params.push(limit);
+  const result = await getDatabase().query<DispatchMessageRow>(
+    `SELECT * FROM agent_dispatch_messages
+     WHERE ${where}
+     ORDER BY created_at DESC, id DESC
+     LIMIT $${params.length}`,
+    params
+  );
+  return result.rows.map(normalizeMessage);
+}
+
 export async function listMessages(filters: {
   recipient?: string;
   status?: DispatchMessageStatus;
@@ -1147,6 +1187,39 @@ export async function releaseMessage(data: {
   );
   if (result.rowCount !== 1) return null;
   return getMessage(data.id);
+}
+
+/**
+ * Fenced claimed-to-queued deferral with a bounded future `not_before`.
+ *
+ * WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7 names `deferMessage()`
+ * as the transition the review worker uses when it must come back later rather
+ * than post a terminal result. That transition already exists as
+ * `releaseMessage`, built under WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01
+ * with precisely the guards Section 9 and Test 3 require -- only the current
+ * lease owner, holding the current fencing token, on a row still `claimed`; the
+ * body, exact-head identity, subject_key and repeat_reason are preserved; the
+ * fence is bumped by the NEXT claim, not by the deferral.
+ *
+ * This is therefore a NAMED ALIAS, not a second implementation. Duplicating the
+ * SQL would mean two transitions that could drift apart on the single row that
+ * carries an in-flight review, which is exactly the class of bug fencing exists
+ * to prevent. `deferUntil` is required here (unlike `releaseMessage`'s optional
+ * `not_before`) because a deferral with no clock is an immediate re-claim and
+ * would spin the worker against the same unfinished evidence every tick.
+ */
+export async function deferMessage(data: {
+  id: string;
+  worker_id: string;
+  fencing_token: number;
+  defer_until: string;
+}): Promise<DispatchMessage | null> {
+  return releaseMessage({
+    id: data.id,
+    worker_id: data.worker_id,
+    fencing_token: data.fencing_token,
+    not_before: data.defer_until,
+  });
 }
 
 export type DispatchMutationResult =
