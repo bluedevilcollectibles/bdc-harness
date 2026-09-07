@@ -3,7 +3,10 @@ import { RECONCILE_ACTION, RECONCILE_SKIP_ACTION, runReconcileOnce } from '../re
 import { fakeDeps, mergedPr, stem } from './reconcile.test';
 
 describe('reconcile partial completion skip marker', () => {
-  test('Reconcile-Skip marker suppresses close while posting evidence and recording skip action', async () => {
+  test('Reconcile-Skip marker excludes the PR as evidence: no close, no comment, one skip action', async () => {
+    // Behavior change 2026-09-02: the marker used to post a "noted merged PR
+    // evidence" comment on the tracker. It now posts nothing -- the author
+    // asked for the tracker to be left alone -- and records one audit row.
     const deps = fakeDeps({
       prs: [
         mergedPr({
@@ -17,9 +20,9 @@ Reconcile-Skip: ${stem}`,
     const result = await runReconcileOnce({ deps });
 
     expect(result).toEqual({ scanned: 1, closed: 0, skipped: false });
-    expect(deps.comments).toHaveLength(1);
-    expect(deps.comments[0]).toContain('intentionally left open');
-    expect(deps.comments[0]).toContain(`Reconcile-Skip: ${stem}`);
+    expect(deps.comments).toEqual([]);
+    expect(deps.findTrackerIssueByStem).not.toHaveBeenCalled();
+    expect(deps.infos).toContain('overseer.reconcile.skip_marker_excluded_pr_evidence');
     expect(deps.labels).toEqual([]);
     expect(deps.closes).toEqual([]);
     expect(deps.actions).toMatchObject([

@@ -10,7 +10,20 @@ const log: ReconcileLogger = {
 export const RECONCILE_ACTION = 'reconcile_close';
 export const RECONCILE_SKIP_ACTION = 'reconcile_skip_noted';
 export const WO_STEM_PATTERN = /\bWO-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]{2}\b/g;
-export const RECONCILE_SKIP_PATTERN = /^Reconcile-Skip: (WO-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]{2})$/gm;
+/**
+ * `Reconcile-Skip: <WO-ID>[, <WO-ID> ...]` on a line of its own. The keyword
+ * matches in any case; the id list may be comma and/or space separated. Line
+ * anchored so a sentence that merely TALKS about the marker does not fire it.
+ * Tolerates CRLF bodies (GitHub returns `\r\n` for PRs edited in the web UI).
+ */
+export const RECONCILE_SKIP_PATTERN = /^[ \t]*reconcile-skip[ \t]*:[ \t]*(\S[^\r\n]*?)[ \t]*$/gim;
+/**
+ * Manifest v2 `WO: <WO-ID>` declaration line. The PR body manifest is the
+ * canonical completion record (CLAUDE.md Rule 2), so when a PR declares its
+ * WO(s) this way, that list -- not every stem mentioned in prose -- is what the
+ * PR is evidence for. See classifyPullRequestStems.
+ */
+export const WO_DECLARATION_PATTERN = /^[ \t]*WO[ \t]*:[ \t]*(\S[^\r\n]*?)[ \t]*$/gim;
 const DEFAULT_ORG = 'thinmansoftware';
 const DEFAULT_TRACKER_REPO = 'bdc-xo';
 const DEFAULT_LOOKBACK_DAYS = 14;
@@ -64,6 +77,14 @@ export interface ReconcileDeps {
   addTrackerLabel: (input: { issue: ReconcileTrackerIssue; label: string }) => Promise<void>;
   closeTrackerIssue: (input: { issue: ReconcileTrackerIssue }) => Promise<void>;
   hasSkipBeenNoted?: (input: { prRef: string; woId: string }) => Promise<boolean>;
+  /**
+   * True when this PR has ALREADY closed this WO's tracker once (an
+   * action=reconcile_close row exists for prRef+woId). Used by the re-close
+   * guard: a tracker that is open again after that was reopened by a human, and
+   * the same merged PR is not new evidence. Optional for deps objects that
+   * predate the guard; the default reads overseer_reconcile_actions.
+   */
+  hasCloseBeenRecorded?: (input: { prRef: string; woId: string }) => Promise<boolean>;
   insertAction?: (record: ReconcileActionRecord) => Promise<unknown>;
   /**
    * Changed-file paths for a merged PR. Used to refuse closing a tracker on a
@@ -156,11 +177,39 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
     if (seen.has(key)) continue;
     seen.add(key);
     if (!pr.merged || pr.state !== 'closed') continue;
-    const stems = extractWoStems(`${pr.title}\n${pr.body ?? ''}`);
-    const skipStems = extractReconcileSkipStems(pr.body ?? '');
-    if (stems.length === 0) continue;
+    const classified = classifyPullRequestStems(pr);
+    const prRef = `${pr.owner}/${pr.repo}#${pr.number}`;
 
-    for (const stem of stems) {
+    // RECONCILE-SKIP. An author who writes `Reconcile-Skip: <WO-ID>` is saying
+    // "this PR is NOT evidence that <WO-ID> is done". The stem is dropped from
+    // this PR's evidence set before any tracker is looked up, and NO comment is
+    // posted -- the marker exists precisely so the tracker is left alone (the
+    // old "noted merged PR evidence" comment put four notices on bdc-xo #1889 in
+    // one morning). One deduplicated action row is the audit trail.
+    for (const stem of classified.skipped) {
+      const alreadyNoted = await (deps.hasSkipBeenNoted ?? hasDefaultSkipBeenNoted)({
+        prRef,
+        woId: stem,
+      });
+      if (alreadyNoted) continue;
+      logger.info?.({ prRef, stem }, 'overseer.reconcile.skip_marker_excluded_pr_evidence');
+      await (deps.insertAction ?? insertDefaultOverseerAction)({
+        prRef,
+        woId: stem,
+        class: 'tracker_reconcile',
+        action: RECONCILE_SKIP_ACTION,
+        result: `${pr.htmlUrl}:${pr.mergeCommitSha ?? 'merge_sha_unknown'}`,
+      });
+    }
+    for (const stem of classified.incidental) {
+      logger.info?.(
+        { prRef, stem, declared: classified.evidence },
+        'overseer.reconcile.incidental_mention_not_evidence'
+      );
+    }
+    if (classified.evidence.length === 0) continue;
+
+    for (const stem of classified.evidence) {
       let tracker: ReconcileTrackerIssue | null;
       try {
         tracker = await deps.findTrackerIssueByStem(stem);
@@ -184,25 +233,21 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       if (!tracker) continue;
       if (tracker.state !== 'open') continue;
 
-      const prRef = `${pr.owner}/${pr.repo}#${pr.number}`;
-      if (skipStems.has(stem)) {
-        const alreadyNoted = await (deps.hasSkipBeenNoted ?? hasDefaultSkipBeenNoted)({
-          prRef,
-          woId: stem,
-        });
-        if (alreadyNoted) continue;
-
-        await deps.addTrackerEvidenceComment({
-          issue: tracker,
-          body: buildEvidenceComment({ pr, stem, intentionallyLeftOpen: true }),
-        });
-        await (deps.insertAction ?? insertDefaultOverseerAction)({
-          prRef,
-          woId: stem,
-          class: 'tracker_reconcile',
-          action: RECONCILE_SKIP_ACTION,
-          result: `${pr.htmlUrl}:${pr.mergeCommitSha ?? 'merge_sha_unknown'}`,
-        });
+      // RE-CLOSE GUARD. If this PR already closed this tracker once and the
+      // tracker is open again, a human reopened it on purpose. The same merged
+      // PR is not new evidence, so the lookback re-scan must not undo that
+      // decision. Anchor (2026-09-02): XO reopened bdc-xo #1889 at 13:51:26Z with
+      // a comment explaining why; reconcile re-closed it at 13:51:33Z on the
+      // same shopops#662 evidence.
+      const closeRecorded = await (deps.hasCloseBeenRecorded ?? hasDefaultCloseBeenRecorded)({
+        prRef,
+        woId: stem,
+      });
+      if (closeRecorded) {
+        logger.warn(
+          { prRef, stem, tracker: tracker.number },
+          'overseer.reconcile.tracker_reopened_after_close_left_open'
+        );
         continue;
       }
 
@@ -294,35 +339,84 @@ export function extractWoStems(input: string): string[] {
   return [...new Set(matches)];
 }
 
+/** WO stems on every `Reconcile-Skip:` line of a PR body. Ids are upper-cased. */
 export function extractReconcileSkipStems(input: string): Set<string> {
+  return collectStemsFromLines(input, RECONCILE_SKIP_PATTERN);
+}
+
+/** WO stems on every manifest `WO:` line of a PR body. Ids are upper-cased. */
+export function extractDeclaredWoStems(input: string): string[] {
+  return [...collectStemsFromLines(input, WO_DECLARATION_PATTERN)];
+}
+
+function collectStemsFromLines(input: string, linePattern: RegExp): Set<string> {
   const stems = new Set<string>();
-  for (const match of input.matchAll(RECONCILE_SKIP_PATTERN)) {
-    const stem = match[1];
-    if (stem) stems.add(stem);
+  for (const match of input.matchAll(linePattern)) {
+    const list = match[1];
+    if (!list) continue;
+    // Upper-case before stem matching so `reconcile-skip: wo-foo-01` names the
+    // same tracker as `WO-FOO-01`. Comma/space separation falls out of the stem
+    // pattern itself: anything between ids that is not a stem is ignored.
+    for (const stem of extractWoStems(list.toUpperCase())) stems.add(stem);
   }
   return stems;
+}
+
+export interface PullRequestStemClassification {
+  /** Stems this merged PR is satisfaction evidence for. */
+  evidence: string[];
+  /** Stems the author excluded with `Reconcile-Skip:`. Never evidence. */
+  skipped: string[];
+  /**
+   * Stems mentioned in passing while the body declares OTHER WO(s) on manifest
+   * `WO:` lines. Never evidence.
+   */
+  incidental: string[];
+}
+
+/**
+ * Decide which WO stems a merged PR counts as evidence for.
+ *
+ * 1. `Reconcile-Skip: <id>` removes <id> from this PR's evidence, whatever else
+ *    the body says. The PR still counts for every other stem it names.
+ * 2. When the body carries a manifest v2 `WO:` declaration, the evidence set is
+ *    the declared stems plus any stem in the title. Other stems in the body are
+ *    incidental prose (a dependency, a follow-up, a reviewer reply) and are
+ *    NOT evidence. Anchor (2026-09-02): shopops#662 was the build for
+ *    WO-SHOPOPS-M157-STREAM-STAYS-OPEN-01 and said so on its `WO:` line; a reply
+ *    to an Overseer finding mentioned WO-LSPRO-M157-STREAM-STAYS-OPEN-UI-01 as
+ *    "step 3, depends_on this WO", and reconcile closed bdc-xo #1889 on it.
+ * 3. A PR with no `WO:` declaration keeps the legacy rule: every stem in the
+ *    title or body is a candidate (the spec-only guard still applies).
+ */
+export function classifyPullRequestStems(
+  pr: Pick<ReconcileMergedPullRequest, 'title' | 'body'>
+): PullRequestStemClassification {
+  const body = pr.body ?? '';
+  const mentioned = extractWoStems(`${pr.title}\n${body}`);
+  const skipped = extractReconcileSkipStems(body);
+  const declared = extractDeclaredWoStems(body);
+  const candidates =
+    declared.length > 0 ? [...new Set([...extractWoStems(pr.title), ...declared])] : mentioned;
+  const candidateSet = new Set(candidates);
+  return {
+    evidence: candidates.filter(stem => !skipped.has(stem)),
+    skipped: [...skipped],
+    incidental: mentioned.filter(stem => !candidateSet.has(stem) && !skipped.has(stem)),
+  };
 }
 
 export function buildEvidenceComment(input: {
   pr: ReconcileMergedPullRequest;
   stem: string;
-  intentionallyLeftOpen?: boolean;
 }): string {
-  const lines = [
+  return [
     `Overseer reconcile closed tracker for ${input.stem}.`,
     '',
     `Merged PR: ${input.pr.htmlUrl}`,
     `Repository: ${input.pr.owner}/${input.pr.repo}`,
     `Merge SHA: ${input.pr.mergeCommitSha ?? 'unknown'}`,
-  ];
-  if (input.intentionallyLeftOpen) {
-    lines[0] = `Overseer reconcile noted merged PR evidence for ${input.stem}.`;
-    lines.push(
-      '',
-      `Tracker intentionally left open because this PR includes Reconcile-Skip: ${input.stem}.`
-    );
-  }
-  return lines.join('\n');
+  ].join('\n');
 }
 
 export async function readReconcileCursorFromActions(): Promise<string | null> {
@@ -349,6 +443,18 @@ async function hasDefaultSkipBeenNoted(input: { prRef: string; woId: string }): 
   });
 }
 
+async function hasDefaultCloseBeenRecorded(input: {
+  prRef: string;
+  woId: string;
+}): Promise<boolean> {
+  const { hasReconcileActionForPr } = await import('@archon/core/db/overseer');
+  return hasReconcileActionForPr({
+    prRef: input.prRef,
+    woId: input.woId,
+    action: RECONCILE_ACTION,
+  });
+}
+
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   if (!token) {
@@ -363,6 +469,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       addTrackerLabel: async () => undefined,
       closeTrackerIssue: async () => undefined,
       hasSkipBeenNoted: async () => false,
+      hasCloseBeenRecorded: async () => false,
       insertAction: insertDefaultOverseerAction,
       log,
     };
@@ -421,6 +528,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       });
     },
     hasSkipBeenNoted: hasDefaultSkipBeenNoted,
+    hasCloseBeenRecorded: hasDefaultCloseBeenRecorded,
     insertAction: insertDefaultOverseerAction,
     log,
   };

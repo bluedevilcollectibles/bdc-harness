@@ -44,6 +44,7 @@ export function fakeDeps(
     searchError?: unknown;
     trackerLookupError?: unknown;
     skipAlreadyNoted?: boolean;
+    closeAlreadyRecorded?: boolean;
   } = {}
 ): ReconcileDeps & {
   comments: string[];
@@ -51,18 +52,21 @@ export function fakeDeps(
   closes: number[];
   actions: ReconcileActionRecord[];
   warnings: string[];
+  infos: string[];
 } {
   const comments: string[] = [];
   const labels: string[] = [];
   const closes: number[] = [];
   const actions: ReconcileActionRecord[] = [];
   const warnings: string[] = [];
+  const infos: string[] = [];
   return {
     comments,
     labels,
     closes,
     actions,
     warnings,
+    infos,
     readCursor: mock(async () => null),
     now: () => new Date('2026-07-17T12:00:00Z'),
     searchMergedPullRequests: mock(async () => {
@@ -84,12 +88,16 @@ export function fakeDeps(
       closes.push(request.issue.number);
     }),
     hasSkipBeenNoted: mock(async () => Boolean(input.skipAlreadyNoted)),
+    hasCloseBeenRecorded: mock(async () => Boolean(input.closeAlreadyRecorded)),
     insertAction: mock(async record => {
       actions.push(record);
     }),
     log: {
       warn: (_fields, message) => {
         warnings.push(message);
+      },
+      info: (_fields, message) => {
+        infos.push(message);
       },
     },
   };

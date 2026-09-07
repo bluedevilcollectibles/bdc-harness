@@ -65,13 +65,18 @@ export { createGitHubQualifiedMergeAdapter } from './adapters/github-qualified-m
 export { resolveDefaultDeps, runOverseerService } from './service';
 export {
   buildEvidenceComment,
+  classifyPullRequestStems,
   createDefaultReconcileDeps,
+  extractDeclaredWoStems,
+  extractReconcileSkipStems,
   extractWoStems,
   readReconcileCursorFromActions,
   RECONCILE_ACTION,
+  RECONCILE_SKIP_ACTION,
   runReconcileOnce,
 } from './reconcile';
 export type {
+  PullRequestStemClassification,
   ReconcileActionRecord,
   ReconcileDeps,
   ReconcileLogger,
