@@ -78,6 +78,16 @@ const JOURNAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PROOF_DEADLINE_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * The only cascade run statuses that count as EVIDENCE of success.
+ *
+ * TERMINAL_WORKFLOW_STATUSES also contains failed / escalated / cancelled --
+ * those are terminal but they are the outcomes an expectation exists to catch,
+ * so they must NOT satisfy it. A run still pending or running does not satisfy
+ * it either: it is simply not yet proven, and the deadline decides.
+ */
+const CASCADE_SUCCESS_STATUSES: readonly string[] = ['completed'];
+
 export interface TaskmasterState {
   deadman: DeadmanState;
   tickIndex: number;
@@ -1529,10 +1539,15 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         await registerExpectation?.({
           dispatch_ref: admitted.cascadeId,
           recipient: proposal.recipient,
+          // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching on
+          // the admission row's existence alone is not evidence of anything:
+          // admission is what CREATES that row, so the expectation would be
+          // met the instant it was registered and a failed or stalled cascade
+          // would never escalate (review finding [major]).
           evidence_json: JSON.stringify({
             kind: 'db_row_exists',
             table: 'remote_agent_workflow_runs',
-            where: { id: admitted.cascadeId },
+            where: { id: admitted.cascadeId, status: CASCADE_SUCCESS_STATUSES },
           }),
           due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
           on_absence: 'escalate',

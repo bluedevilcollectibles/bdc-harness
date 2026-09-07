@@ -45,6 +45,83 @@ describe('expectation evidence', () => {
     ] as EvidenceSpec[])
       expect((await checkEvidence(spec, { query })).ok).toBe(true);
   });
+
+  test('db_row_exists renders a null predicate as IS NULL, not column = $n', async () => {
+    let seen = '';
+    const query = async <T>(sql: string, params?: unknown[]) => {
+      seen = sql;
+      // A NULL column never satisfies `column = $n`, so the old rendering made
+      // every valid null predicate report absent.
+      expect(params).toEqual([1]);
+      return { rows: [{ id: 1 } as T] };
+    };
+    const result = await checkEvidence(
+      { kind: 'db_row_exists', table: 'safe_table', where: { id: 1, archived_at: null } },
+      { query }
+    );
+    expect(seen).toContain('archived_at IS NULL');
+    expect(seen).not.toContain('archived_at = $');
+    expect(result.ok).toBe(true);
+  });
+
+  test('db_row_exists renders an array predicate as IN, so a status set is expressible', async () => {
+    let seen = '';
+    let bound: unknown[] | undefined;
+    const query = async <T>(sql: string, params?: unknown[]) => {
+      seen = sql;
+      bound = params;
+      return { rows: [] as T[] };
+    };
+    const result = await checkEvidence(
+      {
+        kind: 'db_row_exists',
+        table: 'remote_agent_workflow_runs',
+        where: { id: 'run-1', status: ['completed'] },
+      },
+      { query }
+    );
+    expect(seen).toContain('status IN ($2)');
+    expect(bound).toEqual(['run-1', 'completed']);
+    expect(result.ok).toBe(false);
+  });
+
+  test('db_row_exists renders an empty IN list as an unsatisfiable predicate', async () => {
+    let seen = '';
+    const query = async <T>(sql: string) => {
+      seen = sql;
+      return { rows: [] as T[] };
+    };
+    await checkEvidence(
+      { kind: 'db_row_exists', table: 'safe_table', where: { status: [] } },
+      { query }
+    );
+    expect(seen).toContain('1 = 0');
+    expect(seen).not.toContain('IN ()');
+  });
+
+  test('an admitted-but-unfinished cascade run does NOT satisfy the cascade evidence', async () => {
+    // The admission row exists (admission is what creates it) but the run has
+    // not reached a successful terminal status. This must NOT be evidence.
+    const rows = [{ id: 'cascade-1', status: 'running' }];
+    const query = async <T>(sql: string, params?: unknown[]) => {
+      const [id, ...statuses] = (params ?? []) as string[];
+      const matched = rows.filter(
+        row => row.id === id && (statuses.length === 0 || statuses.includes(row.status))
+      );
+      expect(sql).toContain('status IN (');
+      return { rows: matched as T[] };
+    };
+    const spec: EvidenceSpec = {
+      kind: 'db_row_exists',
+      table: 'remote_agent_workflow_runs',
+      where: { id: 'cascade-1', status: ['completed'] },
+    };
+    expect((await checkEvidence(spec, { query })).ok).toBe(false);
+    rows[0]!.status = 'failed';
+    expect((await checkEvidence(spec, { query })).ok).toBe(false);
+    rows[0]!.status = 'completed';
+    expect((await checkEvidence(spec, { query })).ok).toBe(true);
+  });
 });
 
 describe('expectation supervisor', () => {
@@ -80,8 +157,9 @@ describe('expectation supervisor', () => {
       markFailed: async () => {
         calls.push('failed');
       },
-      incrementRetry: async () => {
+      claimRedispatchAttempt: async () => {
         calls.push('retry');
+        return 1;
       },
       getMessage: async () => ({
         id: 'original',
@@ -151,13 +229,15 @@ describe('expectation supervisor', () => {
         sends.push(data.idempotency_key);
         return { id: `d-${sends.length}` } as never;
       },
-      incrementRetry: async () => {
+      claimRedispatchAttempt: async (_id: string, expected: number) => {
+        if (row.retries !== expected || row.retries >= row.max_retries) return null;
         row = {
           ...row,
           retries: row.retries + 1,
           due_at: new Date(0).toISOString(),
           status: 'failed',
         };
+        return row.retries;
       },
       markEscalated: async () => {
         row = { ...row, status: 'escalated' };
@@ -168,7 +248,106 @@ describe('expectation supervisor', () => {
     await checkExpectations(new Date(), deps as never);
     await checkExpectations(new Date(), deps as never);
     await checkExpectations(new Date(), deps as never);
-    expect(sends.filter(key => key.includes(':retry:'))).toHaveLength(2);
+    // Deterministic keys mean a replayed attempt is the SAME key, so distinct
+    // retry keys is the real count of attempts.
+    expect(new Set(sends.filter(key => key.includes(':retry:'))).size).toBe(2);
     expect(sends.filter(key => key.endsWith(':escalate'))).toHaveLength(1);
+  });
+
+  test('the redispatch idempotency key is deterministic in (expectation, attempt)', async () => {
+    const keys: string[] = [];
+    const deps = {
+      listDueExpectations: async () => [base],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => {},
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context: never, data: { idempotency_key: string }) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      claimRedispatchAttempt: async () => 1,
+      retryDelayMs: 0,
+    };
+    // Two independent runs of the SAME attempt must produce the SAME key.
+    // Fails on the old behaviour, which appended a fresh randomUUID each time.
+    await checkExpectations(new Date(), deps as never);
+    await checkExpectations(new Date(), deps as never);
+    expect(keys).toEqual([
+      'tm:expectation:expectation-1:retry:1',
+      'tm:expectation:expectation-1:retry:1',
+    ]);
+  });
+
+  test('a tick that loses the claim does not send', async () => {
+    const keys: string[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [base],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => {},
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      // An overlapping tick already advanced the counter.
+      claimRedispatchAttempt: async () => null,
+      retryDelayMs: 0,
+    } as never);
+    expect(keys).toEqual([]);
+  });
+
+  test('two concurrent ticks over one CAS-backed counter send exactly one attempt', async () => {
+    let retries = 0;
+    const keys: string[] = [];
+    const deps = {
+      listDueExpectations: async () => [{ ...base, retries }],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => {},
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context: never, data: { idempotency_key: string }) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      // Stands in for the real compare-and-set in the DAL.
+      claimRedispatchAttempt: async (_id: string, expected: number) => {
+        if (retries !== expected) return null;
+        retries += 1;
+        return retries;
+      },
+      retryDelayMs: 0,
+    };
+    await Promise.all([
+      checkExpectations(new Date(), deps as never),
+      checkExpectations(new Date(), deps as never),
+    ]);
+    // Fails on the old behaviour: both ticks sent, and both incremented.
+    expect(keys).toEqual(['tm:expectation:expectation-1:retry:1']);
+    expect(retries).toBe(1);
+  });
+
+  test('a crash between the claim and the send is recovered under the same key', async () => {
+    const keys: string[] = [];
+    // The prior tick claimed attempt 1 and died before sending: retries=1 is
+    // durable, but no dispatch row exists for attempt 1.
+    const crashed: TmExpectation = { ...base, retries: 1, status: 'failed' };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [crashed],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => {},
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      claimRedispatchAttempt: async () => 2,
+      retryDelayMs: 0,
+    } as never);
+    // Attempt 1 is replayed under its own deterministic key (a no-op at the
+    // dispatch DAL if it did land), and attempt 2 is the newly claimed one.
+    // The count was never lost and attempt 1 can never be double-sent.
+    expect(keys).toEqual([
+      'tm:expectation:expectation-1:retry:1',
+      'tm:expectation:expectation-1:retry:2',
+    ]);
   });
 });

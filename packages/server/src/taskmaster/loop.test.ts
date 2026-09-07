@@ -26,6 +26,7 @@ import {
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
+import { checkEvidence } from './expectations';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
 import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
@@ -571,6 +572,32 @@ describe('fire_cauldron loop', () => {
       expect(registered).toHaveLength(1);
       expect(registered[0]?.dispatch_ref).toBe('cascade-501');
       expect(registered[0]?.evidence_json).toContain('remote_agent_workflow_runs');
+
+      // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching only on
+      // the admission row's existence is self-fulfilling -- admission creates
+      // that row -- so a failed or stalled cascade would never escalate.
+      const spec = JSON.parse(registered[0]!.evidence_json) as {
+        where: Record<string, unknown>;
+      };
+      expect(spec.where.status).toEqual(['completed']);
+
+      // Run the registered spec against a run table to prove it: admitted but
+      // unfinished is NOT met, failed is NOT met, completed IS met.
+      const runs = [{ id: 'cascade-501', status: 'running' }];
+      const query = async <T>(_sql: string, params?: unknown[]) => {
+        const [id, ...statuses] = (params ?? []) as string[];
+        return {
+          rows: runs.filter(
+            run => run.id === id && statuses.includes(run.status)
+          ) as unknown as T[],
+        };
+      };
+      const evidence = spec as unknown as Parameters<typeof checkEvidence>[0];
+      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      runs[0]!.status = 'failed';
+      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      runs[0]!.status = 'completed';
+      expect((await checkEvidence(evidence, { query })).ok).toBe(true);
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;

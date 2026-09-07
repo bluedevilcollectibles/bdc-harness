@@ -1,4 +1,3 @@
-import { randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core';
 import {
@@ -21,8 +20,17 @@ export type EvidenceSpec =
   | {
       kind: 'db_row_exists';
       table: string;
-      where: Record<string, string | number | boolean | null>;
+      /**
+       * Column predicates. A scalar is an equality test; `null` is an IS NULL
+       * test (SQL NULL never satisfies `column = $n`, so a null predicate
+       * rendered as equality is always absent -- review finding [minor]); an
+       * array is an IN test, which is how a "terminal successful outcome"
+       * predicate is expressed without a bespoke evidence kind.
+       */
+      where: Record<string, EvidenceScalar | readonly EvidenceScalar[] | null>;
     };
+
+type EvidenceScalar = string | number | boolean;
 
 export interface EvidenceResult {
   ok: boolean;
@@ -37,7 +45,7 @@ export interface ExpectationDeps {
   listDueExpectations?: typeof taskmasterDb.listDueExpectations;
   markMet?: typeof taskmasterDb.markMet;
   markFailed?: typeof taskmasterDb.markFailed;
-  incrementRetry?: typeof taskmasterDb.incrementRetry;
+  claimRedispatchAttempt?: typeof taskmasterDb.claimRedispatchAttempt;
   markEscalated?: typeof taskmasterDb.markEscalated;
   markGivenUp?: typeof taskmasterDb.markGivenUp;
   getMessage?: (id: string) => Promise<DispatchMessage | null>;
@@ -144,10 +152,34 @@ export async function checkEvidence(
   const entries = Object.entries(spec.where);
   if (entries.some(([column]) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(column)))
     throw new Error('expectation_db_column_invalid');
-  const clauses = entries.map(([column], index) => `${column} = $${index + 1}`);
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  for (const [column, value] of entries) {
+    if (value === null) {
+      // SQL NULL is never equal to anything, including a null bind parameter.
+      clauses.push(`${column} IS NULL`);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      // An empty IN list can never match; render it as an explicitly false
+      // predicate rather than emitting invalid `IN ()`.
+      if (value.length === 0) {
+        clauses.push('1 = 0');
+        continue;
+      }
+      const placeholders = value.map(item => {
+        params.push(item);
+        return `$${String(params.length)}`;
+      });
+      clauses.push(`${column} IN (${placeholders.join(', ')})`);
+      continue;
+    }
+    params.push(value);
+    clauses.push(`${column} = $${String(params.length)}`);
+  }
   const result = await query<Record<string, unknown>>(
     `SELECT * FROM ${spec.table}${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''} LIMIT 1`,
-    entries.map(([, value]) => value)
+    params
   );
   return {
     ok: result.rows.length > 0,
@@ -195,27 +227,55 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         );
         continue;
       }
-      const key = `tm:expectation:${expectation.id}:retry:${expectation.retries + 1}:${randomUUID()}`;
-      const data: CreateAuthenticatedMessageData = {
-        correlation_id: original.correlation_id,
-        idempotency_key: key,
-        task_type: original.task_type,
-        recipient: original.recipient,
-        body: original.body,
-        priority: original.priority,
-        subject_key: original.subject_key,
-        repeat_reason: `expectation:${expectation.id}:retry:${expectation.retries + 1}`,
+      const createTask = deps.createTask ?? createAuthenticatedMessage;
+      const sendAttempt = async (attempt: number): Promise<string> => {
+        // The key is DETERMINISTIC in (expectation id, attempt number). The
+        // dispatch DAL is idempotent on this key, so replaying an attempt --
+        // after a crash between the claim and the send -- reuses the existing
+        // row instead of sending twice.
+        const key = `tm:expectation:${expectation.id}:retry:${String(attempt)}`;
+        const data: CreateAuthenticatedMessageData = {
+          correlation_id: original.correlation_id,
+          idempotency_key: key,
+          task_type: original.task_type,
+          recipient: original.recipient,
+          body: original.body,
+          priority: original.priority,
+          subject_key: original.subject_key,
+          repeat_reason: `expectation:${expectation.id}:retry:${String(attempt)}`,
+        };
+        await createTask({ kind: 'system', sender: 'taskmaster' }, data);
+        return key;
       };
-      await (deps.createTask ?? createAuthenticatedMessage)(
-        { kind: 'system', sender: 'taskmaster' },
-        data
-      );
+
+      // Recover the previous attempt first. If a crash landed between its claim
+      // and its send, this replays it under its own deterministic key; if it
+      // did send, the dispatch DAL returns the existing row and nothing new is
+      // created. Either way the retry budget is not spent twice.
+      if (expectation.retries > 0) await sendAttempt(expectation.retries);
+
       const dueAt = new Date(
         now.getTime() + (deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)
       ).toISOString();
-      await (deps.incrementRetry ?? taskmasterDb.incrementRetry)(expectation.id, dueAt);
+      // CLAIM BEFORE SEND. The counter advances atomically, bounded by
+      // max_retries, under a compare-and-set on the retry count this tick
+      // observed. An overlapping tick finds the counter already advanced, loses
+      // the claim, and must not send.
+      const attempt = await (deps.claimRedispatchAttempt ?? taskmasterDb.claimRedispatchAttempt)(
+        expectation.id,
+        expectation.retries,
+        dueAt
+      );
+      if (attempt === null) {
+        log.warn(
+          { expectationId: expectation.id, observedRetries: expectation.retries },
+          'taskmaster.expectation_redispatch_claim_lost'
+        );
+        continue;
+      }
+      const key = await sendAttempt(attempt);
       log.warn(
-        { expectationId: expectation.id, idempotencyKey: key },
+        { expectationId: expectation.id, idempotencyKey: key, attempt },
         'taskmaster.expectation_redispatched'
       );
       continue;

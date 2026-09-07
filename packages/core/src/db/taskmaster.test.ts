@@ -38,6 +38,7 @@ import {
   listDueExpectations,
   markMet,
   incrementRetry,
+  claimRedispatchAttempt,
   markEscalated,
   markGivenUp,
   getExpectationCounts,
@@ -109,6 +110,72 @@ describe('tm_expectations DAL', () => {
     expect(counts.met).toBe(0);
     expect(counts.failed).toBe(0);
     expect(counts.escalated).toBe(0);
+  });
+
+  test('two concurrent claims on the same attempt: exactly one wins', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-cas',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    const dueAt = new Date(Date.now() + 60_000).toISOString();
+    // Both ticks observed retries=0 and race to claim attempt 1.
+    const [a, b] = await Promise.all([
+      claimRedispatchAttempt(id, 0, dueAt),
+      claimRedispatchAttempt(id, 0, dueAt),
+    ]);
+    // Fails on the old behaviour: incrementRetry had no CAS, so both ticks
+    // advanced the counter and both sent.
+    expect([a, b].filter(value => value !== null)).toEqual([1]);
+    const row = await db.query<{ retries: number }>(
+      'SELECT retries FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(Number(row.rows[0]?.retries)).toBe(1);
+  });
+
+  test('the claim advances the count before the send, so a crash cannot lose it', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-crash',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    const claimed = await claimRedispatchAttempt(id, 0, new Date().toISOString());
+    expect(claimed).toBe(1);
+    // Simulate the process dying here -- before any send. The counter is
+    // already durable, so the retry budget cannot be replayed from zero.
+    const row = await db.query<{ retries: number; status: string }>(
+      'SELECT retries, status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(Number(row.rows[0]?.retries)).toBe(1);
+    expect(row.rows[0]?.status).toBe('failed');
+    // A tick that still believes retries=0 cannot re-claim attempt 1.
+    expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBeNull();
+  });
+
+  test('the claim refuses to exceed max_retries', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-cap',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 1,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBe(1);
+    expect(await claimRedispatchAttempt(id, 1, new Date().toISOString())).toBeNull();
+    const row = await db.query<{ retries: number }>(
+      'SELECT retries FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(Number(row.rows[0]?.retries)).toBe(1);
   });
 });
 

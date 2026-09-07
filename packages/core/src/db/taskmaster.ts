@@ -203,6 +203,52 @@ export async function incrementRetry(id: string, dueAt: string): Promise<void> {
     [dueAt, new Date().toISOString(), id]
   );
 }
+
+/**
+ * Atomically CLAIM the next redispatch attempt (WO review finding: redispatch
+ * was neither atomic nor idempotent).
+ *
+ * The counter is advanced BEFORE the send, under a compare-and-set on the
+ * retry count the caller observed, and bounded by max_retries in the same
+ * statement. Consequences the caller relies on:
+ *
+ *  - Two overlapping ticks: only one UPDATE matches `retries = $expected`;
+ *    the loser gets null and MUST NOT send. No double-dispatch.
+ *  - A crash after the claim and before the send: the count is already
+ *    advanced, so the budget can never be exceeded and the count is never
+ *    lost. The caller replays the attempt under its deterministic
+ *    idempotency key, so recovery cannot double-send either.
+ *  - retries >= max_retries: no row matches, null is returned, and the caller
+ *    falls through to escalation instead of looping.
+ *
+ * Returns the claimed attempt number (1-based), or null when the claim lost.
+ */
+export async function claimRedispatchAttempt(
+  id: string,
+  expectedRetries: number,
+  dueAt: string
+): Promise<number | null> {
+  // ONE statement decides the claim, and its affected-row count IS the answer.
+  //
+  // Doing this as an UPDATE followed by a separate SELECT would be wrong even
+  // inside a transaction on some engines and is outright unusable here: two
+  // ticks would both re-read expected+1 and both believe they won. Wrapping it
+  // in withTransaction is also not an option -- the sqlite adapter runs on a
+  // single connection and rejects a nested BEGIN, so a caller that already
+  // holds a transaction would crash.
+  //
+  // A conditional UPDATE needs neither: on Postgres the row lock serializes the
+  // two writers and the loser's `retries = $expected` predicate no longer
+  // matches; on the single-connection sqlite adapter the statement is atomic by
+  // construction. rowCount is 1 for the winner and 0 for everyone else.
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET status = 'failed', retries = retries + 1, due_at = $1, updated_at = $2
+      WHERE id = $3 AND retries = $4 AND retries < max_retries`,
+    [dueAt, new Date().toISOString(), id, expectedRetries]
+  );
+  return result.rowCount === 1 ? expectedRetries + 1 : null;
+}
 export async function markEscalated(id: string, evidencePointer?: string): Promise<void> {
   await updateExpectation(id, 'escalated', evidencePointer);
 }
