@@ -3,6 +3,7 @@ import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 import { appendBoardAuditEvent, resolveBoardRecipient } from './board-authority';
 import type { QueryResult } from './adapters/types';
+import { withOverseerControlPlaneImmediateTransaction } from './overseer-control-plane-sqlite';
 import {
   DispatchNonSystemCapability,
   resolveDispatchSenderCapability,
@@ -330,13 +331,80 @@ function bindSenderContext(context: DispatchSenderContext): {
   return resolveDispatchSenderCapability(context);
 }
 
-export async function createAuthenticatedMessage(
+export interface TaskmasterNoticeFence {
+  taskmasterPausedEpoch: number;
+  /**
+   * The exact pause state the notice was authorized against. The self-pause
+   * notice escapes a soft PAUSED only; a concurrent transition to HARD_PAUSE
+   * must refuse the send even at the same epoch.
+   */
+  taskmasterPausedState: 'PAUSED';
+  /**
+   * The exact pause scope the notice was authorized against. A concurrent
+   * re-pause onto a different scope at the same epoch must refuse the send,
+   * because the caller's exemption decision was made against this scope.
+   */
+  taskmasterPausedScope: string | null;
+}
+
+export function createAuthenticatedMessage(
   context: DispatchSenderContext,
   data: CreateAuthenticatedMessageData
-): Promise<DispatchMessage> {
+): Promise<DispatchMessage>;
+export function createAuthenticatedMessage(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData,
+  fence: TaskmasterNoticeFence
+): Promise<DispatchMessage | null>;
+export async function createAuthenticatedMessage(
+  context: DispatchSenderContext,
+  data: CreateAuthenticatedMessageData,
+  fence?: TaskmasterNoticeFence
+): Promise<DispatchMessage | null> {
   if ('supersedes_id' in data) throw new Error('dispatch_supersedes_guarded_path_required');
   const bound = bindSenderContext(context);
   const db = getDatabase();
+  if (fence !== undefined) {
+    if (
+      bound.sender_principal_id !== 'system:taskmaster' ||
+      !Number.isSafeInteger(fence.taskmasterPausedEpoch) ||
+      fence.taskmasterPausedEpoch < 0 ||
+      fence.taskmasterPausedState !== 'PAUSED' ||
+      data.task_type !== 'agent_message' ||
+      data.recipient !== 'duty-officer' ||
+      !data.idempotency_key.startsWith('tm:self-pause:')
+    ) {
+      throw new Error('taskmaster_notice_fence_invalid');
+    }
+    const enqueue = async (query: DispatchQueryExecutor): Promise<DispatchMessage | null> => {
+      // Serialize with resetTaskmaster, through the actual queue insertion.
+      // PostgreSQL uses one pinned connection and locks the same singleton.
+      const control = await query<{
+        pause_state: string;
+        pause_scope: string | null;
+        epoch: number | string;
+      }>(
+        'SELECT pause_state, pause_scope, epoch FROM tm_control WHERE id = 1' +
+          (db.dialect === 'postgres' ? ' FOR UPDATE' : '')
+      );
+      const row = control.rows[0];
+      // Assert the EXACT state this notice was authorized against, not merely
+      // "not RUNNING". A concurrent setPauseState to HARD_PAUSE, or a re-pause
+      // onto a different scope, does not increment the epoch, so epoch equality
+      // alone would let the notice escape a pause it was never authorized for.
+      if (
+        row?.pause_state !== fence.taskmasterPausedState ||
+        (row.pause_scope ?? null) !== (fence.taskmasterPausedScope ?? null) ||
+        Number(row.epoch) !== fence.taskmasterPausedEpoch
+      ) {
+        return null;
+      }
+      return createAuthenticatedMessageWithQuery(query, { bound, data });
+    };
+    return db.dialect === 'sqlite'
+      ? withOverseerControlPlaneImmediateTransaction(db, enqueue)
+      : db.withTransaction(enqueue);
+  }
   return createAuthenticatedMessageWithQuery((sql, params) => db.query(sql, params), {
     bound,
     data,

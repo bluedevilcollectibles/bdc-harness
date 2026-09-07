@@ -1,19 +1,23 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
+import { resolve } from 'path';
 import { PostgresAdapter } from './adapters/postgres';
 
-let db: PostgresAdapter;
-let adminDb: PostgresAdapter | undefined;
-let schemaName: string | undefined;
-mock.module('./connection', () => ({ getDatabase: () => db }));
-const { upsertHealthSample } = await import('./taskmaster');
-const migration = readFileSync(
-  new URL('../../../../migrations/046_tm_health_provider_pk.sql', import.meta.url),
+const schema = `tm_reset_${randomUUID().replace(/-/g, '')}`;
+let admin: PostgresAdapter | undefined;
+let primary: PostgresAdapter;
+let secondary: PostgresAdapter;
+let active: PostgresAdapter;
+mock.module('./connection', () => ({ getDatabase: () => active }));
+const { resetTaskmaster, upsertHealthSample } = await import('./taskmaster');
+const { createAuthenticatedMessage } = await import('./dispatch');
+const healthMigration = readFileSync(
+  resolve(import.meta.dir, '../../../../migrations/046_tm_health_provider_pk.sql'),
   'utf8'
 );
 
-beforeEach(async () => {
+beforeAll(async () => {
   const raw = process.env.TASKMASTER_POSTGRES_TEST_URL;
   if (!raw) throw new Error('TASKMASTER_POSTGRES_TEST_URL is required');
   const url = new URL(raw);
@@ -22,35 +26,205 @@ beforeEach(async () => {
     !['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ||
     (url.pathname !== '/phase15' && !url.pathname.endsWith('_test'))
   ) {
-    throw new Error('TASKMASTER_POSTGRES_TEST_URL must target a loopback test database');
+    throw new Error('Taskmaster integration requires a loopback test database');
   }
-  adminDb = new PostgresAdapter(raw);
-  schemaName = `tm_health_test_${randomUUID().replace(/-/g, '')}`;
-  await adminDb.query(`CREATE SCHEMA ${schemaName}`);
-  url.searchParams.set('options', `-c search_path=${schemaName}`);
-  db = new PostgresAdapter(url.toString());
+  admin = new PostgresAdapter(raw);
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  url.searchParams.set('options', `-c search_path=${schema}`);
+  primary = new PostgresAdapter(url.toString());
+  secondary = new PostgresAdapter(url.toString());
+  active = primary;
+  // Use the canonical Dispatch schema in this isolated loopback-test namespace.
+  for (const migration of [
+    '028_agent_dispatch.sql',
+    '029_board_authority_foundation.sql',
+    '031_board_motion_dispatch.sql',
+    '040_agent_messaging_phase0.sql',
+    '042_agent_messaging_phase1.sql',
+    '043_agent_messaging_phase15.sql',
+  ]) {
+    await primary.query(
+      readFileSync(resolve(import.meta.dir, '../../../../migrations', migration), 'utf8')
+    );
+  }
+  await primary.query(`INSERT INTO dispatch_principals
+    (principal_id, display_name, delivery_mode, active)
+    VALUES ('duty-officer', 'Duty Officer fixture', 'drain_on_start', TRUE)`);
+  await primary.query(
+    readFileSync(
+      resolve(import.meta.dir, '../../../../migrations/041_taskmaster_slice1.sql'),
+      'utf8'
+    )
+  );
 });
 
-afterEach(async () => {
-  try {
-    if (db) await db.close();
-  } finally {
+beforeEach(async () => {
+  active = primary;
+  await primary.query('DROP TRIGGER IF EXISTS reject_reset_audit ON tm_journal');
+  await primary.query('TRUNCATE tm_journal');
+  await primary.query('TRUNCATE agent_dispatch_messages');
+  await primary.query(
+    "UPDATE tm_control SET pause_state='PAUSED', epoch=7, pause_scope='all', pause_reason='test', pause_actor='test' WHERE id=1"
+  );
+  await primary.query(
+    "INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,outcome) VALUES ($1,'test:pending','digest','{}','pending')",
+    [randomUUID()]
+  );
+});
+
+afterAll(async () => {
+  await Promise.all([primary?.close(), secondary?.close()]);
+  if (admin) {
     try {
-      if (adminDb && schemaName) await adminDb.query(`DROP SCHEMA ${schemaName} CASCADE`);
+      await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     } finally {
-      try {
-        if (adminDb) await adminDb.close();
-      } finally {
-        adminDb = undefined;
-        schemaName = undefined;
-      }
+      await admin.close();
     }
   }
 });
 
+test('independent PostgreSQL pools serialize overlapping resets with one transition', async () => {
+  expect(primary.dialect).toBe('postgres');
+  const results = await Promise.all(
+    Array.from({ length: 12 }, (_, i) => {
+      active = i % 2 === 0 ? primary : secondary;
+      return resetTaskmaster({ actor: `operator-${i}`, reason: 'test recovery' });
+    })
+  );
+  expect(
+    results.filter(result => JSON.parse(result.audit.proposal_json).transitioned)
+  ).toHaveLength(1);
+  expect(results.reduce((sum, result) => sum + result.expiredProposals, 0)).toBe(1);
+  expect(new Set(results.map(result => result.audit.id)).size).toBe(12);
+  for (const [i, result] of results.entries()) {
+    expect(result.control.epoch).toBe(8);
+    expect(result.control.pause_actor).toBe(`operator-${i}`);
+    expect(JSON.parse(result.audit.proposal_json).new_epoch).toBe(8);
+  }
+  const audits = await primary.query(
+    "SELECT id FROM tm_journal WHERE thread_ref='taskmaster:reset'"
+  );
+  expect(audits.rowCount).toBe(12);
+});
+
+test('PostgreSQL already-running reset preserves the epoch-start timestamp', async () => {
+  const epochStart = new Date(Date.now() - 3_600_000).toISOString();
+  await primary.query("UPDATE tm_control SET pause_state='RUNNING', updated_at=$1 WHERE id=1", [
+    epochStart,
+  ]);
+  const result = await resetTaskmaster({ actor: 'operator', reason: 'repeat' });
+  expect(result.control.epoch).toBe(7);
+  expect(result.control.updated_at).toBe(epochStart);
+  expect(result.expiredProposals).toBe(1);
+  expect(JSON.parse(result.audit.proposal_json).transitioned).toBe(false);
+});
+
+test('PostgreSQL notice fence rejects a reset that won before enqueue', async () => {
+  await resetTaskmaster({ actor: 'operator', reason: 'race before enqueue' });
+  const notice = await createAuthenticatedMessage(
+    { kind: 'system', sender: 'taskmaster' },
+    {
+      correlation_id: 'pg-notice-race',
+      idempotency_key: 'tm:self-pause:7',
+      task_type: 'agent_message',
+      recipient: 'duty-officer',
+      body: 'obsolete pause',
+    },
+    { taskmasterPausedEpoch: 7, taskmasterPausedState: 'PAUSED', taskmasterPausedScope: 'all' }
+  );
+  expect(notice).toBeNull();
+  expect(
+    (await primary.query('SELECT pause_state, epoch FROM tm_control WHERE id=1')).rows
+  ).toEqual([{ pause_state: 'RUNNING', epoch: '8' }]);
+});
+
+test('PostgreSQL paused notice queues once with BIGINT epoch and holds its row lock', async () => {
+  const originalTransaction = primary.withTransaction.bind(primary);
+  let competingWriterError: unknown;
+  let checkedLock = false;
+  primary.withTransaction = async fn =>
+    originalTransaction(async query =>
+      fn(async <T>(sql: string, params?: unknown[]) => {
+        const result = await query<T>(sql, params);
+        if (sql.startsWith('SELECT pause_state, pause_scope, epoch FROM tm_control')) {
+          checkedLock = true;
+          try {
+            await secondary.withTransaction(q =>
+              q('SELECT id FROM tm_control WHERE id=1 FOR UPDATE NOWAIT')
+            );
+          } catch (error) {
+            competingWriterError = error;
+          }
+        }
+        return result;
+      })
+    );
+  const data = {
+    correlation_id: 'pg-valid-notice',
+    idempotency_key: 'tm:self-pause:7',
+    task_type: 'agent_message' as const,
+    recipient: 'duty-officer',
+    body: 'valid paused notice',
+  };
+  try {
+    const notice = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'taskmaster' },
+      data,
+      { taskmasterPausedEpoch: 7, taskmasterPausedState: 'PAUSED', taskmasterPausedScope: 'all' }
+    );
+    expect(checkedLock).toBe(true);
+    expect((competingWriterError as { code?: string })?.code).toBe('55P03');
+    expect(notice?.status).toBe('queued');
+    primary.withTransaction = originalTransaction;
+    const retry = await createAuthenticatedMessage({ kind: 'system', sender: 'taskmaster' }, data, {
+      taskmasterPausedEpoch: 7,
+      taskmasterPausedState: 'PAUSED',
+      taskmasterPausedScope: 'all',
+    });
+    expect(retry?.id).toBe(notice?.id);
+    expect((await primary.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
+  } finally {
+    primary.withTransaction = originalTransaction;
+  }
+});
+
+test('PostgreSQL audit failure rolls back control and pending expiration', async () => {
+  const before = await primary.query('SELECT * FROM tm_control WHERE id=1');
+  await primary.query(`CREATE OR REPLACE FUNCTION reject_reset_audit_fn() RETURNS trigger AS $$
+    BEGIN RAISE EXCEPTION 'test reset audit failure'; END;
+    $$ LANGUAGE plpgsql`);
+  await primary.query(`CREATE TRIGGER reject_reset_audit BEFORE INSERT ON tm_journal
+    FOR EACH ROW WHEN (NEW.thread_ref='taskmaster:reset') EXECUTE FUNCTION reject_reset_audit_fn()`);
+  await expect(resetTaskmaster({ actor: 'operator', reason: 'test recovery' })).rejects.toThrow(
+    'test reset audit failure'
+  );
+  expect((await primary.query('SELECT * FROM tm_control WHERE id=1')).rows).toEqual(before.rows);
+  expect(
+    (await primary.query("SELECT outcome FROM tm_journal WHERE thread_ref='test:pending'")).rows
+  ).toEqual([{ outcome: 'pending' }]);
+  expect(
+    (await primary.query("SELECT id FROM tm_journal WHERE thread_ref='taskmaster:reset'")).rowCount
+  ).toBe(0);
+});
+
 describe('tm_health PostgreSQL migration 046', () => {
+  // These cases replace tm_health with drifted shapes; restore migration 041's
+  // canonical table afterwards so no later suite inherits a dropped table.
+  afterAll(async () => {
+    await primary.query('DROP TABLE IF EXISTS tm_health CASCADE');
+    await primary.query(`CREATE TABLE tm_health (
+      provider TEXT PRIMARY KEY, state TEXT NOT NULL,
+      sampled_at TIMESTAMPTZ NOT NULL, expires_at TIMESTAMPTZ NOT NULL,
+      evidence TEXT
+    )`);
+  });
+
   for (const key of ['absent', 'composite', 'provider'] as const) {
     test(`${key} primary key: preserves latest data, supports upserts, and replays safely`, async () => {
+      const db = primary;
+      // Migration 041 already created tm_health with the correct provider-only
+      // primary key; replace it with the drifted shape this case exercises.
+      await db.query('DROP TABLE IF EXISTS tm_health CASCADE');
       const constraint =
         key === 'absent'
           ? ''
@@ -75,7 +249,7 @@ describe('tm_health PostgreSQL migration 046', () => {
         ('codex', 'healthy', '2026-08-26T00:00:00Z', '2026-08-27T00:00:00Z', 'independent')`);
       await db.query('CREATE INDEX health_state_sentinel ON tm_health(state)');
 
-      await db.query(migration);
+      await db.query(healthMigration);
       const preserved = await db.query(
         'SELECT provider, state, sampled_at, expires_at, evidence FROM tm_health ORDER BY provider'
       );
@@ -95,14 +269,14 @@ describe('tm_health PostgreSQL migration 046', () => {
           expires_at: new Date('2026-08-27T00:00:00Z'),
         },
       ]);
-      const primary = await db.query<{ conname: string; definition: string }>(
+      const primaryKey = await db.query<{ conname: string; definition: string }>(
         `SELECT conname, pg_get_constraintdef(oid) AS definition FROM pg_constraint
          WHERE conrelid = 'tm_health'::regclass AND contype = 'p'`
       );
-      expect(primary.rows).toHaveLength(1);
-      expect(primary.rows[0]?.definition).toBe('PRIMARY KEY (provider)');
-      if (key === 'provider') expect(primary.rows[0]?.conname).toBe('correct_health_key');
-      await db.query(migration);
+      expect(primaryKey.rows).toHaveLength(1);
+      expect(primaryKey.rows[0]?.definition).toBe('PRIMARY KEY (provider)');
+      if (key === 'provider') expect(primaryKey.rows[0]?.conname).toBe('correct_health_key');
+      await db.query(healthMigration);
       expect((await db.query('SELECT * FROM tm_health ORDER BY provider')).rows).toEqual(
         preserved.rows
       );
@@ -129,7 +303,7 @@ describe('tm_health PostgreSQL migration 046', () => {
         { provider: 'codex', state: 'healthy', evidence: 'independent' },
       ]);
       const afterUpserts = await db.query('SELECT * FROM tm_health ORDER BY provider');
-      await db.query(migration);
+      await db.query(healthMigration);
       expect((await db.query('SELECT * FROM tm_health ORDER BY provider')).rows).toEqual(
         afterUpserts.rows
       );

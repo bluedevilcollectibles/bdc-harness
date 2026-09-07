@@ -108,7 +108,7 @@ export const USEFUL_RATE_FLOOR = 0.4;
  * noise grade (1 noise / 0 useful = 0%) from pausing a freshly-resumed loop
  * before it has produced enough graded evidence to judge.
  */
-export const USEFUL_RATE_MIN_GRADED = 5;
+export const USEFUL_RATE_MIN_GRADED = 20;
 
 /**
  * Pure floor test: true when the graded sample is large enough AND the
