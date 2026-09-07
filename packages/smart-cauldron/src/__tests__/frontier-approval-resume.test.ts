@@ -92,7 +92,11 @@ function makePassVerdict(): GateVerdict {
 }
 
 /** Produce a real paused (pending-frontier-approval) record on disk. */
-async function producePausedRecord(outDir: string, woId: string): Promise<CascadeRunRecord> {
+async function producePausedRecord(
+  outDir: string,
+  woId: string,
+  binding: Partial<RunCascadeOptions> = {}
+): Promise<CascadeRunRecord> {
   const deps: CascadeDeps = {
     fire: async opts => makeFireOk(`run-${opts.workflowName}`),
     poll: async () => makeFailPoll(),
@@ -109,6 +113,7 @@ async function producePausedRecord(outDir: string, woId: string): Promise<Cascad
     project: 'test-project',
     outDir,
     deps,
+    ...binding,
   };
   const record = await runCascade(opts);
   expect(record.status).toBe('pending-frontier-approval');
@@ -116,6 +121,64 @@ async function producePausedRecord(outDir: string, woId: string): Promise<Cascad
 }
 
 describe('frontier-approval resume (Test 2: approve fires exactly once)', () => {
+  test('rejects an identity-less original Taskmaster packet before any premium fire', async () => {
+    const outDir = await makeOutDir();
+    const paused = await producePausedRecord(outDir, 'WO-LEGACY-01', {
+      dispatchId: 'tm:fire:legacy:1',
+    });
+    let fires = 0;
+    await expect(
+      resumeFrontierTier(paused, {
+        outDir,
+        deps: {
+          fire: async () => {
+            fires++;
+            return makeFireOk('must-not-fire');
+          },
+          poll: async () => makePassPoll(),
+          judge: () => makePassVerdict(),
+          findWoClaim: async () => null,
+        },
+      })
+    ).rejects.toThrow('authority_conflict');
+    expect(fires).toBe(0);
+  });
+  test('persists and resumes the exact eligibility binding after premium approval', async () => {
+    const outDir = await makeOutDir();
+    const expectedSpec = {
+      specSource: 'github:org/repo:docs/WO-BOUND-01.md',
+      specRevision: 'a'.repeat(40),
+      specHash: `sha256:${'b'.repeat(64)}`,
+    };
+    const paused = await producePausedRecord(outDir, 'WO-BOUND-01', {
+      expectedSpec,
+      dispatchId: 'tm:fire:bound:1',
+    });
+    const persisted = await readCascadeRecordById(paused.cascadeId, outDir);
+    expect(persisted?.frontierApproval?.expectedSpec).toEqual(expectedSpec);
+    const messages: string[] = [];
+    await resumeFrontierTier(persisted!, {
+      outDir,
+      deps: {
+        fire: async options => {
+          messages.push(options.message);
+          return makeFireOk('bound-resume');
+        },
+        poll: async () => makePassPoll(),
+        judge: () => makePassVerdict(),
+        findWoClaim: async () => null,
+      },
+    });
+    expect(messages).toHaveLength(1);
+    expect(
+      JSON.parse(
+        Buffer.from(
+          messages[0].split('\n')[0].split(' --expected-spec=')[1],
+          'base64url'
+        ).toString()
+      )
+    ).toEqual(expectedSpec);
+  });
   test('approve resumes + fires the premium tier once; second approve is a no-op', async () => {
     const outDir = await makeOutDir();
     const paused = await producePausedRecord(outDir, 'WO-FRONTIER-RESUME-001');

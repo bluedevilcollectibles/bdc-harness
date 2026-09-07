@@ -1,9 +1,45 @@
+import { createHash } from 'crypto';
 import type { RunAuthorityPolicy } from '@archon/workflows/schemas/workflow';
 import type { FrozenSpecSource } from '@archon/workflows/reliability/run-authority';
 
 export interface WorkOrderSourceDependencies {
   readonly fetcher?: typeof fetch;
   readonly githubToken?: string;
+}
+
+/** A constraint on policy-resolved authority, never an alternate authority source. */
+export interface ExpectedSpecIdentity {
+  readonly specSource: string;
+  readonly specRevision: string;
+  readonly specHash: string;
+}
+
+function readExpectedSpecIdentity(userMessage: string): ExpectedSpecIdentity | undefined {
+  const header = userMessage.split(/\r?\n/, 1)[0];
+  if (!header.includes('--expected-spec')) return undefined;
+  const match =
+    /^(?:\/workflow run [A-Za-z0-9_-]+ )?WO_ID=WO-[A-Z0-9-]+ --project [A-Za-z0-9_.-]+ --expected-spec=([A-Za-z0-9_-]+)$/.exec(
+      header
+    );
+  if (!match) throw new Error('authority_conflict: malformed expected spec header');
+  try {
+    const value: unknown = JSON.parse(Buffer.from(match[1], 'base64url').toString('utf8'));
+    if (typeof value !== 'object' || value === null) throw new Error();
+    const identity = value as Record<string, unknown>;
+    if (
+      Object.keys(identity).length !== 3 ||
+      typeof identity.specSource !== 'string' ||
+      !identity.specSource ||
+      typeof identity.specRevision !== 'string' ||
+      !identity.specRevision ||
+      typeof identity.specHash !== 'string' ||
+      !/^sha256:[a-f0-9]{64}$/.test(identity.specHash)
+    )
+      throw new Error();
+    return identity as unknown as ExpectedSpecIdentity;
+  } catch {
+    throw new Error('authority_conflict: malformed expected spec identity');
+  }
 }
 
 function githubHeaders(token: string | undefined): Record<string, string> {
@@ -68,6 +104,23 @@ export async function freezeWorkOrderSource(
   policy: RunAuthorityPolicy,
   userMessage: string,
   dependencies: WorkOrderSourceDependencies = {}
+): Promise<FrozenSpecSource> {
+  const expected = readExpectedSpecIdentity(userMessage);
+  const source = await resolveWorkOrderSource(policy, userMessage, dependencies);
+  if (
+    expected &&
+    (source.specSource !== expected.specSource ||
+      source.specRevision !== expected.specRevision ||
+      `sha256:${createHash('sha256').update(source.specBytes).digest('hex')}` !== expected.specHash)
+  )
+    throw new Error('authority_conflict: canonical spec changed since eligibility');
+  return source;
+}
+
+async function resolveWorkOrderSource(
+  policy: RunAuthorityPolicy,
+  userMessage: string,
+  dependencies: WorkOrderSourceDependencies
 ): Promise<FrozenSpecSource> {
   const repository = policy.spec_repository;
   const woId = readWoId(userMessage);

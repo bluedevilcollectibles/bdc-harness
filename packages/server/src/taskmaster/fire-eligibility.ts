@@ -1,4 +1,9 @@
 import { listCodebases } from '@archon/core/db/codebases';
+import { createHash } from 'crypto';
+import {
+  freezeWorkOrderSource,
+  type ExpectedSpecIdentity,
+} from '@archon/core/workflows/work-order-source';
 
 export interface FireEligibilityEvidence {
   woId: string;
@@ -6,6 +11,10 @@ export interface FireEligibilityEvidence {
   project: string;
   specVerifiedAt: string;
   noOpenOrMergedPr: true;
+  /** Legacy source category; repo-path covers either exact committed path.
+   * expectedSpec.specSource carries the full canonical path. */
+  specSource?: 'repo-path' | 'date-glob' | 'issue-body';
+  expectedSpec?: ExpectedSpecIdentity;
 }
 
 export interface FireEligibilityResult {
@@ -18,15 +27,20 @@ export interface FireEligibilityDeps {
   fetchImpl?: typeof fetch;
   now?: () => Date;
   codebases?: () => Promise<readonly { name: string; repository_url: string | null }[]>;
+  /** Overrides GITHUB_TOKEN/GH_TOKEN resolution; canonical reads are never anonymous. */
+  githubToken?: string;
 }
 
 const WO_ID_RE = /\b(WO-[A-Z][A-Z0-9-]*-\d+)\b/;
 
-function headers(): Record<string, string> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+function githubToken(): string | undefined {
+  return process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+}
+
+function headers(token: string): Record<string, string> {
   return {
     accept: 'application/vnd.github+json',
-    ...(token ? { authorization: `Bearer ${token}` } : {}),
+    authorization: `Bearer ${token}`,
   };
 }
 
@@ -54,18 +68,49 @@ export async function checkFireEligibility(
   const woId = WO_ID_RE.exec(issueTitle)?.[1];
   if (!woId) return { eligible: false, reason: 'wo_id_missing' };
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const specResponse = await fetchImpl(
-    `https://api.github.com/repos/thinmansoftware/bdc-xo/contents/docs/work-orders/${woId}.md?ref=main`,
-    { headers: headers() }
-  );
-  assertRateLimit(specResponse);
-  if (specResponse.status === 404) return { eligible: false, reason: 'spec_missing' };
-  if (!specResponse.ok) throw new Error(`taskmaster_fire_spec_read_failed:${specResponse.status}`);
-  const payload = (await specResponse.json()) as { content?: string; encoding?: string };
-  const body =
-    payload.encoding === 'base64' && payload.content
-      ? Buffer.from(payload.content.replace(/\s/g, ''), 'base64').toString('utf8')
-      : '';
+  // Injecting a fetcher bypasses the fail-closed authentication guard inside
+  // resolveWorkOrderSource, so the token is resolved and asserted here instead.
+  // Unauthenticated canonical reads would break private-repo access and burn
+  // the 60/hr anonymous rate limit.
+  const token = deps.githubToken ?? githubToken();
+  if (!token) return { eligible: false, reason: 'github_auth_missing' };
+  let frozen;
+  try {
+    // Restrictive subset of the current lane authority policy. The runtime
+    // resolves its own policy and must match this identity before worker creation.
+    // XO1843 permits rejecting issue-only specs; issue content is not a grant.
+    frozen = await freezeWorkOrderSource(
+      {
+        required: true,
+        spec_repository: 'thinmansoftware/bdc-xo',
+        spec_revision: 'main',
+        spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
+        allow_issue_fallback: false,
+      },
+      woId,
+      {
+        githubToken: token,
+        fetcher: (async (input, init) => {
+          const response = await fetchImpl(input, init);
+          assertRateLimit(response);
+          if (!response.ok && response.status !== 404)
+            throw new Error(`taskmaster_fire_spec_read_failed:${response.status}`);
+          return response;
+        }) as typeof fetch,
+      }
+    );
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('scope_authority_missing:')) {
+      return { eligible: false, reason: 'spec_missing' };
+    }
+    throw error;
+  }
+  const body = Buffer.from(frozen.specBytes).toString('utf8');
+  const expectedSpec: ExpectedSpecIdentity = {
+    specSource: frozen.specSource,
+    specRevision: frozen.specRevision,
+    specHash: `sha256:${createHash('sha256').update(frozen.specBytes).digest('hex')}`,
+  };
   if (!/^cauldron_compatible:\s*true\s*$/im.test(body)) {
     return { eligible: false, reason: 'cauldron_incompatible' };
   }
@@ -85,7 +130,7 @@ export async function checkFireEligibility(
   // enforcing a WO token boundary to avoid generic-title substring matches.
   const searchResponse = await fetchImpl(
     `https://api.github.com/search/issues?q=${encodeURIComponent(`${woId} repo:${targetRepo} is:pr`)}`,
-    { headers: headers() }
+    { headers: headers(token) }
   );
   assertRateLimit(searchResponse);
   if (!searchResponse.ok)
@@ -115,6 +160,8 @@ export async function checkFireEligibility(
       project,
       specVerifiedAt: (deps.now ?? ((): Date => new Date()))().toISOString(),
       noOpenOrMergedPr: true,
+      specSource: 'repo-path',
+      expectedSpec,
     },
   };
 }

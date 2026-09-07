@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
@@ -143,6 +144,8 @@ export interface SpecRepairResult {
 
 export interface RunCascadeOptions {
   woId: string;
+  /** Constrain each lane's canonical spec to the identity checked before dispatch. */
+  expectedSpec?: ExpectedSpecIdentity;
   /** Stable caller-supplied dispatch identity. Replays return the existing durable record. */
   dispatchId?: string;
   /** Resolves only after the initial record is durable; used by async API dispatch. */
@@ -642,6 +645,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
 
         frontierApprovalRecord = {
+          ...(opts.expectedSpec ? { expectedSpec: opts.expectedSpec } : {}),
           tierName: tier.name,
           workflowName: tier.workflowName,
           priorContext,
@@ -734,7 +738,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         workflowName: tier.workflowName,
         woId,
         project,
-        message: buildFireMessage(woId, project, priorContext ?? undefined),
+        message: buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec),
         apiBaseUrl,
         token,
       });

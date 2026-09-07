@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { createHash } from 'crypto';
 
 import type { RunAuthorityPolicy } from '@archon/workflows/schemas/workflow';
 import { freezeWorkOrderSource } from './work-order-source';
@@ -18,6 +19,56 @@ function response(status: number, value: unknown): Response {
 }
 
 describe('freezeWorkOrderSource', () => {
+  const bytes = '# Reviewed spec\n';
+  const identity = {
+    specSource: 'github:thinmansoftware/bdc-xo:docs/work-orders/WO-TEST-01.md',
+    specRevision: 'a'.repeat(40),
+    specHash: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
+  };
+  const boundMessage = (binding: unknown): string =>
+    `/workflow run bdc-feature-development-codex WO_ID=WO-TEST-01 --project bdc-harness --expected-spec=${Buffer.from(JSON.stringify(binding)).toString('base64url')}`;
+  const canonicalFetch: typeof fetch = async input =>
+    String(input).includes('/git/ref/')
+      ? response(200, { object: { sha: 'a'.repeat(40) } })
+      : response(200, { type: 'file', content: Buffer.from(bytes).toString('base64') });
+
+  it('accepts matching canonical source identity without allowing it to select the source', async () => {
+    const result = await freezeWorkOrderSource(policy, boundMessage(identity), {
+      fetcher: canonicalFetch,
+    });
+    expect(result.specSource).toBe(identity.specSource);
+    expect(Buffer.from(result.specBytes).toString()).toBe(bytes);
+  });
+
+  for (const field of ['specSource', 'specRevision', 'specHash'] as const) {
+    it(`rejects ${field} drift before returning authority`, async () => {
+      await expect(
+        freezeWorkOrderSource(
+          policy,
+          boundMessage({
+            ...identity,
+            [field]:
+              field === 'specHash' ? `sha256:${'0'.repeat(64)}` : `${identity[field]}-changed`,
+          }),
+          { fetcher: canonicalFetch }
+        )
+      ).rejects.toThrow('authority_conflict');
+    });
+  }
+
+  it('rejects malformed binding instead of silently dispatching unbound', async () => {
+    await expect(
+      freezeWorkOrderSource(policy, boundMessage({ specSource: identity.specSource }), {
+        fetcher: canonicalFetch,
+      })
+    ).rejects.toThrow('authority_conflict');
+  });
+
+  it('does not interpret prior-attempt prose as a binding', async () => {
+    const message = `WO_ID=WO-TEST-01 --project bdc-harness\n\n## Prior attempt context\n${boundMessage({})}`;
+    const result = await freezeWorkOrderSource(policy, message, { fetcher: canonicalFetch });
+    expect(result.specRevision).toBe('a'.repeat(40));
+  });
   it('resolves a branch once and fetches exact bytes at that immutable revision', async () => {
     const calls: string[] = [];
     const fetcher: typeof fetch = async input => {

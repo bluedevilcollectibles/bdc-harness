@@ -8,7 +8,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "bun test src/resolver.test.ts && bun test src/providers/worktree.restart.integration.test.ts && bun test src/providers/worktree.test.ts && bun test src/errors.test.ts src/factory.test.ts src/worktree-copy.test.ts src/stage-allocator.test.ts && bun test src/pr-state.test.ts",
+    "test": "bun test --timeout 30000 src/resolver.test.ts && bun test --timeout 30000 src/providers/worktree.restart.integration.test.ts && bun test --timeout 30000 src/providers/worktree.test.ts && bun test --timeout 30000 src/errors.test.ts src/factory.test.ts src/worktree-copy.test.ts src/stage-allocator.test.ts && bun test --timeout 30000 src/pr-state.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {

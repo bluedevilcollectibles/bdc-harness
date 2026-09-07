@@ -10,6 +10,7 @@
  */
 
 import type { FireResult } from './types.js';
+import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
 
 interface FireTierOptions {
   workflowName: string;
@@ -267,9 +268,13 @@ async function discoverRunId(opts: {
 export function buildFireMessage(
   woId: string,
   project: string,
-  priorAttemptContext?: string
+  priorAttemptContext?: string,
+  expectedSpec?: ExpectedSpecIdentity
 ): string {
-  const base = `WO_ID=${woId} --project ${project}`;
+  const binding = expectedSpec
+    ? ` --expected-spec=${Buffer.from(JSON.stringify(expectedSpec)).toString('base64url')}`
+    : '';
+  const base = `WO_ID=${woId} --project ${project}${binding}`;
   if (!priorAttemptContext) return base;
   return `${base}\n\n## Prior attempt context\n${priorAttemptContext}`;
 }

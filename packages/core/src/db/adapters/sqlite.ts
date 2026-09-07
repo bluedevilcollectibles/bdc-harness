@@ -173,6 +173,15 @@ export class SqliteAdapter implements IDatabase {
     // on Windows this makes rmSync on the db directory fail with EBUSY until a
     // collection runs. Force one so close() means closed. (Verified 2026-07-13:
     // rm fails after close(), succeeds after Bun.gc(true).)
+    //
+    // DO NOT remove this to chase a slow-CI hook timeout. Measured 2026-09-07
+    // while diagnosing the windows-latest taskmaster flake: this forced GC costs
+    // ~3ms per close (2.3ms at a 3.5MB heap, 3.8ms at 17MB), against ~82ms for
+    // the constructor's initSchema() in the same cycle. It is not the cost, and
+    // dropping it re-opens the EBUSY class above. The flake's actual cause was
+    // filesystem contention from running many sqlite-backed test files
+    // concurrently in one `bun test` invocation -- fixed in this package's
+    // "test" script, not here.
     if (typeof Bun !== 'undefined' && typeof Bun.gc === 'function') {
       Bun.gc(true);
     }
@@ -303,6 +312,60 @@ export class SqliteAdapter implements IDatabase {
           DROP TABLE tm_journal;
           ALTER TABLE tm_journal_new RENAME TO tm_journal;
         `);
+        this.db.run('COMMIT');
+      } catch (error: unknown) {
+        this.db.run('ROLLBACK');
+        throw error;
+      }
+    }
+    // Migration 046: older on-disk databases used a composite primary key for
+    // tm_health. Add a provider-only UNIQUE index (allowed by the WO) instead
+    // of rebuilding: table constraints, columns, indexes and triggers survive.
+    const hasHealthConflictTarget = (): boolean =>
+      this.db
+        .prepare(
+          `
+          SELECT 1 FROM pragma_index_list('tm_health') AS idx
+          WHERE idx."unique" = 1 AND idx.partial = 0
+            AND (SELECT COUNT(*) FROM pragma_index_info(idx.name)) = 1
+            AND (SELECT name FROM pragma_index_info(idx.name)) = 'provider'
+          LIMIT 1
+        `
+        )
+        .get() != null;
+    if (!hasHealthConflictTarget()) {
+      this.db.run('BEGIN IMMEDIATE');
+      try {
+        // Another connection may have repaired it while this one awaited the
+        // writer lock. Recheck before deleting rows or creating the index.
+        if (!hasHealthConflictTarget()) {
+          const occupiedNames = new Set(
+            (this.db.query('SELECT name FROM sqlite_schema').all() as { name: string }[]).map(row =>
+              row.name.toLowerCase()
+            )
+          );
+          const indexBase = 'tm_health_provider_unique';
+          let indexName = indexBase;
+          for (let suffix = 1; occupiedNames.has(indexName); suffix++) {
+            indexName = `${indexBase}_${String(suffix)}`;
+          }
+          // Execute the deletion separately so trigger failures reach rollback
+          // before attempting the index DDL.
+          this.db
+            .query(
+              `
+            DELETE FROM tm_health AS older
+            WHERE EXISTS (
+              SELECT 1 FROM tm_health AS newer
+              WHERE newer.provider = older.provider
+                AND (newer.sampled_at > older.sampled_at
+                  OR (newer.sampled_at = older.sampled_at AND newer.rowid > older.rowid))
+            );
+          `
+            )
+            .run();
+          this.db.run(`CREATE UNIQUE INDEX "${indexName}" ON tm_health(provider)`);
+        }
         this.db.run('COMMIT');
       } catch (error: unknown) {
         this.db.run('ROLLBACK');
