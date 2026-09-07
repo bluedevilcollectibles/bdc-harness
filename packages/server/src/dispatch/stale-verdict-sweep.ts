@@ -15,13 +15,20 @@
  * each -- reusing the SAME idempotency rule as the webhook path, so a sweep and
  * a delivery that both notice the same completion produce one row, not two.
  *
- * BOUNDED BY DESIGN. `OVERSEER_STALE_VERDICT_SWEEP_MAX` (default 3) caps how
- * many re-reviews one heartbeat may enqueue. The bound exists because this is
- * the only part of #782 that costs GitHub API budget: deciding whether a
- * verdict is stale requires reading the check runs at that head, and the shared
- * per-user budget is what collapsed a review on #776 in the first place. An
- * unbounded sweep across every open PR every minute would reintroduce exactly
- * the exhaustion this WO is also fixing.
+ * BOUNDED BY DESIGN. `OVERSEER_STALE_VERDICT_SWEEP_MAX` (default 3) is a budget
+ * of CANDIDATES TOUCHED per heartbeat, not of re-reviews enqueued. The bound
+ * exists because this is the only part of #782 that costs GitHub API budget:
+ * deciding whether a verdict is stale requires reading the check runs at that
+ * head, and the shared per-user budget is what collapsed a review on #776 in
+ * the first place. An unbounded sweep across every open PR every minute would
+ * reintroduce exactly the exhaustion this WO is also fixing.
+ *
+ * Counting enqueues instead would not bound anything that matters: a heartbeat
+ * where every candidate is authorized but not yet stale, or already enqueued by
+ * the webhook, produces zero enqueues while still issuing one GitHub read per
+ * candidate. So the budget is spent when a candidate is PICKED UP, before its
+ * outcome is known, and the single refund is the local-only unsweepable check
+ * that issues no read at all.
  */
 import { createLogger } from '@archon/paths';
 import {
@@ -34,8 +41,21 @@ import {
 
 const log = createLogger('dispatch/stale-verdict-sweep');
 
-/** Default number of re-reviews one heartbeat may enqueue. */
+/**
+ * Default sweep budget: the number of candidates one heartbeat may TOUCH, and
+ * therefore the ceiling on GitHub reads it may make. It is not a cap on
+ * enqueues -- a heartbeat that examines three candidates and finds none stale
+ * has spent its whole budget and enqueued nothing, which is the correct and
+ * intended shape (Overseer review finding, PR #786).
+ */
 export const DEFAULT_STALE_SWEEP_MAX = 3;
+
+/**
+ * Extra candidates listed beyond the budget, to cover slots refunded by the
+ * local-only "not sweepable" check. Additive and small on purpose: listing is
+ * one local query, but every candidate actually TOUCHED still costs a slot.
+ */
+const CANDIDATE_LOOKAHEAD = 5;
 
 export function resolveStaleSweepMax(
   env: Record<string, string | undefined> = process.env
@@ -74,7 +94,8 @@ export interface StaleVerdictSweepDeps {
   /**
    * The most recent completed check at that head, or null when none has
    * completed. THIS IS THE ONE GITHUB READ in the sweep, which is why the
-   * per-heartbeat bound is applied before it is ever called.
+   * per-heartbeat budget is spent before it is ever called -- and why a
+   * candidate that reaches this line keeps its slot whatever the answer is.
    */
   readLatestCheckCompletion(candidate: SweepCandidate): Promise<LatestCheckCompletion | null>;
   /** Same enqueue seam the webhook ingest uses; same idempotency contract. */
@@ -90,9 +111,13 @@ export interface StaleVerdictSweepDeps {
 }
 
 export interface StaleVerdictSweepResult {
-  /** Candidates examined (i.e. that survived the local-only filters). */
+  /**
+   * Candidates that survived the local-only filters and therefore cost one
+   * GitHub read each. This is the number the budget actually bounds, so it is
+   * always <= the configured max.
+   */
   examined: number;
-  /** Re-reviews actually enqueued as NEW rows. */
+  /** Re-reviews actually enqueued as NEW rows. Never bounds the sweep. */
   enqueued: number;
   /** Candidates whose re-review row already existed (idempotent no-op). */
   duplicates: number;
@@ -132,25 +157,57 @@ export async function runStaleVerdictSweep(
 
   let candidates: SweepCandidate[];
   try {
-    // Read more candidates than the bound: most will be filtered out locally
-    // (approved, no verdict, verdict newer than the completion), and only the
-    // survivors cost a GitHub read.
-    candidates = await deps.listCandidates(Math.max(max * 5, max));
+    // Ask for exactly the budget, never a multiple of it. An earlier version
+    // over-fetched on the theory that most candidates are filtered out locally
+    // and only survivors cost a GitHub read -- but the stopping rule then
+    // counted only successful enqueues, so a heartbeat in which every
+    // candidate was authorized-but-not-stale (or already enqueued by the
+    // webhook) walked the whole over-fetched list and made one GitHub read per
+    // candidate. That is `max * 5` reads per heartbeat from a bound advertised
+    // as `max`, which inverts the rate-budget guarantee this sweep exists to
+    // honor. Overseer review finding on PR #786 @5b53b394.
+    //
+    // The list is still slightly longer than the budget because the
+    // local-only refund below can hand a slot back: a run of approved PRs at
+    // the head of the list would otherwise leave the budget unspent with
+    // sweepable PRs sitting just past the end. The over-fetch is bounded and
+    // additive (not multiplicative), and a listed-but-never-touched candidate
+    // costs nothing -- `listCandidates` is a single local query.
+    candidates = await deps.listCandidates(max + CANDIDATE_LOOKAHEAD);
   } catch (error) {
     log.error({ err: error }, 'overseer_stale_verdict_sweep_candidates_failed');
     return result;
   }
 
+  // ONE BUDGET, SPENT ON EVERY CANDIDATE TOUCHED. `remaining` is decremented
+  // as each candidate is picked up, before any of its outcomes are known, so a
+  // duplicate, a non-stale verdict, a completion-less head and a successful
+  // enqueue all cost exactly the same. That is what makes the bound a real
+  // ceiling on GitHub reads per heartbeat rather than a ceiling on the one
+  // outcome that happens to be cheapest to reach.
+  let remaining = max;
+
   for (const candidate of candidates) {
-    if (result.enqueued >= max) break;
+    if (remaining <= 0) break;
+    remaining -= 1;
     try {
       const verdict = await deps.readStandingVerdict(candidate);
       // Same authorization question as the webhook path, and deliberately the
       // SAME function: an approved PR, or one rejected on a code finding, is
       // never swept. Two copies of this rule would drift.
-      if (!verdictAuthorizesRecheck(verdict) || !verdict) continue;
+      //
+      // This is the ONE branch that refunds the budget: it is decided entirely
+      // from the local store and issues no GitHub read, so letting an
+      // unsweepable PR consume a slot would let a backlog of approved PRs
+      // starve the sweep without spending any of the budget it is protecting.
+      if (!verdictAuthorizesRecheck(verdict) || !verdict) {
+        remaining += 1;
+        continue;
+      }
       result.examined += 1;
 
+      // Past this point a GitHub read has been issued, so the slot stays spent
+      // no matter how the candidate turns out.
       const completion = await deps.readLatestCheckCompletion(candidate);
       if (!completion) continue;
       if (!verdictIsStale(verdict, completion)) continue;

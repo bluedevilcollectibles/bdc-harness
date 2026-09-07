@@ -105,9 +105,113 @@ describe('runStaleVerdictSweep', () => {
 
     expect(result.enqueued).toBe(2);
     expect(recorded.enqueued).toHaveLength(2);
-    // The bound is applied BEFORE the GitHub read, so an over-budget candidate
-    // costs no rate budget at all.
-    expect(recorded.githubReads).toBeLessThanOrEqual(3);
+    // EXACTLY the budget, not merely "no more than a multiple of it": the
+    // budget is spent per candidate touched, so it caps GitHub reads directly.
+    expect(recorded.githubReads).toBe(2);
+    expect(result.examined).toBe(2);
+  });
+
+  // Overseer review finding, PR #786 @5b53b394. The budget used to be spent
+  // only on a SUCCESSFUL enqueue, so a heartbeat that enqueued nothing never
+  // advanced the stopping counter and walked the whole over-fetched candidate
+  // list -- max*5 GitHub reads from a bound advertised as max.
+  test('three non-stale candidates exhaust the budget with zero enqueues, and a fourth is never read', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const touched: number[] = [];
+    const candidates = [1, 2, 3, 4].map(number => candidate(number, `head-${number}`));
+    const deps = makeDeps(candidates, recorded, {
+      readStandingVerdict: mock(async input => {
+        touched.push(input.prNumber);
+        // Authorized (check-caused CHANGES_REQUESTED) but NOT stale: the
+        // verdict postdates the completion, so nothing is ever enqueued.
+        return { ...STALE_VERDICT, headSha: input.headSha, recordedAt: '2026-09-07T18:00:00.000Z' };
+      }),
+    });
+
+    const result = await runStaleVerdictSweep(deps, 3);
+
+    expect(result.enqueued).toBe(0);
+    expect(recorded.enqueued).toHaveLength(0);
+    // The budget was fully spent on candidates that produced nothing.
+    expect(result.examined).toBe(3);
+    expect(recorded.githubReads).toBe(3);
+    // The fourth candidate is never touched at all -- not read from the store,
+    // and certainly not read from GitHub.
+    expect(touched).toEqual([1, 2, 3]);
+    expect(touched).not.toContain(4);
+  });
+
+  test('duplicates also spend the budget, so a re-swept backlog cannot exceed it', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const candidates = [1, 2, 3, 4, 5].map(number => candidate(number, `head-${number}`));
+    const deps = makeDeps(candidates, recorded, {
+      readStandingVerdict: mock(async input => ({ ...STALE_VERDICT, headSha: input.headSha })),
+      // Every candidate is already queued by the webhook path.
+      enqueueRecheckWork: mock(async () => ({ messageId: 'existing', alreadyExisted: true })),
+    });
+
+    const result = await runStaleVerdictSweep(deps, 2);
+
+    expect(result.enqueued).toBe(0);
+    expect(result.duplicates).toBe(2);
+    expect(recorded.githubReads).toBe(2);
+  });
+
+  test('completion-less candidates also spend the budget', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const candidates = [1, 2, 3, 4, 5].map(number => candidate(number, `head-${number}`));
+    const deps = makeDeps(candidates, recorded, {
+      readStandingVerdict: mock(async input => ({ ...STALE_VERDICT, headSha: input.headSha })),
+      readLatestCheckCompletion: mock(async () => {
+        recorded.githubReads += 1;
+        return null;
+      }),
+    });
+
+    const result = await runStaleVerdictSweep(deps, 2);
+
+    expect(result.enqueued).toBe(0);
+    expect(result.examined).toBe(2);
+    expect(recorded.githubReads).toBe(2);
+  });
+
+  test('an unsweepable candidate refunds its slot, because it costs no GitHub read', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    // Two approved PRs at the head of the list, then two genuinely stale ones.
+    const candidates = [1, 2, 3, 4].map(number => candidate(number, `head-${number}`));
+    const deps = makeDeps(candidates, recorded, {
+      readStandingVerdict: mock(async input =>
+        input.prNumber <= 2
+          ? { headSha: input.headSha, disposition: 'approved', summary: null, recordedAt: null }
+          : { ...STALE_VERDICT, headSha: input.headSha }
+      ),
+    });
+
+    const result = await runStaleVerdictSweep(deps, 2);
+
+    // The approved pair did not starve the budget: both stale PRs were swept.
+    expect(result.enqueued).toBe(2);
+    // And the refund never inflates the GitHub-read ceiling.
+    expect(recorded.githubReads).toBe(2);
+  });
+
+  test('never lists more candidates than the budget plus a bounded lookahead', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const requested: number[] = [];
+    const deps = makeDeps([], recorded, {
+      listCandidates: mock(async limit => {
+        requested.push(limit);
+        return [];
+      }),
+    });
+
+    await runStaleVerdictSweep(deps, 3);
+
+    // Additive, never multiplicative: the old `max * 5` fetch is what made the
+    // unbounded read count reachable in the first place.
+    expect(requested).toHaveLength(1);
+    expect(requested[0]).toBeLessThanOrEqual(3 + 5);
+    expect(requested[0]).toBeGreaterThanOrEqual(3);
   });
 
   test('a bound of zero disables the sweep entirely', async () => {
