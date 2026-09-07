@@ -16,9 +16,11 @@
  * subscription remains a separate, external step.
  */
 import * as dispatch from '@archon/core/db/dispatch';
+import { createLogger } from '@archon/paths';
 import {
   createRealFetchExactHeadPullRequestEvidence,
   createRealOctokitClient,
+  createRealReadOnlyPatOctokitClient,
   createRealSubmitPullRequestReview,
 } from './adapters/github-real-deps';
 import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
@@ -40,6 +42,8 @@ const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
 
 /** Code-fixed Overseer sender that owns queued review work. */
 export const REVIEW_SENDER = 'overseer';
+const log = createLogger('overseer/pr-review-wiring');
+
 export const REVIEW_RECIPIENT = 'overseer-reviewer';
 
 export interface ReviewRouteConfig {
@@ -235,6 +239,12 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
 
 interface RealSubmitWiringOverrides {
   octokit?: ReturnType<typeof createRealOctokitClient>;
+  /**
+   * PAT-identity client used only as the second identity for the
+   * branch-protection required-contexts lookup the App cannot read. Pass `null`
+   * to assert "no PAT identity" explicitly (tests); omit to resolve from env.
+   */
+  patOctokit?: ReturnType<typeof createRealOctokitClient> | null;
   reviewerModel?: string;
   evaluate?: (input: PrReviewInput, deps: PrReviewDeps) => Promise<PrReviewResult>;
   invokeModel?: PrReviewDeps['invokeModel'];
@@ -242,6 +252,34 @@ interface RealSubmitWiringOverrides {
 
 const INDETERMINATE_REVIEW_SUMMARY =
   'The independent review could not reach a determinate verdict. No approval was issued.';
+
+/**
+ * The body posted on the PR when the required status-check contexts could not
+ * be read after the attempt bound (#775).
+ *
+ * It states the attempt count and whether the cause was a PERMISSION or a
+ * TRANSIENT fault, because those need different human actions: grant the App
+ * the branch-protection scope (or supply GH_TOKEN / OVERSEER_REQUIRED_CONTEXTS_JSON)
+ * versus wait out a GitHub API fault. It says explicitly that the PR is BLOCKED
+ * and NOT approved, so nobody reads a comment-only review as a soft pass.
+ */
+export function buildRequiredContextsBlockedSummary(error: string | undefined): string {
+  const attemptsMatch = /attempts=(\d+)/.exec(error ?? '');
+  const attempts = attemptsMatch?.[1] ?? 'the configured number of';
+  const reasonMatch = /reason=(permission|transient)/.exec(error ?? '');
+  const reason = reasonMatch?.[1] ?? 'transient';
+  const remedy =
+    reason === 'permission'
+      ? 'The reviewing identity lacks permission to read branch protection. Grant the Overseer GitHub App the branch-protection read scope, provide a PAT via GH_TOKEN, or declare the contexts with OVERSEER_REQUIRED_CONTEXTS_JSON.'
+      : 'The GitHub API did not answer the branch-protection lookup. This may clear on its own; if it persists, treat it as a permission problem.';
+  return [
+    `Required status-check contexts unavailable after ${attempts} attempts (reason: ${reason}); review blocked, not approved.`,
+    '',
+    'The reviewer could not determine which status checks this base branch requires, so it cannot tell whether CI is genuinely complete. It will not approve on the checks that happen to have reported.',
+    '',
+    remedy,
+  ].join('\n');
+}
 
 /**
  * Bind WO-2's evaluator into WO-1's injected submit-side reviewer seam.
@@ -253,7 +291,11 @@ export function createRealSubmitDeps(
   overrides: RealSubmitWiringOverrides = {}
 ): SubmitDeps {
   const octokit = overrides.octokit ?? createRealOctokitClient();
-  const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(octokit);
+  const patOctokit =
+    overrides.patOctokit === undefined
+      ? (createRealReadOnlyPatOctokitClient() ?? undefined)
+      : (overrides.patOctokit ?? undefined);
+  const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(octokit, patOctokit);
   const configuredModelReviewer = configuredReviewIdentity();
   const modelReviewer = {
     provider: configuredModelReviewer.provider,
@@ -298,6 +340,17 @@ export function createRealSubmitDeps(
           checksPending: true,
         };
       }
+      // CHECKS_UNAVAILABLE (#775): terminal, never approving. Carries its own
+      // summary because a COMMENT with no body says nothing, and the whole
+      // point of this path is that a human can read why the PR is stuck.
+      if (result.verdict === 'CHECKS_UNAVAILABLE') {
+        return {
+          approved: false,
+          summary: buildRequiredContextsBlockedSummary(result.error),
+          reviewedHeadSha: result.reviewed_head_sha,
+          requiredContextsUnavailable: true,
+        };
+      }
       const summary =
         result.findings.length > 0
           ? result.findings
@@ -322,6 +375,23 @@ export function createRealSubmitDeps(
       return pr.data.head.sha;
     },
     async recordReceipt(input): Promise<void> {
+      // This receipt IS the escalation path: every terminal disposition lands
+      // in the operator dispatch inbox, which XO drains at session start. #775
+      // additionally logs at error level and marks the body `needsOperator` so
+      // a blocked-for-permissions PR is not just one more receipt in the list.
+      const blocked = input.disposition === 'blocked_required_contexts_unavailable';
+      if (blocked) {
+        log.error(
+          {
+            owner: input.owner,
+            repo: input.repo,
+            prNumber: input.prNumber,
+            headSha: input.headSha,
+            reason: input.reason ?? null,
+          },
+          'overseer.pr_review.required_contexts_unavailable_blocked'
+        );
+      }
       await dispatch.createAuthenticatedMessage(
         { kind: 'system', sender: REVIEW_SENDER },
         {
@@ -329,7 +399,11 @@ export function createRealSubmitDeps(
           idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
           task_type: 'run_report',
           recipient: 'operator',
-          body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
+          body: JSON.stringify({
+            kind: 'pr_review_submit_receipt',
+            ...input,
+            ...(blocked ? { needsOperator: true } : {}),
+          }),
         }
       );
     },

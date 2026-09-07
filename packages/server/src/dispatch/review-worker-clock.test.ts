@@ -154,6 +154,10 @@ describe('review worker clock', () => {
     ['merge_custody_conflict', 'failed', 'blocked'],
     ['reviewer_failed', 'failed', 'failed'],
     ['submission_failed', 'failed', 'failed'],
+    // #775: the required status-check contexts could not be read after the
+    // attempt bound. TERMINAL and blocked -- it must be POSTED, not released,
+    // or the item goes back into the forever-defer loop it was blocked to end.
+    ['blocked_required_contexts_unavailable', 'failed', 'blocked'],
   ] as const)(
     'maps %s submissions to %s with a %s task outcome',
     async (disposition, status, taskOutcome) => {

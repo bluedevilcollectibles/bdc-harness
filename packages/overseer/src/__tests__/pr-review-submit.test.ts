@@ -249,6 +249,86 @@ describe('checks pending (WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01)', () =
   });
 });
 
+describe('required contexts unavailable -- blocked, never approved (#775)', () => {
+  const BLOCKED_SUMMARY =
+    'Required status-check contexts unavailable after 5 attempts (reason: permission); review blocked, not approved.';
+
+  function blockedReviewer(): SubmitDeps['runReviewer'] {
+    return async () => ({
+      approved: false,
+      summary: BLOCKED_SUMMARY,
+      reviewedHeadSha: HEAD,
+      requiredContextsUnavailable: true,
+    });
+  }
+
+  test('posts a COMMENT review and finishes with the blocked disposition', async () => {
+    const { deps, rec } = makeDeps({ runReviewer: blockedReviewer() });
+    const outcome = await runAndSubmitReview(WORK, deps);
+
+    expect(outcome.disposition).toBe('blocked_required_contexts_unavailable');
+    expect(outcome.reason).toBe('required_contexts_unavailable_blocked');
+    // A COMMENT states the problem on the PR without approving it and without
+    // claiming a code finding that was never made.
+    expect(rec.submitted).toHaveLength(1);
+    expect(rec.submitted[0]?.event).toBe('COMMENT');
+    expect(rec.submitted[0]?.event).not.toBe('APPROVE');
+    expect(rec.submitted[0]?.body).toContain('review blocked, not approved');
+    expect(rec.submitted[0]?.commitId).toBe(HEAD);
+    // Terminal: a receipt exists, and it is the escalation the operator drains.
+    expect(rec.receipts).toHaveLength(1);
+    expect(rec.receipts[0]?.disposition).toBe('blocked_required_contexts_unavailable');
+  });
+
+  test('a failed comment still blocks -- it never degrades to a retry or an approval', async () => {
+    const { deps, rec } = makeDeps({
+      runReviewer: blockedReviewer(),
+      submitReview: async () => ({ submitted: false, message: 'github_review_unprocessable' }),
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+
+    expect(outcome.disposition).toBe('blocked_required_contexts_unavailable');
+    expect(outcome.disposition).not.toBe('checks_pending');
+    expect(outcome.reason).toContain('comment_failed');
+    // The escalation is what guarantees a human sees it even when the comment
+    // could not be posted, so the receipt must still be written.
+    expect(rec.receipts[0]?.disposition).toBe('blocked_required_contexts_unavailable');
+  });
+
+  test('a throwing comment is classified, not propagated', async () => {
+    const { deps } = makeDeps({
+      runReviewer: blockedReviewer(),
+      submitReview: async () => {
+        throw new Error('network exploded');
+      },
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('blocked_required_contexts_unavailable');
+  });
+
+  test('checks-pending is checked first: a pending verdict never blocks', async () => {
+    // The two are distinct outcomes. checksPending is retried; blocked is not.
+    const { deps, rec } = makeDeps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: '',
+        reviewedHeadSha: HEAD,
+        checksPending: true,
+      }),
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('checks_pending');
+    expect(rec.submitted).toHaveLength(0);
+  });
+
+  test('custody is still enforced ahead of the blocked branch', async () => {
+    const { deps, rec } = makeDeps({ runReviewer: blockedReviewer() });
+    const outcome = await runAndSubmitReview({ ...WORK, author: REVIEWER }, deps);
+    expect(outcome.disposition).toBe('custody_conflict');
+    expect(rec.submitted).toHaveLength(0);
+  });
+});
+
 describe('exact-head binding', () => {
   test('refuses to submit when the reviewer examined a different head', async () => {
     const { deps, rec } = makeDeps({

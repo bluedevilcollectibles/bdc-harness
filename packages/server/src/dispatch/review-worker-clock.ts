@@ -57,8 +57,14 @@ function mapSubmitOutcome(
     case 'changes_requested':
     case 'stale_head':
       return { status: 'done', task_outcome: 'succeeded' };
+    // `blocked_required_contexts_unavailable` (#775): the required
+    // status-check contexts could not be read after the attempt bound.
+    // TERMINAL and blocked -- never released for another tick (unbounded
+    // release is what parked these rows at fencing_token 240) and never
+    // succeeded, because no review judgment was ever formed.
     case 'custody_conflict':
     case 'merge_custody_conflict':
+    case 'blocked_required_contexts_unavailable':
       return { status: 'failed', task_outcome: 'blocked' };
     case 'reviewer_failed':
     case 'submission_failed':

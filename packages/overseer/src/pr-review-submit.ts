@@ -40,6 +40,16 @@ export interface ReviewerVerdict {
    * fixes). The worker releases and retries the item on a later tick.
    */
   checksPending?: boolean;
+  /**
+   * Set when the required status-check contexts could not be read after the
+   * configured attempt bound (#775). TERMINAL and NON-APPROVING: unlike
+   * `checksPending` the item is not released for another try, and unlike
+   * `approved: false` it is not a code rejection -- the reviewer found nothing
+   * wrong, it could not see what CI is mandatory. The submit path posts a
+   * COMMENT review carrying `summary` and finishes with
+   * `blocked_required_contexts_unavailable`, which the worker escalates.
+   */
+  requiredContextsUnavailable?: boolean;
 }
 
 export interface ReviewWorkItem {
@@ -61,7 +71,14 @@ export type SubmitDisposition =
   | 'stale_head'
   | 'reviewer_failed'
   | 'submission_failed'
-  | 'checks_pending';
+  | 'checks_pending'
+  /**
+   * TERMINAL, NEVER APPROVING (#775). The required status-check contexts could
+   * not be read after the configured attempt bound, so the review is blocked
+   * and a human is told. Distinct from `checks_pending` (non-terminal, retried)
+   * and from `changes_requested` (a real code finding).
+   */
+  | 'blocked_required_contexts_unavailable';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
@@ -171,6 +188,37 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
+    });
+  }
+
+  // REQUIRED CONTEXTS UNAVAILABLE (#775): bounded deferral has been exhausted.
+  // Post a COMMENT so the PR itself says why it is blocked, then finish with a
+  // terminal non-approving disposition the worker escalates. Submission failure
+  // must NOT convert this into a retry or an approval, so the disposition is
+  // preserved either way -- the escalation is what guarantees a human sees it.
+  if (verdict.requiredContextsUnavailable) {
+    let submitted = false;
+    let submitMessage: string | undefined;
+    try {
+      const result = await deps.submitReview({
+        owner: work.owner,
+        repo: work.repo,
+        number: work.prNumber,
+        event: 'COMMENT',
+        body: buildReviewBody(work, verdict),
+        commitId: work.headSha,
+      });
+      submitted = result.submitted;
+      submitMessage = result.message;
+    } catch (error) {
+      submitMessage = errorCode(error);
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'blocked_required_contexts_unavailable',
+      reason: submitted
+        ? 'required_contexts_unavailable_blocked'
+        : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
+      event: 'COMMENT',
     });
   }
 

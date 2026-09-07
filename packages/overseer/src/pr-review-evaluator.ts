@@ -1,7 +1,20 @@
 import type { IndependentReviewFinding, ReviewAgentIdentity } from './independent-review-evidence';
 import { assertCandidateIsCurrentHead } from './independent-review-evidence';
 
-export type PrReviewVerdict = 'APPROVE' | 'REQUEST_CHANGES' | 'INDETERMINATE' | 'CHECKS_PENDING';
+/**
+ * CHECKS_UNAVAILABLE (#775) is TERMINAL and NON-APPROVING: the required
+ * status-check contexts could not be read after the configured attempt bound,
+ * so no verdict can be formed and deferring further would park the PR forever.
+ * It is distinct from CHECKS_PENDING (retry later) and from REQUEST_CHANGES
+ * (a real code finding) -- nothing was found wrong with the code; the reviewer
+ * simply could not see what CI is mandatory.
+ */
+export type PrReviewVerdict =
+  | 'APPROVE'
+  | 'REQUEST_CHANGES'
+  | 'INDETERMINATE'
+  | 'CHECKS_PENDING'
+  | 'CHECKS_UNAVAILABLE';
 
 export interface PrReviewInput {
   owner: string;
@@ -66,7 +79,7 @@ export interface PrReviewDeps {
 }
 
 interface ParsedReviewVerdict {
-  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING'>;
+  verdict: Exclude<PrReviewVerdict, 'INDETERMINATE' | 'CHECKS_PENDING' | 'CHECKS_UNAVAILABLE'>;
   findings: IndependentReviewFinding[];
   reviewed_head_sha: string;
 }
@@ -232,11 +245,36 @@ export async function evaluatePullRequest(
     return indeterminate(input, deps, false, 'reviewer_identity_missing');
   }
 
-  let evidence: { diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null };
+  let evidence: {
+    diff: string;
+    checks: PrReviewCheck[];
+    requiredContexts?: string[] | null;
+    requiredContextsBlocked?: { reason: string; attempts: number; failureKind: string };
+  };
   try {
     evidence = await deps.fetchEvidence(input);
   } catch (error) {
     return indeterminate(input, deps, false, `evidence_error:${errorMessage(error)}`);
+  }
+
+  // BOUNDED DEFERRAL, ESCALATING (#775). The required-contexts lookup has now
+  // failed on consecutive attempts past its bound. Stop deferring -- but do NOT
+  // proceed to the reported-checks heuristic, which would approve on evidence
+  // the reviewer just admitted it cannot see. Terminal and non-approving; the
+  // submit path turns this into a PR comment plus an operator escalation.
+  //
+  // Checked BEFORE checksAreTerminal so the outcome cannot depend on what the
+  // reported checks happen to say: green reported checks with unknown mandatory
+  // contexts must block exactly like red ones.
+  if (evidence.requiredContextsBlocked) {
+    return {
+      verdict: 'CHECKS_UNAVAILABLE',
+      findings: [],
+      reviewed_head_sha: input.head_sha,
+      reviewer: deps.reviewer,
+      acceptance_criteria_available: false,
+      error: `${evidence.requiredContextsBlocked.reason}:attempts=${evidence.requiredContextsBlocked.attempts}:reason=${evidence.requiredContextsBlocked.failureKind}`,
+    };
   }
 
   // Defer (never REQUEST_CHANGES) until CI checks on the exact head are

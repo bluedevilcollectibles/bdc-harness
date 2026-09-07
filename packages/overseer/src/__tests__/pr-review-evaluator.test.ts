@@ -1,8 +1,9 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 import {
   createRealFetchExactHeadPullRequestEvidence,
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
+import { resetRequiredContextsAttemptCounters } from '../adapters/required-contexts.ts';
 import {
   buildReviewPrompt,
   checksAreTerminal,
@@ -11,6 +12,15 @@ import {
   type PrReviewDeps,
   type PrReviewInput,
 } from '../pr-review-evaluator.ts';
+
+// The required-contexts resolver counts CONSECUTIVE unknown attempts per
+// owner/repo@base+head in module scope, and degrades to the reported-checks
+// heuristic past the bound. These tests assert the FAIL-CLOSED first-attempt
+// behaviour, so each must start from a clean count rather than inheriting one
+// from an earlier test in this file and degrading by accident.
+beforeEach(() => {
+  resetRequiredContextsAttemptCounters();
+});
 
 const HEAD_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const HEAD_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -420,6 +430,9 @@ describe('governed PR-code reviewer', () => {
       Object.assign(new Error('Resource not accessible by integration'), { status: 403 }),
       Object.assign(new Error('Bad gateway'), { status: 502 }),
     ]) {
+      // Each shape asserts fail-closed on a FIRST attempt; without this the
+      // three iterations would share one consecutive-unknown count.
+      resetRequiredContextsAttemptCounters();
       const octokit = {
         pulls: {
           get: async () => ({
