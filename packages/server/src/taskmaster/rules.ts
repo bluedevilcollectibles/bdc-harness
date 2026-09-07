@@ -24,19 +24,14 @@
  */
 import { createHash } from 'crypto';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
+import type { FireEligibilityEvidence } from './fire-eligibility';
 import { WO_ID_RE } from './guard';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
 export type ThreadClass = 'ready' | 'stale' | 'blocked' | 'healthy';
 export type TmActionType = 'deliver_ruling' | 'nudge' | 'escalate_p0' | 'digest' | 'fire_cauldron';
 
-export interface FireEvidence {
-  woId: string;
-  targetRepo: string;
-  project: string;
-  specVerifiedAt: string;
-  noOpenOrMergedPr: true;
-}
+export type FireEvidence = FireEligibilityEvidence;
 
 export interface ThreadSnapshot {
   /** Stable reference, e.g. "gh:owner/repo#123" or "dispatch:<message-id>" */
@@ -48,10 +43,14 @@ export interface ThreadSnapshot {
   lastActivityAt: string;
   /** Blocked threads are watched, never nudged (John's decision surface). */
   isBlocked?: boolean;
+  /** Hold labels withhold fire without changing ordinary nudge classification. */
+  isHeld?: boolean;
   /** Ratified ruling sitting undelivered for this thread's seat. */
   undeliveredRulingId?: string;
   /** P0 with no assignee/claim. */
   isUnclaimedP0?: boolean;
+  /** No assignee and no claim status, at any priority. */
+  isUnclaimed?: boolean;
   /** Recipient seat for any message about this thread. */
   recipient: string;
 }
@@ -317,7 +316,6 @@ export function computeNextAction(
   // Section 6 row 3: a blocked item is watched, never nudged -- unless its
   // blocked_reason names a seat that can unblock it (full content required).
   const blockedSeatNudge = classification === 'blocked' && blockedReasonNamesSeat(adoption);
-  if (classification === 'healthy') return null;
   if (classification === 'blocked' && !blockedSeatNudge) return null;
   if (context.interventionsLast24h >= MAX_INTERVENTIONS_PER_ITEM_24H) return null;
 
@@ -336,18 +334,15 @@ export function computeNextAction(
     };
   }
 
-  if (thread.isUnclaimedP0) {
+  if (
+    (thread.isUnclaimed ?? thread.isUnclaimedP0) &&
+    classification !== 'blocked' &&
+    !thread.isHeld
+  ) {
     const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
-    const woId = adoption?.title?.match(WO_ID_RE);
-    const title = woId?.index === 0 ? woId[0] : adoption?.title;
-    const titleNote = title ? `"${title}" (${thread.ref})` : thread.ref;
-    const age = describeMovement(
-      adoption?.last_movement_at ?? thread.lastActivityAt,
-      context.nowMs
-    );
     if (
       context.fireEligible &&
-      context.fireEvidence &&
+      context.fireEvidence?.expectedSpec &&
       !context.fireEscalate &&
       (context.fireLane || context.customerP0Exempt)
     ) {
@@ -362,7 +357,27 @@ export function computeNextAction(
         fireEvidence: context.fireEvidence,
       };
     }
-    if (context.fireEligible && context.fireEvidence && context.fireHolding) return null;
+    if (
+      thread.isUnclaimedP0 &&
+      context.fireEligible &&
+      context.fireEvidence &&
+      context.fireHolding
+    ) {
+      return null;
+    }
+  }
+
+  if (classification === 'healthy') return null;
+
+  if (thread.isUnclaimedP0) {
+    const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
+    const woId = adoption?.title?.match(WO_ID_RE);
+    const title = woId?.index === 0 ? woId[0] : adoption?.title;
+    const titleNote = title ? `"${title}" (${thread.ref})` : thread.ref;
+    const age = describeMovement(
+      adoption?.last_movement_at ?? thread.lastActivityAt,
+      context.nowMs
+    );
     return {
       type: 'escalate_p0',
       threadRef: thread.ref,

@@ -72,6 +72,8 @@ export type CascadeStatus =
  * cascade/cli secret boundary). The resume endpoint re-supplies the token.
  */
 export interface FrontierApprovalPacket {
+  /** Preserve the dispatch-time canonical source constraint across approval. */
+  expectedSpec?: import('@archon/core/workflows/work-order-source').ExpectedSpecIdentity;
   /** The premium tier the cascade would have fired next (e.g. 'frontier'). */
   tierName: TierName;
   /** The workflow lane bound to that premium tier (e.g. 'bdc-feature-development-fable'). */

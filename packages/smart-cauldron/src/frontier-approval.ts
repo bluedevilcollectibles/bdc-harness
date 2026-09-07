@@ -181,6 +181,11 @@ export async function resumeFrontierTier(
     );
   }
   const outDir = opts.outDir ?? DEFAULT_OUT_DIR;
+  // Original Taskmaster dispatch IDs carry this prefix. Legacy manual packets
+  // remain compatible; UUID descendants do not prove historical provenance.
+  if (record.cascadeId.startsWith('tm:fire:') && !packet.expectedSpec) {
+    throw new Error('authority_conflict: Taskmaster approval packet lacks expected spec identity');
+  }
   const project = packet.project ?? record.project ?? undefined;
   if (!project) {
     throw new Error(
@@ -197,6 +202,7 @@ export async function resumeFrontierTier(
     tags: packet.tags,
     entryOverride: packet.tierName,
     initialPriorContext: packet.priorContext,
+    expectedSpec: packet.expectedSpec,
     apiBaseUrl: opts.apiBaseUrl ?? packet.apiBaseUrl,
     token: opts.token,
     project,

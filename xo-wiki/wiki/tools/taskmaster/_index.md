@@ -15,6 +15,78 @@ All effects are dispatch messages through the existing dispatch DAL
 (`agent_dispatch_messages`). It has NO spend, send-to-customer, deploy,
 merge, assignment, or WO-authoring authority (Slice 1 exclusions, ratified).
 
+## Fire source binding (PR746 source candidate, not activated)
+
+This subsection documents `WO-HARNESS-TASKMASTER-FIRE-ALL-PRIORITIES-01`
+source behavior. It does not certify deployment or authorize enabling fire.
+The older Slice 1 and P0-only descriptions elsewhere on this page are
+historical context, not evidence that this candidate is running.
+
+Eligible, unclaimed P0-P3 work can produce a fire proposal. Priority determines
+fire order, not permission. The fire cap is three per tick within the existing
+ten-effect cap; overflow remains deferred. Assigned, claimed, blocked, or held
+work cannot fire. Existing pause, backoff, and lane-budget checks still apply.
+Hold labels exclude fire without changing ordinary nudge classification.
+
+### Canonical source and trust boundary
+
+Eligibility reuses `freezeWorkOrderSource`, resolving bdc-xo `main` to an
+immutable commit before reading these exact paths in order:
+
+1. `docs/work-orders/<WO_ID>.md`
+2. `docs/superpowers/specs/<WO_ID>.md`
+
+There is no date-glob or issue-title-search fallback for Taskmaster fires.
+Issue-only specs fail closed: issue-authored `cauldron_compatible: true` and
+`target_repo` fields are not an execution grant. This follows the permitted
+safety alternative recorded on bdc-xo issue1843 and replaces the older WO
+scenario expecting issue-only automatic eligibility. The current feature
+lanes consume frozen authority artifacts, not their historical dead resolver.
+
+Eligibility records `expectedSpec` with the full canonical source, commit
+revision, and SHA-256 content hash. The legacy `specSource: repo-path` category
+covers either exact committed path; `expectedSpec.specSource` distinguishes
+them. Both the loop and direct proposal function require the identity to fire.
+The cascade carries it through retries. Runtime resolves its own authority
+policy and rejects a mismatch before worker creation or isolation.
+Prior-attempt prose cannot supply or replace the binding.
+
+Premium approval packets preserve the same constraint on resume. Original
+Taskmaster packets identified by `tm:fire:` without a binding are refused.
+Existing identity-less manual packets remain compatible; historical UUID
+descendants do not establish Taskmaster provenance.
+
+### Diagnose a blocked fire
+
+- `spec_missing`: verify a spec exists at one of the two committed paths,
+  rather than only in an issue body.
+- `authority_conflict`: compare journal `fireEvidence.expectedSpec` with the
+  canonical source and, when available, the run's authority manifest. A changed
+  source, revision, or hash requires fresh eligibility and governed re-dispatch.
+  Strict revision equality intentionally also refuses an unchanged spec after
+  an unrelated bdc-xo main commit, including a delayed premium resume. Do not
+  strip the binding to recover. This liveness tradeoff remains an activation
+  decision; this source repair does not relax the same-revision/hash contract.
+- A legacy Taskmaster approval packet missing its identity needs fresh
+  eligibility and governed re-dispatch, not fabricated approval metadata.
+
+Local verification from the bdc-harness checkout:
+
+```powershell
+bun test packages/server/src/taskmaster/
+bun test packages/core/src/workflows/work-order-source.test.ts
+bun test packages/smart-cauldron/src/__tests__/fire.test.ts
+bun test packages/smart-cauldron/src/__tests__/cascade.test.ts
+bun test packages/smart-cauldron/src/__tests__/frontier-approval-resume.test.ts
+bun run validate
+```
+
+These commands do not deploy, unpause Taskmaster, enable firing, or satisfy
+the WO's runtime stop condition. Source review and runtime acceptance are
+separate gates. A supplied `healthy` classification does not suppress an
+undelivered ruling; normal classification already marks that ruling ready.
+This preserves the existing governance-delivery behavior.
+
 ## Environment
 
 | Variable                       | Meaning                                                                                                             |
