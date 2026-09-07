@@ -61,17 +61,21 @@ export const MAX_FIRES_PER_TICK = 3;
 /**
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
  *
- * When the control row is paused with scope='effects', only the daily canary
- * may leave the process through the proposal delivery path. A
+ * WO-HARNESS-TASKMASTER-UNPAUSE-AND-RESET-01 Section 6 authorizes only the
+ * daily canary and self-pause notice to escape scope='effects'. A
  * pause with any non-'effects' scope keeps the legacy watching-never-dark
  * exemption for escalate_p0 and the digest. Callers must still check
  * pause_state !== 'RUNNING' before consulting this helper.
  */
 export function isPauseEffectsExempt(proposalType: string, pauseScope: string | null): boolean {
   if (pauseScope === 'effects') {
-    return proposalType === 'canary';
+    return proposalType === 'canary' || proposalType === 'self_pause_notice';
   }
-  return proposalType === 'escalate_p0' || proposalType === 'digest';
+  return (
+    proposalType === 'escalate_p0' ||
+    proposalType === 'digest' ||
+    proposalType === 'self_pause_notice'
+  );
 }
 
 /** Journal lookback used for dedupe and per-item budgets. */
@@ -1130,10 +1134,19 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           pause_actor: 'taskmaster:useful-rate-floor',
         });
         try {
-          await createTask(
-            { kind: 'system', sender: 'taskmaster' },
-            buildSelfPauseNotice(pauseReason, control.epoch)
-          );
+          // Apply the explicit monitoring exemption and re-check the epoch;
+          // do not announce an obsolete pause after a concurrent reset.
+          const noticeControl = await dal.getPauseState();
+          if (
+            noticeControl.pause_state !== 'RUNNING' &&
+            noticeControl.epoch === control.epoch &&
+            isPauseEffectsExempt('self_pause_notice', noticeControl.pause_scope)
+          ) {
+            await createTask(
+              { kind: 'system', sender: 'taskmaster' },
+              buildSelfPauseNotice(pauseReason, control.epoch)
+            );
+          }
         } catch (error) {
           tickFailures += 1;
           log.error({ err: error as Error }, 'taskmaster.self_pause_notice_failed');

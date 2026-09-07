@@ -35,7 +35,24 @@ if [ -z "${ARCHON_OPERATOR_TOKEN:-}" ]; then
 fi
 
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  # Bash arguments cannot contain NUL. Escape every other JSON control byte,
+  # including final newlines, before command substitution can trim them.
+  local LC_ALL=C value="$1" char code i
+  for ((i = 0; i < ${#value}; i++)); do
+    char="${value:i:1}"
+    case "$char" in
+      '"') printf '\\"' ;;
+      '\') printf '\\\\' ;;
+      *)
+        printf -v code '%d' "'$char"
+        if ((code < 32)); then
+          printf '\\u%04x' "$code"
+        else
+          printf '%s' "$char"
+        fi
+        ;;
+    esac
+  done
 }
 
 curl --fail-with-body --silent --show-error \

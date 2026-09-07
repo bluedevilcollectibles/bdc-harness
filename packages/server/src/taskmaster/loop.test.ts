@@ -40,11 +40,14 @@ import type {
 import type { HeadroomReading } from './ledger';
 
 describe('Taskmaster reset visibility and canary', () => {
-  test('only the canary proposal escapes an effects pause', () => {
+  test('only the two WO-authorized monitoring signals escape an effects pause', () => {
     expect(isPauseEffectsExempt('canary', 'effects')).toBe(true);
-    expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(true);
     expect(isPauseEffectsExempt('digest', 'effects')).toBe(false);
     expect(isPauseEffectsExempt('escalate_p0', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('nudge', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('fire_cauldron', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('deliver_ruling', 'effects')).toBe(false);
   });
 
   test('paused daily canary reaches duty-officer once and carries reset guidance', async () => {
@@ -122,6 +125,44 @@ describe('Taskmaster reset visibility and canary', () => {
     expect(notice?.body).toContain('scripts/taskmaster/reset.sh');
     expect(notice?.body).toContain('M-155 useful-rate floor auto-pause');
   });
+
+  test.each(['epoch', 'pause state'] as const)(
+    'a changed control %s prevents a stale self-pause notice',
+    async change => {
+      const world = makeWorld();
+      for (let i = 0; i < 20; i += 1) {
+        world.journal.push({
+          id: `noise-fenced-${i}`,
+          created_at: new Date(T0 + i + 1).toISOString(),
+          thread_ref: `gh:test/repo#${i}`,
+          action_type: 'nudge',
+          proposal_json: '{}',
+          idempotency_key: `noise-fenced-${i}`,
+          before_hash: null,
+          proof_predicate: null,
+          proof_deadline_at: null,
+          outcome: 'sent',
+          graded_at: new Date(T0 + i + 1).toISOString(),
+          grade: 'noise',
+        });
+      }
+      const deps = makeDeps(world);
+      const originalSetPauseState = deps.db!.setPauseState;
+      deps.db!.setPauseState = async data => {
+        const paused = await originalSetPauseState(data);
+        const snapshot = { ...paused };
+        world.control =
+          change === 'epoch'
+            ? { ...paused, epoch: paused.epoch + 1 }
+            : { ...paused, pause_state: 'RUNNING' };
+        return snapshot;
+      };
+      await tick(createTaskmasterState(60_000), deps);
+      expect(
+        world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:self-pause:'))
+      ).toHaveLength(0);
+    }
+  );
 });
 
 const T0 = Date.parse('2026-08-07T12:00:00.000Z');
