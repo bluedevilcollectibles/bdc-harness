@@ -27,6 +27,7 @@ import {
   resetRequiredContextsAttemptCounters,
   resetUnprotectedBranchCache,
   resolveRequiredContexts,
+  unprotectedBranchCacheStats,
 } from '../adapters/required-contexts.ts';
 
 afterEach(() => {
@@ -450,8 +451,111 @@ describe('#796 -- an unprotected base is not re-probed every tick', () => {
     await resolveRequiredContexts(input, {});
 
     expect(counts.protection).toBe(2);
-    // Short enough that turning protection ON is noticed within one session.
-    expect(UNPROTECTED_CACHE_TTL_MS).toBeLessThanOrEqual(15 * 60 * 1000);
+  });
+
+  test('the TTL is SHORT, because this is a security answer with no invalidation path', () => {
+    // Security finding (Overseer, PR #804 [major]): "unprotected" is a policy
+    // statement, and nothing tells this process that a human enabled protection
+    // through the GitHub UI. The first cut cached it for ten minutes, which
+    // could serve "nothing is required here" for ten minutes after protection
+    // went on -- and an empty required set routes the reviewer to the weaker
+    // reported-checks heuristic, whose APPROVE the merge manager gates on.
+    expect(UNPROTECTED_CACHE_TTL_MS).toBeLessThanOrEqual(60 * 1000);
+    // Still long enough to collapse the observed ~40-second poll interval.
+    expect(UNPROTECTED_CACHE_TTL_MS).toBeGreaterThanOrEqual(30 * 1000);
+  });
+
+  test('a REVALIDATING lookup always hits GitHub, even inside the TTL', async () => {
+    const counts = { protection: 0, rules: 0, branch: 0 };
+    const input = unprotectedInput(counts);
+    await resolveRequiredContexts(input, {});
+    expect(counts.protection).toBe(1);
+
+    // A merge-affecting caller must never be served a cached security answer.
+    await resolveRequiredContexts({ ...input, revalidate: true }, {});
+    await resolveRequiredContexts({ ...input, revalidate: true }, {});
+
+    expect(counts.protection).toBe(3);
+    expect(unprotectedBranchCacheStats().revalidations).toBe(2);
+  });
+
+  test('protection enabled mid-TTL is seen by the next revalidating lookup', async () => {
+    const counts = { protection: 0, rules: 0, branch: 0 };
+    let protectionEnabled = false;
+    const input = {
+      ...unprotectedInput(counts),
+      fetchWithAppClient: async () => {
+        counts.protection += 1;
+        if (protectionEnabled) return { data: ['test (ubuntu-latest)'] };
+        throw Object.assign(new Error('Branch not protected'), { status: 404 });
+      },
+    };
+
+    const before = await resolveRequiredContexts(input, {});
+    expect(before).toMatchObject({ contexts: [], source: 'unprotected_branch' });
+
+    // Someone turns protection on in the GitHub UI. Nothing notifies us.
+    protectionEnabled = true;
+
+    // A cached (non-revalidating) read still says unprotected inside the TTL...
+    const cached = await resolveRequiredContexts(input, {});
+    expect(cached).toMatchObject({ contexts: [], source: 'unprotected_branch' });
+
+    // ...but the merge-affecting read sees the new policy immediately.
+    const fresh = await resolveRequiredContexts({ ...input, revalidate: true }, {});
+    expect(fresh).toMatchObject({ state: 'known', contexts: ['test (ubuntu-latest)'] });
+  });
+
+  test('a revalidate INVALIDATES the entry, so the next cached read is fresh too', async () => {
+    const counts = { protection: 0, rules: 0, branch: 0 };
+    const input = unprotectedInput(counts);
+    await resolveRequiredContexts(input, {});
+    await resolveRequiredContexts({ ...input, revalidate: true }, {});
+    const afterRevalidate = counts.protection;
+
+    // Not served from the pre-revalidate entry: that answer is gone.
+    await resolveRequiredContexts(input, {});
+
+    expect(counts.protection).toBe(afterRevalidate + 1);
+  });
+
+  test('SEQUENTIAL polls of the same base collapse to one probe, which is the 40 s storm', async () => {
+    // The observed defect was a SEQUENCE -- one work item re-asking the same
+    // settled question every ~40 seconds -- not a simultaneous burst. That is
+    // what the TTL collapses, and this measures it directly.
+    //
+    // Deliberately NOT asserting anything about simultaneous callers: an
+    // attempt at in-flight coalescing was written and then removed, because a
+    // traced run (2026-09-08, eight parallel callers) showed each one passing
+    // the cache check before any probe registered, so the sharing never
+    // happened. Claiming a guarantee the code does not provide would be worse
+    // than the extra calls. A genuine burst still costs one probe per caller;
+    // the steady-state poll, which is what produced 45 calls in 30 minutes,
+    // now costs one per TTL window.
+    const counts = { protection: 0, rules: 0, branch: 0 };
+    const input = unprotectedInput(counts);
+
+    for (let poll = 0; poll < 8; poll += 1) {
+      const result = await resolveRequiredContexts(input, {});
+      expect(result).toMatchObject({ state: 'known', contexts: [] });
+    }
+
+    expect(counts.protection).toBe(1);
+    expect(counts.rules).toBe(1);
+    expect(counts.branch).toBe(1);
+  });
+
+  test('hit and miss counters make the poll-rate effect measurable', async () => {
+    const counts = { protection: 0, rules: 0, branch: 0 };
+    const input = unprotectedInput(counts);
+
+    await resolveRequiredContexts(input, {});
+    await resolveRequiredContexts(input, {});
+    await resolveRequiredContexts(input, {});
+
+    const stats = unprotectedBranchCacheStats();
+    expect(stats.misses).toBe(1);
+    expect(stats.hits).toBe(2);
   });
 
   test('a FAILED lookup is never cached -- only positive unprotected evidence is', async () => {
