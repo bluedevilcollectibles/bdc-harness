@@ -420,7 +420,7 @@ describe('#797 -- the cap comment is idempotent for real, not just in the happy 
     const octokit = commentOctokit([fullPageOfNoise('p1'), [capInput.marker]]);
 
     const result = await postCapExhaustedCommentWith(
-      { octokit: octokit.client, claim: async () => true },
+      { octokit: octokit.client, claim: async () => true, releaseClaim: async () => {} },
       capInput
     );
 
@@ -435,7 +435,7 @@ describe('#797 -- the cap comment is idempotent for real, not just in the happy 
     const octokit = commentOctokit([['just one comment']]);
 
     await postCapExhaustedCommentWith(
-      { octokit: octokit.client, claim: async () => true },
+      { octokit: octokit.client, claim: async () => true, releaseClaim: async () => {} },
       capInput
     );
 
@@ -452,7 +452,7 @@ describe('#797 -- the cap comment is idempotent for real, not just in the happy 
     );
 
     await postCapExhaustedCommentWith(
-      { octokit: octokit.client, claim: async () => true },
+      { octokit: octokit.client, claim: async () => true, releaseClaim: async () => {} },
       capInput
     );
 
@@ -480,8 +480,14 @@ describe('#797 -- the cap comment is idempotent for real, not just in the happy 
     const octokit = commentOctokit([[]]);
 
     const results = await Promise.all([
-      postCapExhaustedCommentWith({ octokit: octokit.client, claim }, capInput),
-      postCapExhaustedCommentWith({ octokit: octokit.client, claim }, capInput),
+      postCapExhaustedCommentWith(
+        { octokit: octokit.client, claim, releaseClaim: async () => {} },
+        capInput
+      ),
+      postCapExhaustedCommentWith(
+        { octokit: octokit.client, claim, releaseClaim: async () => {} },
+        capInput
+      ),
     ]);
 
     expect(octokit.created).toHaveLength(1);
@@ -498,9 +504,12 @@ describe('#797 -- the cap comment is idempotent for real, not just in the happy 
     };
     const octokit = commentOctokit([[]]);
 
-    await postCapExhaustedCommentWith({ octokit: octokit.client, claim }, capInput);
     await postCapExhaustedCommentWith(
-      { octokit: octokit.client, claim },
+      { octokit: octokit.client, claim, releaseClaim: async () => {} },
+      capInput
+    );
+    await postCapExhaustedCommentWith(
+      { octokit: octokit.client, claim, releaseClaim: async () => {} },
       { ...capInput, headSha: OLD_HEAD, marker: rereviewCapCommentMarker(OLD_HEAD) }
     );
 
@@ -508,17 +517,124 @@ describe('#797 -- the cap comment is idempotent for real, not just in the happy 
     expect(capCommentIdempotencyKey(capInput)).toContain(NEW_HEAD);
   });
 
-  test('losing the claim skips the GitHub calls entirely', async () => {
+  test('losing the claim posts nothing', async () => {
     const octokit = commentOctokit([[]]);
 
     const result = await postCapExhaustedCommentWith(
-      { octokit: octokit.client, claim: async () => false },
+      { octokit: octokit.client, claim: async () => false, releaseClaim: async () => {} },
       capInput
     );
 
     expect(result.posted).toBe(false);
-    expect(octokit.pagesRead).toHaveLength(0);
     expect(octokit.created).toHaveLength(0);
+    // The marker scan DOES run first now (#803 review 2). That reordering is
+    // deliberate: taking the claim before the GitHub calls meant any failure
+    // after it silenced the head permanently. One extra listComments per lost
+    // race is the price of a claim that can be given back, and it is a page
+    // read on the core budget rather than a search.
+    expect(octokit.pagesRead).toEqual([1]);
+  });
+
+  test('createComment throwing ONCE does not silence the head forever', async () => {
+    // Review finding (Overseer, PR #803, second pass): the claim was consumed
+    // before the GitHub calls and never released, so ANY failure after it --
+    // a throw from createComment, a missing method, a marker-scan error --
+    // left the claim held. The next delivery lost the claim, skipped GitHub,
+    // and the cap notice became permanently invisible for that head: a guard
+    // against duplicates had turned into a guarantee of no comment.
+    const claimed = new Set<string>();
+    const released: string[] = [];
+    const claim = async (input: CapCommentInput): Promise<boolean> => {
+      const key = capCommentIdempotencyKey(input) + `:${released.length}`;
+      if (claimed.has(key)) return false;
+      claimed.add(key);
+      return true;
+    };
+    const releaseClaim = async (input: CapCommentInput): Promise<void> => {
+      released.push(capCommentIdempotencyKey(input));
+    };
+    const octokit = commentOctokit([[]]);
+    let failNext = true;
+    const failingClient = (): never =>
+      ({
+        issues: {
+          listComments: async () => ({ data: [] }),
+          createComment: async (input: { body: string }) => {
+            if (failNext) {
+              failNext = false;
+              throw new Error('github_502');
+            }
+            return (octokit.created.push(input.body), { data: {} });
+          },
+        },
+      }) as never;
+
+    // First delivery: the create throws, and the claim is given back.
+    await expect(
+      postCapExhaustedCommentWith({ octokit: failingClient, claim, releaseClaim }, capInput)
+    ).rejects.toThrow('github_502');
+    expect(released).toHaveLength(1);
+
+    // Second delivery: claims afresh and posts. EXACTLY ONE comment exists.
+    const second = await postCapExhaustedCommentWith(
+      { octokit: failingClient, claim, releaseClaim },
+      capInput
+    );
+
+    expect(second.posted).toBe(true);
+    expect(octokit.created).toHaveLength(1);
+  });
+
+  test('the marker scan runs BEFORE the claim, so a lost claim costs no notice', async () => {
+    // Ordering is the fix: the durable, self-healing check (does the comment
+    // exist on the PR?) gates first; the claim is only the race breaker.
+    const marked = commentOctokit([[capInput.marker]]);
+    let claimTaken = false;
+
+    const result = await postCapExhaustedCommentWith(
+      {
+        octokit: marked.client,
+        claim: async () => {
+          claimTaken = true;
+          return true;
+        },
+        releaseClaim: async () => {},
+      },
+      capInput
+    );
+
+    expect(result.posted).toBe(false);
+    // No claim is burned when the comment already exists.
+    expect(claimTaken).toBe(false);
+    expect(marked.created).toHaveLength(0);
+  });
+
+  test('TWO CONCURRENT deliveries still produce exactly ONE comment after the reorder', async () => {
+    // The reorder must not cost the race guarantee: both callers scan an empty
+    // thread, both find no marker, and the claim is what separates them.
+    const claimed = new Set<string>();
+    const claim = async (input: CapCommentInput): Promise<boolean> => {
+      const key = capCommentIdempotencyKey(input);
+      await Promise.resolve();
+      if (claimed.has(key)) return false;
+      claimed.add(key);
+      return true;
+    };
+    const octokit = commentOctokit([[]]);
+
+    const results = await Promise.all([
+      postCapExhaustedCommentWith(
+        { octokit: octokit.client, claim, releaseClaim: async () => {} },
+        capInput
+      ),
+      postCapExhaustedCommentWith(
+        { octokit: octokit.client, claim, releaseClaim: async () => {} },
+        capInput
+      ),
+    ]);
+
+    expect(octokit.created).toHaveLength(1);
+    expect(results.filter(result => result.posted)).toHaveLength(1);
   });
 
   test('a client with no listComments declines rather than posting blind', async () => {
@@ -527,7 +643,7 @@ describe('#797 -- the cap comment is idempotent for real, not just in the happy 
       ({ issues: { createComment: async () => created.push('x') } }) as never;
 
     const result = await postCapExhaustedCommentWith(
-      { octokit, claim: async () => true },
+      { octokit, claim: async () => true, releaseClaim: async () => {} },
       capInput
     );
 

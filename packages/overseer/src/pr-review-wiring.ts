@@ -194,14 +194,46 @@ function collectVerdicts(
  */
 export const CAP_COMMENT_MAX_COMMENT_PAGES = 5;
 
-/** Durable per-head key that decides which caller posts the cap comment. */
-export function capCommentIdempotencyKey(input: {
-  owner: string;
-  repo: string;
-  prNumber: number;
-  headSha: string;
-}): string {
-  return `pr-review-rereview-cap-comment:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}`;
+/**
+ * Durable per-head key that decides which caller posts the cap comment.
+ *
+ * `attempt` exists so a claim can be RELEASED (#803 review 2). The dispatch
+ * store has no delete, and cancelling a message is reserved for real
+ * cancellation -- so "release" is implemented by advancing to the next key.
+ * The failed attempt's row stays as an audit trail of the attempt that did not
+ * post, and the next delivery claims a key nobody holds.
+ */
+export function capCommentIdempotencyKey(
+  input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+  },
+  attempt = 0
+): string {
+  const base = `pr-review-rereview-cap-comment:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}`;
+  return attempt === 0 ? base : `${base}:retry${attempt}`;
+}
+
+/**
+ * How many claim attempts one head may burn before the claim stops being the
+ * gate (#803 review 2).
+ *
+ * Past this, `claimCapCommentViaDispatch` returns true unconditionally and the
+ * paginated marker scan is the only guard. That is the correct trade: after
+ * several failures the risk of a duplicate comment is far smaller than the risk
+ * of a head that is permanently silent, and the marker scan still prevents the
+ * duplicate in every case where the earlier comment actually landed.
+ */
+export const CAP_COMMENT_MAX_CLAIM_ATTEMPTS = 5;
+
+/** Per-process record of released claims, so a retry advances its key. */
+const capCommentClaimAttempts = new Map<string, number>();
+
+/** Test seam: forget every released-claim counter. */
+export function resetCapCommentClaimAttempts(): void {
+  capCommentClaimAttempts.clear();
 }
 
 /** Correlation prefix the claim's winning nonce is appended to. */
@@ -260,6 +292,15 @@ export interface CapCommentSeams {
    * claim store itself is unavailable (see the fallback rationale below).
    */
   claim: (input: CapCommentInput) => Promise<boolean>;
+  /**
+   * Give the claim back when this call failed to post (#803 review 2).
+   *
+   * Without it a claim taken and then abandoned silences the head forever: the
+   * next delivery loses the claim, skips GitHub, and no comment ever appears.
+   * Best-effort -- a release that itself fails leaves the marker scan as the
+   * recovery path once the comment does eventually land.
+   */
+  releaseClaim: (input: CapCommentInput) => Promise<void>;
 }
 
 /**
@@ -287,22 +328,49 @@ export async function postCapExhaustedCommentWith(
   seams: CapCommentSeams,
   input: CapCommentInput
 ): Promise<{ posted: boolean }> {
-  if (!(await seams.claim(input))) return { posted: false };
-
+  // ORDER MATTERS, and this order is the fix for a second review finding
+  // (Overseer, PR #803, second pass).
+  //
+  // The first cut took the claim FIRST and never released it. Every path after
+  // that point could return without posting -- a client missing `listComments`,
+  // a throw from the marker scan, a throw from `createComment` -- and the claim
+  // stayed taken. The next delivery then LOST the claim, skipped GitHub, and
+  // returned `posted: false`, so the cap-exhaustion notice was permanently
+  // invisible for that head. A guard against duplicate comments had become a
+  // guarantee of NO comment, which is strictly worse than the duplicate: an
+  // un-announced block is the entire defect #797 exists to fix.
+  //
+  // Now: the MARKER SCAN is the pre-check (it is the durable, self-healing
+  // source of truth -- the comment either exists on the PR or it does not), the
+  // claim is only the RACE BREAKER between simultaneous deliveries, and it is
+  // RELEASED whenever this call fails to post, so a later delivery retries.
   const octokit = seams.octokit();
   // `listComments` is optional on the narrow client interface; without it we
   // cannot prove absence, and posting blind would risk spamming the thread --
-  // so we decline rather than duplicate.
+  // so we decline rather than duplicate. No claim has been taken yet, so a
+  // client that regains the method later still posts.
   if (!octokit.issues?.listComments || !octokit.issues?.createComment) {
     return { posted: false };
   }
   if (await hasMarkerComment(octokit, input)) return { posted: false };
-  await octokit.issues.createComment({
-    owner: input.owner,
-    repo: input.repo,
-    issue_number: input.prNumber,
-    body: input.body,
-  });
+
+  // Race breaker: exactly one concurrent delivery proceeds past here.
+  if (!(await seams.claim(input))) return { posted: false };
+
+  try {
+    await octokit.issues.createComment({
+      owner: input.owner,
+      repo: input.repo,
+      issue_number: input.prNumber,
+      body: input.body,
+    });
+  } catch (error) {
+    // RELEASE, then rethrow. Holding the claim through a transient GitHub
+    // failure is what made the notice permanently invisible; releasing it means
+    // the next delivery re-scans (finding no marker) and tries again.
+    await seams.releaseClaim(input);
+    throw error;
+  }
   return { posted: true };
 }
 
@@ -315,13 +383,18 @@ export async function postCapExhaustedCommentWith(
  * without needing the DAL to report which branch it took.
  */
 export async function claimCapCommentViaDispatch(input: CapCommentInput): Promise<boolean> {
+  const attempt = capCommentClaimAttempts.get(capCommentIdempotencyKey(input)) ?? 0;
+  // Past the attempt bound the claim stops gating: a permanently silent head is
+  // a worse outcome than a possible duplicate, and the marker scan still
+  // catches the duplicate whenever the earlier comment landed.
+  if (attempt >= CAP_COMMENT_MAX_CLAIM_ATTEMPTS) return true;
   const nonce = randomUUID();
   try {
     const claim = await dispatch.createAuthenticatedMessage(
       { kind: 'system', sender: REVIEW_SENDER },
       {
         correlation_id: `${capCommentCorrelationPrefix(input)}${nonce}`,
-        idempotency_key: capCommentIdempotencyKey(input),
+        idempotency_key: capCommentIdempotencyKey(input, attempt),
         task_type: 'run_report',
         recipient: 'operator',
         subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
@@ -343,6 +416,21 @@ export async function claimCapCommentViaDispatch(input: CapCommentInput): Promis
     // harm than a PR the reviewer quietly stopped answering.
     return true;
   }
+}
+
+/**
+ * Release a claim taken by `claimCapCommentViaDispatch` (#803 review 2).
+ *
+ * Advances this head's attempt counter so the NEXT claim uses a fresh
+ * idempotency key that nobody holds. The abandoned row is left in place as the
+ * audit record of an attempt that did not post -- the dispatch store has no
+ * delete, and cancelling a message is reserved for genuine cancellation
+ * (XO doctrine: never cancel a message merely to clear bookkeeping).
+ */
+export async function releaseCapCommentClaimViaDispatch(input: CapCommentInput): Promise<void> {
+  const key = capCommentIdempotencyKey(input);
+  capCommentClaimAttempts.set(key, (capCommentClaimAttempts.get(key) ?? 0) + 1);
+  return Promise.resolve();
 }
 
 /**
@@ -381,6 +469,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           // require a token to exist at all.
           octokit: () => createRealOctokitClient(),
           claim: claimCapCommentViaDispatch,
+          releaseClaim: releaseCapCommentClaimViaDispatch,
         },
         input
       );
