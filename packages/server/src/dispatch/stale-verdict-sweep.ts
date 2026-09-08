@@ -81,6 +81,37 @@ export interface SweepCandidate {
 }
 
 /**
+ * One page of the walk: the candidates that parsed, PLUS how far the underlying
+ * query actually got.
+ *
+ * WHY THE RAW POSITION IS PART OF THE CONTRACT (Overseer review finding, PR
+ * #786 @e80159e4). `listCandidates` used to return a bare array, so a page whose
+ * rows all failed parse/validation was indistinguishable from the end of the
+ * store: the caller rewound the cursor to 0 and the walk restarted, forever,
+ * never reaching valid rows sitting beyond the malformed ones.
+ *
+ * Not hypothetical -- live store, read 2026-09-08: 8 of 423 completed
+ * `run_review` rows already have unparseable or incomplete bodies. The discard
+ * path is exercised in production today.
+ *
+ * So the page reports both:
+ *  - `lastRawSeq`: the position of the last RAW row the query returned, whether
+ *    or not it parsed. This is what the cursor advances to, so discarded rows
+ *    are walked PAST rather than re-read every heartbeat.
+ *  - `rawCount`: how many raw rows the query returned. ZERO of these -- never
+ *    zero candidates -- is what "end of store" means.
+ */
+export interface SweepCandidatePage {
+  candidates: SweepCandidate[];
+  /** Position of the last raw row in the page; 0 when the page was empty. */
+  lastRawSeq: number;
+  /** Raw rows the query returned, before parse/validation and dedupe. */
+  rawCount: number;
+  /** Raw rows dropped by parse/validation failure. Surfaced for visibility. */
+  discarded: number;
+}
+
+/**
  * Where the walk resumes, as a KEYSET rather than an array index.
  *
  * WHY A CURSOR EXISTS AT ALL (Overseer review finding, PR #786 @939d42f7): the
@@ -148,10 +179,11 @@ export interface StaleVerdictSweepDeps {
    * applied to an already-fetched page: that is what makes each page a
    * genuinely different slice of a store far larger than any one page.
    *
-   * Returning fewer than `limit` rows means the walk has reached the end of the
-   * store, and the caller rewinds the cursor to the start.
+   * Returns a PAGE, not a bare list, because the two questions the caller must
+   * distinguish -- "did we reach the end of the store" and "did anything in
+   * this page parse" -- have different answers (#786 review @e80159e4).
    */
-  listCandidates(limit: number, afterSeq: number): Promise<SweepCandidate[]>;
+  listCandidates(limit: number, afterSeq: number): Promise<SweepCandidatePage>;
   /** The standing verdict at that exact head, or null. Local read. */
   readStandingVerdict(candidate: SweepCandidate): Promise<StandingVerdict | null>;
   /**
@@ -191,10 +223,16 @@ export interface StaleVerdictSweepResult {
    */
   consumed: number;
   /**
-   * The resume token this heartbeat ended on: the `cursorSeq` of the last
-   * candidate consumed, or 0 when the walk wrapped at the end of the store.
+   * The resume token this heartbeat ended on: the position the walk advanced
+   * to, or 0 when the walk wrapped at the end of the store.
    */
   afterSeq: number;
+  /**
+   * Raw rows this heartbeat's page dropped for unparseable or incomplete
+   * bodies. Non-zero means the store holds malformed review items -- the walk
+   * still advances past them, but they are worth seeing.
+   */
+  discarded: number;
 }
 
 /**
@@ -233,6 +271,7 @@ export async function runStaleVerdictSweep(
     duplicates: 0,
     consumed: 0,
     afterSeq: 0,
+    discarded: 0,
   };
   if (max <= 0) return result;
 
@@ -247,7 +286,7 @@ export async function runStaleVerdictSweep(
   }
   result.afterSeq = startAfterSeq;
 
-  let candidates: SweepCandidate[];
+  let page: SweepCandidatePage;
   try {
     // Ask for exactly the budget, never a multiple of it. An earlier version
     // over-fetched on the theory that most candidates are filtered out locally
@@ -265,21 +304,41 @@ export async function runStaleVerdictSweep(
     // sweepable PRs sitting just past the end. The over-fetch is bounded and
     // additive (not multiplicative), and a listed-but-never-touched candidate
     // costs nothing -- `listCandidates` is a single local query.
-    candidates = await deps.listCandidates(max + CANDIDATE_LOOKAHEAD, startAfterSeq);
+    page = await deps.listCandidates(max + CANDIDATE_LOOKAHEAD, startAfterSeq);
   } catch (error) {
     log.error({ err: error }, 'overseer_stale_verdict_sweep_candidates_failed');
     return result;
   }
+  const candidates = page.candidates;
+  result.discarded = page.discarded;
 
-  // END OF THE STORE: nothing remains after this cursor. Rewind so the next
-  // heartbeat starts from the head again -- rows skipped earlier as ineligible
-  // may have acquired a new verdict since, and a cursor that only ever moved
-  // forward would stop sweeping entirely once it reached the end.
-  if (candidates.length === 0) {
+  // A malformed run must be VISIBLE. Rows are dropped silently otherwise, and a
+  // sweep that quietly examines nothing looks identical to a healthy one.
+  if (page.discarded > 0) {
+    log.warn(
+      { discarded: page.discarded, rawCount: page.rawCount, afterSeq: startAfterSeq },
+      'overseer_stale_verdict_sweep_discarded_unparseable_rows'
+    );
+  }
+
+  // END OF THE STORE means the QUERY RETURNED NOTHING -- never "nothing
+  // parsed". Conflating the two is what let a page of unparseable rows rewind
+  // the cursor to 0 on every heartbeat, so valid candidates sitting beyond
+  // those rows were unreachable forever (#786 review @e80159e4).
+  if (page.rawCount === 0) {
     if (startAfterSeq !== 0) {
       await safeWriteCursor(cursor, 0);
       result.afterSeq = 0;
     }
+    return result;
+  }
+
+  // RAW ROWS EXIST BUT NONE PARSED: advance PAST them rather than rewinding, so
+  // the next heartbeat resumes beyond the malformed block instead of re-reading
+  // it. This is the branch the finding named.
+  if (candidates.length === 0) {
+    await safeWriteCursor(cursor, page.lastRawSeq);
+    result.afterSeq = page.lastRawSeq;
     return result;
   }
 
@@ -375,14 +434,27 @@ export async function runStaleVerdictSweep(
   }
 
   // ADVANCE THE WALK to the last position actually consumed, so the next
-  // heartbeat asks for rows strictly after it rather than re-reading this
-  // slice. When the fetched page was shorter than requested AND we walked all
-  // of it, the store is exhausted, so the cursor rewinds to the head instead of
-  // running off into positions that return nothing forever.
+  // heartbeat asks for rows strictly after it rather than re-reading this slice.
+  //
+  // WHICH POSITION depends on whether the budget stopped us mid-page. If we
+  // walked every candidate the page offered, advance to the last RAW row --
+  // that carries the cursor past any unparseable rows trailing the last good
+  // candidate, which is the whole point of tracking the raw position. If the
+  // budget ran out first, advance only to the last candidate actually examined,
+  // because the rows after it have NOT been looked at and must not be skipped.
+  //
+  // END-OF-STORE is judged on RAW rows against the requested limit, never on
+  // candidate count: with rows being discarded, a completely full raw page can
+  // still yield only a handful of candidates, and comparing those would rewind
+  // the walk while the store still had rows left.
   result.consumed = consumed;
-  const pageWasShort = candidates.length < max + CANDIDATE_LOOKAHEAD;
-  const reachedEndOfPage = consumed >= candidates.length;
-  const nextAfterSeq = pageWasShort && reachedEndOfPage ? 0 : lastSeq;
+  const walkedWholePage = consumed >= candidates.length;
+  const pageWasShort = page.rawCount < max + CANDIDATE_LOOKAHEAD;
+  const nextAfterSeq = walkedWholePage
+    ? pageWasShort
+      ? 0 // Short raw page fully walked: the store is exhausted, restart.
+      : page.lastRawSeq
+    : lastSeq;
   await safeWriteCursor(cursor, nextAfterSeq);
   result.afterSeq = nextAfterSeq;
   return result;

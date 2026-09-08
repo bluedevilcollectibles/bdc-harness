@@ -20,6 +20,7 @@ import type {
   LatestCheckCompletion,
   StaleVerdictSweepDeps,
   SweepCandidate,
+  SweepCandidatePage,
   SweepCursor,
 } from './stale-verdict-sweep';
 
@@ -33,6 +34,7 @@ export {
   type StaleVerdictSweepDeps,
   type StaleVerdictSweepResult,
   type SweepCandidate,
+  type SweepCandidatePage,
   type SweepCursor,
 } from './stale-verdict-sweep';
 
@@ -65,6 +67,13 @@ export {
  * candidate on the next heartbeat -- bounded, and never a skipped row. Doing it
  * in SQL would need a window function over a mixed-dialect schema for no gain.
  *
+ * DISCARDED ROWS STILL MOVE THE CURSOR. Rows whose body will not parse, or
+ * which lack owner/repo/prNumber/headSha, cannot become candidates -- but they
+ * are still positions in the store, and the page reports the last raw one so
+ * the caller can walk past them. Returning only parsed candidates made a page
+ * of malformed rows indistinguishable from the end of the store, which rewound
+ * the walk on every heartbeat and stranded everything beyond it.
+ *
  * ELIGIBILITY IS NOT FILTERED HERE, and cannot be: a candidate's disposition
  * lives on a separate `pr_review_submit_receipt` row addressed to `operator`,
  * not on the review work item this reads, so no single query over this table
@@ -75,7 +84,7 @@ export {
 export async function listRealSweepCandidates(
   limit: number,
   afterSeq = 0
-): Promise<SweepCandidate[]> {
+): Promise<SweepCandidatePage> {
   // Over-fetch the raw page: dedupe and body-parse both drop rows, and the
   // caller asked for `limit` USABLE candidates. Bounded by the DAL's own cap.
   const messages = await dispatch.listMessagesBySeqCursor({
@@ -87,9 +96,20 @@ export async function listRealSweepCandidates(
   });
   const seen = new Set<string>();
   const candidates: SweepCandidate[] = [];
+  let discarded = 0;
+  // The position of the last RAW row examined, whether or not it parsed. The
+  // caller advances its cursor to this, so a block of unparseable rows is
+  // walked PAST instead of being re-read on every heartbeat (#786 review
+  // @e80159e4). Live store 2026-09-08: 8 of 423 done run_review rows already
+  // have unparseable or incomplete bodies.
+  let lastRawSeq = 0;
   for (const message of messages) {
+    lastRawSeq = message.cursor_seq;
     const body = parseReviewWorkBody(message.body);
-    if (!body?.owner || !body.repo || !body.prNumber || !body.headSha) continue;
+    if (!body?.owner || !body.repo || !body.prNumber || !body.headSha) {
+      discarded += 1;
+      continue;
+    }
     const key = `${body.owner}/${body.repo}#${body.prNumber}@${body.headSha}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -100,9 +120,11 @@ export async function listRealSweepCandidates(
       headSha: body.headSha,
       cursorSeq: message.cursor_seq,
     });
+    // Stop at the caller's limit, but leave `lastRawSeq` at THIS row: rows
+    // after it were never examined and must not be skipped by the cursor.
     if (candidates.length >= limit) break;
   }
-  return candidates;
+  return { candidates, lastRawSeq, rawCount: messages.length, discarded };
 }
 
 /**

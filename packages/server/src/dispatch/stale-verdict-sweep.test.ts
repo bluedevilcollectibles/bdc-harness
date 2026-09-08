@@ -57,11 +57,18 @@ function makeDeps(
   const rows = new Map<string, string>();
   return {
     // KEYSET-aware, exactly like the real listing: rows strictly after the
-    // given seq, ascending. A double that sliced by array index would hide the
-    // very bug the keyset cursor exists to fix.
-    listCandidates: mock(async (limit, afterSeq = 0) =>
-      candidates.filter(row => row.cursorSeq > afterSeq).slice(0, limit)
-    ),
+    // given seq, ascending, returned as a PAGE. A double that sliced by array
+    // index -- or that returned a bare array -- would hide the very bugs the
+    // cursor and the raw-position contract exist to fix.
+    listCandidates: mock(async (limit, afterSeq = 0) => {
+      const slice = candidates.filter(row => row.cursorSeq > afterSeq).slice(0, limit);
+      return {
+        candidates: slice,
+        lastRawSeq: slice[slice.length - 1]?.cursorSeq ?? 0,
+        rawCount: slice.length,
+        discarded: 0,
+      };
+    }),
     readStandingVerdict: mock(async () => STALE_VERDICT),
     readLatestCheckCompletion: mock(async () => {
       recorded.githubReads += 1;
@@ -211,7 +218,7 @@ describe('runStaleVerdictSweep', () => {
     const deps = makeDeps([], recorded, {
       listCandidates: mock(async limit => {
         requested.push(limit);
-        return [];
+        return { candidates: [], lastRawSeq: 0, rawCount: 0, discarded: 0 };
       }),
     });
 
@@ -228,7 +235,14 @@ describe('runStaleVerdictSweep', () => {
     const recorded: Recorded = { enqueued: [], githubReads: 0 };
     const deps = makeDeps([candidate()], recorded);
     const result = await runStaleVerdictSweep(deps, 0);
-    expect(result).toEqual({ examined: 0, enqueued: 0, duplicates: 0, consumed: 0, afterSeq: 0 });
+    expect(result).toEqual({
+      examined: 0,
+      enqueued: 0,
+      duplicates: 0,
+      consumed: 0,
+      afterSeq: 0,
+      discarded: 0,
+    });
     expect(deps.listCandidates).not.toHaveBeenCalled();
   });
 
@@ -427,7 +441,13 @@ describe('cursor: the sweep window advances across heartbeats', () => {
       readStandingVerdict: mock(async input => verdictFor(input.prNumber)),
       listCandidates: mock(async (limit, afterSeq = 0) => {
         requestedAfterSeq.push(afterSeq);
-        return candidates.filter(row => row.cursorSeq > afterSeq).slice(0, limit);
+        const slice = candidates.filter(row => row.cursorSeq > afterSeq).slice(0, limit);
+        return {
+          candidates: slice,
+          lastRawSeq: slice[slice.length - 1]?.cursorSeq ?? 0,
+          rawCount: slice.length,
+          discarded: 0,
+        };
       }),
     });
     const cursor = createMemorySweepCursor();
@@ -495,7 +515,84 @@ describe('cursor: the sweep window advances across heartbeats', () => {
       duplicates: 0,
       consumed: 0,
       afterSeq: 0,
+      discarded: 0,
     });
+  });
+
+  /**
+   * Overseer review finding, PR #786 @e80159e4: A PAGE OF UNPARSEABLE ROWS
+   * RESET THE WALK.
+   *
+   * `listCandidates` returned only PARSED candidates, so a page whose rows all
+   * failed parse/validation looked exactly like the end of the store: the
+   * caller rewound the cursor to 0 and did it again on the next heartbeat,
+   * forever. Anything past the malformed block was unreachable.
+   *
+   * Live store 2026-09-08: 8 of 423 done run_review rows already have
+   * unparseable or incomplete bodies, so this path runs in production today.
+   */
+  test('a page whose rows ALL fail to parse advances past them instead of rewinding', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps([], recorded, {
+      // Raw rows exist and end at seq 50; none of them parsed.
+      listCandidates: mock(async () => ({
+        candidates: [],
+        lastRawSeq: 50,
+        rawCount: 8,
+        discarded: 8,
+      })),
+    });
+    const cursor = createMemorySweepCursor();
+
+    const result = await runStaleVerdictSweep(deps, 3, cursor);
+
+    // THE REGRESSION GUARD: this was 0 (a rewind) before the fix.
+    expect(result.afterSeq).toBe(50);
+    expect(await cursor.read()).toBe(50);
+    // The discard count is reported so a malformed run is visible.
+    expect(result.discarded).toBe(8);
+    expect(recorded.githubReads).toBe(0);
+  });
+
+  test('a page of ZERO RAW ROWS is the only thing that rewinds the walk', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps([], recorded, {
+      listCandidates: mock(async () => ({
+        candidates: [],
+        lastRawSeq: 0,
+        rawCount: 0,
+        discarded: 0,
+      })),
+    });
+    const cursor = createMemorySweepCursor(500);
+
+    const result = await runStaleVerdictSweep(deps, 3, cursor);
+
+    expect(result.afterSeq).toBe(0);
+    expect(await cursor.read()).toBe(0);
+  });
+
+  test('a full raw page yielding few candidates does not read as end-of-store', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    // 8 raw rows (a full page for max=3) but only one parsed: the walk must
+    // advance to the last RAW row, not rewind because the candidate count was
+    // shorter than the requested limit.
+    const only = candidate(1, 'head-1', 3);
+    const deps = makeDeps([], recorded, {
+      readStandingVerdict: mock(async input => ({ ...STALE_VERDICT, headSha: input.headSha })),
+      listCandidates: mock(async () => ({
+        candidates: [only],
+        lastRawSeq: 40,
+        rawCount: 8,
+        discarded: 7,
+      })),
+    });
+    const cursor = createMemorySweepCursor();
+
+    const result = await runStaleVerdictSweep(deps, 3, cursor);
+
+    expect(result.afterSeq).toBe(40);
+    expect(result.discarded).toBe(7);
   });
 });
 
