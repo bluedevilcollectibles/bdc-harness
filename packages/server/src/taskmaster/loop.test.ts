@@ -447,6 +447,7 @@ describe('expectation registry tick wiring', () => {
         pending: 2,
         met: 3,
         failed: 4,
+        escalating: 7,
         escalated: 5,
         given_up: 6,
       }),
@@ -468,7 +469,11 @@ describe('expectation registry tick wiring', () => {
     const digest = world.sentMessages.find(message =>
       message.idempotency_key.startsWith('tm:digest:')
     );
-    expect(digest?.body).toContain('pending=2, met=3, failed=4, escalated=5, given_up=6');
+    // `escalating` is in the digest: a non-terminal claimed-but-unsent
+    // escalation is exactly the thing a human needs to see in the daily line.
+    expect(digest?.body).toContain(
+      'pending=2, met=3, failed=4, escalating=7, escalated=5, given_up=6'
+    );
     expect(digest?.body).toContain('Needs priority triage: gh:thinmansoftware/bdc-harness#404');
   });
 });

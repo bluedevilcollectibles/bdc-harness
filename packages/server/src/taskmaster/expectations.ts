@@ -85,6 +85,34 @@ export interface ExpectationDeps {
   retryDelayMs?: number;
 }
 
+/**
+ * Page cap for the issue-comment evidence read. 20 pages x 100 = 2000 comments,
+ * far beyond any real WO thread, so the cap should never bind in practice --
+ * it exists so a pathological issue cannot spend the whole GitHub rate budget
+ * on one expectation check. Reaching it is logged with its reason rather than
+ * silently reported as absent evidence.
+ */
+const MAX_COMMENT_PAGES = 20;
+
+/**
+ * Next page URL from a GitHub `Link` header, or null on the last page.
+ *
+ * Following the server's own rel="next" is preferred over synthesizing
+ * `&page=N`: GitHub owns the cursor semantics, and the header is the documented
+ * contract for when pagination has ended.
+ */
+export function nextPageUrl(linkHeader: string | null | undefined): string | null {
+  if (!linkHeader) return null;
+  for (const part of linkHeader.split(',')) {
+    const match = /^\s*<([^>]+)>\s*;\s*(.+)$/.exec(part);
+    // The value must TERMINATE at next: rel="nextish" is a different relation,
+    // and a loose match would follow the wrong link.
+    if (match && /\brel\s*=\s*(?:"next"|next)\s*(?:;|$)/.test(match[2] ?? ''))
+      return match[1] ?? null;
+  }
+  return null;
+}
+
 function githubHeaders(): Record<string, string> {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   return {
@@ -104,22 +132,48 @@ export async function checkEvidence(
     (<T>(sql: string, params?: unknown[]): Promise<{ rows: readonly T[] }> =>
       getDatabase().query<T>(sql, params));
   if (spec.kind === 'issue_comment_exists') {
-    const response = await fetchImpl(
-      `https://api.github.com/repos/${spec.repo}/issues/${spec.number}/comments?per_page=100`,
-      { headers: githubHeaders() }
-    );
-    if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
-    const comments = (await response.json()) as {
-      html_url?: string;
-      body?: string;
-      user?: { login?: string };
-    }[];
-    const match = comments.find(
-      comment =>
-        (!spec.author || comment.user?.login?.toLowerCase() === spec.author.toLowerCase()) &&
-        (!spec.marker || comment.body?.includes(spec.marker))
-    );
-    return { ok: Boolean(match), pointer: match?.html_url ?? null };
+    // PAGINATE. A single per_page=100 read reported qualifying evidence on any
+    // busy issue as ABSENT -- and absence here is not benign: it drives a
+    // redispatch or an operator escalation for work that actually succeeded.
+    // Long-running WO issues routinely pass 100 comments, so this was a live
+    // wrong-answer path, not a theoretical one.
+    let url: string | null =
+      `https://api.github.com/repos/${spec.repo}/issues/${spec.number}/comments?per_page=100`;
+    for (let page = 1; url && page <= MAX_COMMENT_PAGES; page += 1) {
+      const response = await fetchImpl(url, { headers: githubHeaders() });
+      if (!response.ok) throw new Error(`expectation_github_read_failed:${response.status}`);
+      const comments = (await response.json()) as {
+        html_url?: string;
+        body?: string;
+        user?: { login?: string };
+      }[];
+      const match = comments.find(
+        comment =>
+          (!spec.author || comment.user?.login?.toLowerCase() === spec.author.toLowerCase()) &&
+          (!spec.marker || comment.body?.includes(spec.marker))
+      );
+      // Stop on the first match: the remaining pages cannot change the answer,
+      // and every skipped request is GitHub rate budget preserved.
+      if (match) return { ok: true, pointer: match.html_url ?? null };
+      const next = nextPageUrl(response.headers.get('link'));
+      if (!next) return { ok: false, pointer: null };
+      url = next;
+      if (page === MAX_COMMENT_PAGES) {
+        // Bounded, and the bound is REPORTED. Returning a bare "absent" after
+        // giving up would be indistinguishable from genuinely-absent evidence
+        // and would silently trigger a redispatch or escalation.
+        log.warn(
+          {
+            repo: spec.repo,
+            number: spec.number,
+            pagesRead: MAX_COMMENT_PAGES,
+            reason: 'comment pagination cap reached before a match or the last page',
+          },
+          'taskmaster.expectation_comment_pagination_capped'
+        );
+      }
+    }
+    return { ok: false, pointer: null };
   }
   if (spec.kind === 'label_present') {
     const response = await fetchImpl(

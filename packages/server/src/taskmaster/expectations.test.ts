@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { checkEvidence, checkExpectations, type EvidenceSpec } from './expectations';
+import { checkEvidence, checkExpectations, nextPageUrl, type EvidenceSpec } from './expectations';
 import type { TmExpectation } from '@archon/core/db/taskmaster';
 
 const base: TmExpectation = {
@@ -34,6 +34,117 @@ describe('expectation evidence', () => {
       }
     );
     expect(result).toEqual({ ok: true, pointer: 'https://example/comment' });
+  });
+
+  test('issue_comment_exists paginates: 150 comments, match on page 2', async () => {
+    // REGRESSION. A single per_page=100 read reported evidence on any issue
+    // past 100 comments as ABSENT -- and absence drives a redispatch or an
+    // operator escalation for work that actually succeeded.
+    const page1 = Array.from({ length: 100 }, (_, i) => ({
+      body: `noise ${String(i)}`,
+      html_url: `https://example/c${String(i)}`,
+      user: { login: 'someone' },
+    }));
+    const page2 = [
+      ...Array.from({ length: 49 }, (_, i) => ({
+        body: `more noise ${String(i)}`,
+        html_url: `https://example/d${String(i)}`,
+        user: { login: 'someone' },
+      })),
+      { body: 'CLAIM', html_url: 'https://example/the-claim', user: { login: 'xo' } },
+    ];
+    const requested: string[] = [];
+    const result = await checkEvidence(
+      { kind: 'issue_comment_exists', repo: 'x/y', number: 1, marker: 'CLAIM' },
+      {
+        fetch: ((url: string) => {
+          requested.push(url);
+          const onPage2 = url.includes('page=2');
+          return Promise.resolve(
+            new Response(JSON.stringify(onPage2 ? page2 : page1), {
+              status: 200,
+              // Only page 1 advertises a next page.
+              headers: onPage2
+                ? {}
+                : { link: '<https://api.github.com/x?per_page=100&page=2>; rel="next"' },
+            })
+          );
+        }) as unknown as typeof fetch,
+      }
+    );
+    expect(result).toEqual({ ok: true, pointer: 'https://example/the-claim' });
+    expect(requested).toHaveLength(2);
+    expect(requested[1]).toContain('page=2');
+  });
+
+  test('issue_comment_exists reports absent after exhausting 2 pages with no match', async () => {
+    const noise = Array.from({ length: 100 }, (_, i) => ({
+      body: `noise ${String(i)}`,
+      html_url: `https://example/c${String(i)}`,
+      user: { login: 'someone' },
+    }));
+    const requested: string[] = [];
+    const result = await checkEvidence(
+      { kind: 'issue_comment_exists', repo: 'x/y', number: 1, marker: 'CLAIM' },
+      {
+        fetch: ((url: string) => {
+          requested.push(url);
+          const onPage2 = url.includes('page=2');
+          return Promise.resolve(
+            new Response(JSON.stringify(noise), {
+              status: 200,
+              headers: onPage2
+                ? {}
+                : { link: '<https://api.github.com/x?per_page=100&page=2>; rel="next"' },
+            })
+          );
+        }) as unknown as typeof fetch,
+      }
+    );
+    expect(result).toEqual({ ok: false, pointer: null });
+    // Both pages were actually read before declaring absence.
+    expect(requested).toHaveLength(2);
+  });
+
+  test('issue_comment_exists stops at the first match without reading later pages', async () => {
+    // Every skipped request is GitHub rate budget preserved.
+    const requested: string[] = [];
+    const result = await checkEvidence(
+      { kind: 'issue_comment_exists', repo: 'x/y', number: 1, marker: 'CLAIM' },
+      {
+        fetch: ((url: string) => {
+          requested.push(url);
+          return Promise.resolve(
+            new Response(
+              JSON.stringify([
+                { body: 'CLAIM', html_url: 'https://example/early', user: { login: 'xo' } },
+              ]),
+              {
+                status: 200,
+                // A next page exists, but the match is on this one.
+                headers: { link: '<https://api.github.com/x?per_page=100&page=2>; rel="next"' },
+              }
+            )
+          );
+        }) as unknown as typeof fetch,
+      }
+    );
+    expect(result).toEqual({ ok: true, pointer: 'https://example/early' });
+    expect(requested).toHaveLength(1);
+  });
+
+  test('nextPageUrl parses rel="next" and returns null on the last page', async () => {
+    expect(
+      nextPageUrl('<https://api.github.com/x?page=2>; rel="next", <https://x?page=9>; rel="last"')
+    ).toBe('https://api.github.com/x?page=2');
+    // Last page: GitHub sends prev/first only.
+    expect(
+      nextPageUrl('<https://x?page=1>; rel="prev", <https://x?page=1>; rel="first"')
+    ).toBeNull();
+    expect(nextPageUrl(null)).toBeNull();
+    expect(nextPageUrl('')).toBeNull();
+    // rel="next" must not be matched inside another rel value.
+    expect(nextPageUrl('<https://x?page=3>; rel="nextish"')).toBeNull();
   });
 
   test('all declarative DB evidence kinds produce pointers', async () => {

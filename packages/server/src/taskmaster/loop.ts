@@ -693,7 +693,11 @@ function digestProposal(
   // along on the same daily message (this WO); the canary's pause-state fields
   // above are #757's. Both are load-bearing -- neither replaces the other.
   const expectationSummary = expectationCounts
-    ? ` Expectations: pending=${expectationCounts.pending}, met=${expectationCounts.met}, failed=${expectationCounts.failed}, escalated=${expectationCounts.escalated}, given_up=${expectationCounts.given_up}.`
+    ? // `escalating` is reported alongside the rest: it is a NON-terminal state
+      // meaning an escalation was claimed but its operator notification is not
+      // yet confirmed sent. Omitting it hid outstanding escalation sends from
+      // the one daily message a human actually reads.
+      ` Expectations: pending=${expectationCounts.pending}, met=${expectationCounts.met}, failed=${expectationCounts.failed}, escalating=${expectationCounts.escalating}, escalated=${expectationCounts.escalated}, given_up=${expectationCounts.given_up}.`
     : '';
   const triageSummary = unlabelledPriorityTriage.length
     ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
