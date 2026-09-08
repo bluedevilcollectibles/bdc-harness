@@ -19,12 +19,32 @@
  * no IO, so every branch (primary limit, secondary limit, retry-after header,
  * reset header, missing headers, unrelated 403) is deterministically testable.
  *
- * WHY 403 AND 429 BOTH: GitHub answers a primary rate-limit exhaustion with
- * 403 and `x-ratelimit-remaining: 0`, and secondary/abuse limits with either
- * 403 or 429 plus a `retry-after` header. A bare 403 with neither marker is an
- * ordinary permission denial and MUST NOT be classified as a rate limit --
- * doing so would convert a real, permanent authorization failure into an
- * infinite deferral loop (the #774 spin).
+ * WHY 403 AND 429 ARE TREATED DIFFERENTLY (#786 review @4ae233ad): GitHub
+ * answers a primary rate-limit exhaustion with 403 and
+ * `x-ratelimit-remaining: 0`, and secondary/abuse limits with either 403 or 429
+ * plus a `retry-after` header.
+ *
+ *  - 429 IS SELF-DESCRIBING. "Too Many Requests" means exactly one thing, so a
+ *    429 is a rate limit on its own, with no marker required. GitHub or an
+ *    intermediary (a proxy, a gateway, Cloudflare) may omit `retry-after` or
+ *    word the body in a way this module does not recognize; before this change
+ *    such a response fell through to a TERMINAL INDETERMINATE /
+ *    reviewer_failed, retiring a review for a condition that is by definition
+ *    temporary. The default backoff covers the no-usable-clock case.
+ *
+ *  - 403 IS AMBIGUOUS and still REQUIRES a marker. It is GitHub's answer for
+ *    both "rate limited" and "you may not do that", and the two are
+ *    indistinguishable without `x-ratelimit-remaining: 0`, a `retry-after`
+ *    header, or an explicit rate-limit message. Deferring on a bare 403 would
+ *    convert a real, permanent authorization failure into an infinite deferral
+ *    loop (the #774 spin), so it stays a null.
+ *
+ * Live evidence (archon-app-1, 7-day window read 2026-09-08): every observed
+ * GitHub rate-limit error was a 403 carrying the "API rate limit exceeded"
+ * message -- already classified correctly before this change. No bare 429 was
+ * observed. The 429 branch is therefore PROPHYLACTIC: it closes a real hole in
+ * the classifier (a temporary condition being made terminal), not a defect seen
+ * in production.
  */
 
 /** Default wait when the response says "rate limited" but carries no usable clock. */
@@ -104,10 +124,12 @@ function clampRetryMs(value: number): number {
  * Classify a thrown GitHub error as a rate limit, or return null.
  *
  * Returning null is the SAFE default: an unrecognized error keeps whatever
- * terminal handling the caller already had. Only an unambiguous rate-limit
- * signal -- `x-ratelimit-remaining: 0`, a `retry-after` header, or an explicit
- * secondary-rate-limit message -- converts a failure into a deferral, so a
- * permanent 403 can never become an endless retry.
+ * terminal handling the caller already had.
+ *
+ * A 429 is unambiguous on its own -- the status IS the signal. A 403 needs a
+ * corroborating marker (`x-ratelimit-remaining: 0`, a `retry-after` header, or
+ * an explicit rate-limit message) before it becomes a deferral, so a permanent
+ * permission denial can never become an endless retry.
  *
  * `now` is injected so the computed instant is deterministic in tests.
  */
@@ -131,12 +153,24 @@ export function classifyRateLimitError(
     message.includes('abuse detection');
   const messageSignalled = message.includes('rate limit') || message.includes('api rate limit');
 
-  if (!primaryExhausted && !secondarySignalled && !messageSignalled) {
-    // A bare 403/429 with no rate-limit marker is a permission denial or an
-    // unrelated refusal. Deferring on it would spin forever (#774).
+  // 429 NEEDS NO MARKER: "Too Many Requests" is itself the rate-limit signal.
+  // Requiring a header or a recognized phrase made a bare 429 -- one whose
+  // `retry-after` was stripped by an intermediary, or whose body is worded
+  // differently -- fall through to a TERMINAL verdict for a condition that is
+  // by definition temporary (#786 review @4ae233ad).
+  const statusIsSelfDescribing = status === 429;
+
+  if (!statusIsSelfDescribing && !primaryExhausted && !secondarySignalled && !messageSignalled) {
+    // A bare 403 with no rate-limit marker is a permission denial or an
+    // unrelated refusal -- 403 is the SAME status GitHub uses for "you may not
+    // do that". Deferring on it would spin forever (#774).
     return null;
   }
 
+  // `primary` is claimed only on the explicit exhausted-budget marker. A bare
+  // 429 is reported `secondary`: that is what an unqualified "Too Many
+  // Requests" is, and mislabelling it `primary` would put a wrong cause in the
+  // receipt.
   const kind: RateLimitClassification['kind'] = primaryExhausted ? 'primary' : 'secondary';
 
   // Preference order: an explicit retry-after is GitHub telling us exactly how

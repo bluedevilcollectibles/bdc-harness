@@ -118,6 +118,61 @@ describe('classifyRateLimitError', () => {
     ).toBe(false);
   });
 
+  /**
+   * Overseer review finding, PR #786 @4ae233ad: A BARE 429 WAS MADE TERMINAL.
+   *
+   * 429 means "Too Many Requests" and nothing else, but the classifier required
+   * a header or a recognized phrase on top of the status. GitHub or an
+   * intermediary (proxy, gateway, CDN) may strip `retry-after` or word the body
+   * differently, and such a response fell through to a TERMINAL
+   * INDETERMINATE / reviewer_failed -- retiring a review for a condition that
+   * is by definition temporary.
+   */
+  test('A BARE 429 IS A RATE LIMIT ON ITS OWN -- no header, no recognized message', () => {
+    const classification = classifyRateLimitError(
+      octokitError(429, {}, 'Something the classifier has never seen'),
+      NOW
+    );
+
+    // THE REGRESSION GUARD: this was null before the fix.
+    expect(classification).not.toBeNull();
+    expect(classification?.source).toBe('default');
+    expect(classification?.retryAfterMs).toBe(DEFAULT_RATE_LIMIT_RETRY_MS);
+    // A deferral always carries a finite clock the worker can schedule against.
+    expect(classification?.retryAfter).toBe(
+      new Date(NOW.getTime() + DEFAULT_RATE_LIMIT_RETRY_MS).toISOString()
+    );
+    // An unqualified 429 is a secondary limit; claiming `primary` would put a
+    // cause in the receipt that no evidence supports.
+    expect(classification?.kind).toBe('secondary');
+    expect(isRateLimitError(octokitError(429, {}, 'no markers at all'))).toBe(true);
+  });
+
+  test('a bare 429 with an empty message is still a rate limit', () => {
+    expect(isRateLimitError(octokitError(429, {}, ''))).toBe(true);
+    // And a 429 nested in a response object, not just a top-level status.
+    expect(classifyRateLimitError({ response: { status: 429 } }, NOW)?.source).toBe('default');
+  });
+
+  test('403 KEEPS its marker requirement -- the two statuses are not symmetric', () => {
+    // 403 is GitHub's answer for BOTH "rate limited" and "you may not do that",
+    // so it stays ambiguous and must not be inferred from the status alone.
+    expect(classifyRateLimitError(octokitError(403, {}, 'Bad credentials'), NOW)).toBeNull();
+    expect(classifyRateLimitError(octokitError(403, {}, 'Must have admin rights'), NOW)).toBeNull();
+
+    // ...but a 403 WITH the markers is classified exactly as before.
+    expect(
+      classifyRateLimitError(octokitError(403, { 'x-ratelimit-remaining': '0' }), NOW)?.kind
+    ).toBe('primary');
+    expect(
+      classifyRateLimitError(octokitError(403, { 'retry-after': '30' }, 'slow down'), NOW)?.kind
+    ).toBe('secondary');
+    expect(
+      classifyRateLimitError(octokitError(403, {}, 'You have exceeded a secondary rate limit'), NOW)
+        ?.kind
+    ).toBe('secondary');
+  });
+
   test('unrelated errors and non-error values are not rate limits', () => {
     expect(classifyRateLimitError(new Error('ECONNRESET'))).toBeNull();
     expect(classifyRateLimitError(octokitError(500, {}, 'Server Error'))).toBeNull();
