@@ -161,6 +161,18 @@ export interface RealGitHubOctokitLike {
       issue_number: number;
       body: string;
     }): Promise<{ data: { html_url?: string } }>;
+    /**
+     * Optional: existing issue/PR comments, newest page last. Present on the
+     * real Octokit client; omitted by narrow test mocks. Used to make a posted
+     * notice idempotent by searching for its marker (#797) -- a caller that
+     * cannot read comments must NOT post blind, or a redelivery duplicates it.
+     */
+    listComments?(input: {
+      owner: string;
+      repo: string;
+      issue_number: number;
+      per_page: number;
+    }): Promise<{ data: { body?: string | null }[] }>;
   };
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{

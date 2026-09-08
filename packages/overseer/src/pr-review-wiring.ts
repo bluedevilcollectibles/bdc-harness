@@ -23,7 +23,11 @@ import {
   createRealReadOnlyPatOctokitClient,
   createRealSubmitPullRequestReview,
 } from './adapters/github-real-deps';
-import { isAutoRereviewReason } from './pr-review-ingest';
+import {
+  MAX_REREVIEW_ATTEMPTS_ENV,
+  isAutoRereviewReason,
+  resolveMaxRereviewAttempts,
+} from './pr-review-ingest';
 import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
 import {
   configuredReviewIdentity,
@@ -186,9 +190,55 @@ function collectVerdicts(
  * application logic that could race.
  */
 export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
+  // #797: the automatic re-review budget is now configurable, so the EFFECTIVE
+  // value has to be visible at boot. An operator debugging a PR that stopped
+  // getting reviews should be able to read the cap out of the container log
+  // rather than inferring it from source.
+  const maxRereviewAttempts = resolveMaxRereviewAttempts();
+  log.info(
+    {
+      maxRereviewAttempts,
+      source: process.env[MAX_REREVIEW_ATTEMPTS_ENV] ? MAX_REREVIEW_ATTEMPTS_ENV : 'default',
+    },
+    'overseer.pr_review.rereview_budget_configured'
+  );
   return {
     webhookSecret: config.webhookSecret,
     reviewerIdentity: config.reviewerIdentity,
+
+    async postCapExhaustedComment(input): Promise<{ posted: boolean }> {
+      // The client is built HERE, not at deps-construction time.
+      // `createRealOctokitClient` throws without GH_TOKEN, and ingest has
+      // always been constructible without one -- the integration suite builds
+      // these deps against a real SqliteAdapter and no GitHub credential.
+      // Constructing eagerly would make every ingest path require a token to
+      // exist at all, which is a far larger behaviour change than this issue.
+      const commentOctokit = createRealOctokitClient();
+      // IDEMPOTENT PER HEAD. GitHub redelivers, and a push storm at one head
+      // can drive several ingests, so the marker is searched for before any
+      // comment is created. `listComments` is optional on the narrow client
+      // interface; without it we cannot prove absence, and posting blind would
+      // risk spamming the thread -- so we decline rather than duplicate.
+      if (!commentOctokit.issues?.listComments || !commentOctokit.issues?.createComment) {
+        return { posted: false };
+      }
+      const existing = await commentOctokit.issues.listComments({
+        owner: input.owner,
+        repo: input.repo,
+        issue_number: input.prNumber,
+        per_page: 100,
+      });
+      if (existing.data.some(comment => (comment.body ?? '').includes(input.marker))) {
+        return { posted: false };
+      }
+      await commentOctokit.issues.createComment({
+        owner: input.owner,
+        repo: input.repo,
+        issue_number: input.prNumber,
+        body: input.body,
+      });
+      return { posted: true };
+    },
 
     async listPriorReviewWork(input): Promise<PriorReviewWork[]> {
       const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
