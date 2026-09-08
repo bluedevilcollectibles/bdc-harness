@@ -575,41 +575,141 @@ export async function invokeConfiguredReviewModel(
   }
 }
 
-async function runReviewModelProcess(
-  transport: ReviewModelTransport,
-  binary: string,
-  timeoutMs: number
-): Promise<PrReviewModelResult> {
-  const subprocess = Bun.spawn(transport.argv, {
-    stdin: transport.stdinPrompt === undefined ? 'ignore' : 'pipe',
+/**
+ * The subset of a spawned child this module uses. Declared so a test can supply
+ * a double -- notably one that never READS stdin, which is the only way to
+ * exercise the pipe back-pressure path deterministically.
+ */
+export interface ReviewModelChild {
+  stdin: unknown;
+  stdout: ReadableStream | null;
+  stderr: ReadableStream | null;
+  exited: Promise<number>;
+  kill(): void;
+}
+
+export type ReviewModelSpawn = (argv: string[], stdinMode: 'ignore' | 'pipe') => ReviewModelChild;
+
+const defaultReviewModelSpawn: ReviewModelSpawn = (argv, stdinMode) =>
+  Bun.spawn(argv, {
+    stdin: stdinMode,
     stdout: 'pipe',
     stderr: 'pipe',
-  });
-  if (transport.stdinPrompt !== undefined) {
-    // Write and close so the child sees EOF; codex blocks on stdin otherwise.
-    const stdin = subprocess.stdin as { write(chunk: string): unknown; end(): unknown };
-    stdin.write(transport.stdinPrompt);
-    await stdin.end();
-  }
+  }) as unknown as ReviewModelChild;
+
+/** Exported for the back-pressure test; not part of the review API surface. */
+export async function runReviewModelProcess(
+  transport: ReviewModelTransport,
+  binary: string,
+  timeoutMs: number,
+  spawn: ReviewModelSpawn = defaultReviewModelSpawn
+): Promise<PrReviewModelResult> {
+  const subprocess = spawn(transport.argv, transport.stdinPrompt === undefined ? 'ignore' : 'pipe');
+
+  // ARM THE WALL CLOCK FIRST -- before any stdin delivery.
+  //
+  // Writing the prompt is itself a blocking operation that can hang forever: a
+  // child that starts but never READS stdin fills the OS pipe buffer (~64 KB on
+  // Linux) and the write back-pressures, so `await stdin.end()` never settles.
+  // The prompt here is a full PR diff, routinely far larger than that buffer.
+  // Arming the timer after the write -- as this did -- meant
+  // OVERSEER_REVIEW_MODEL_TIMEOUT_MS bounded only the model's THINKING time, not
+  // the call, and a non-consuming child hung the review worker indefinitely with
+  // no timeout, no verdict and no deferral.
   let timeout: Timer | undefined;
+  let timedOut = false;
   const timeoutResult = new Promise<PrReviewModelResult>(resolve => {
     timeout = setTimeout(() => {
+      timedOut = true;
+      // Kill the child AND tear down the writer. Killing alone is not enough:
+      // the pending write is parked on a pipe whose reader is gone, so the
+      // writer must be destroyed for the awaited write to settle (as an
+      // EPIPE/abort rejection, swallowed below) instead of hanging on.
       subprocess.kill();
+      destroyStdin(subprocess.stdin);
       resolve({ exitCode: 124, stdout: '', timedOut: true });
     }, timeoutMs);
   });
+
+  // Deliver the prompt WITHOUT awaiting it here: the delivery promise races the
+  // timeout alongside the process itself, so a stalled write can never outlive
+  // the wall clock. Its rejection is handled inside deliverStdin, which keeps a
+  // child that exits early (EPIPE on a closed pipe) from surfacing as an
+  // unhandled rejection.
+  const delivery =
+    transport.stdinPrompt === undefined
+      ? Promise.resolve()
+      : deliverStdin(subprocess.stdin, transport.stdinPrompt);
+
   const processResult = (async (): Promise<PrReviewModelResult> => {
+    // Never block on delivery completing: a child may legitimately exit before
+    // consuming the whole prompt, which settles this as an EPIPE no-op.
+    void delivery;
     const [exitCode, stdout, stderr] = await Promise.all([
       subprocess.exited,
       new Response(subprocess.stdout).text(),
       new Response(subprocess.stderr).text(),
     ]);
     const payload = stdout.trim().length > 0 ? stdout : stderr;
+    // A kill fired by the timeout also settles `exited`; report that as the
+    // timeout it is rather than as a spurious non-zero exit.
+    if (timedOut) return { exitCode: 124, stdout: '', timedOut: true };
     return { exitCode, stdout: normalizeModelOutput(binary, payload), timedOut: false };
   })();
   const result = await Promise.race([processResult, timeoutResult]);
   if (timeout) clearTimeout(timeout);
+  // The child must never outlive this call: on the timeout path the kill above
+  // already fired, but a race won by processResult can still leave the writer
+  // parked if the child exited without draining stdin.
+  destroyStdin(subprocess.stdin);
   return result;
+}
+
+/**
+ * Write the prompt to the child and close the pipe so it sees EOF.
+ *
+ * Rejections are swallowed on purpose. Once the child is gone -- killed by the
+ * timeout, or exited early having read only part of the prompt -- the pending
+ * write fails with EPIPE/ERR_STREAM_DESTROYED. That is expected, is not a
+ * review failure, and must not surface as an unhandled rejection (which crashes
+ * the worker under Bun's default handler).
+ */
+async function deliverStdin(stdin: unknown, prompt: string): Promise<void> {
+  const writer = stdin as {
+    write(chunk: string): unknown;
+    end(): unknown;
+  } | null;
+  if (!writer) return;
+  try {
+    await writer.write(prompt);
+    await writer.end();
+  } catch {
+    // Child gone or pipe torn down -- see above.
+  }
+}
+
+/**
+ * Force the stdin pipe closed so any write parked on back-pressure settles.
+ *
+ * Killing the child is not sufficient on its own: the awaiting write stays
+ * pending until the writer itself is torn down. Every method is attempted
+ * defensively because the concrete stdin object differs between Bun's
+ * FileSink and a test double, and cleanup must never throw into the result path.
+ */
+function destroyStdin(stdin: unknown): void {
+  const writer = stdin as {
+    destroy?: () => unknown;
+    end?: () => unknown;
+    close?: () => unknown;
+  } | null;
+  if (!writer) return;
+  for (const method of ['destroy', 'end', 'close'] as const) {
+    try {
+      writer[method]?.();
+    } catch {
+      // Best effort: teardown never changes the review's outcome.
+    }
+  }
 }
 
 function normalizeModelOutput(binary: string, stdout: string): string {

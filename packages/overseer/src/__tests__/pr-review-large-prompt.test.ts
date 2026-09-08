@@ -19,9 +19,11 @@ import {
   isTransportError,
   resolveReviewModelTimeoutMs,
   reviewErrorCode,
+  runReviewModelProcess,
   DEFAULT_REVIEW_MODEL_TIMEOUT_MS,
   type PrReviewDeps,
   type PrReviewInput,
+  type ReviewModelChild,
 } from '../pr-review-evaluator.ts';
 import { buildIndeterminateSummary } from '../pr-review-wiring.ts';
 import { runAndSubmitReview, type ReviewWorkItem, type SubmitDeps } from '../pr-review-submit.ts';
@@ -198,6 +200,151 @@ describe('#789 -- a reached rung makes the failure terminal, not a deferral', ()
     // The FIRST transport failure is reported, and it is still a deferral
     // because no rung ever returned anything to judge.
     expect(reviewErrorCode(result.error)).toBe('model_error');
+  });
+});
+
+describe('#789 -- the timeout bounds stdin delivery, not just model thinking', () => {
+  /** Linux pipe buffer; a write past this blocks until the child reads. */
+  const PIPE_BUFFER = 64 * 1024;
+  const OVERSIZED_PROMPT = 'x'.repeat(200_000);
+
+  /**
+   * A child that STARTS but never READS stdin -- the deadlock case. Its writer
+   * resolves until the pipe buffer fills, then parks forever, exactly as a real
+   * pipe back-pressures. `exited` never settles on its own either, so the only
+   * thing that can end the call is the wall clock.
+   */
+  function nonConsumingChild(): ReviewModelChild & {
+    killed: boolean;
+    destroyed: boolean;
+    written: number;
+  } {
+    let buffered = 0;
+    const child = {
+      killed: false,
+      destroyed: false,
+      written: 0,
+      stdin: {
+        async write(chunk: string): Promise<number> {
+          child.written += chunk.length;
+          buffered += chunk.length;
+          if (buffered <= PIPE_BUFFER) return chunk.length;
+          // Pipe full and nobody reading: park until the writer is destroyed.
+          return new Promise<number>((resolve, reject) => {
+            pendingWrite = { resolve, reject };
+          });
+        },
+        async end(): Promise<void> {},
+        destroy(): void {
+          child.destroyed = true;
+          // A destroyed writer must settle the parked write, or the awaiting
+          // caller hangs even after the child is killed.
+          pendingWrite?.reject(new Error('EPIPE: write after destroy'));
+          pendingWrite = undefined;
+        },
+      },
+      stdout: null,
+      stderr: null,
+      exited: new Promise<number>(() => {}), // never exits on its own
+      kill(): void {
+        child.killed = true;
+      },
+    };
+    let pendingWrite: { resolve: (n: number) => void; reject: (e: Error) => void } | undefined;
+    return child;
+  }
+
+  test('a child that never reads stdin still times out within the wall clock', async () => {
+    const child = nonConsumingChild();
+    const started = Date.now();
+
+    const result = await runReviewModelProcess(
+      { argv: ['codex'], stdinPrompt: OVERSIZED_PROMPT },
+      'codex',
+      250,
+      () => child
+    );
+
+    // Before the fix this never returned: the timer was armed only AFTER
+    // `await stdin.end()`, which parked on the full pipe forever.
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).toBe(124);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    // The child is killed AND the writer torn down, so the parked write settles.
+    expect(child.killed).toBe(true);
+    expect(child.destroyed).toBe(true);
+    // The prompt genuinely exceeded the pipe buffer -- otherwise the write
+    // would never have blocked and this test would prove nothing.
+    expect(child.written).toBeGreaterThan(PIPE_BUFFER);
+  });
+
+  test('a child that exits early mid-write leaves no unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (event: PromiseRejectionEvent): void => {
+      unhandled.push(event.reason);
+      event.preventDefault?.();
+    };
+    // Bun surfaces unhandled rejections on the global; a leaked EPIPE here
+    // would crash the review worker in production.
+    globalThis.addEventListener?.('unhandledrejection', onUnhandled as EventListener);
+    try {
+      let rejectWrite: ((error: Error) => void) | undefined;
+      const child: ReviewModelChild = {
+        stdin: {
+          write: (): Promise<number> =>
+            new Promise<number>((_resolve, reject) => {
+              rejectWrite = reject;
+            }),
+          end: async (): Promise<void> => {},
+          destroy: (): void => rejectWrite?.(new Error('EPIPE: broken pipe')),
+        },
+        stdout: null,
+        stderr: null,
+        // Exits immediately, before the write can finish.
+        exited: Promise.resolve(0),
+        kill: (): void => {},
+      };
+
+      const result = await runReviewModelProcess(
+        { argv: ['codex'], stdinPrompt: OVERSIZED_PROMPT },
+        'codex',
+        5_000,
+        () => child
+      );
+
+      // The early exit is reported normally, not as a timeout...
+      expect(result.timedOut).toBe(false);
+      expect(result.exitCode).toBe(0);
+      // ...and the EPIPE from the abandoned write was swallowed.
+      await new Promise(resolve => setTimeout(resolve, 50));
+      expect(unhandled).toEqual([]);
+    } finally {
+      globalThis.removeEventListener?.('unhandledrejection', onUnhandled as EventListener);
+    }
+  });
+
+  test('a normally-consuming child is unaffected', async () => {
+    const child: ReviewModelChild = {
+      stdin: {
+        write: async (chunk: string): Promise<number> => chunk.length,
+        end: async (): Promise<void> => {},
+      },
+      stdout: new Response(verdictJson()).body,
+      stderr: null,
+      exited: Promise.resolve(0),
+      kill: (): void => {},
+    };
+
+    const result = await runReviewModelProcess(
+      { argv: ['codex'], stdinPrompt: OVERSIZED_PROMPT },
+      'grok',
+      5_000,
+      () => child
+    );
+
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('APPROVE');
   });
 });
 
