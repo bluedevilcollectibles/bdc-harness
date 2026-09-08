@@ -49,11 +49,32 @@ WORKDIR /app
 # ~/.grok/auth.json and write a proxy auth header, so it is deliberately NOT
 # piped to a shell here -- we fetch the pinned artifact directly instead.
 # Credentials reach the seat only at run time, by bind mount / env.
+#
+# The build verifies the pin landed and that `grok agent stdio` starts. A seat
+# that ships without a working provider CLI fails closed at
+# seat_provider_command_unavailable, which is a far more expensive place to
+# discover this than the build.
 ARG GROK_VERSION=1.0.13
-RUN set -eux;     apt-get update;     apt-get install -y --no-install-recommends ca-certificates curl;     rm -rf /var/lib/apt/lists/*;     arch="$(dpkg --print-architecture)";     case "$arch" in       amd64) grok_arch='x86_64' ;;       arm64) grok_arch='aarch64' ;;       *) echo "unsupported architecture for grok CLI: $arch" >&2; exit 1 ;;     esac;     curl -fsSL --retry 3 --retry-delay 2       -o /tmp/grok.gz       "https://x.ai/cli/grok-${GROK_VERSION}-linux-${grok_arch}.gz";     gzip -dc /tmp/grok.gz > /usr/local/bin/grok;     rm -f /tmp/grok.gz;     chmod 0755 /usr/local/bin/grok;     # Fail the build now if the pin did not land: a seat that starts without a
-    # working provider CLI fails closed at seat_provider_command_unavailable,
-    # which is a much more expensive place to discover this.
-    installed="$(/usr/local/bin/grok --version)";     echo "$installed" | grep -q "${GROK_VERSION}"       || { echo "grok pin mismatch: wanted ${GROK_VERSION}, got ${installed}" >&2; exit 1; };     /usr/local/bin/grok agent stdio --help >/dev/null
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl; \
+    rm -rf /var/lib/apt/lists/*; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) grok_arch='x86_64' ;; \
+      arm64) grok_arch='aarch64' ;; \
+      *) echo "unsupported architecture for grok CLI: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 --retry-delay 2 \
+      -o /tmp/grok.gz \
+      "https://x.ai/cli/grok-${GROK_VERSION}-linux-${grok_arch}.gz"; \
+    gzip -dc /tmp/grok.gz > /usr/local/bin/grok; \
+    rm -f /tmp/grok.gz; \
+    chmod 0755 /usr/local/bin/grok; \
+    installed="$(/usr/local/bin/grok --version)"; \
+    echo "$installed" | grep -q "${GROK_VERSION}" \
+      || { echo "grok pin mismatch: wanted ${GROK_VERSION}, got ${installed}" >&2; exit 1; }; \
+    /usr/local/bin/grok agent stdio --help >/dev/null
 
 # Worker source + the minimal dependency set it imports at runtime.
 #
