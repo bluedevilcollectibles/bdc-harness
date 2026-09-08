@@ -41,6 +41,16 @@ export interface ReviewerVerdict {
    */
   checksPending?: boolean;
   /**
+   * Set when the required status-check contexts could not be read after the
+   * configured attempt bound (#775). TERMINAL and NON-APPROVING: unlike
+   * `checksPending` the item is not released for another try, and unlike
+   * `approved: false` it is not a code rejection -- the reviewer found nothing
+   * wrong, it could not see what CI is mandatory. The submit path posts a
+   * COMMENT review carrying `summary` and finishes with
+   * `blocked_required_contexts_unavailable`, which the worker escalates.
+   */
+  requiredContextsUnavailable?: boolean;
+  /**
    * True when the judge process could not be reached at all -- the prompt
    * exceeded the argv limit (E2BIG), the binary failed to spawn, or every rung
    * timed out -- so no evidence was read and no verdict formed (#789).
@@ -76,6 +86,30 @@ export type SubmitDisposition =
   | 'reviewer_failed'
   | 'submission_failed'
   | 'checks_pending'
+  /**
+   * TERMINAL for THIS work item (#777 review finding, second pass). The head
+   * under evaluation was superseded before a required-contexts BLOCK could be
+   * recorded, so the block is suppressed -- it must never land on a head the
+   * reviewer did not judge. But the item itself is finished: its payload is
+   * bound to the now-dead SHA and nothing rewrites it, so releasing it would
+   * make every later tick re-evaluate the same stale SHA and return
+   * `superseded_head` again forever.
+   *
+   * The new head is NOT left unreviewed: ingest cancels every in-flight item
+   * bound to a different SHA and enqueues a fresh item bound to the exact new
+   * head. Unlike `checks_pending`, whose bound head is still live and therefore
+   * worth retrying, there is nothing here left to retry.
+   */
+  | 'superseded_head'
+  /**
+   * TERMINAL, NEVER APPROVING (#775). The required status-check contexts could
+   * not be read after the configured attempt bound, so the review is blocked
+   * and a human is told. Only reachable once BOTH head gates have passed, so it
+   * always binds to a head the reviewer actually evaluated and that is still
+   * live. Distinct from `checks_pending` (non-terminal, retried) and from
+   * `changes_requested` (a real code finding).
+   */
+  | 'blocked_required_contexts_unavailable'
   /**
    * NON-TERMINAL (#789). The judge process was never reached (E2BIG on the
    * prompt argument, spawn failure, or every rung timing out). Released with a
@@ -219,7 +253,22 @@ export async function runAndSubmitReview(
   }
 
   // EXACT-HEAD BINDING: the reviewer must have examined the bound head.
+  //
+  // Both head gates run BEFORE the required-contexts block below. A blocked
+  // outcome is TERMINAL, so recording it against a head the reviewer did not
+  // actually evaluate -- or one the PR has already moved past -- would retire
+  // the work item for a head nobody reviewed (#777 review finding). Every
+  // terminal branch, approving or not, passes both gates first.
   if (verdict.reviewedHeadSha !== work.headSha) {
+    // A stale evaluator result must never record a BLOCK against the bound
+    // head. Report it as superseded: the block is suppressed, this item
+    // finishes, and ingest's fresh item covers the head that is actually live.
+    if (verdict.requiredContextsUnavailable) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'superseded_head',
+        reason: 'reviewer_examined_different_head_before_required_contexts_block',
+      });
+    }
     return finish(deps, work, work.headSha, {
       disposition: 'stale_head',
       reason: 'reviewer_examined_different_head',
@@ -242,9 +291,53 @@ export async function runAndSubmitReview(
     });
   }
   if (liveHead !== work.headSha) {
+    // The PR moved while we were evaluating. For a required-contexts BLOCK this
+    // matters more than for an ordinary verdict: a BLOCK is a lasting verdict,
+    // and landing it here would record it against head A while head B is what
+    // the PR now is. Report it as superseded so the block is suppressed. This
+    // item still finishes -- head B is covered by the item ingest enqueues for
+    // it, not by re-running this one against a SHA that no longer exists.
+    if (verdict.requiredContextsUnavailable) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'superseded_head',
+        reason: 'head_advanced_before_required_contexts_block',
+      });
+    }
     return finish(deps, work, work.headSha, {
       disposition: 'stale_head',
       reason: 'head_advanced_during_review',
+    });
+  }
+
+  // REQUIRED CONTEXTS UNAVAILABLE (#775): bounded deferral has been exhausted,
+  // and the head the reviewer evaluated is confirmed to still be the live head.
+  // Post a COMMENT so the PR itself says why it is blocked, then finish with a
+  // terminal non-approving disposition the worker escalates. Submission failure
+  // must NOT convert this into a retry or an approval, so the disposition is
+  // preserved either way -- the escalation is what guarantees a human sees it.
+  if (verdict.requiredContextsUnavailable) {
+    let submitted = false;
+    let submitMessage: string | undefined;
+    try {
+      const result = await deps.submitReview({
+        owner: work.owner,
+        repo: work.repo,
+        number: work.prNumber,
+        event: 'COMMENT',
+        body: buildReviewBody(work, verdict),
+        commitId: work.headSha,
+      });
+      submitted = result.submitted;
+      submitMessage = result.message;
+    } catch (error) {
+      submitMessage = errorCode(error);
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'blocked_required_contexts_unavailable',
+      reason: submitted
+        ? 'required_contexts_unavailable_blocked'
+        : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
+      event: 'COMMENT',
     });
   }
 

@@ -53,12 +53,28 @@ function mapSubmitOutcome(
   disposition: Exclude<SubmitDisposition, 'checks_pending' | 'transport_error'>
 ): ResultMapping {
   switch (disposition) {
+    // `stale_head` and `superseded_head` both mean the head this item is BOUND
+    // to is no longer the live head. The item's payload carries that dead SHA
+    // and nothing rewrites it, so releasing it back to the queue would make
+    // every later tick re-evaluate the same stale SHA and return the same
+    // disposition forever (#777 review finding). Ingest already covers the new
+    // head: a push cancels every in-flight item bound to a different SHA and
+    // enqueues a fresh item bound to the exact new head, so this item retiring
+    // leaves no head unreviewed. TERMINAL, and `succeeded` rather than
+    // `blocked` because supersession is the system working, not a failure.
     case 'approved':
     case 'changes_requested':
     case 'stale_head':
+    case 'superseded_head':
       return { status: 'done', task_outcome: 'succeeded' };
+    // `blocked_required_contexts_unavailable` (#775): the required
+    // status-check contexts could not be read after the attempt bound.
+    // TERMINAL and blocked -- never released for another tick (unbounded
+    // release is what parked these rows at fencing_token 240) and never
+    // succeeded, because no review judgment was ever formed.
     case 'custody_conflict':
     case 'merge_custody_conflict':
+    case 'blocked_required_contexts_unavailable':
       return { status: 'failed', task_outcome: 'blocked' };
     case 'reviewer_failed':
     case 'submission_failed':
@@ -123,9 +139,13 @@ export async function tickReviewWorkerClock(
           work,
           deps.createSubmitDeps(config.reviewerIdentity)
         );
-        // CHECKS PENDING is non-terminal: release the claim (not postResult) with
-        // a backoff so the item is retried on a later tick once CI concludes,
-        // rather than orphaned or re-polled every tick.
+        // CHECKS PENDING is the ONLY non-terminal disposition: the bound head is
+        // still live and CI on it has simply not concluded, so releasing the
+        // claim with a backoff retries the SAME head productively.
+        //
+        // `superseded_head` is deliberately NOT released here. Its bound head is
+        // dead, the payload still names that dead SHA, and a release would spin
+        // the item forever -- see mapSubmitOutcome for the full reasoning.
         if (outcome.disposition === 'checks_pending') {
           await deps.releaseMessage({
             id: claimed.id,
