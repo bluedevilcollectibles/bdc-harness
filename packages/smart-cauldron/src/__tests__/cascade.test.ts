@@ -81,13 +81,6 @@ function makeFailVerdict(reason: string): GateVerdict {
   };
 }
 
-/** Windows CI runners are slow enough that the first cascade test in the file
- *  (which pays module + config cold-start plus real wo-lock file IO) crosses
- *  Bun's 5000ms default (~5016ms observed on windows-latest, 2026-08-25: PRs
- *  #701/#703/#705/#710). Known timeout class: reference_windows-ci-timeout-class-bun-5000.
- *  Ubuntu is always green -- this is runner speed, not product code. */
-const SLOW_TEST_TIMEOUT_MS = 30_000;
-
 /** Root for this test run's outDirs -- removed after the suite. */
 const testOutRoot = join(tmpdir(), `smart-cauldron-test-runs-${randomUUID()}`);
 afterAll(async () => {
@@ -150,31 +143,27 @@ test('cascade preserves the eligibility identity on every attempted lane', async
 // ---------------------------------------------------------------------------
 
 describe('auth/project binding guards', () => {
-  test(
-    'lane preflight failure is recorded and prevents provider fire',
-    async () => {
-      let fireCalled = false;
-      const deps: CascadeDeps = {
-        preflight: async tier => {
-          throw new Error(`workflow ${tier.workflowName} is unavailable`);
-        },
-        fire: async () => {
-          fireCalled = true;
-          return makeFireOk('should-not-fire');
-        },
-        escalate: async () => undefined,
-        writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
-      };
+  test('lane preflight failure is recorded and prevents provider fire', async () => {
+    let fireCalled = false;
+    const deps: CascadeDeps = {
+      preflight: async tier => {
+        throw new Error(`workflow ${tier.workflowName} is unavailable`);
+      },
+      fire: async () => {
+        fireCalled = true;
+        return makeFireOk('should-not-fire');
+      },
+      escalate: async () => undefined,
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
 
-      const result = await runCascade(baseOpts({ deps }));
+    const result = await runCascade(baseOpts({ deps }));
 
-      expect(fireCalled).toBe(false);
-      expect(result.status).toBe('infra-alert');
-      expect(result.attempts[0]?.outcome).toBe('infra-error');
-      expect(result.attempts[0]?.infraErrorReason).toContain('is unavailable');
-    },
-    SLOW_TEST_TIMEOUT_MS
-  );
+    expect(fireCalled).toBe(false);
+    expect(result.status).toBe('infra-alert');
+    expect(result.attempts[0]?.outcome).toBe('infra-error');
+    expect(result.attempts[0]?.infraErrorReason).toContain('is unavailable');
+  });
 
   test('missing project throws before firing', async () => {
     let fireCalled = false;
@@ -956,7 +945,7 @@ describe('Test: cancelled stops the cascade (real gate)', () => {
     } finally {
       await rm(outDir, { recursive: true, force: true });
     }
-  }, 15000);
+  });
 
   test('cancelled is never pass:true under the real gate (otherwise-clean fields)', async () => {
     // Even with validator satisfied + PR mergeable, cancelled must fail the gate.

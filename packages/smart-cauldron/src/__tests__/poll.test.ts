@@ -50,7 +50,7 @@ describe('pollForTerminal PR-detection race guard', () => {
     // 1ms, so this test has no business taking 15 SECONDS -- the wall time is not
     // slowness, it is something in the PR-lookup path blocking. Raising the ceiling
     // unblocks the branch; it does NOT explain the duration. Worth a real look.
-  }, 30000);
+  });
 
   test('declares no PR only after exhausting retries', async () => {
     let calls = 0;

@@ -42,11 +42,11 @@ test('reset payload round-trips quotes, backslashes and every non-NUL control ch
   const result = await runReset(['--confirm', '--actor', actor, '--reason', reason]);
   expect(result.exitCode).toBe(0);
   expect(JSON.parse(result.stdout)).toEqual({ actor, reason });
-}, 15_000);
+});
 
 test('reset dry run needs no token and does not call the network boundary', async () => {
   const result = await runReset([], '');
   expect(result.exitCode).toBe(0);
   expect(result.stdout).toContain('[dry-run]');
   expect(result.stdout).not.toContain('{"actor"');
-}, 15_000);
+});
