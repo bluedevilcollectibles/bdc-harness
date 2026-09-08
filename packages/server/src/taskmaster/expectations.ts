@@ -56,6 +56,14 @@ export interface ExpectationDeps {
   markGivenUp?: (id: string, reason: string) => Promise<boolean | undefined>;
   getMessage?: (id: string) => Promise<DispatchMessage | null>;
   createTask?: typeof createAuthenticatedMessage;
+  /**
+   * Existence probe for an already-claimed attempt's deterministic key. Returns
+   * null when no taskmaster-sent dispatch row carries that key, which is the
+   * signal that a claimed attempt was never actually sent.
+   */
+  findEffectByIdempotencyKey?: (
+    key: string
+  ) => Promise<{ id: string; status: string; createdAt: string } | null>;
   checkEvidence?: (spec: EvidenceSpec) => Promise<EvidenceResult>;
   retryDelayMs?: number;
 }
@@ -193,6 +201,71 @@ export async function checkEvidence(
   };
 }
 
+/**
+ * The idempotency key for one redispatch attempt. DETERMINISTIC in
+ * (expectation id, attempt number) -- no random component -- which is what
+ * makes replaying a claimed-but-unsent attempt safe: the dispatch DAL is
+ * idempotent on this key, so a replay of an attempt that did land reuses the
+ * existing row instead of sending twice.
+ */
+function redispatchKey(expectationId: string, attempt: number): string {
+  return `tm:expectation:${expectationId}:retry:${String(attempt)}`;
+}
+
+/**
+ * Does a taskmaster-sent dispatch row already carry this idempotency key?
+ *
+ * Deliberately defined here rather than imported from ./loop, which already
+ * imports checkExpectations from this module -- reusing that export would make
+ * the two files circular. The predicate matches loop.ts's
+ * defaultFindEffectByIdempotencyKey exactly, including the system:taskmaster
+ * sender scoping, so the two agree on what "already sent" means.
+ */
+export async function defaultFindEffectByIdempotencyKey(
+  key: string,
+  deps: Pick<ExpectationDeps, 'query'> = {}
+): Promise<{ id: string; status: string; createdAt: string } | null> {
+  const query =
+    deps.query ??
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters
+    (<T>(sql: string, params?: unknown[]): Promise<{ rows: readonly T[] }> =>
+      getDatabase().query<T>(sql, params));
+  const result = await query<{ id: string; status: string; created_at: string }>(
+    `SELECT id, status, created_at FROM agent_dispatch_messages
+      WHERE idempotency_key = $1
+        AND sender_principal_id = 'system:taskmaster'
+      LIMIT 1`,
+    [key]
+  );
+  const row = result.rows[0];
+  return row ? { id: row.id, status: row.status, createdAt: row.created_at } : null;
+}
+
+/** Send (or idempotently replay) one redispatch attempt. Returns the key used. */
+async function sendRedispatch(
+  expectation: taskmasterDb.TmExpectation,
+  original: DispatchMessage,
+  attempt: number,
+  deps: ExpectationDeps
+): Promise<string> {
+  const key = redispatchKey(expectation.id, attempt);
+  const data: CreateAuthenticatedMessageData = {
+    correlation_id: original.correlation_id,
+    idempotency_key: key,
+    task_type: original.task_type,
+    recipient: original.recipient,
+    body: original.body,
+    priority: original.priority,
+    subject_key: original.subject_key,
+    repeat_reason: `expectation:${expectation.id}:retry:${String(attempt)}`,
+  };
+  await (deps.createTask ?? createAuthenticatedMessage)(
+    { kind: 'system', sender: 'taskmaster' },
+    data
+  );
+  return key;
+}
+
 export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): Promise<void> {
   const list = deps.listDueExpectations ?? taskmasterDb.listDueExpectations;
   const active = await list(now.toISOString());
@@ -222,6 +295,66 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       continue;
     }
     if (now.getTime() < Date.parse(expectation.due_at)) continue;
+
+    // RECOVERY FIRST, AND INDEPENDENT OF CLAIMING ANYTHING.
+    //
+    // An attempt is PAID FOR the moment it is claimed: the counter advanced, so
+    // the budget was spent. If the worker then crashed before the send, that
+    // attempt exists only as a number in the row -- no dispatch row carries its
+    // deterministic key. Replaying it is not a new attempt, it is finishing the
+    // one already bought.
+    //
+    // This ran nested inside the new-claim branch until this repair, which made
+    // it unreachable in exactly the case that matters most: an expectation that
+    // crashed after claiming its LAST allowed attempt (retries == max_retries)
+    // failed the `retries < max_retries` guard on the outer branch, so it
+    // escalated with its final paid-for attempt never dispatched. The same
+    // nesting also spent the next retry before replaying the previous one, and
+    // let a replay failure strand a freshly claimed attempt.
+    //
+    // A crashed attempt is NOT a failure -- it was never sent, so no deadline
+    // can have elapsed on it. Recovery therefore precedes markFailed, replays
+    // the key, and stops the tick there; the evidence deadline is re-judged on
+    // a later tick against an attempt that was actually dispatched.
+    if (expectation.on_absence === 'redispatch' && expectation.retries > 0) {
+      const claimedKey = redispatchKey(expectation.id, expectation.retries);
+      const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
+      let alreadySent: boolean;
+      try {
+        alreadySent = (await findEffect(claimedKey)) !== null;
+      } catch (error) {
+        // Unknown is not "absent": replaying blind here could double-send if
+        // the row does exist. Leave the expectation active and retry the read
+        // on the next tick.
+        log.warn(
+          { err: error as Error, expectationId: expectation.id, idempotencyKey: claimedKey },
+          'taskmaster.expectation_recovery_probe_failed'
+        );
+        continue;
+      }
+      if (!alreadySent) {
+        const original = await (deps.getMessage ?? getMessage)(expectation.dispatch_ref);
+        if (!original) {
+          log.error({ expectationId: expectation.id }, 'taskmaster.expectation_dispatch_missing');
+          await (deps.markGivenUp ?? taskmasterDb.markGivenUp)(
+            expectation.id,
+            `original dispatch missing: ${expectation.dispatch_ref}`
+          );
+          continue;
+        }
+        await sendRedispatch(expectation, original, expectation.retries, deps);
+        log.warn(
+          {
+            expectationId: expectation.id,
+            idempotencyKey: claimedKey,
+            attempt: expectation.retries,
+          },
+          'taskmaster.expectation_redispatch_recovered'
+        );
+        continue;
+      }
+    }
+
     // EVERY follow-on action below is gated on winning this transition. A tick
     // that loses it is stale: another tick has already marked this expectation
     // met, escalated or given up, and acting on a snapshot taken before that
@@ -249,37 +382,19 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         );
         continue;
       }
-      const createTask = deps.createTask ?? createAuthenticatedMessage;
-      const sendAttempt = async (attempt: number): Promise<string> => {
-        // The key is DETERMINISTIC in (expectation id, attempt number). The
-        // dispatch DAL is idempotent on this key, so replaying an attempt --
-        // after a crash between the claim and the send -- reuses the existing
-        // row instead of sending twice.
-        const key = `tm:expectation:${expectation.id}:retry:${String(attempt)}`;
-        const data: CreateAuthenticatedMessageData = {
-          correlation_id: original.correlation_id,
-          idempotency_key: key,
-          task_type: original.task_type,
-          recipient: original.recipient,
-          body: original.body,
-          priority: original.priority,
-          subject_key: original.subject_key,
-          repeat_reason: `expectation:${expectation.id}:retry:${String(attempt)}`,
-        };
-        await createTask({ kind: 'system', sender: 'taskmaster' }, data);
-        return key;
-      };
-
       const dueAt = new Date(
         now.getTime() + (deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)
       ).toISOString();
-      // CLAIM BEFORE ANY SEND. The counter advances atomically, bounded by
+      // CLAIM BEFORE THE SEND. The counter advances atomically, bounded by
       // max_retries, under a compare-and-set on BOTH the retry count and the
       // active status this tick observed. An overlapping tick finds the counter
       // already advanced -- or the row already closed as met -- loses the
-      // claim, and must not send. The claim precedes the recovery replay below
-      // for exactly that reason: a tick that has lost the race must not put a
-      // message on the wire at all, not even a replayed one.
+      // claim, and must not send.
+      //
+      // By the time control reaches here, the previously claimed attempt is
+      // CONFIRMED SENT (the recovery step above returned without replaying) and
+      // its evidence is still absent past the deadline. Only then is buying
+      // another attempt the right move.
       const attempt = await (deps.claimRedispatchAttempt ?? taskmasterDb.claimRedispatchAttempt)(
         expectation.id,
         expectation.retries,
@@ -293,13 +408,10 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         continue;
       }
 
-      // Recover the previous attempt. If a crash landed between its claim and
-      // its send, this replays it under its own deterministic key; if it did
-      // send, the dispatch DAL returns the existing row and nothing new is
-      // created. Either way the retry budget is not spent twice.
-      if (expectation.retries > 0) await sendAttempt(expectation.retries);
-
-      const key = await sendAttempt(attempt);
+      // If this send throws, the attempt stays claimed but unsent -- which is
+      // precisely the state the recovery step above is built to finish on the
+      // next tick, under this same deterministic key.
+      const key = await sendRedispatch(expectation, original, attempt, deps);
       log.warn(
         { expectationId: expectation.id, idempotencyKey: key, attempt },
         'taskmaster.expectation_redispatched'

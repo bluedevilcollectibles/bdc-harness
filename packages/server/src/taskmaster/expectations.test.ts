@@ -211,10 +211,17 @@ describe('expectation supervisor', () => {
   test('retry_cap_then_escalate_never_loops', async () => {
     let row = { ...base };
     const sends: string[] = [];
+    // Models the dispatch table: a key is "sent" once createTask has written
+    // it, which is what the recovery probe reads.
+    const sentKeys = new Set<string>();
     const deps = {
       listDueExpectations: async () => (row.status === 'escalated' ? [] : [row]),
       checkEvidence: async () => ({ ok: false, pointer: null }),
       markFailed: async () => {},
+      findEffectByIdempotencyKey: async (key: string) =>
+        sentKeys.has(key)
+          ? { id: `sent-${key}`, status: 'queued', createdAt: new Date(0).toISOString() }
+          : null,
       getMessage: async () =>
         ({
           id: 'original',
@@ -227,6 +234,7 @@ describe('expectation supervisor', () => {
         }) as never,
       createTask: async (_context: never, data: { idempotency_key: string }) => {
         sends.push(data.idempotency_key);
+        sentKeys.add(data.idempotency_key);
         return { id: `d-${sends.length}` } as never;
       },
       claimRedispatchAttempt: async (_id: string, expected: number) => {
@@ -385,11 +393,16 @@ describe('expectation supervisor', () => {
   test('a stale tick that loses the claim sends nothing, not even a replay', async () => {
     const keys: string[] = [];
     await checkExpectations(new Date(), {
-      // retries=1 means the recovery replay would fire if the claim were not
-      // checked first.
       listDueExpectations: async () => [{ ...base, retries: 1 }],
       checkEvidence: async () => ({ ok: false, pointer: null }),
       markFailed: async () => true,
+      // Attempt 1 is confirmed sent, so recovery does not fire and the tick
+      // goes on to try to buy attempt 2 -- which it loses.
+      findEffectByIdempotencyKey: async () => ({
+        id: 'sent-1',
+        status: 'queued',
+        createdAt: new Date(0).toISOString(),
+      }),
       getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
       createTask: async (_context, data) => {
         keys.push(data.idempotency_key);
@@ -398,20 +411,187 @@ describe('expectation supervisor', () => {
       claimRedispatchAttempt: async () => null,
       retryDelayMs: 0,
     } as never);
-    // The claim is checked BEFORE the replay, so a tick that lost the race puts
-    // no message on the wire at all.
+    // A tick that lost the claim puts no message on the wire at all.
     expect(keys).toEqual([]);
   });
 
   test('a crash between the claim and the send is recovered under the same key', async () => {
     const keys: string[] = [];
+    const claims: number[] = [];
     // The prior tick claimed attempt 1 and died before sending: retries=1 is
-    // durable, but no dispatch row exists for attempt 1.
+    // durable, but no dispatch row carries attempt 1's key.
     const crashed: TmExpectation = { ...base, retries: 1, status: 'failed' };
     await checkExpectations(new Date(), {
       listDueExpectations: async () => [crashed],
       checkEvidence: async () => ({ ok: false, pointer: null }),
-      markFailed: async () => {},
+      markFailed: async () => {
+        throw new Error('markFailed must not run: a never-sent attempt is not a failure');
+      },
+      findEffectByIdempotencyKey: async () => null,
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      claimRedispatchAttempt: async () => {
+        claims.push(1);
+        return 2;
+      },
+      retryDelayMs: 0,
+    } as never);
+    // ONLY attempt 1 is replayed, and NO new attempt is claimed. Recovery is
+    // finishing an attempt already paid for, not buying another one -- the old
+    // behaviour spent retry 2 just to replay retry 1.
+    expect(keys).toEqual(['tm:expectation:expectation-1:retry:1']);
+    expect(claims).toEqual([]);
+  });
+
+  test('a crash after claiming the LAST attempt is replayed, not escalated', async () => {
+    // THE REGRESSION THIS REPAIR IS FOR. retries === max_retries, so the
+    // outer `retries < max_retries` guard is false: the old code skipped
+    // recovery entirely and escalated with the final paid-for attempt never
+    // dispatched.
+    const keys: string[] = [];
+    const escalations: string[] = [];
+    const lastAttemptCrashed: TmExpectation = {
+      ...base,
+      retries: 2,
+      max_retries: 2,
+      status: 'failed',
+    };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [lastAttemptCrashed],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      markEscalated: async () => {
+        escalations.push('escalated');
+        return true;
+      },
+      findEffectByIdempotencyKey: async () => null,
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      claimRedispatchAttempt: async () => null,
+      retryDelayMs: 0,
+    } as never);
+    // Exactly one send: the final attempt, under its own key. No escalation yet
+    // -- the seat has not been given its last chance until the message lands.
+    expect(keys).toEqual(['tm:expectation:expectation-1:retry:2']);
+    expect(escalations).toEqual([]);
+  });
+
+  test('once the last attempt is confirmed sent and evidence stays absent, it escalates', async () => {
+    // The tick after the recovery above: attempt 2 now HAS a dispatch row, the
+    // retry budget is spent, so the expectation escalates to a human.
+    const keys: string[] = [];
+    const escalations: string[] = [];
+    const exhausted: TmExpectation = { ...base, retries: 2, max_retries: 2, status: 'failed' };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [exhausted],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      markEscalated: async () => {
+        escalations.push('escalated');
+        return true;
+      },
+      findEffectByIdempotencyKey: async () => ({
+        id: 'sent-2',
+        status: 'queued',
+        createdAt: new Date(0).toISOString(),
+      }),
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      claimRedispatchAttempt: async () => null,
+      retryDelayMs: 0,
+    } as never);
+    // No retry send; one operator escalation on the deterministic escalate key.
+    expect(keys).toEqual(['tm:expectation:expectation-1:escalate']);
+    expect(escalations).toEqual(['escalated']);
+  });
+
+  test('recovery then escalation across two ticks sends the last attempt exactly once', async () => {
+    // The full arc the review describes, driven end to end: crash on the final
+    // attempt -> tick A replays it -> tick B (evidence still absent) escalates.
+    const keys: string[] = [];
+    const escalations: string[] = [];
+    let sentKeys = new Set<string>();
+    const row: TmExpectation = { ...base, retries: 2, max_retries: 2, status: 'failed' };
+    const deps = {
+      listDueExpectations: async () => [row],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      markEscalated: async () => {
+        escalations.push('escalated');
+        return true;
+      },
+      findEffectByIdempotencyKey: async (key: string) =>
+        sentKeys.has(key)
+          ? { id: 'sent', status: 'queued', createdAt: new Date(0).toISOString() }
+          : null,
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context: never, data: { idempotency_key: string }) => {
+        keys.push(data.idempotency_key);
+        sentKeys.add(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      claimRedispatchAttempt: async () => null,
+      retryDelayMs: 0,
+    };
+    await checkExpectations(new Date(), deps as never);
+    await checkExpectations(new Date(), deps as never);
+    expect(keys).toEqual([
+      'tm:expectation:expectation-1:retry:2',
+      'tm:expectation:expectation-1:escalate',
+    ]);
+    // Exactly one send of the final attempt across both ticks.
+    expect(keys.filter(key => key === 'tm:expectation:expectation-1:retry:2')).toHaveLength(1);
+    expect(escalations).toEqual(['escalated']);
+    sentKeys = new Set();
+  });
+
+  test('a replay failure leaves the attempt recoverable rather than stranded', async () => {
+    // If the replay send throws, the attempt stays claimed-but-unsent, which is
+    // exactly the state the next tick's recovery step is built to finish. No
+    // new attempt is bought and nothing is escalated.
+    const claims: number[] = [];
+    const crashed: TmExpectation = { ...base, retries: 1, status: 'failed' };
+    await expect(
+      checkExpectations(new Date(), {
+        listDueExpectations: async () => [crashed],
+        checkEvidence: async () => ({ ok: false, pointer: null }),
+        findEffectByIdempotencyKey: async () => null,
+        getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+        createTask: async () => {
+          throw new Error('dispatch unavailable');
+        },
+        claimRedispatchAttempt: async () => {
+          claims.push(1);
+          return 2;
+        },
+        retryDelayMs: 0,
+      } as never)
+    ).rejects.toThrow('dispatch unavailable');
+    expect(claims).toEqual([]);
+  });
+
+  test('an unreadable recovery probe does not blind-replay', async () => {
+    // Unknown is not absent: if the existence probe throws, replaying could
+    // double-send. The tick leaves the row active and retries next time.
+    const keys: string[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [{ ...base, retries: 1 }],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => {
+        throw new Error('markFailed must not run when the probe is unreadable');
+      },
+      findEffectByIdempotencyKey: async () => {
+        throw new Error('database unavailable');
+      },
       getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
       createTask: async (_context, data) => {
         keys.push(data.idempotency_key);
@@ -420,12 +600,6 @@ describe('expectation supervisor', () => {
       claimRedispatchAttempt: async () => 2,
       retryDelayMs: 0,
     } as never);
-    // Attempt 1 is replayed under its own deterministic key (a no-op at the
-    // dispatch DAL if it did land), and attempt 2 is the newly claimed one.
-    // The count was never lost and attempt 1 can never be double-sent.
-    expect(keys).toEqual([
-      'tm:expectation:expectation-1:retry:1',
-      'tm:expectation:expectation-1:retry:2',
-    ]);
+    expect(keys).toEqual([]);
   });
 });
