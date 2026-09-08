@@ -9,6 +9,7 @@
   },
   "include": [
     "*.ts",
+    "db/**/*.ts",
     "dispatch-worker/**/*.ts",
     "staging/**/*.ts",
     "taskmaster/**/*.ts",

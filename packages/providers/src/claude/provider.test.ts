@@ -642,7 +642,7 @@ describe('ClaudeProvider', () => {
       await expect(consumeGenerator()).rejects.toThrow(/Claude Code crash/);
       // Should have been called 4 times (initial + 3 retries)
       expect(mockQuery).toHaveBeenCalledTimes(4);
-    }, 5_000);
+    });
 
     test('recovers from transient crash on retry', async () => {
       let callCount = 0;
@@ -666,7 +666,7 @@ describe('ClaudeProvider', () => {
       expect(callCount).toBe(3);
       expect(chunks).toHaveLength(1);
       expect(chunks[0]).toEqual({ type: 'assistant', content: 'Recovered!' });
-    }, 5_000);
+    });
 
     test('classifies auth errors as fatal when refresh has no credentials', async () => {
       const error = new Error('unauthorized');
@@ -799,7 +799,7 @@ describe('ClaudeProvider', () => {
       // crash classification = retried up to 3 times -> 4 total calls
       await expect(consumeGenerator()).rejects.toThrow(/Claude Code crash/);
       expect(mockQuery).toHaveBeenCalledTimes(4);
-    }, 5_000);
+    });
 
     test('classifies mixed-case "OPERATION ABORTED" errors as crash', async () => {
       const error = new Error('OPERATION ABORTED');
@@ -815,7 +815,7 @@ describe('ClaudeProvider', () => {
 
       await expect(consumeGenerator()).rejects.toThrow(/Claude Code crash/);
       expect(mockQuery).toHaveBeenCalledTimes(4);
-    }, 5_000);
+    });
 
     test('captures all stderr output for diagnostics', async () => {
       mockQuery.mockImplementation(async function* (args: {
@@ -843,7 +843,7 @@ describe('ClaudeProvider', () => {
       expect(err.message).toContain('stderr:');
       expect(err.message).toContain('AJV validation');
       expect(err.message).toContain('startup diagnostic');
-    }, 5_000);
+    });
 
     test('passes settingSources from assistantConfig', async () => {
       mockQuery.mockImplementation(async function* () {
@@ -1295,7 +1295,7 @@ describe('sendQuery decomposition behaviors', () => {
     const systemChunks = chunks.filter(c => c.type === 'system');
     expect(systemChunks).toHaveLength(0);
     expect(callCount).toBe(3); // Confirms retries happened
-  }, 5_000);
+  });
 
   test('abort signal cancels query across retries without listener leak', async () => {
     const abortController = new AbortController();
@@ -1327,7 +1327,7 @@ describe('sendQuery decomposition behaviors', () => {
     await expect(consumeGenerator()).rejects.toThrow('Query aborted');
     // Single abort listener registered (not per-retry)
     expect(callCount).toBe(1);
-  }, 5_000);
+  });
 
   test('enriched error (with stderr) is thrown at retry exhaustion, not raw error', async () => {
     mockQuery.mockImplementation(async function* (args: {
@@ -1350,7 +1350,7 @@ describe('sendQuery decomposition behaviors', () => {
     // Must contain stderr context, not just the raw error
     expect(err.message).toContain('stderr:');
     expect(err.message).toContain('diagnostic: something broke');
-  }, 5_000);
+  });
 
   test('PostToolUse hook handles circular reference without crashing', async () => {
     mockQuery.mockImplementation(async function* (args: {

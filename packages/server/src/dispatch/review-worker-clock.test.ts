@@ -158,6 +158,10 @@ describe('review worker clock', () => {
     ['merge_custody_conflict', 'failed', 'blocked'],
     ['reviewer_failed', 'failed', 'failed'],
     ['submission_failed', 'failed', 'failed'],
+    // #775: the required status-check contexts could not be read after the
+    // attempt bound. TERMINAL and blocked -- it must be POSTED, not released,
+    // or the item goes back into the forever-defer loop it was blocked to end.
+    ['blocked_required_contexts_unavailable', 'failed', 'blocked'],
   ] as const)(
     'maps %s submissions to %s with a %s task outcome',
     async (disposition, status, taskOutcome) => {
@@ -174,6 +178,52 @@ describe('review worker clock', () => {
       );
     }
   );
+
+  // #777 review finding (second pass): a superseded-head item is bound to a SHA
+  // that is no longer live, and nothing rewrites that payload. Releasing it back
+  // to the queue made every later tick re-evaluate the same dead SHA and return
+  // superseded_head again -- an indefinite retry loop. It must TERMINATE; ingest
+  // separately enqueues a fresh item bound to the exact new head.
+  test('terminates a superseded-head item instead of releasing it back to the queue', async () => {
+    const deps = fakeDeps([message('superseded', 'exact-head')], () => ({
+      disposition: 'superseded_head',
+      reason: 'head_advanced_before_required_contexts_block',
+    }));
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'superseded',
+        fencing_token: 1,
+        status: 'done',
+        task_outcome: 'succeeded',
+      })
+    );
+    // Releasing an item whose bound head is dead is what created the loop.
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  // The loop the finding names is only visible across TWO ticks: the first tick
+  // disposes of the item, the second must not evaluate it again.
+  test('does not re-evaluate a superseded-head item on the next tick', async () => {
+    const deps = fakeDeps([message('superseded', 'exact-head')], () => ({
+      disposition: 'superseded_head',
+      reason: 'head_advanced_before_required_contexts_block',
+    }));
+
+    await tickReviewWorkerClock(CONFIG, deps);
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    // One evaluation total: the stale SHA is never judged twice.
+    expect(deps.runAndSubmitReview).toHaveBeenCalledTimes(1);
+    expect(deps.runAndSubmitReview).toHaveBeenCalledWith(
+      expect.objectContaining({ headSha: 'exact-head', messageId: 'superseded' }),
+      expect.anything()
+    );
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
 
   // WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01: a checks-pending item is
   // released (not posted as a result) with a future not_before, and is retried

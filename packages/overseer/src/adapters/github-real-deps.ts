@@ -11,6 +11,13 @@ import type {
   PullRequestEvidence,
   PullRequestRef,
 } from '../types.ts';
+import { resolveRequiredContexts } from './required-contexts';
+import type {
+  AttemptCounterStore,
+  REQUIRED_CONTEXTS_BLOCKED_REASON,
+  RequiredContextsFailureKind,
+} from './required-contexts.ts';
+import { createDurableAttemptCounterStore } from './required-contexts-store';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -127,7 +134,9 @@ export interface RealGitHubOctokitLike {
       owner: string;
       repo: string;
       pull_number: number;
-      event: 'APPROVE' | 'REQUEST_CHANGES';
+      // COMMENT added for #775: the non-approving, non-rejecting event used
+      // when the reviewer cannot form a verdict at all.
+      event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
       body?: string;
       commit_id: string;
     }): Promise<{ data: { id: number; state: string } }>;
@@ -180,8 +189,86 @@ export interface RealGitHubOctokitLike {
       repo: string;
       branch: string;
     }): Promise<{ data: string[] }>;
+    /**
+     * Optional: repository ruleset rules that apply to a branch. Unlike the
+     * admin-scoped protection endpoint, this is readable by the App
+     * installation AND the PAT, which is what makes an empty array usable as
+     * POSITIVE evidence that a branch enforces nothing.
+     */
+    getBranchRules?(input: {
+      owner: string;
+      repo: string;
+      branch: string;
+    }): Promise<{ data: unknown[] }>;
+    /**
+     * Optional: the branch itself. `protected: false` is the second half of the
+     * positive-unprotected signature (paired with an empty rules array).
+     */
+    getBranch?(input: {
+      owner: string;
+      repo: string;
+      branch: string;
+    }): Promise<{ data: { protected?: boolean; protection?: { enabled?: boolean } } }>;
   };
 }
+
+/**
+ * COMPILE-TIME GUARD on the method NAMES above (#777 review).
+ *
+ * `RealGitHubOctokitLike` is a hand-written structural stand-in, and the real
+ * clients reach it through `as unknown as RealGitHubOctokitLike` -- a cast that
+ * asserts the shape rather than checking it. Two things therefore used to be
+ * invisible: a method we name that Octokit does not actually have, and a method
+ * Octokit renames out from under us. Either one makes `bindRepoMethod` return
+ * `undefined` at runtime, which silently disables positive unprotected-branch
+ * detection: the probe never answers, the counter climbs, and a genuinely
+ * unprotected base gets BLOCKED instead of resolving to an authoritative empty
+ * set. The hand mocks in the tests cannot catch it either, because they
+ * implement whatever name we invented.
+ *
+ * `RealOctokitReposMethodName` is every optional method name we declare, and it
+ * is constrained to `keyof RealOctokitRepos`. If a name here does not exist on
+ * the installed @octokit/rest, this file fails to compile with a clear error
+ * instead of failing quietly in production. Verified 2026-09-08 against
+ * @octokit/rest 22.0.1 / plugin-rest-endpoint-methods 17.0.0: `repos` exposes
+ * `getBranchRules` (route `GET /repos/{owner}/{repo}/rules/branches/{branch}`).
+ * There is no `getRulesForBranch` on this version.
+ */
+type RealOctokitRepos = InstanceType<typeof Octokit>['repos'];
+
+/**
+ * A name that exists on BOTH our stand-in and the real client.
+ *
+ * Constrained against `keyof RealOctokitRepos` DIRECTLY, not via `Extract`. An
+ * earlier cut of this guard used `Extract<ours, theirs>`, which silently DROPS a
+ * name the real client lacks instead of rejecting it -- so the bad name simply
+ * vanished from the union and everything still compiled. Verified by
+ * substituting `getRulesForBranch` and watching tsc exit 0. The constraint below
+ * has nowhere to put an unknown name, so it errors instead.
+ */
+type RealOctokitReposMethodName = keyof RealOctokitRepos;
+
+/**
+ * Every name we bind, checked against the real client at COMPILE time.
+ *
+ * `satisfies` is what does the work: each literal must be assignable to
+ * `RealOctokitReposMethodName`, so a method the installed @octokit/rest does not
+ * expose -- a typo, an invention, or a name Octokit later renames -- fails the
+ * build here rather than returning `undefined` in production.
+ */
+export const BOUND_REPOS_METHODS = [
+  'getAllStatusCheckContexts',
+  'getBranchRules',
+  'getBranch',
+] as const satisfies readonly RealOctokitReposMethodName[];
+
+/**
+ * The bound names, additionally required to exist on our own stand-in so
+ * `bindRepoMethod` can index it. Both halves are enforced: `satisfies` above
+ * pins them to the real client, this pins them to the interface.
+ */
+export type BoundReposMethodName = (typeof BOUND_REPOS_METHODS)[number] &
+  keyof NonNullable<RealGitHubOctokitLike['repos']>;
 
 export interface ExactHeadPullRequestEvidence {
   diff: string;
@@ -200,11 +287,63 @@ export interface ExactHeadPullRequestEvidence {
    *   required suite registers.
    */
   requiredContexts: string[] | null;
+  /**
+   * Set when the required-contexts lookup has failed on CONSECUTIVE attempts
+   * past the configured bound for this head (#775). It is NOT a third value of
+   * `requiredContexts`: the set is still unknown, so `requiredContexts` stays
+   * `null` and `checksAreTerminal` still fails closed. This flag only tells the
+   * reviewer to stop deferring and BLOCK visibly instead -- a PR comment plus
+   * an operator escalation, never an approval and never a downgrade to the
+   * reported-checks heuristic.
+   */
+  requiredContextsBlocked?: {
+    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON;
+    attempts: number;
+    failureKind: RequiredContextsFailureKind;
+  };
 }
 
-/** Read review evidence with every ref-addressable call pinned to headSha. */
+/**
+ * Read review evidence with every ref-addressable call pinned to headSha.
+ *
+ * `patOctokit` is the PAT-identity client used ONLY as the second identity for
+ * the branch-protection lookup. The GitHub App installation lacks that
+ * permission (2026-09-07 incident: HTTP 403 "Resource not accessible by
+ * integration" on every tick), while the PAT in the same container can read it.
+ * Every other call stays on the primary client so review attribution is
+ * unchanged. Omit it and the resolver simply has one fewer identity to try.
+ */
+/**
+ * Bind one optional `repos` method to its own client, or return undefined when
+ * the client or the method is absent.
+ *
+ * Octokit's REST methods are plugin-decorated closures that read `this` for the
+ * request machinery, so handing the resolver a bare `octokit.repos.getBranch`
+ * reference would invoke it detached. Binding here also satisfies
+ * `@typescript-eslint/unbound-method`, which flags exactly this hazard.
+ */
+function bindRepoMethod<K extends BoundReposMethodName>(
+  client: RealGitHubOctokitLike | undefined,
+  method: K
+): NonNullable<NonNullable<RealGitHubOctokitLike['repos']>[K]> | undefined {
+  const repos = client?.repos;
+  const fn = repos?.[method];
+  if (typeof fn !== 'function') return undefined;
+  return fn.bind(repos) as NonNullable<NonNullable<RealGitHubOctokitLike['repos']>[K]>;
+}
+
+/**
+ * @param attemptStore Where the required-contexts deferral counts are kept.
+ *   Defaults to the DURABLE store, because this is the long-running reviewer
+ *   path: a process-local count resets on every container rebuild and is split
+ *   across worker processes, so the bound it feeds would never arrive and the
+ *   deferral would still be forever (#777 review). Injectable so tests can
+ *   substitute an in-memory store rather than stand up a database.
+ */
 export function createRealFetchExactHeadPullRequestEvidence(
-  octokit: RealGitHubOctokitLike
+  octokit: RealGitHubOctokitLike,
+  patOctokit?: RealGitHubOctokitLike,
+  attemptStore: AttemptCounterStore = createDurableAttemptCounterStore()
 ): (input: {
   owner: string;
   repo: string;
@@ -253,40 +392,43 @@ export function createRealFetchExactHeadPullRequestEvidence(
     // by the review worker, so an unknown state re-resolves as soon as the
     // lookup succeeds; it is never silently downgraded to an approval path.
     const baseRef = pr.data.base?.ref;
-    let requiredContexts: string[] | null = null;
-    if (!baseRef || !octokit.repos.getAllStatusCheckContexts) {
-      log.warn(
-        {
-          owner: input.owner,
-          repo: input.repo,
-          baseRef: baseRef ?? null,
-          reason: !baseRef ? 'base_ref_unavailable' : 'protection_api_unavailable',
-        },
-        'overseer.github_real_deps.required_contexts_unknown_deferring_review'
-      );
-    } else {
-      try {
-        const contexts = await octokit.repos.getAllStatusCheckContexts({
-          owner: input.owner,
-          repo: input.repo,
-          branch: baseRef,
-        });
-        if (Array.isArray(contexts.data)) {
-          requiredContexts = contexts.data.map(context => context.trim()).filter(Boolean);
-        } else {
-          log.warn(
-            { owner: input.owner, repo: input.repo, baseRef, reason: 'non_array_payload' },
-            'overseer.github_real_deps.required_contexts_unknown_deferring_review'
-          );
-        }
-      } catch (error) {
-        log.warn(
-          { err: error, owner: input.owner, repo: input.repo, baseRef, reason: 'lookup_failed' },
-          'overseer.github_real_deps.required_contexts_unknown_deferring_review'
-        );
-      }
-    }
+    const resolution = await resolveRequiredContexts({
+      owner: input.owner,
+      repo: input.repo,
+      baseRef,
+      headSha: input.headSha,
+      // Every fetcher is bound to its own client. Octokit's REST methods read
+      // `this` for the request machinery, so passing the bare method reference
+      // would call it detached and throw at request time.
+      fetchWithAppClient: bindRepoMethod(octokit, 'getAllStatusCheckContexts'),
+      // The App installation lacks the branch-protection permission (2026-09-07
+      // incident); the PAT in the same container can read it. Absent when no
+      // separate PAT client was supplied.
+      fetchWithPatClient: bindRepoMethod(patOctokit, 'getAllStatusCheckContexts'),
+      fetchBranchRules:
+        bindRepoMethod(octokit, 'getBranchRules') ?? bindRepoMethod(patOctokit, 'getBranchRules'),
+      fetchBranch: bindRepoMethod(octokit, 'getBranch') ?? bindRepoMethod(patOctokit, 'getBranch'),
+      // Durable by default. The bound only means anything if the count survives
+      // this process (#777 review [major]).
+      attemptStore,
+    });
+    // EXHAUSTED does NOT relax `requiredContexts`: the set is still unknown, so
+    // it stays `null` and checksAreTerminal still fails closed. The separate
+    // flag is what tells the reviewer to stop deferring and block visibly.
+    // Collapsing the two would be the silent downgrade this fix exists to
+    // prevent (#775).
+    const requiredContexts: string[] | null =
+      resolution.state === 'known' ? resolution.contexts : null;
     return {
+      ...(resolution.state === 'exhausted'
+        ? {
+            requiredContextsBlocked: {
+              reason: resolution.reason,
+              attempts: resolution.attempts,
+              failureKind: resolution.failureKind,
+            },
+          }
+        : {}),
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
@@ -435,6 +577,20 @@ export function resolveRealOctokitAuthOptions(): RealOctokitAuthOptions {
  */
 export function createRealOctokitClient(): RealGitHubOctokitLike {
   return new Octokit(resolveRealOctokitAuthOptions()) as unknown as RealGitHubOctokitLike;
+}
+
+/**
+ * Construct a PAT-identity Octokit client, or null when no PAT is configured.
+ *
+ * Used ONLY as the second identity for the branch-protection required-contexts
+ * lookup, which the GitHub App installation cannot read. This is deliberately
+ * NOT a general fallback client: reviews, comments and merges keep their own
+ * identities, and nothing here widens what the PAT is used for.
+ */
+export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | null {
+  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  if (!token) return null;
+  return new Octokit({ auth: token }) as unknown as RealGitHubOctokitLike;
 }
 
 /**
@@ -732,7 +888,14 @@ export function createRealApprovePullRequest(
 }
 
 /** Review events the Overseer App may submit. */
-export type OverseerReviewEvent = 'APPROVE' | 'REQUEST_CHANGES';
+/**
+ * COMMENT (added for #775) is the NON-APPROVING, non-rejecting event. It is
+ * used when the reviewer cannot form a verdict at all -- the required
+ * status-check contexts could not be read after the configured attempt bound --
+ * so the PR carries a visible statement of why it is blocked without either
+ * approving it or claiming a code finding that was never made.
+ */
+export type OverseerReviewEvent = 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
 
 export interface SubmitPullRequestReviewInput extends PullRequestRef {
   event: OverseerReviewEvent;
@@ -776,10 +939,17 @@ export function createRealSubmitPullRequestReview(
       throw new Error('overseer_real_adapter_missing_review_api');
     }
     const body = input.body?.trim() ?? '';
-    if (input.event === 'REQUEST_CHANGES' && body.length === 0) {
+    // A COMMENT with no body says nothing at all, so it carries the same
+    // non-empty precondition as REQUEST_CHANGES.
+    if (input.event !== 'APPROVE' && body.length === 0) {
       return { submitted: false, message: 'github_review_missing_evidence_body' };
     }
-    const expectedState = input.event === 'APPROVE' ? 'APPROVED' : 'CHANGES_REQUESTED';
+    const expectedState =
+      input.event === 'APPROVE'
+        ? 'APPROVED'
+        : input.event === 'COMMENT'
+          ? 'COMMENTED'
+          : 'CHANGES_REQUESTED';
     try {
       const response = await octokit.pulls.createReview({
         owner: input.owner,

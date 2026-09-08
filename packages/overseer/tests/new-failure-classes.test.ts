@@ -27,7 +27,8 @@ import {
   spyOn,
   mock,
 } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp } from 'node:fs/promises';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { classifyError, decide } from '../src/index.ts';
@@ -188,7 +189,7 @@ describe('runEscalation: durable operator card', () => {
     fetchSpy.mockRestore();
     await closeDatabase();
     resetDatabase();
-    await rm(tmpHome, { recursive: true, force: true });
+    removeTempDirWithRetry(tmpHome);
   });
 
   test('runEscalation preserves diagnostics and queues all three channel jobs', async () => {
@@ -225,7 +226,7 @@ describe('runEscalation: durable operator card', () => {
       'notion',
     ]);
     expect(fetchSpy).toHaveBeenCalledTimes(0);
-  }, 15000);
+  });
 
   test('runEscalation queues Notion without contacting it when credentials are absent', async () => {
     delete process.env.NOTION_API_KEY;
@@ -250,7 +251,7 @@ describe('runEscalation: durable operator card', () => {
     expect(view?.card.canonical_event_identity.error_class).toBe('implement_loop_no_output');
     expect(view?.delivery_summary.notion.state).toBe('pending');
     expect(fetchSpy).toHaveBeenCalledTimes(0);
-  }, 15000);
+  });
 });
 
 // --- Test 5 -- end-to-end (incident replay) -----------------------------------
@@ -285,7 +286,7 @@ describe('end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay', () => {
     fetchSpy.mockRestore();
     await closeDatabase();
     resetDatabase();
-    await rm(tmpHome, { recursive: true, force: true });
+    removeTempDirWithRetry(tmpHome);
   });
 
   test('commit-and-push stderr + validator remediation feedback yields a complete durable card', async () => {
@@ -341,7 +342,7 @@ describe('end-to-end: WO-AUTH-SINGLE-PATH-E2E-04 incident replay', () => {
     ]);
     expect(view?.jobs).toHaveLength(3);
     expect(fetchSpy).toHaveBeenCalledTimes(0);
-  }, 15000);
+  });
 });
 
 // Reference the mock helper so bun:test doesn't drop it as unused (linter quirk).

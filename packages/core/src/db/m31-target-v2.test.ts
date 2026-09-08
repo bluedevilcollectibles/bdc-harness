@@ -472,5 +472,5 @@ describe('M31 target v2 persistence', () => {
     } finally {
       await second.close();
     }
-  }, 10_000);
+  });
 });

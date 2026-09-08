@@ -172,7 +172,7 @@ describe('already-satisfied lane wiring', () => {
       } else {
         expect(needsBuild.stderr).toBe('');
       }
-    }, 15000);
+    });
 
     it(`${file} preserves adversarial already-satisfied evidence through shell embedding`, async () => {
       const content = readFileSync(join(LANES_DIR, file), 'utf-8');

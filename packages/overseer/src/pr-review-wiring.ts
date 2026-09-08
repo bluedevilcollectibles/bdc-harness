@@ -16,16 +16,20 @@
  * subscription remains a separate, external step.
  */
 import * as dispatch from '@archon/core/db/dispatch';
+import { createLogger } from '@archon/paths';
 import {
   createRealFetchExactHeadPullRequestEvidence,
   createRealOctokitClient,
+  createRealReadOnlyPatOctokitClient,
   createRealSubmitPullRequestReview,
 } from './adapters/github-real-deps';
+import { isAutoRereviewReason } from './pr-review-ingest';
 import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
 import {
   configuredReviewIdentity,
   evaluatePullRequest,
   invokeConfiguredReviewModel,
+  reviewErrorCode,
 } from './pr-review-evaluator';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
@@ -40,6 +44,8 @@ const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
 
 /** Code-fixed Overseer sender that owns queued review work. */
 export const REVIEW_SENDER = 'overseer';
+const log = createLogger('overseer/pr-review-wiring');
+
 export const REVIEW_RECIPIENT = 'overseer-reviewer';
 
 export interface ReviewRouteConfig {
@@ -116,6 +122,62 @@ export function reviewSubjectKey(owner: string, repo: string, prNumber: number):
 }
 
 /**
+ * Head-independent prefix of every review correlation id for one PR.
+ *
+ * `reviewCorrelationId` produces `pr-review:owner/repo#N@<head>`; trimming the
+ * head yields the group key. This is the ONLY identifier legacy submit
+ * receipts carry that ties them to a pull request, which is what makes the
+ * fallback below possible.
+ */
+export function reviewCorrelationPrefix(owner: string, repo: string, prNumber: number): string {
+  return `pr-review:${owner}/${repo}#${prNumber}@`;
+}
+
+interface PriorVerdict {
+  verdict: PriorReviewWork['verdict'];
+  verdictId: string;
+}
+
+function classifyVerdict(disposition: string | undefined): PriorReviewWork['verdict'] {
+  if (disposition === 'approved') return 'approved';
+  if (disposition === 'changes_requested') return 'changes_requested';
+  return 'other';
+}
+
+/**
+ * Folds submit receipts into a messageId -> verdict map.
+ *
+ * `receipts` MUST arrive newest-first: the first receipt seen for a message
+ * wins, so an older failed attempt cannot overwrite a later, authoritative
+ * submission verdict. Entries already present are never replaced, which also
+ * makes the legacy pass below strictly additive -- a subject_key-bearing
+ * receipt always outranks a legacy one for the same message.
+ */
+function collectVerdicts(
+  receipts: { id: string; body: string }[],
+  into: Map<string, PriorVerdict>
+): Map<string, PriorVerdict> {
+  for (const receipt of receipts) {
+    try {
+      const body = JSON.parse(receipt.body) as {
+        kind?: string;
+        messageId?: string;
+        disposition?: string;
+      };
+      if (body.kind !== 'pr_review_submit_receipt' || !body.messageId) continue;
+      if (into.has(body.messageId)) continue;
+      into.set(body.messageId, {
+        verdict: classifyVerdict(body.disposition),
+        verdictId: receipt.id,
+      });
+    } catch {
+      // Malformed and unrelated reports are not verdict evidence.
+    }
+  }
+  return into;
+}
+
+/**
  * Binds the pure ingest dependencies to the live dispatch queue.
  *
  * Reuses `agent_dispatch_messages` with `task_type: 'run_review'`. Its UNIQUE
@@ -136,6 +198,43 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         recipient: REVIEW_RECIPIENT,
         subject_key: subjectKey,
       });
+      // listMessages orders subject_key queries newest-first, which is what
+      // collectVerdicts requires.
+      const receipts = await dispatch.listMessages({
+        recipient: 'operator',
+        subject_key: subjectKey,
+      });
+      const verdictByMessageId = collectVerdicts(receipts, new Map<string, PriorVerdict>());
+
+      // LEGACY FALLBACK. Review finding (Overseer, PR #772): subject_key on
+      // submit receipts is NEW in this change -- recordReceipt did not persist
+      // it before. So every receipt written prior to deployment is invisible
+      // to the query above, and the completed CHANGES_REQUESTED reviews that
+      // exist today -- precisely the historical cases this change intends to
+      // repair -- could not authorize an automatic re-review at all.
+      //
+      // Legacy receipts do carry `correlation_id`
+      // (`pr-review:owner/repo#N@<head>`), so they are still attributable to a
+      // PR. Only pay for this lookup when the indexed query left work
+      // unexplained, and never let it override a subject_key-bearing receipt
+      // (collectVerdicts keeps the first entry per message).
+      //
+      // The prefix match runs IN SQL. A client-side scan of a listMessages
+      // page cannot work here: listMessages hard-caps limit at 500 and offers
+      // no offset or cursor, while the live store holds ~2,700 queued operator
+      // rows (bdc-harness #761 backlog) plus completed ones. A genuinely old
+      // CHANGES_REQUESTED receipt therefore sits well outside any single page
+      // -- which is precisely the receipt this fallback exists to find.
+      const needsLegacyLookup = messages.some(message => !verdictByMessageId.has(message.id));
+      if (needsLegacyLookup) {
+        // Already newest-first from the DAL, as collectVerdicts requires.
+        const legacy = await dispatch.listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: 'operator',
+          correlationPrefix: reviewCorrelationPrefix(input.owner, input.repo, input.prNumber),
+        });
+        collectVerdicts(legacy, verdictByMessageId);
+      }
+
       return messages
         .map(message => {
           const body = parseReviewWorkBody(message.body);
@@ -143,6 +242,14 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
             messageId: message.id,
             headSha: body?.headSha ?? '',
             status: message.status,
+            verdict: verdictByMessageId.get(message.id)?.verdict ?? null,
+            verdictId: verdictByMessageId.get(message.id)?.verdictId ?? null,
+            // Only a reason THIS module stamped counts toward the attempt cap.
+            // repeat_reason is shared free text (legacy `review_exact_head:`
+            // rows, Taskmaster nudges, hand-written operator requests), so
+            // `!== null` would exhaust the budget on rows that were never
+            // automatic re-reviews. See AUTO_REREVIEW_REASON_PREFIX.
+            isAutoRereview: isAutoRereviewReason(message.repeat_reason),
           };
         })
         .filter((work): work is PriorReviewWork => work.headSha !== '');
@@ -199,7 +306,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           recipient: REVIEW_RECIPIENT,
           body: JSON.stringify(body),
           subject_key: subjectKey,
-          repeat_reason: `review_exact_head:${input.headSha}`,
+          repeat_reason: input.repeatReason,
         }
       );
       return { messageId: message.id, alreadyExisted };
@@ -235,6 +342,12 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
 
 interface RealSubmitWiringOverrides {
   octokit?: ReturnType<typeof createRealOctokitClient>;
+  /**
+   * PAT-identity client used only as the second identity for the
+   * branch-protection required-contexts lookup the App cannot read. Pass `null`
+   * to assert "no PAT identity" explicitly (tests); omit to resolve from env.
+   */
+  patOctokit?: ReturnType<typeof createRealOctokitClient> | null;
   reviewerModel?: string;
   evaluate?: (input: PrReviewInput, deps: PrReviewDeps) => Promise<PrReviewResult>;
   invokeModel?: PrReviewDeps['invokeModel'];
@@ -242,6 +355,56 @@ interface RealSubmitWiringOverrides {
 
 const INDETERMINATE_REVIEW_SUMMARY =
   'The independent review could not reach a determinate verdict. No approval was issued.';
+
+/**
+ * The body posted on the PR when the required status-check contexts could not
+ * be read after the attempt bound (#775).
+ *
+ * It states the attempt count and whether the cause was a PERMISSION or a
+ * TRANSIENT fault, because those need different human actions: grant the App
+ * the branch-protection scope (or supply GH_TOKEN / OVERSEER_REQUIRED_CONTEXTS_JSON)
+ * versus wait out a GitHub API fault. It says explicitly that the PR is BLOCKED
+ * and NOT approved, so nobody reads a comment-only review as a soft pass.
+ */
+export function buildRequiredContextsBlockedSummary(error: string | undefined): string {
+  const attemptsMatch = /attempts=(\d+)/.exec(error ?? '');
+  const attempts = attemptsMatch?.[1] ?? 'the configured number of';
+  const reasonMatch = /reason=(permission|transient)/.exec(error ?? '');
+  const reason = reasonMatch?.[1] ?? 'transient';
+  const remedy =
+    reason === 'permission'
+      ? 'The reviewing identity lacks permission to read branch protection. Grant the Overseer GitHub App the branch-protection read scope, provide a PAT via GH_TOKEN, or declare the contexts with OVERSEER_REQUIRED_CONTEXTS_JSON.'
+      : 'The GitHub API did not answer the branch-protection lookup. This may clear on its own; if it persists, treat it as a permission problem.';
+  return [
+    `Required status-check contexts unavailable after ${attempts} attempts (reason: ${reason}); review blocked, not approved.`,
+    '',
+    'The reviewer could not determine which status checks this base branch requires, so it cannot tell whether CI is genuinely complete. It will not approve on the checks that happen to have reported.',
+    '',
+    remedy,
+  ].join('\n');
+}
+
+/**
+ * The INDETERMINATE summary, plus the evaluator's error CODE when there is one.
+ *
+ * An INDETERMINATE review used to post the bare sentence above, so a blocked PR
+ * carried no clue why -- the author could not tell a bad model response from an
+ * unreachable judge (#789). The CODE (the identifier before the first colon:
+ * `model_error`, `model_timeout`, `model_output_invalid`, `evidence_error`,
+ * `reviewed_head_mismatch`) is enough to act on.
+ *
+ * ONLY the code. The detail half of the error carries model output, API
+ * messages, and binary names that may embed tokens or provider internals, and
+ * `reviewErrorCode` additionally refuses anything outside a conservative
+ * identifier charset, so a malformed error string cannot smuggle text into a
+ * public review body.
+ */
+export function buildIndeterminateSummary(error: string | undefined): string {
+  const code = reviewErrorCode(error);
+  return code
+    ? `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.`
+    : INDETERMINATE_REVIEW_SUMMARY;
+}
 
 /**
  * Bind WO-2's evaluator into WO-1's injected submit-side reviewer seam.
@@ -253,7 +416,11 @@ export function createRealSubmitDeps(
   overrides: RealSubmitWiringOverrides = {}
 ): SubmitDeps {
   const octokit = overrides.octokit ?? createRealOctokitClient();
-  const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(octokit);
+  const patOctokit =
+    overrides.patOctokit === undefined
+      ? (createRealReadOnlyPatOctokitClient() ?? undefined)
+      : (overrides.patOctokit ?? undefined);
+  const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(octokit, patOctokit);
   const configuredModelReviewer = configuredReviewIdentity();
   const modelReviewer = {
     provider: configuredModelReviewer.provider,
@@ -298,6 +465,17 @@ export function createRealSubmitDeps(
           checksPending: true,
         };
       }
+      // CHECKS_UNAVAILABLE (#775): terminal, never approving. Carries its own
+      // summary because a COMMENT with no body says nothing, and the whole
+      // point of this path is that a human can read why the PR is stuck.
+      if (result.verdict === 'CHECKS_UNAVAILABLE') {
+        return {
+          approved: false,
+          summary: buildRequiredContextsBlockedSummary(result.error),
+          reviewedHeadSha: result.reviewed_head_sha,
+          requiredContextsUnavailable: true,
+        };
+      }
       // RATE_LIMITED (#782 part 2) is a deferral for the same reason
       // CHECKS_PENDING is: no verdict was formed, so it must NOT be collapsed
       // into `approved: false` (a de facto REQUEST_CHANGES on rate-limit
@@ -316,13 +494,32 @@ export function createRealSubmitDeps(
             : {}),
         };
       }
+      // TRANSPORT_ERROR is a deferral for the same reason CHECKS_PENDING is: no
+      // model was ever reached, so no verdict was formed. It must NOT be
+      // collapsed into `approved: false` (a de facto REQUEST_CHANGES on
+      // argument-size or spawn grounds -- the #789 bug) nor into the terminal
+      // INDETERMINATE summary below. The retry delay travels with it so the
+      // worker requeues instead of spinning.
+      if (result.verdict === 'TRANSPORT_ERROR') {
+        const reasonCode = reviewErrorCode(result.error);
+        return {
+          approved: false,
+          summary: '',
+          reviewedHeadSha: result.reviewed_head_sha,
+          transportError: true,
+          ...(reasonCode ? { reasonCode } : {}),
+          ...(typeof result.retry_after_ms === 'number'
+            ? { retryAfterMs: result.retry_after_ms }
+            : {}),
+        };
+      }
       const summary =
         result.findings.length > 0
           ? result.findings
               .map(finding => `[${finding.severity}] ${finding.scope}: ${finding.summary}`)
               .join('\n')
           : result.verdict === 'INDETERMINATE'
-            ? INDETERMINATE_REVIEW_SUMMARY
+            ? buildIndeterminateSummary(result.error)
             : 'No blocking findings.';
       return {
         approved: result.verdict === 'APPROVE',
@@ -340,6 +537,23 @@ export function createRealSubmitDeps(
       return pr.data.head.sha;
     },
     async recordReceipt(input): Promise<void> {
+      // This receipt IS the escalation path: every terminal disposition lands
+      // in the operator dispatch inbox, which XO drains at session start. #775
+      // additionally logs at error level and marks the body `needsOperator` so
+      // a blocked-for-permissions PR is not just one more receipt in the list.
+      const blocked = input.disposition === 'blocked_required_contexts_unavailable';
+      if (blocked) {
+        log.error(
+          {
+            owner: input.owner,
+            repo: input.repo,
+            prNumber: input.prNumber,
+            headSha: input.headSha,
+            reason: input.reason ?? null,
+          },
+          'overseer.pr_review.required_contexts_unavailable_blocked'
+        );
+      }
       await dispatch.createAuthenticatedMessage(
         { kind: 'system', sender: REVIEW_SENDER },
         {
@@ -347,7 +561,13 @@ export function createRealSubmitDeps(
           idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
           task_type: 'run_report',
           recipient: 'operator',
-          body: JSON.stringify({ kind: 'pr_review_submit_receipt', ...input }),
+          subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+          repeat_reason: `review_verdict_receipt:${input.messageId}:${input.disposition}`,
+          body: JSON.stringify({
+            kind: 'pr_review_submit_receipt',
+            ...input,
+            ...(blocked ? { needsOperator: true } : {}),
+          }),
         }
       );
     },

@@ -48,10 +48,19 @@ afterAll(() => {
 });
 
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
-const { createRealIngestDeps, createRealSubmitDeps, REVIEW_RECIPIENT, REVIEW_SENDER } =
-  await import('../pr-review-wiring.ts');
-const { ingestPullRequestEvent } = await import('../pr-review-ingest.ts');
+const {
+  createRealIngestDeps,
+  createRealSubmitDeps,
+  reviewSubjectKey,
+  REVIEW_RECIPIENT,
+  REVIEW_SENDER,
+} = await import('../pr-review-wiring.ts');
+const { AUTO_REREVIEW_REASON_PREFIX, MAX_REREVIEW_ATTEMPTS, ingestPullRequestEvent } =
+  await import('../pr-review-ingest.ts');
 const { createHmac } = await import('crypto');
+// Imported dynamically, after mock.module above, so it binds the mocked
+// connection and therefore the per-test SqliteAdapter.
+const dispatchModule = await import('@archon/core/db/dispatch');
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -268,6 +277,18 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
        WHERE id = $1`,
       [first.messageId]
     );
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: first.correlationId ?? '',
+        messageId: first.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 148,
+        headSha: '1'.repeat(40),
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
 
     const secondHeadSha = '2'.repeat(40);
     const secondPayload = payloadFor('synchronize', secondHeadSha);
@@ -291,8 +312,106 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       [second.messageId]
     );
     expect(rows.rows).toHaveLength(1);
-    expect(rows.rows[0]?.repeat_reason).toBe(`review_exact_head:${secondHeadSha}`);
+    expect(rows.rows[0]?.repeat_reason).toContain('changes_requested verdict');
+    expect(rows.rows[0]?.repeat_reason).toContain('1'.repeat(40));
+    expect(rows.rows[0]?.repeat_reason).toContain(secondHeadSha);
     expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
+  });
+
+  test('an approved receipt round-trip does not authorize review of a newer head', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: 149,
+        pull_request: {
+          number: 149,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = '6'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-approved-head-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+    const submitDeps = createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() });
+    await submitDeps.recordReceipt({
+      correlationId: first.correlationId ?? '',
+      messageId: first.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 149,
+      headSha: firstHeadSha,
+      disposition: 'submission_failed',
+      reason: 'transient_failure',
+    });
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET created_at = '2000-01-01 00:00:00'
+       WHERE idempotency_key = $1`,
+      [`pr-review-submit-receipt:${first.messageId}:submission_failed`]
+    );
+    await submitDeps.recordReceipt({
+      correlationId: first.correlationId ?? '',
+      messageId: first.messageId ?? '',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 149,
+      headSha: firstHeadSha,
+      disposition: 'approved',
+      event: 'APPROVE',
+    });
+
+    const prior = await deps.listPriorReviewWork({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 149,
+    });
+    expect(prior.find(work => work.messageId === first.messageId)?.verdict).toBe('approved');
+
+    const secondHeadSha = '7'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-approved-head-2',
+      },
+      deps
+    );
+
+    expect(second.disposition).toBe('blocked');
+    expect(second.reason).toBe('enqueue_failed:repeat_reason_required');
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages
+       WHERE recipient = $1 AND body LIKE $2`,
+      [REVIEW_RECIPIENT, `%${secondHeadSha}%`]
+    );
+    expect(rows.rows).toHaveLength(0);
   });
 
   /**
@@ -372,7 +491,7 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
     ]);
     expect(rows.rows).toHaveLength(1);
     expect(rows.rows[0]?.status).toBe('queued');
-    expect(rows.rows[0]?.repeat_reason).toBe(`review_exact_head:${secondHeadSha}`);
+    expect(rows.rows[0]?.repeat_reason).toBeNull();
     expect(JSON.parse(rows.rows[0]?.body ?? '{}').headSha).toBe(secondHeadSha);
 
     // The original (older-head) queued row was cancelled, not left dangling.
@@ -381,6 +500,162 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       [first.messageId]
     );
     expect(cancelledPriorStatus.rows[0]?.status).toBe('cancelled');
+  });
+
+  /**
+   * Review finding (Overseer, PR #772): `isAutoRereview` was derived from
+   * `repeat_reason !== null`. Because the pre-2026-09 enqueue path stamped
+   * EVERY review -- initial ones included -- with `review_exact_head:<sha>`,
+   * and because unrelated writers (Taskmaster nudges, operator re-review
+   * requests) also fill that shared column, a PR whose history predates this
+   * change could exhaust MAX_REREVIEW_ATTEMPTS without a single automatic
+   * re-review having run. Verified live 2026-09-06: 6 legacy-format rows and
+   * 134 prose reasons on the reviewer queue, shopops#662 holding 16 alone.
+   *
+   * This proves the derivation against the REAL dispatch DAL, since the fake
+   * IngestDeps in the unit suite set `isAutoRereview` directly and so cannot
+   * exercise the wiring where the defect lived.
+   */
+  test('legacy and foreign repeat_reason rows are not counted as auto re-review attempts', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const prNumber = 662;
+    const subjectKey = reviewSubjectKey('thinmansoftware', 'shopops', prNumber);
+
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: prNumber,
+        pull_request: {
+          number: prNumber,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'shopops', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = '8'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-reason-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    // Backfill the legacy shape onto the initial review, exactly as the old
+    // enqueue path wrote it, and add more legacy/foreign rows than the cap
+    // allows. None of these were automatic re-reviews.
+    await db.query(`UPDATE agent_dispatch_messages SET repeat_reason = $1 WHERE id = $2`, [
+      `review_exact_head:${firstHeadSha}`,
+      first.messageId,
+    ]);
+    const legacyReasons = [
+      `review_exact_head:${'a'.repeat(40)}`,
+      'tm:nudge:follow-up',
+      'Fresh exact-head review after source repair.',
+      'system XO escalation handoff',
+    ];
+    expect(legacyReasons.length).toBeGreaterThan(MAX_REREVIEW_ATTEMPTS);
+    for (const [index, reason] of legacyReasons.entries()) {
+      // Backdated: listMessages orders subject_key queries newest-first, and
+      // in real history these legacy rows predate the review that carries the
+      // CHANGES_REQUESTED verdict. Keeping that order means this test
+      // exercises the attempt cap rather than the reason-selection path.
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient,
+            body, subject_key, repeat_reason, status, created_at)
+         VALUES ($1, $2, $3, 'run_review', $4, $5, $6, $7, $8, 'done', '2000-01-01 00:00:00')`,
+        [
+          `legacy-row-${index}`,
+          `legacy-correlation-${index}`,
+          `legacy-idempotency-${index}`,
+          REVIEW_SENDER,
+          REVIEW_RECIPIENT,
+          JSON.stringify({
+            owner: 'thinmansoftware',
+            repo: 'shopops',
+            prNumber,
+            headSha: String(index + 1).repeat(40),
+            baseRef: 'dev',
+            author: 'bluedevilcollectibles',
+          }),
+          subjectKey,
+          reason,
+        ]
+      );
+    }
+
+    const prior = await deps.listPriorReviewWork({
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+      prNumber,
+    });
+    expect(prior.length).toBe(legacyReasons.length + 1);
+    expect(prior.every(work => work.isAutoRereview === false)).toBe(true);
+
+    // Give the initial review a CHANGES_REQUESTED verdict so the next push
+    // takes the re-review path -- the path the cap guards.
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: first.correlationId ?? '',
+        messageId: first.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'shopops',
+        prNumber,
+        headSha: firstHeadSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
+
+    const secondHeadSha = '9'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-reason-2',
+      },
+      deps
+    );
+
+    // Pre-fix this was 'blocked' / 'rereview_attempts_exhausted'.
+    expect(second.disposition).toBe('queued');
+
+    // The reason the auto path just wrote IS the one the cap reads back.
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages WHERE id = $1`,
+      [second.messageId]
+    );
+    const writtenReason = rows.rows[0]?.repeat_reason ?? null;
+    expect(writtenReason).toContain(AUTO_REREVIEW_REASON_PREFIX);
+    const afterRereview = await deps.listPriorReviewWork({
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+      prNumber,
+    });
+    expect(afterRereview.filter(work => work.isAutoRereview).length).toBe(1);
+    expect(afterRereview.find(work => work.messageId === second.messageId)?.isAutoRereview).toBe(
+      true
+    );
   });
 
   test('a same-head redelivery while the review is still queued is a duplicate, not a new enqueue', async () => {
@@ -447,5 +722,404 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       [REVIEW_RECIPIENT, `%${headSha}%`]
     );
     expect(Number(count.rows[0]?.n ?? 0)).toBe(1);
+  });
+
+  /**
+   * Review finding (Overseer, PR #772): verdict discovery queries receipts by
+   * subject_key, but subject_key on submit receipts is NEW in this change --
+   * recordReceipt did not persist it before. Every receipt written prior to
+   * deployment is therefore invisible to that query, so the completed
+   * CHANGES_REQUESTED reviews that exist today -- exactly the historical cases
+   * this change intends to repair -- could not authorize an automatic
+   * re-review at all.
+   */
+  test('a legacy receipt with no subject_key still authorizes the re-review', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const prNumber = 771;
+
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: prNumber,
+        pull_request: {
+          number: prNumber,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = '3'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-receipt-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: first.correlationId ?? '',
+        messageId: first.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber,
+        headSha: firstHeadSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
+
+    // Rewrite the receipt into the PRE-DEPLOYMENT shape: no subject_key, which
+    // is precisely what every receipt on disk today looks like. correlation_id
+    // is left intact because legacy receipts do carry it.
+    const stripped = await db.query(
+      `UPDATE agent_dispatch_messages
+       SET subject_key = NULL
+       WHERE task_type = 'run_report' AND body LIKE '%pr_review_submit_receipt%'`,
+      []
+    );
+    expect(stripped.rowCount).toBeGreaterThan(0);
+    const remaining = await db.query<{ count: number }>(
+      `SELECT COUNT(*) AS count
+       FROM agent_dispatch_messages
+       WHERE task_type = 'run_report'
+         AND subject_key IS NOT NULL
+         AND body LIKE '%pr_review_submit_receipt%'`,
+      []
+    );
+    // Proves the subject_key query below genuinely has nothing to find.
+    expect(Number(remaining.rows[0]?.count ?? 0)).toBe(0);
+
+    const secondHeadSha = '4'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-receipt-2',
+      },
+      deps
+    );
+
+    // Pre-fix: the subject_key query returned nothing, the prior verdict was
+    // null, no reason was built, and Dispatch refused the enqueue.
+    expect(second.disposition).toBe('queued');
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages WHERE id = $1`,
+      [second.messageId]
+    );
+    const reason = rows.rows[0]?.repeat_reason ?? '';
+    expect(reason.startsWith(AUTO_REREVIEW_REASON_PREFIX)).toBe(true);
+    expect(reason).toContain('changes_requested verdict');
+    expect(reason).toContain(firstHeadSha);
+    expect(reason).toContain(secondHeadSha);
+  });
+
+  test('a legacy receipt belonging to a DIFFERENT pr does not authorize a re-review', async () => {
+    // The fallback scans operator receipts without a subject_key filter, so it
+    // must discriminate by correlation prefix. A neighbouring PR's legacy
+    // changes_requested receipt must not leak across.
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+
+    const payloadFor = (
+      action: 'opened' | 'synchronize',
+      prNumber: number,
+      headSha: string
+    ): string =>
+      JSON.stringify({
+        action,
+        number: prNumber,
+        pull_request: {
+          number: prNumber,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    // A neighbouring PR reaches changes_requested, and its receipt is legacy.
+    const neighbourHeadSha = '5'.repeat(40);
+    const neighbourPayload = payloadFor('opened', 900, neighbourHeadSha);
+    const neighbour = await ingestPullRequestEvent(
+      {
+        rawBody: neighbourPayload,
+        signature: sign(neighbourPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-neighbour-1',
+      },
+      deps
+    );
+    expect(neighbour.disposition).toBe('queued');
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: neighbour.correlationId ?? '',
+        messageId: neighbour.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber: 900,
+        headSha: neighbourHeadSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET subject_key = NULL
+       WHERE task_type = 'run_report' AND body LIKE '%pr_review_submit_receipt%'`,
+      []
+    );
+
+    // The PR under test has been reviewed once with NO verdict recorded.
+    const firstHeadSha = '7'.repeat(40);
+    const firstPayload = payloadFor('opened', 901, firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-neighbour-2',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    const secondPayload = payloadFor('synchronize', 901, '8'.repeat(40));
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-legacy-neighbour-3',
+      },
+      deps
+    );
+
+    // The PR under test has no verdict of its own, so NO re-review reason may
+    // be built. The neighbour's legacy changes_requested receipt must not leak
+    // across: the fallback scans operator receipts unfiltered by subject_key,
+    // so correlation-prefix discrimination is the only thing separating them.
+    // (The prior row was still queued, so it is cancelled as stale and the
+    // enqueue itself succeeds -- Dispatch only demands a reason once a prior
+    // row is terminal. The load-bearing assertion is the null reason.)
+    expect(second.disposition).toBe('superseded_head');
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages WHERE id = $1`,
+      [second.messageId]
+    );
+    expect(rows.rows[0]?.repeat_reason ?? null).toBeNull();
+    expect(rows.rows[0]?.repeat_reason ?? '').not.toContain(neighbourHeadSha);
+  });
+
+  /**
+   * Review finding (coordinator, PR #772): the first version of the legacy
+   * fallback scanned a single `listMessages` page. That page is hard-capped at
+   * 500 rows and has no offset or cursor, while the live store holds ~2,700
+   * queued operator rows (bdc-harness #761 backlog) plus completed ones. A
+   * genuinely old CHANGES_REQUESTED receipt therefore falls outside the
+   * window -- defeating the fallback exactly where it matters most, on the
+   * oldest PRs it exists to repair.
+   *
+   * This test buries the legacy receipt behind MORE than 500 newer, unrelated
+   * operator rows. It passes only because the prefix match runs in SQL.
+   */
+  test('a legacy receipt survives a backlog of 600 newer unrelated operator rows', async () => {
+    const config = {
+      webhookSecret: 'integration-test-secret',
+      reviewerIdentity: 'thinman-overseer[bot]',
+    };
+    const deps = createRealIngestDeps(config);
+    const prNumber = 761;
+
+    const payloadFor = (action: 'opened' | 'synchronize', headSha: string): string =>
+      JSON.stringify({
+        action,
+        number: prNumber,
+        pull_request: {
+          number: prNumber,
+          draft: false,
+          head: { sha: headSha, ref: 'feature-branch' },
+          base: { ref: 'dev', sha: 'f'.repeat(40) },
+          user: { login: 'bluedevilcollectibles' },
+        },
+        repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+      });
+
+    const firstHeadSha = 'a'.repeat(40);
+    const firstPayload = payloadFor('opened', firstHeadSha);
+    const first = await ingestPullRequestEvent(
+      {
+        rawBody: firstPayload,
+        signature: sign(firstPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-backlog-1',
+      },
+      deps
+    );
+    expect(first.disposition).toBe('queued');
+
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET status = 'done', completed_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [first.messageId]
+    );
+    await createRealSubmitDeps('thinman-overseer[bot]', { octokit: submitOctokit() }).recordReceipt(
+      {
+        correlationId: first.correlationId ?? '',
+        messageId: first.messageId ?? '',
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumber,
+        headSha: firstHeadSha,
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+      }
+    );
+
+    // Legacy shape: no subject_key, correlation_id intact. Pinned to a
+    // timestamp strictly NEWER than every backlog row below. An unfiltered
+    // listMessages orders OLDEST-first, so this receipt sorts last -- past the
+    // 500-row page cap, and therefore unreachable by a client-side scan. The
+    // DAL query orders newest-first and finds it immediately.
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET subject_key = NULL, created_at = '2026-06-01T00:00:00.000Z'
+       WHERE task_type = 'run_report' AND body LIKE '%pr_review_submit_receipt%'`,
+      []
+    );
+
+    // 600 newer operator rows -- more than listMessages can return in one
+    // page. These are ordinary run_report traffic for other subjects, exactly
+    // what the #761 backlog looks like.
+    const BACKLOG_ROWS = 600;
+    for (let index = 0; index < BACKLOG_ROWS; index += 1) {
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at)
+         VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', $4, 'queued', $5)`,
+        [
+          `backlog-${index}`,
+          `unrelated-correlation:${index}`,
+          `backlog-idem-${index}`,
+          JSON.stringify({ kind: 'unrelated_report', index }),
+          `2026-01-01T00:00:${String(index % 60).padStart(2, '0')}.${String(index).padStart(3, '0')}Z`,
+        ]
+      );
+    }
+
+    // The backlog genuinely exceeds a single page, and the legacy receipt is
+    // NOT in it -- so the previous client-side scan could not have found it.
+    // listMessages caps limit at 500 and exposes no offset, so there is no
+    // second page to ask for.
+    const page = await dispatchModule.listMessages({ recipient: 'operator', limit: 500 });
+    expect(page.length).toBe(500);
+    expect(page.some(message => message.body.includes('pr_review_submit_receipt'))).toBe(false);
+
+    const secondHeadSha = 'b'.repeat(40);
+    const secondPayload = payloadFor('synchronize', secondHeadSha);
+    const second = await ingestPullRequestEvent(
+      {
+        rawBody: secondPayload,
+        signature: sign(secondPayload, config.webhookSecret),
+        eventType: 'pull_request',
+        deliveryId: 'integration-delivery-backlog-2',
+      },
+      deps
+    );
+
+    // Found despite the backlog: the prefix filter runs in SQL.
+    expect(second.disposition).toBe('queued');
+    const rows = await db.query<{ repeat_reason: string | null }>(
+      `SELECT repeat_reason FROM agent_dispatch_messages WHERE id = $1`,
+      [second.messageId]
+    );
+    const reason = rows.rows[0]?.repeat_reason ?? '';
+    expect(reason.startsWith(AUTO_REREVIEW_REASON_PREFIX)).toBe(true);
+    expect(reason).toContain('changes_requested verdict');
+    expect(reason).toContain(firstHeadSha);
+    expect(reason).toContain(secondHeadSha);
+  });
+
+  test('the correlation-prefix DAL query is scoped, escaped and newest-first', async () => {
+    // Direct DAL coverage: the wiring test above proves the end-to-end path,
+    // this pins the query contract the fallback depends on.
+    const rows: [string, string, string | null][] = [
+      ['dal-a', 'pr-review:thinmansoftware/bdc-harness#800@aaa', null],
+      ['dal-b', 'pr-review:thinmansoftware/bdc-harness#800@bbb', null],
+      // Same prefix but already indexed by subject_key -- excluded, because
+      // the indexed query already reaches it.
+      [
+        'dal-c',
+        'pr-review:thinmansoftware/bdc-harness#800@ccc',
+        'gh:thinmansoftware/bdc-harness#800',
+      ],
+      // A different PR whose number merely STARTS with 800.
+      ['dal-d', 'pr-review:thinmansoftware/bdc-harness#8001@ddd', null],
+      // A different repo.
+      ['dal-e', 'pr-review:thinmansoftware/shopops#800@eee', null],
+    ];
+    for (const [index, [id, correlationId, subjectKey]] of rows.entries()) {
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, subject_key)
+         VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', '{}', 'queued', $4, $5)`,
+        [id, correlationId, `dal-idem-${id}`, `2026-02-0${index + 1}T00:00:00.000Z`, subjectKey]
+      );
+    }
+
+    const found = await dispatchModule.listMessagesByCorrelationPrefixWithoutSubjectKey({
+      recipient: 'operator',
+      correlationPrefix: 'pr-review:thinmansoftware/bdc-harness#800@',
+    });
+
+    // Only the two subject_key-less rows for THIS pr, newest-first.
+    expect(found.map(message => message.id)).toEqual(['dal-b', 'dal-a']);
+  });
+
+  test('an underscore in a repo name is matched literally, not as a wildcard', async () => {
+    // '_' is a single-character LIKE wildcard. Without escaping, a prefix for
+    // repo 'a_c' would also match repo 'abc' and leak a foreign verdict.
+    await db.query(
+      `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at)
+       VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', '{}', 'queued', $4)`,
+      [
+        'wildcard-decoy',
+        'pr-review:thinmansoftware/abc#1@aaa',
+        'wildcard-idem',
+        '2026-03-01T00:00:00.000Z',
+      ]
+    );
+
+    const found = await dispatchModule.listMessagesByCorrelationPrefixWithoutSubjectKey({
+      recipient: 'operator',
+      correlationPrefix: 'pr-review:thinmansoftware/a_c#1@',
+    });
+    expect(found).toHaveLength(0);
   });
 });

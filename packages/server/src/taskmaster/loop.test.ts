@@ -11,6 +11,7 @@ import {
   defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
+  priorityFromLabels,
   tick,
   resolveTaskmasterIntervalMs,
   resolveFireVerbEnabled,
@@ -19,12 +20,14 @@ import {
   resolveRecipient,
   MAX_EFFECTS_PER_TICK,
   OWNER_RECIPIENT_MAP,
+  isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
   type TaskmasterDeps,
   type ListedThread,
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
+import { checkEvidence } from './expectations';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
 import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
@@ -37,6 +40,145 @@ import type {
   TmJournalEntry,
 } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
+
+describe('Taskmaster reset visibility and canary', () => {
+  test('only the two WO-authorized monitoring signals escape an effects pause', () => {
+    expect(isPauseEffectsExempt('canary', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('self_pause_notice', 'effects')).toBe(true);
+    expect(isPauseEffectsExempt('digest', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('escalate_p0', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('nudge', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('fire_cauldron', 'effects')).toBe(false);
+    expect(isPauseEffectsExempt('deliver_ruling', 'effects')).toBe(false);
+  });
+
+  test('paused daily canary reaches duty-officer once and carries reset guidance', async () => {
+    const world = makeWorld();
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.control.pause_reason = 'operator safety pause';
+    const deps = makeDeps(world);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    await tick(state, deps);
+
+    const canaries = world.sentMessages.filter(m => m.idempotency_key === `tm:digest:${TODAY_KEY}`);
+    expect(canaries).toHaveLength(1);
+    expect(canaries[0]?.recipient).toBe('duty-officer');
+    expect(canaries[0]?.body).toContain('operator safety pause');
+    expect(canaries[0]?.body).toContain('scripts/taskmaster/reset.sh');
+  });
+
+  test('healthy quiet day still sends a daily canary', async () => {
+    const world = makeWorld();
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.sentMessages).toHaveLength(1);
+    expect(world.sentMessages[0]?.recipient).toBe('duty-officer');
+    expect(world.sentMessages[0]?.body).toContain('no proposals today');
+  });
+
+  test('reset audit does not inflate a quiet daily canary outcome count', async () => {
+    const world = makeWorld();
+    world.journal.push({
+      id: 'reset-audit',
+      created_at: new Date(world.nowMs).toISOString(),
+      thread_ref: 'taskmaster:reset',
+      action_type: 'digest',
+      proposal_json: JSON.stringify({ audit_type: 'taskmaster_reset' }),
+      idempotency_key: null,
+      before_hash: null,
+      proof_predicate: null,
+      proof_deadline_at: null,
+      outcome: 'sent',
+      graded_at: null,
+      grade: null,
+    });
+
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+
+    expect(world.sentMessages).toHaveLength(1);
+    expect(world.sentMessages[0]?.body).toContain('sent=0, parked=0, rejected=0');
+    expect(world.sentMessages[0]?.body).toContain('no proposals today');
+  });
+
+  test('post-resume noise pauses and sends the Duty Officer reset notice', async () => {
+    const world = makeWorld();
+    for (let i = 0; i < 20; i += 1) {
+      world.journal.push({
+        id: `noise-${i}`,
+        created_at: new Date(T0 + i + 1).toISOString(),
+        thread_ref: `gh:test/repo#${i}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: `noise-${i}`,
+        before_hash: null,
+        proof_predicate: null,
+        proof_deadline_at: null,
+        outcome: 'sent',
+        graded_at: new Date(T0 + i + 1).toISOString(),
+        grade: 'noise',
+      });
+    }
+    await tick(createTaskmasterState(60_000), makeDeps(world));
+    expect(world.control.pause_state).toBe('PAUSED');
+    const notice = world.sentMessages.find(m => m.idempotency_key.startsWith('tm:self-pause:'));
+    expect(notice?.recipient).toBe('duty-officer');
+    expect(notice?.body).toContain('scripts/taskmaster/reset.sh');
+    expect(notice?.body).toContain('M-155 useful-rate floor auto-pause');
+  });
+
+  test.each(['epoch', 'pause state', 'enqueue'] as const)(
+    'a changed control %s prevents a stale self-pause notice',
+    async change => {
+      const world = makeWorld();
+      for (let i = 0; i < 20; i += 1) {
+        world.journal.push({
+          id: `noise-fenced-${i}`,
+          created_at: new Date(T0 + i + 1).toISOString(),
+          thread_ref: `gh:test/repo#${i}`,
+          action_type: 'nudge',
+          proposal_json: '{}',
+          idempotency_key: `noise-fenced-${i}`,
+          before_hash: null,
+          proof_predicate: null,
+          proof_deadline_at: null,
+          outcome: 'sent',
+          graded_at: new Date(T0 + i + 1).toISOString(),
+          grade: 'noise',
+        });
+      }
+      const deps = makeDeps(world);
+      const originalSetPauseState = deps.db!.setPauseState;
+      if (change === 'enqueue') {
+        const originalCreate = deps.createTask!;
+        deps.createTask = (async (context, data, fence) => {
+          if (data.idempotency_key.startsWith('tm:self-pause:')) {
+            world.control = {
+              ...world.control,
+              pause_state: 'RUNNING',
+              epoch: world.control.epoch + 1,
+            };
+          }
+          return fence ? originalCreate(context, data, fence) : originalCreate(context, data);
+        }) as TaskmasterDeps['createTask'];
+      } else
+        deps.db!.setPauseState = async data => {
+          const paused = await originalSetPauseState(data);
+          const snapshot = { ...paused };
+          world.control =
+            change === 'epoch'
+              ? { ...paused, epoch: paused.epoch + 1 }
+              : { ...paused, pause_state: 'RUNNING' };
+          return snapshot;
+        };
+      await tick(createTaskmasterState(60_000), deps);
+      expect(
+        world.sentMessages.filter(m => m.idempotency_key.startsWith('tm:self-pause:'))
+      ).toHaveLength(0);
+    }
+  );
+});
 
 const T0 = Date.parse('2026-08-07T12:00:00.000Z');
 const TODAY_KEY = new Date(T0).toISOString().slice(0, 10);
@@ -218,8 +360,24 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
     headroom: async () => okHeadroom,
     createTask: (async (
       _context: unknown,
-      data: { idempotency_key: string; recipient: string; body: string }
+      data: { idempotency_key: string; recipient: string; body: string },
+      fence?: {
+        taskmasterPausedEpoch: number;
+        taskmasterPausedState?: string;
+        taskmasterPausedScope?: string | null;
+      }
     ) => {
+      // Fake the Dispatch boundary; its real SQLite/PG transaction has DAL
+      // tests. Mirror the real fence exactly: the notice is refused unless the
+      // live control row still matches the authorized state, scope and epoch.
+      if (
+        fence &&
+        (world.control.pause_state !== fence.taskmasterPausedState ||
+          (world.control.pause_scope ?? null) !== (fence.taskmasterPausedScope ?? null) ||
+          world.control.epoch !== fence.taskmasterPausedEpoch)
+      ) {
+        return null;
+      }
       world.sentMessages.push({
         idempotency_key: data.idempotency_key,
         recipient: data.recipient,
@@ -268,6 +426,57 @@ function ruling(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
     ...overrides,
   };
 }
+
+describe('expectation registry tick wiring', () => {
+  test('checks expectations, reports counts, and registers ordinary dispatch proof', async () => {
+    const world = makeWorld();
+    const checkedAt: Date[] = [];
+    const registered: Array<{ dispatch_ref: string; on_absence: string }> = [];
+    const deps = makeDeps(world, {
+      checkExpectations: async now => {
+        checkedAt.push(now);
+      },
+      listThreads: async () =>
+        Object.assign([], {
+          unlabelledPriorityTriage: ['gh:thinmansoftware/bdc-harness#404'],
+        }),
+    });
+    deps.db = {
+      ...deps.db!,
+      getExpectationCounts: async () => ({
+        pending: 2,
+        met: 3,
+        failed: 4,
+        escalating: 7,
+        escalated: 5,
+        given_up: 6,
+      }),
+      registerExpectation: async data => {
+        registered.push(data);
+        return 'expectation-digest';
+      },
+    };
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(checkedAt).toEqual([new Date(T0)]);
+    expect(registered).toHaveLength(1);
+    expect(registered[0]?.dispatch_ref).toBe('msg-1');
+    expect(registered[0]?.on_absence).toBe('escalate');
+    // The journal action id is the other half of the deterministic identity;
+    // without it a replayed action would register a second expectation.
+    expect(registered[0]?.action_ref).toBeTruthy();
+    const digest = world.sentMessages.find(message =>
+      message.idempotency_key.startsWith('tm:digest:')
+    );
+    // `escalating` is in the digest: a non-terminal claimed-but-unsent
+    // escalation is exactly the thing a human needs to see in the daily line.
+    expect(digest?.body).toContain(
+      'pending=2, met=3, failed=4, escalating=7, escalated=5, given_up=6'
+    );
+    expect(digest?.body).toContain('Needs priority triage: gh:thinmansoftware/bdc-harness#404');
+  });
+});
 
 describe('scenario 1: undelivered ruling is delivered exactly once (dedupe proven)', () => {
   test('two ticks produce one deliver_ruling row and one send; a third tick adds nothing', async () => {
@@ -508,6 +717,14 @@ describe('fire_cauldron loop', () => {
           return record;
         }) as NonNullable<TaskmasterDeps['runCascade']>,
       });
+      const registered: Array<{ dispatch_ref: string; evidence_json: string }> = [];
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async data => {
+          registered.push(data);
+          return 'expectation-fire';
+        },
+      };
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
       await tick(state, deps);
@@ -516,6 +733,38 @@ describe('fire_cauldron loop', () => {
       expect(fires).toHaveLength(1);
       expect(fires[0]?.outcome).toBe('sent');
       expect(fires[0]?.proposal_json).toContain('cascade-501');
+      expect(registered).toHaveLength(1);
+      expect(registered[0]?.dispatch_ref).toBe('cascade-501');
+      expect(registered[0]?.evidence_json).toContain('remote_agent_workflow_runs');
+      // Deterministic identity: the journal action id is passed so a replayed
+      // fire reuses this expectation instead of registering a second one.
+      expect(registered[0]?.action_ref).toBe(fires[0]?.id);
+
+      // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching only on
+      // the admission row's existence is self-fulfilling -- admission creates
+      // that row -- so a failed or stalled cascade would never escalate.
+      const spec = JSON.parse(registered[0]!.evidence_json) as {
+        where: Record<string, unknown>;
+      };
+      expect(spec.where.status).toEqual(['completed']);
+
+      // Run the registered spec against a run table to prove it: admitted but
+      // unfinished is NOT met, failed is NOT met, completed IS met.
+      const runs = [{ id: 'cascade-501', status: 'running' }];
+      const query = async <T>(_sql: string, params?: unknown[]) => {
+        const [id, ...statuses] = (params ?? []) as string[];
+        return {
+          rows: runs.filter(
+            run => run.id === id && statuses.includes(run.status)
+          ) as unknown as T[],
+        };
+      };
+      const evidence = spec as unknown as Parameters<typeof checkEvidence>[0];
+      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      runs[0]!.status = 'failed';
+      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      runs[0]!.status = 'completed';
+      expect((await checkEvidence(evidence, { query })).ok).toBe(true);
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
@@ -2031,12 +2280,20 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const byNumber = new Map(threads.map(thread => [Number(thread.ref.split('#')[1]), thread]));
     expect([10, 11, 12].map(number => byNumber.get(number)?.priority)).toEqual(['P1', 'P1', 'P1']);
     expect(byNumber.get(13)?.priority).toBe('P0');
-    expect(byNumber.get(14)?.priority).toBe('P2');
+    expect(byNumber.has(14)).toBe(false);
     expect(byNumber.get(15)?.isBlocked).toBe(true);
     expect(byNumber.get(16)?.isUnclaimedP0).toBe(false);
     expect(byNumber.get(17)?.isBlocked).toBe(false);
     expect(byNumber.get(17)?.isHeld).toBe(true);
     expect(byNumber.get(18)?.isUnclaimed).toBe(false);
+  });
+
+  test('unlabelled_priority_surfaces_for_triage', async () => {
+    const { fetchImpl } = fakeGithubFetch({ wo: [ghIssue(44, ['wo'])] });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(0);
+    expect(threads.unlabelledPriorityTriage).toEqual(['gh:thinmansoftware/bdc-harness#44']);
+    expect(priorityFromLabels(['wo'])).toBeNull();
   });
 
   test('defaults to bdc-xo when TASKMASTER_GH_REPOS is unset', async () => {

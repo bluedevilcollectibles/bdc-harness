@@ -235,8 +235,11 @@ describe('on-ramp atom structural placeholder gate', () => {
   });
 
   // This test intentionally runs 20 real Git Bash processes (4 nodes x 5 guard cases).
-  // Windows CI has taken up to 6937ms, so use a bounded budget above Bun's 5000ms default.
-  const LOOPBACK_GUARD_TEST_TIMEOUT_MS = 15000;
+  // The old 15000 budget UNDERCUT the package-wide --timeout 30000 and made this the
+  // binding constraint: Windows CI observed 20219ms and failed at 15000ms on run
+  // 34174699464. Keep an explicit override only because this file genuinely needs MORE
+  // than the package budget, and set it above that budget so it never grants less.
+  const LOOPBACK_GUARD_TEST_TIMEOUT_MS = 45000;
 
   it(
     'requires every API-touching node to use an explicit loopback Archon base',

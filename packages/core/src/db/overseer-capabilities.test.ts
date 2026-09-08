@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { readFileSync, rmSync, unlinkSync } from 'fs';
+import { readFileSync, unlinkSync } from 'fs';
+import { removeTempDirWithRetry } from '../test/temp-dir';
 import { join } from 'path';
 import type { IDatabase } from './adapters/types';
 import { closeDatabase, getDatabase, resetDatabase } from './connection';
@@ -88,7 +89,7 @@ describe('overseer capability persistence (sqlite)', () => {
     await closeDatabase();
     resetDatabase();
     cleanupDb(currentDbPath);
-    if (currentHome) rmSync(currentHome, { recursive: true, force: true });
+    if (currentHome) removeTempDirWithRetry(currentHome);
     if (oldArchonHome === undefined) delete process.env.ARCHON_HOME;
     else process.env.ARCHON_HOME = oldArchonHome;
     if (oldDatabaseUrl === undefined) delete process.env.DATABASE_URL;
