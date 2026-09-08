@@ -15,10 +15,14 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-// Windows CI runners' git is sometimes slower than bun's default 5000ms test
-// timeout (flakes on 2026-07-13: runs 29249126291 and 29251514278). Raise the
-// per-test timeout well above worst observed latency.
-const TEST_TIMEOUT_MS = 30000;
+// Each test here drives 3-5 real git subprocesses against a temp repo, and
+// Windows CI runners' git is far slower than bun's default 5000ms test timeout
+// (flakes on 2026-07-13: runs 29249126291 and 29251514278). A sibling
+// process-spawning test in this package was observed at 20219ms on Windows CI
+// (run 34174699464), so the package-wide --timeout 30000 is too tight a budget
+// for this file: keep an explicit override, but set it ABOVE the package budget
+// so it only ever grants more time, never less.
+const TEST_TIMEOUT_MS = 45000;
 
 // The core backstop bash logic extracted from the fixed commit-and-push nodes.
 // Uses BRANCH variable passed via env to bash (set before this snippet in the workflow).

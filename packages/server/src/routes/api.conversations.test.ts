@@ -351,7 +351,7 @@ describe('POST /api/conversations with message (atomic create+send)', () => {
     expect(body.conversationId).toBe('web-test-abc');
     expect(body.id).toBe('internal-uuid-123');
     expect(body.dispatched).toBe(true);
-  }, 15000);
+  });
 
   test('persists user message during atomic creation', async () => {
     const callsBefore = mockAddMessage.mock.calls.length;

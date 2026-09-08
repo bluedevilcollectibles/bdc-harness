@@ -145,5 +145,5 @@ describe('cascade default escalation boundary', () => {
         mutation_sent: false,
       });
     });
-  }, 15000);
+  });
 });
