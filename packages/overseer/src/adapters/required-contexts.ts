@@ -43,14 +43,31 @@
  *    disposition `blocked_required_contexts_unavailable`, and an operator
  *    escalation -- never an approval.
  *
- *    The counter is keyed by BOTH branch AND head. Keying it by branch alone
- *    (the first cut of this fix, caught in review on #777) reinstated the
- *    forever-defer it was written to bound: several PRs normally target the same
- *    base, the review worker interleaves their ticks, and each head's arrival
- *    reset the single per-branch slot back to 1. Two such PRs could then defer
- *    forever without either ever reaching the bound. Per-head keys make
- *    exhaustion independent, and stale keys are pruned on their own schedule
- *    (see `pruneAttemptCounters`) rather than by being overwritten.
+ *    The counter is keyed by owner, repo, base AND head -- every part
+ *    load-bearing, each one added after a review found the shorter key
+ *    reinstating the forever-defer it was written to bound:
+ *      - branch alone: several PRs normally target the same base and the worker
+ *        interleaves their ticks, so each head's arrival reset the single slot
+ *        back to 1 and neither PR ever reached the bound.
+ *      - head alone, when CLEARING: identical commits exist across forks, so one
+ *        repository's success wiped another's progress (#777 review).
+ *      - head plus repo, when CLEARING: required contexts are BASE-specific, so
+ *        a base whose lookup keeps succeeding held a base whose lookup never
+ *        succeeds permanently below its bound (#777 review). A success now
+ *        clears exactly the owner/repo/base/head that succeeded.
+ *    Stale keys are pruned on their own schedule (see `pruneAttemptCounters`)
+ *    rather than by being overwritten.
+ *
+ *    The count must also OUTLIVE THE PROCESS (#777 review). Held only in a
+ *    module-scoped Map it reset on every container rebuild and was counted
+ *    independently by each worker process, so the bound was never actually
+ *    reached and the deferral it bounds was still forever. The counting is
+ *    therefore delegated to an `AttemptCounterStore`: the in-memory map remains
+ *    the default for tests and single-shot use, while the real reviewer adapter
+ *    supplies a database-backed store (migration 048,
+ *    `overseer_required_contexts_attempts`) whose increment is a single atomic
+ *    upsert, so concurrent workers produce distinct counts instead of holding
+ *    the total still.
  *
  *    EXHAUSTED deliberately does NOT fall back to the reported-checks
  *    heuristic. A silent downgrade would turn "we cannot see what CI is
@@ -78,6 +95,14 @@ export const DEFAULT_MAX_ATTEMPTS = 5;
 
 /** Stable log/receipt code for the terminal blocked outcome. */
 export const REQUIRED_CONTEXTS_BLOCKED_REASON = 'required_contexts_unavailable_blocked' as const;
+
+/**
+ * Stands in for the base branch when the PR's base ref could not be read. A
+ * distinct literal, never a blank or a wildcard: "we could not see the base" is
+ * its own question, and letting it collide with a real base would let one clear
+ * the other's counter.
+ */
+export const NO_BASE_REF_SENTINEL = '<no-base-ref>' as const;
 
 /** Which identity or probe produced an authoritative answer. */
 export type RequiredContextsSource =
@@ -158,6 +183,13 @@ export interface ResolveRequiredContextsInput extends UnprotectedBranchProbes {
   fetchWithAppClient?: StatusCheckContextsFetcher;
   /** PAT-identity fetcher. Absent when no PAT is configured in this process. */
   fetchWithPatClient?: StatusCheckContextsFetcher;
+  /**
+   * Where the consecutive-UNKNOWN counts live. Defaults to the process-local
+   * map, which is right for tests and single-shot use. The long-running reviewer
+   * MUST pass a durable store: a count that dies with the process never reaches
+   * the bound, so the deferral it bounds would still be forever (#777 review).
+   */
+  attemptStore?: AttemptCounterStore;
 }
 
 /**
@@ -181,12 +213,64 @@ interface AttemptCounterEntry {
 }
 
 /**
+ * One lookup question: this head, on this base, in this repository. All four
+ * parts are load-bearing -- see `AttemptCounterStore`.
+ */
+export interface AttemptCounterKey {
+  owner: string;
+  repo: string;
+  baseRef: string;
+  headSha: string;
+}
+
+/**
+ * Where the consecutive-UNKNOWN counts live.
+ *
+ * Pluggable because the two callers need different durability. Unit tests and
+ * any pure use of the resolver get the in-memory default; the real reviewer
+ * adapter supplies a database-backed store, because a bound that only holds
+ * inside one process lifetime is not a bound (#777 review [major]): archon-app-1
+ * is rebuilt regularly and the review worker may run in more than one process,
+ * so a process-local count reset before it could ever reach the bound and an
+ * unreadable lookup still deferred forever.
+ *
+ * KEYING CONTRACT, which every implementation must honor exactly:
+ *   owner/repo -- identical commits exist across forks and mirrors, so a sha
+ *                 alone would let one repository's success clear another's.
+ *   baseRef    -- required contexts are BASE-specific. The same commit against
+ *                 two bases is two different questions; one being answered says
+ *                 nothing about the other, and clearing across bases would let a
+ *                 base that keeps succeeding hold a base that never succeeds
+ *                 permanently below its bound.
+ *   headSha    -- a new push is a new question, and a sibling PR on the same
+ *                 base must not share (hence reset) this head's slot.
+ */
+export interface AttemptCounterStore {
+  /**
+   * Record one more consecutive UNKNOWN for this key; return the new total.
+   *
+   * Return 0 to say the attempt could NOT be recorded. 0 never satisfies the
+   * bound (`resolveMaxAttempts` floors at 1), so a store that cannot count
+   * always yields a DEFER -- an outage must never manufacture the terminal
+   * BLOCK on someone's PR.
+   */
+  increment(key: AttemptCounterKey, now: number): Promise<number>;
+  /** Forget this key's counter -- and ONLY this key's -- after a lookup answers. */
+  clear(key: AttemptCounterKey): Promise<void>;
+}
+
+function counterKeyOf(key: AttemptCounterKey): string {
+  return attemptKey(branchKey(key.owner, key.repo, key.baseRef), key.headSha);
+}
+
+/**
  * Consecutive-UNKNOWN counts, keyed by owner/repo@base#head.
  *
  * MODULE scope on purpose: `createRealSubmitDeps` (and with it the evidence
  * fetcher closure) is constructed fresh for every claimed message by the review
  * worker, so a closure-local counter would reset on every tick and the bound
- * would never be reached.
+ * would never be reached. Module scope is still only process-wide, which is why
+ * the real adapter overrides this with a durable store.
  *
  * PER-HEAD keys on purpose: the review worker interleaves PRs, and several PRs
  * routinely target the same base. A per-branch key holding a single head made
@@ -197,12 +281,12 @@ interface AttemptCounterEntry {
  */
 const unknownAttempts = new Map<string, AttemptCounterEntry>();
 
-/** Test seam: drop all attempt state. */
+/** Test seam: drop all in-memory attempt state. */
 export function resetRequiredContextsAttemptCounters(): void {
   unknownAttempts.clear();
 }
 
-/** Test seam: the live counter for one branch+head, or 0 when none is held. */
+/** Test seam: the live in-memory counter for one branch+head, or 0 when none is held. */
 export function peekRequiredContextsAttempts(
   owner: string,
   repo: string,
@@ -212,7 +296,7 @@ export function peekRequiredContextsAttempts(
   return unknownAttempts.get(attemptKey(branchKey(owner, repo, baseRef), headSha))?.attempts ?? 0;
 }
 
-/** Test seam: how many counters are currently retained. */
+/** Test seam: how many in-memory counters are currently retained. */
 export function requiredContextsAttemptCounterSize(): number {
   return unknownAttempts.size;
 }
@@ -245,27 +329,23 @@ function pruneAttemptCounters(now: number, incomingKey: string): void {
 }
 
 /**
- * Forget every counter for one head within ONE repository, across all of that
- * repository's base branches. Called when a lookup finally succeeds: that
- * head's deferrals are over, whichever base it targets. Scoped to the head so
- * a sibling PR's in-flight count survives.
- *
- * The owner/repo scope is load-bearing (#777 review finding). A counter key is
- * `owner/repo@baseRef#headSha`, and matching on the `#headSha` suffix alone
- * matched EVERY repository's entry for that sha. Identical commits routinely
- * exist across forks and mirrors, so one repo's successful lookup would reset
- * another repo's deferral counter -- and a repo whose counter keeps being reset
- * never reaches the configured attempt bound, which is the exact
- * forever-deferral this bound was added to end. Matching the `owner/repo@`
- * prefix as well as the head keeps each repository's bound independent.
+ * Process-local counters. The default, and correct for tests and any single-shot
+ * use; NOT sufficient for the long-running reviewer, which supplies a durable
+ * store instead.
  */
-function clearAttemptsForHead(owner: string, repo: string, headSha: string): void {
-  const prefix = `${owner}/${repo}@`;
-  const suffix = `#${headSha}`;
-  for (const key of unknownAttempts.keys()) {
-    if (key.startsWith(prefix) && key.endsWith(suffix)) unknownAttempts.delete(key);
-  }
-}
+export const inMemoryAttemptCounterStore: AttemptCounterStore = {
+  increment(key, now) {
+    const counterKey = counterKeyOf(key);
+    pruneAttemptCounters(now, counterKey);
+    const attempts = (unknownAttempts.get(counterKey)?.attempts ?? 0) + 1;
+    unknownAttempts.set(counterKey, { attempts, touchedAt: now });
+    return Promise.resolve(attempts);
+  },
+  clear(key) {
+    unknownAttempts.delete(counterKeyOf(key));
+    return Promise.resolve();
+  },
+};
 
 /**
  * One-shot log de-duplication for the "which identity answered" line. The
@@ -438,16 +518,20 @@ export async function resolveRequiredContexts(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<RequiredContextsResolution> {
   const { owner, repo, baseRef, headSha } = input;
+  const store = input.attemptStore ?? inMemoryAttemptCounterStore;
   if (!baseRef) {
+    // A sentinel base, not a wildcard: an unreadable base ref is its own
+    // question and must not share a slot with any real base of this head.
     return deferOrBlock(
-      `${owner}/${repo}@<no-base-ref>`,
-      headSha,
+      { owner, repo, baseRef: NO_BASE_REF_SENTINEL, headSha },
       'base_ref_unavailable',
       'transient',
-      env
+      env,
+      store
     );
   }
   const key = branchKey(owner, repo, baseRef);
+  const counterKey: AttemptCounterKey = { owner, repo, baseRef, headSha };
 
   const override = parseRequiredContextsOverride(env[REQUIRED_CONTEXTS_OVERRIDE_ENV]);
   const overrideContexts = override?.get(key);
@@ -455,7 +539,7 @@ export async function resolveRequiredContexts(
   // "nothing is required", and treating it as absent would send a deliberately
   // unblocked branch back to the API that could not answer.
   if (overrideContexts !== undefined) {
-    clearAttemptsForHead(owner, repo, headSha);
+    await store.clear(counterKey);
     logSourceOnce(
       `override:${key}`,
       { owner, repo, baseRef, contexts: overrideContexts, source: 'env_override' },
@@ -485,7 +569,7 @@ export async function resolveRequiredContexts(
         failureKind = 'transient';
         continue;
       }
-      clearAttemptsForHead(owner, repo, headSha);
+      await store.clear(counterKey);
       logSourceOnce(
         `${attempt.source}:${key}`,
         { owner, repo, baseRef, contexts, source: attempt.source },
@@ -519,7 +603,7 @@ export async function resolveRequiredContexts(
   // that to UNKNOWN is what parked its PRs forever. An authoritative EMPTY set
   // is a real answer, not a fallback: it says "nothing is required here".
   if (await hasPositiveUnprotectedEvidence(input, baseRef)) {
-    clearAttemptsForHead(owner, repo, headSha);
+    await store.clear(counterKey);
     logSourceOnce(
       `unprotected:${key}`,
       { owner, repo, baseRef, source: 'unprotected_branch', lastReason },
@@ -528,39 +612,45 @@ export async function resolveRequiredContexts(
     return { state: 'known', contexts: [], source: 'unprotected_branch' };
   }
 
-  return deferOrBlock(key, headSha, lastReason, failureKind, env);
+  return deferOrBlock(counterKey, lastReason, failureKind, env, store);
 }
 
 /**
- * Fail closed (DEFER) until the consecutive-UNKNOWN bound for this branch+head
- * is passed, then report EXHAUSTED so the reviewer can BLOCK visibly.
+ * Fail closed (DEFER) until the consecutive-UNKNOWN bound for this exact
+ * owner/repo/base/head is passed, then report EXHAUSTED so the reviewer can
+ * BLOCK visibly.
  *
- * The counter lives under a key that includes the head, so a new head starts at
- * 1 (its predecessor's failures say nothing about it) and, critically, a SIBLING
- * PR on the same base has its own slot and cannot reset this one.
+ * The counter lives under all four key parts, so a new head starts at 1 (its
+ * predecessor's failures say nothing about it), a SIBLING PR on the same base
+ * has its own slot and cannot reset this one, and the same commit against a
+ * different base -- a genuinely different question -- is counted separately.
+ *
+ * The increment is delegated to the store rather than done here so the real
+ * reviewer's count can be atomic and durable across restarts and worker
+ * processes; see `AttemptCounterStore`.
  *
  * EXHAUSTED never carries a set of contexts and never routes to the heuristic:
  * the caller must treat it as a terminal, non-approving outcome.
  */
-function deferOrBlock(
-  key: string,
-  headSha: string,
+async function deferOrBlock(
+  key: AttemptCounterKey,
   reason: string,
   failureKind: RequiredContextsFailureKind,
-  env: NodeJS.ProcessEnv
-): RequiredContextsResolution {
+  env: NodeJS.ProcessEnv,
+  store: AttemptCounterStore
+): Promise<RequiredContextsResolution> {
   const maxAttempts = resolveMaxAttempts(env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]);
-  const now = Date.now();
-  const counterKey = attemptKey(key, headSha);
-  pruneAttemptCounters(now, counterKey);
-  const attempts = (unknownAttempts.get(counterKey)?.attempts ?? 0) + 1;
-  unknownAttempts.set(counterKey, { attempts, touchedAt: now });
+  const counterKey = counterKeyOf(key);
+  // A store that could not record this tick reports 0. Since `resolveMaxAttempts`
+  // never returns less than 1, 0 can never satisfy the bound below, so a broken
+  // counter always DEFERS rather than manufacturing the terminal BLOCK.
+  const attempts = await store.increment(key, Date.now());
 
   if (attempts >= maxAttempts) {
     log.error(
       {
         key: counterKey,
-        headSha,
+        headSha: key.headSha,
         attempts,
         maxAttempts,
         lastReason: reason,
@@ -578,7 +668,7 @@ function deferOrBlock(
   }
 
   log.warn(
-    { key: counterKey, headSha, attempts, maxAttempts, reason, failureKind },
+    { key: counterKey, headSha: key.headSha, attempts, maxAttempts, reason, failureKind },
     'overseer.required_contexts.unknown_deferring_review'
   );
   return { state: 'unknown', reason, failureKind };

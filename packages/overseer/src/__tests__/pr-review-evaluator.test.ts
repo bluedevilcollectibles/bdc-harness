@@ -3,7 +3,10 @@ import {
   createRealFetchExactHeadPullRequestEvidence,
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
-import { resetRequiredContextsAttemptCounters } from '../adapters/required-contexts.ts';
+import {
+  inMemoryAttemptCounterStore,
+  resetRequiredContextsAttemptCounters,
+} from '../adapters/required-contexts.ts';
 import {
   buildReviewPrompt,
   checksAreTerminal,
@@ -122,7 +125,11 @@ describe('governed PR-code reviewer', () => {
         },
       },
     } as unknown as RealGitHubOctokitLike;
-    await createRealFetchExactHeadPullRequestEvidence(octokit)({
+    await createRealFetchExactHeadPullRequestEvidence(
+      octokit,
+      undefined,
+      inMemoryAttemptCounterStore
+    )({
       owner: input.owner,
       repo: input.repo,
       prNumber: input.pr_number,
@@ -151,7 +158,11 @@ describe('governed PR-code reviewer', () => {
     } as unknown as RealGitHubOctokitLike;
 
     await expect(
-      createRealFetchExactHeadPullRequestEvidence(octokit)({
+      createRealFetchExactHeadPullRequestEvidence(
+        octokit,
+        undefined,
+        inMemoryAttemptCounterStore
+      )({
         owner: input.owner,
         repo: input.repo,
         prNumber: input.pr_number,
@@ -410,7 +421,11 @@ describe('governed PR-code reviewer', () => {
       },
     } as unknown as RealGitHubOctokitLike;
 
-    const evidence = await createRealFetchExactHeadPullRequestEvidence(octokit)({
+    const evidence = await createRealFetchExactHeadPullRequestEvidence(
+      octokit,
+      undefined,
+      inMemoryAttemptCounterStore
+    )({
       owner: input.owner,
       repo: input.repo,
       prNumber: input.pr_number,
@@ -454,7 +469,11 @@ describe('governed PR-code reviewer', () => {
         },
       } as unknown as RealGitHubOctokitLike;
 
-      const evidence = await createRealFetchExactHeadPullRequestEvidence(octokit)({
+      const evidence = await createRealFetchExactHeadPullRequestEvidence(
+        octokit,
+        undefined,
+        inMemoryAttemptCounterStore
+      )({
         owner: input.owner,
         repo: input.repo,
         prNumber: input.pr_number,
@@ -484,7 +503,11 @@ describe('governed PR-code reviewer', () => {
       },
     } as unknown as RealGitHubOctokitLike;
 
-    const evidence = await createRealFetchExactHeadPullRequestEvidence(octokit)({
+    const evidence = await createRealFetchExactHeadPullRequestEvidence(
+      octokit,
+      undefined,
+      inMemoryAttemptCounterStore
+    )({
       owner: input.owner,
       repo: input.repo,
       prNumber: input.pr_number,
@@ -512,7 +535,11 @@ describe('governed PR-code reviewer', () => {
       },
     } as unknown as RealGitHubOctokitLike;
 
-    const evidence = await createRealFetchExactHeadPullRequestEvidence(octokit)({
+    const evidence = await createRealFetchExactHeadPullRequestEvidence(
+      octokit,
+      undefined,
+      inMemoryAttemptCounterStore
+    )({
       owner: input.owner,
       repo: input.repo,
       prNumber: input.pr_number,

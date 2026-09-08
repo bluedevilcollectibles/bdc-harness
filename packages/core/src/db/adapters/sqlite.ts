@@ -1768,7 +1768,32 @@ export class SqliteAdapter implements IDatabase {
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
 
+      -- overseer_required_contexts_attempts: durable consecutive-UNKNOWN counters
+      -- for the PR reviewer's required-status-check-context lookup (migration 048,
+      -- bdc-harness #777 review). The bound it enforces used to live in a
+      -- process-local Map, which reset on every container rebuild and counted
+      -- independently per worker process -- so the "bound" never actually arrived
+      -- and unreadable contexts still deferred forever.
+      --
+      -- All four key parts are load-bearing: owner/repo because identical commits
+      -- exist across forks; base_ref because required contexts are BASE-specific;
+      -- head_sha because a new push is a new question and a sibling PR on the same
+      -- base must not share (hence reset) this head's slot. Rows are deleted on a
+      -- successful lookup; touched_at exists only so abandoned heads can be retired
+      -- by age.
+      CREATE TABLE IF NOT EXISTS overseer_required_contexts_attempts (
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        touched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (owner, repo, base_ref, head_sha)
+      );
+
       -- Indexes
+      CREATE INDEX IF NOT EXISTS idx_overseer_required_contexts_attempts_touched
+        ON overseer_required_contexts_attempts(touched_at);
       CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);

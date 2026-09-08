@@ -13,9 +13,11 @@ import type {
 } from '../types.ts';
 import { resolveRequiredContexts } from './required-contexts';
 import type {
+  AttemptCounterStore,
   REQUIRED_CONTEXTS_BLOCKED_REASON,
   RequiredContextsFailureKind,
 } from './required-contexts.ts';
+import { createDurableAttemptCounterStore } from './required-contexts-store';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -272,9 +274,18 @@ function bindRepoMethod<K extends 'getAllStatusCheckContexts' | 'getBranchRules'
   return fn.bind(repos) as NonNullable<NonNullable<RealGitHubOctokitLike['repos']>[K]>;
 }
 
+/**
+ * @param attemptStore Where the required-contexts deferral counts are kept.
+ *   Defaults to the DURABLE store, because this is the long-running reviewer
+ *   path: a process-local count resets on every container rebuild and is split
+ *   across worker processes, so the bound it feeds would never arrive and the
+ *   deferral would still be forever (#777 review). Injectable so tests can
+ *   substitute an in-memory store rather than stand up a database.
+ */
 export function createRealFetchExactHeadPullRequestEvidence(
   octokit: RealGitHubOctokitLike,
-  patOctokit?: RealGitHubOctokitLike
+  patOctokit?: RealGitHubOctokitLike,
+  attemptStore: AttemptCounterStore = createDurableAttemptCounterStore()
 ): (input: {
   owner: string;
   repo: string;
@@ -339,6 +350,9 @@ export function createRealFetchExactHeadPullRequestEvidence(
       fetchBranchRules:
         bindRepoMethod(octokit, 'getBranchRules') ?? bindRepoMethod(patOctokit, 'getBranchRules'),
       fetchBranch: bindRepoMethod(octokit, 'getBranch') ?? bindRepoMethod(patOctokit, 'getBranch'),
+      // Durable by default. The bound only means anything if the count survives
+      // this process (#777 review [major]).
+      attemptStore,
     });
     // EXHAUSTED does NOT relax `requiredContexts`: the set is still unknown, so
     // it stays `null` and checksAreTerminal still fails closed. The separate

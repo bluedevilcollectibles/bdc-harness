@@ -12,8 +12,10 @@ import {
   ATTEMPT_COUNTER_MAX_ENTRIES,
   ATTEMPT_COUNTER_TTL_MS,
   DEFAULT_MAX_ATTEMPTS,
+  NO_BASE_REF_SENTINEL,
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
   REQUIRED_CONTEXTS_OVERRIDE_ENV,
+  inMemoryAttemptCounterStore,
   isBranchNotProtectedError,
   isPermissionFailure,
   parseRequiredContextsOverride,
@@ -496,7 +498,12 @@ describe('resolveRequiredContexts -- concurrent PRs on one base keep separate bo
     expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('exhausted');
   });
 
-  test('34 a success clears only that head, across the bases it targets', async () => {
+  // #777 review finding [major]: the clear swept every BASE in the repository
+  // for that head. Required contexts are base-specific, so the same commit
+  // against two bases is two different questions -- and a base whose lookup
+  // keeps succeeding would hold a base whose lookup never succeeds permanently
+  // below its bound, which is the forever-deferral the bound exists to end.
+  test('34 a success clears ONLY that base, not the same head on another base', async () => {
     const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '5' };
     await resolveRequiredContexts(failingFor(HEAD_A), env);
     await resolveRequiredContexts(failingFor(HEAD_A, 'main'), env);
@@ -504,14 +511,57 @@ describe('resolveRequiredContexts -- concurrent PRs on one base keep separate bo
     expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(1);
     expect(peekRequiredContextsAttempts(OWNER, REPO, 'main', HEAD_A)).toBe(1);
 
+    // Head A's lookup succeeds ON BASE `dev` ONLY.
     await resolveRequiredContexts(
       baseInput({ headSha: HEAD_A, fetchWithAppClient: async () => ({ data: ['test'] }) }),
       env
     );
-    // Head A is clear everywhere; head B, which never succeeded, is not touched.
     expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(0);
-    expect(peekRequiredContextsAttempts(OWNER, REPO, 'main', HEAD_A)).toBe(0);
+    // Under the base-blind clear this read was 0: the `dev` success wiped the
+    // `main` question's progress, and repeating that every tick meant `main`
+    // never reached its bound.
+    expect(peekRequiredContextsAttempts(OWNER, REPO, 'main', HEAD_A)).toBe(1);
+    // Head B, which never succeeded anywhere, is untouched either way.
     expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_B)).toBe(1);
+  });
+
+  test('34b the un-cleared base still reaches its own bound after the other base succeeds', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '3' };
+    await resolveRequiredContexts(failingFor(HEAD_A, 'main'), env);
+    await resolveRequiredContexts(failingFor(HEAD_A, 'main'), env);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, 'main', HEAD_A)).toBe(2);
+
+    // Repeated successes on `dev` for the same head, exactly as a healthy
+    // sibling PR produces. None of them may touch the `main` counter.
+    for (let tick = 0; tick < 3; tick += 1) {
+      await resolveRequiredContexts(
+        baseInput({ headSha: HEAD_A, fetchWithAppClient: async () => ({ data: ['test'] }) }),
+        env
+      );
+    }
+    expect(peekRequiredContextsAttempts(OWNER, REPO, 'main', HEAD_A)).toBe(2);
+
+    // So `main` exhausts on its own third tick rather than deferring forever.
+    const exhausted = await resolveRequiredContexts(failingFor(HEAD_A, 'main'), env);
+    expect(exhausted.state).toBe('exhausted');
+    if (exhausted.state === 'exhausted') expect(exhausted.attempts).toBe(3);
+  });
+
+  test('34c an unreadable base ref is its own counter, not a wildcard over real bases', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '5' };
+    await resolveRequiredContexts(failingFor(HEAD_A), env);
+    // The base ref could not be read at all -- a distinct question.
+    await resolveRequiredContexts(baseInput({ headSha: HEAD_A, baseRef: null }), env);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(1);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, NO_BASE_REF_SENTINEL, HEAD_A)).toBe(1);
+
+    // A success on the real base must not clear the sentinel's count either.
+    await resolveRequiredContexts(
+      baseInput({ headSha: HEAD_A, fetchWithAppClient: async () => ({ data: ['test'] }) }),
+      env
+    );
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(0);
+    expect(peekRequiredContextsAttempts(OWNER, REPO, NO_BASE_REF_SENTINEL, HEAD_A)).toBe(1);
   });
 
   test('35 the same head on different bases is bounded separately', async () => {
@@ -631,7 +681,8 @@ describe('createRealFetchExactHeadPullRequestEvidence -- adapter boundary', () =
     });
     const evidence = await createRealFetchExactHeadPullRequestEvidence(
       appClient,
-      patClient
+      patClient,
+      inMemoryAttemptCounterStore
     )({
       owner: OWNER,
       repo: REPO,
@@ -649,7 +700,11 @@ describe('createRealFetchExactHeadPullRequestEvidence -- adapter boundary', () =
       getBranchRules: async () => ({ data: [] }),
       getBranch: async () => ({ data: { protected: false, protection: { enabled: false } } }),
     });
-    const evidence = await createRealFetchExactHeadPullRequestEvidence(client)({
+    const evidence = await createRealFetchExactHeadPullRequestEvidence(
+      client,
+      undefined,
+      inMemoryAttemptCounterStore
+    )({
       owner: OWNER,
       repo: 'bdc-xo',
       prNumber: PR_NUMBER,
@@ -665,7 +720,11 @@ describe('createRealFetchExactHeadPullRequestEvidence -- adapter boundary', () =
         throw maskedNotFoundError();
       },
     });
-    const evidence = await createRealFetchExactHeadPullRequestEvidence(client)({
+    const evidence = await createRealFetchExactHeadPullRequestEvidence(
+      client,
+      undefined,
+      inMemoryAttemptCounterStore
+    )({
       owner: OWNER,
       repo: REPO,
       prNumber: PR_NUMBER,
@@ -681,7 +740,11 @@ describe('createRealFetchExactHeadPullRequestEvidence -- adapter boundary', () =
         throw maskedNotFoundError();
       },
     });
-    const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(client);
+    const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(
+      client,
+      undefined,
+      inMemoryAttemptCounterStore
+    );
     const request = { owner: OWNER, repo: REPO, prNumber: PR_NUMBER, headSha: HEAD };
     let evidence = await fetchEvidence(request);
     for (let i = 0; i < DEFAULT_MAX_ATTEMPTS - 1; i += 1) {
@@ -711,7 +774,11 @@ describe('createRealFetchExactHeadPullRequestEvidence -- adapter boundary', () =
         throw appPermissionError();
       },
     });
-    const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(client);
+    const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(
+      client,
+      undefined,
+      inMemoryAttemptCounterStore
+    );
     const request = { owner: OWNER, repo: REPO, prNumber: PR_NUMBER, headSha: HEAD };
     let evidence = await fetchEvidence(request);
     for (let i = 0; i < DEFAULT_MAX_ATTEMPTS - 1; i += 1) {
