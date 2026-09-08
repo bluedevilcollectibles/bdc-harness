@@ -42,6 +42,13 @@ export type RecheckDisposition =
   | 'ignored_not_completed'
   | 'ignored_no_open_pull_request'
   | 'ignored_no_authorizing_verdict'
+  /**
+   * The PR had an authorizing verdict, but THIS completion does not warrant a
+   * re-review: it did not pass, or it is unrelated to the check the verdict
+   * named. Distinct from `ignored_no_authorizing_verdict` so the receipts can
+   * tell "this PR is not eligible" apart from "this event is not the trigger".
+   */
+  | 'ignored_check_not_actionable'
   | 'rejected_signature'
   | 'blocked';
 
@@ -223,6 +230,95 @@ export function recheckIdempotencyKey(input: {
 
 /** Machine-readable marker prefixing every repeat_reason this module writes. */
 export const RECHECK_REASON_PREFIX = 'recheck:check_completed:';
+
+/**
+ * Conclusions that count as a check having PASSED.
+ *
+ * `success` is the unambiguous pass. `neutral` and `skipped` are included
+ * because GitHub's own branch protection treats them as non-blocking: a
+ * required context that concludes `skipped` (a path-filtered job) or `neutral`
+ * does not hold a PR back, so a verdict that was waiting on it is genuinely
+ * unblocked. Everything else -- `failure`, `cancelled`, `timed_out`,
+ * `action_required`, `stale`, or a null conclusion -- is NOT a pass, and must
+ * never trigger a re-review: the reviewer's rejection still stands, and
+ * re-running the model would churn a valid CHANGES_REQUESTED.
+ */
+export const PASSING_CONCLUSIONS = ['success', 'neutral', 'skipped'] as const;
+
+/** True when a completed check's conclusion means "this check is no longer blocking". */
+export function conclusionIsPassing(conclusion: string | null | undefined): boolean {
+  if (typeof conclusion !== 'string') return false;
+  return (PASSING_CONCLUSIONS as readonly string[]).includes(conclusion.toLowerCase());
+}
+
+/**
+ * Does the completed check bear on what the standing verdict was actually
+ * waiting for?
+ *
+ * THE GAP THIS CLOSES (#786 review @18df6323): the recheck path used to fire on
+ * ANY completed check, so an unrelated job going green -- or the SAME job going
+ * red again -- re-ran the reviewer against an unchanged head and could churn a
+ * valid CHANGES_REQUESTED.
+ *
+ * The test is deliberately asymmetric between the two authorizing verdicts:
+ *
+ *  - `checks_pending` carries NO check names (the reviewer deferred before
+ *    forming a finding, and its summary is the empty string). There is nothing
+ *    to match against, so any PASSING completion is relevant -- that is exactly
+ *    the event the deferral was waiting for. Requiring a name here would make
+ *    the deferral case permanently unrecoverable.
+ *
+ *  - `changes_requested` DOES name its checks, in the finding text
+ *    (`[major] checks/test (windows-latest): ...`). A completion is relevant
+ *    only when the verdict's summary mentions that check's name. This is the
+ *    fail-closed direction: an unrecognised name is treated as unrelated, so a
+ *    stray green job cannot clear a real rejection.
+ *
+ *  - A SUITE-level unit (`workflow_run`, `check_suite`) is always relevant when
+ *    it passed: a green suite means every job inside it passed, the named one
+ *    included, which is strictly stronger than any single job's result. Its own
+ *    name ("CI") will not match an individual job name, so this case has to be
+ *    recognised by unit kind rather than by name.
+ *
+ * NO GITHUB READ. The spec's alternative -- "the required-context set for the
+ * head is now fully green" -- would need a `checks.listForRef` call per
+ * completion event, on a path that exists precisely because the shared per-user
+ * rate budget is what collapsed the review on #776. The sweep, which already
+ * spends one bounded GitHub read per candidate, is where a whole-suite check
+ * belongs; see `allRelevantChecksGreen` there.
+ */
+export function completionIsRelevantToVerdict(
+  verdict: StandingVerdict,
+  completion: { checkName: string; checkId?: string }
+): boolean {
+  // The deferral case names nothing and is unblocked by any passing completion.
+  if (verdict.disposition === 'checks_pending') return true;
+
+  // A SUITE-LEVEL completion (`workflow_run` / `check_suite`) that concluded
+  // passing means EVERY job inside it passed, including whichever one the
+  // verdict named. That is strictly stronger evidence than a single job going
+  // green, so it is always relevant -- and its name ("CI") deliberately will
+  // not match an individual job name like "test (windows-latest)".
+  const checkId = completion.checkId ?? '';
+  if (checkId.startsWith('workflow_run:') || checkId.startsWith('check_suite:')) return true;
+
+  const summary = typeof verdict.summary === 'string' ? verdict.summary.toLowerCase() : '';
+  if (summary.length === 0) return false;
+
+  const name = completion.checkName.trim().toLowerCase();
+  if (name.length === 0) return false;
+
+  // Exact mention wins: "checks/test (windows-latest)" contains "test
+  // (windows-latest)".
+  if (summary.includes(name)) return true;
+
+  // GitHub reports a matrix job as `test (windows-latest)` while a required
+  // CONTEXT is sometimes just `test`. Compare the bare job name too, so the
+  // matrix suffix does not defeat an otherwise exact match. Bounded to a
+  // non-trivial stem so a one-letter fragment cannot match everything.
+  const bare = name.replace(/\s*\([^)]*\)\s*$/, '').trim();
+  return bare.length >= 3 && bare !== name && summary.includes(bare);
+}
 
 export function buildRecheckReason(completion: {
   checkName: string;
@@ -455,6 +551,46 @@ export async function ingestCheckCompletionEvent(
         reason: verdict
           ? `verdict_not_check_caused:${verdict.disposition}`
           : 'no_standing_verdict_at_head',
+      });
+      continue;
+    }
+
+    // THE COMPLETION ITSELF MUST WARRANT THE RE-REVIEW (#786 review @18df6323).
+    // An authorizing verdict says the PR is ELIGIBLE; it does not say THIS
+    // event is the one that changed anything. A check that failed, was
+    // cancelled, or is unrelated to what the verdict named leaves the rejection
+    // exactly as valid as it was, and re-running the reviewer on an unchanged
+    // head would churn it.
+    if (!conclusionIsPassing(completion.conclusion)) {
+      await safeReceipt(deps, {
+        correlationId,
+        deliveryId,
+        owner,
+        repo,
+        prNumber,
+        headSha: completion.headSha,
+        disposition: 'ignored_check_not_actionable',
+        reason: `rereview_skipped_check_not_success:${completion.checkName}:${completion.conclusion ?? 'null'}`,
+      });
+      continue;
+    }
+
+    if (
+      !verdict ||
+      !completionIsRelevantToVerdict(verdict, {
+        checkName: completion.checkName,
+        checkId: completion.checkId,
+      })
+    ) {
+      await safeReceipt(deps, {
+        correlationId,
+        deliveryId,
+        owner,
+        repo,
+        prNumber,
+        headSha: completion.headSha,
+        disposition: 'ignored_check_not_actionable',
+        reason: `rereview_skipped_check_not_relevant:${completion.checkName}`,
       });
       continue;
     }

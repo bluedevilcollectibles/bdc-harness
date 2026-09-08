@@ -180,6 +180,9 @@ describe('the sweep walks past malformed rows across heartbeats', () => {
         checkName: 'test (windows-latest)',
         conclusion: 'success',
         completedAt: '2026-09-08T16:00:00.000Z',
+        // The suite is fully green: staleness alone no longer authorizes an
+        // enqueue (#786 review @18df6323).
+        allChecksGreen: true,
       }),
       enqueueRecheckWork: async (input: { prNumber: number }) => {
         enqueued.push(input.prNumber);

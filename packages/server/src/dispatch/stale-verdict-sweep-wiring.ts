@@ -10,6 +10,10 @@
  */
 import * as dispatch from '@archon/core/db/dispatch';
 import { createRealRecheckIngestDeps } from '@archon/overseer/pr-review-check-wiring';
+// ONE definition of "this check passed", shared with the webhook path. Two
+// copies of that rule would drift, and the two paths must never disagree about
+// whether a completion is good news.
+import { conclusionIsPassing } from '@archon/overseer/pr-review-check-ingest';
 import {
   REVIEW_RECIPIENT,
   parseReviewWorkBody,
@@ -168,7 +172,17 @@ interface CheckRunLike {
 export function selectLatestCompletion(runs: CheckRunLike[]): LatestCheckCompletion | null {
   let latest: LatestCheckCompletion | null = null;
   let latestMs = Number.NEGATIVE_INFINITY;
+  // WHOLE-SUITE HEALTH (#786 review @18df6323). Computed from the SAME list the
+  // latest-completion scan walks, so the stricter "has the evidence actually
+  // improved" test costs no additional GitHub read. Any run that is not
+  // completed, or completed in a non-passing state, disqualifies the head.
+  let allChecksGreen = true;
+  let sawAnyRun = false;
   for (const run of runs) {
+    sawAnyRun = true;
+    if (run.status !== 'completed' || !conclusionIsPassing(run.conclusion)) {
+      allChecksGreen = false;
+    }
     if (run.status !== 'completed') continue;
     if (run.id === undefined || run.id === null) continue;
     if (typeof run.completed_at !== 'string' || run.completed_at.length === 0) continue;
@@ -183,7 +197,11 @@ export function selectLatestCompletion(runs: CheckRunLike[]): LatestCheckComplet
       completedAt: run.completed_at,
     };
   }
-  return latest;
+  if (!latest) return null;
+  // A head with NO runs at all is not "green" -- there is no passing evidence,
+  // so it must not clear a rejection. Unreachable while `latest` is set, but
+  // stated so the fail-closed intent survives a future refactor.
+  return { ...latest, allChecksGreen: sawAnyRun && allChecksGreen };
 }
 
 export function createRealStaleVerdictSweepDeps(config: ReviewRouteConfig): StaleVerdictSweepDeps {

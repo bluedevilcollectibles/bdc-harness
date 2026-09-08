@@ -10,6 +10,8 @@ import { createHmac } from 'node:crypto';
 import { describe, expect, test } from 'bun:test';
 import {
   buildRecheckReason,
+  completionIsRelevantToVerdict,
+  conclusionIsPassing,
   extractCheckCompletion,
   ingestCheckCompletionEvent,
   recheckIdempotencyKey,
@@ -137,6 +139,186 @@ describe('ingestCheckCompletionEvent', () => {
     expect(recorded.enqueued).toHaveLength(2);
     expect(recorded.enqueued[0]?.idempotencyKey).toBe(recorded.enqueued[1]?.idempotencyKey);
     expect(new Set(recorded.enqueued.map(row => row.idempotencyKey)).size).toBe(1);
+  });
+
+  /**
+   * Overseer review finding, PR #786 @18df6323: ANY COMPLETION TRIGGERED A
+   * RE-REVIEW.
+   *
+   * The path gated only on the standing VERDICT, never on what the completion
+   * concluded or which check it was. A job that failed again, or an unrelated
+   * job going green, therefore re-ran the reviewer against an unchanged head
+   * and could churn a valid CHANGES_REQUESTED.
+   */
+  test('A FAILED completion queues NOTHING -- the rejection still stands', async () => {
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded);
+    const rawBody = checkRunPayload({ conclusion: 'failure' });
+
+    const result = await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'check_run', deliveryId: 'delivery-fail' },
+      deps
+    );
+
+    // THE REGRESSION GUARD: this enqueued before the fix.
+    expect(recorded.enqueued).toHaveLength(0);
+    expect(result.disposition).toBe('ignored_no_authorizing_verdict');
+    const skip = recorded.receipts.find(r => r.disposition === 'ignored_check_not_actionable');
+    expect(skip?.reason).toContain('rereview_skipped_check_not_success');
+    expect(skip?.reason).toContain('failure');
+  });
+
+  test('cancelled and timed_out completions queue nothing either', async () => {
+    for (const conclusion of ['cancelled', 'timed_out', 'action_required', 'stale']) {
+      const recorded: Recorded = { enqueued: [], receipts: [] };
+      const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded);
+      const rawBody = checkRunPayload({ conclusion });
+      await ingestCheckCompletionEvent(
+        {
+          rawBody,
+          signature: sign(rawBody),
+          eventType: 'check_run',
+          deliveryId: `delivery-${conclusion}`,
+        },
+        deps
+      );
+      expect(recorded.enqueued).toHaveLength(0);
+    }
+    // A null conclusion is not a pass either.
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded);
+    const rawBody = checkRunPayload({ conclusion: null });
+    await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'check_run', deliveryId: 'delivery-null' },
+      deps
+    );
+    expect(recorded.enqueued).toHaveLength(0);
+  });
+
+  test('SUCCESS on an UNRELATED check queues nothing -- the named check is still red', async () => {
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded);
+    // The verdict names `checks/test (windows-latest)`; this is a different job.
+    const rawBody = JSON.stringify({
+      action: 'completed',
+      check_run: {
+        id: 999002,
+        name: 'lint',
+        status: 'completed',
+        conclusion: 'success',
+        head_sha: HEAD,
+        pull_requests: [{ number: 746, head: { sha: HEAD } }],
+      },
+      repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+    });
+
+    const result = await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'check_run', deliveryId: 'delivery-lint' },
+      deps
+    );
+
+    expect(recorded.enqueued).toHaveLength(0);
+    expect(result.disposition).toBe('ignored_no_authorizing_verdict');
+    const skip = recorded.receipts.find(r => r.disposition === 'ignored_check_not_actionable');
+    expect(skip?.reason).toContain('rereview_skipped_check_not_relevant');
+    expect(skip?.reason).toContain('lint');
+  });
+
+  test('SUCCESS on the NAMED check queues exactly one re-review', async () => {
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded);
+    const rawBody = checkRunPayload({ conclusion: 'success' });
+
+    const result = await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'check_run', deliveryId: 'delivery-ok' },
+      deps
+    );
+
+    expect(result.disposition).toBe('queued');
+    expect(recorded.enqueued).toHaveLength(1);
+  });
+
+  test('neutral and skipped count as passing, because branch protection treats them so', async () => {
+    for (const conclusion of ['neutral', 'skipped']) {
+      const recorded: Recorded = { enqueued: [], receipts: [] };
+      const deps = makeDeps(CHECK_CAUSED_VERDICT, recorded);
+      const rawBody = checkRunPayload({ conclusion });
+      const result = await ingestCheckCompletionEvent(
+        {
+          rawBody,
+          signature: sign(rawBody),
+          eventType: 'check_run',
+          deliveryId: `delivery-${conclusion}`,
+        },
+        deps
+      );
+      expect(result.disposition).toBe('queued');
+      expect(recorded.enqueued).toHaveLength(1);
+    }
+  });
+
+  test('a checks_pending deferral is unblocked by ANY passing check, since it names none', async () => {
+    // The deferral case carries no summary at all -- the reviewer never formed a
+    // finding. Requiring a name match here would make it permanently stuck.
+    const recorded: Recorded = { enqueued: [], receipts: [] };
+    const deps = makeDeps(
+      { headSha: HEAD, disposition: 'checks_pending', summary: '', recordedAt: null },
+      recorded
+    );
+    const rawBody = JSON.stringify({
+      action: 'completed',
+      check_run: {
+        id: 999003,
+        name: 'some-unrelated-job',
+        status: 'completed',
+        conclusion: 'success',
+        head_sha: HEAD,
+        pull_requests: [{ number: 746, head: { sha: HEAD } }],
+      },
+      repository: { name: 'bdc-harness', owner: { login: 'thinmansoftware' } },
+    });
+
+    const result = await ingestCheckCompletionEvent(
+      { rawBody, signature: sign(rawBody), eventType: 'check_run', deliveryId: 'delivery-pend' },
+      deps
+    );
+
+    expect(result.disposition).toBe('queued');
+    expect(recorded.enqueued).toHaveLength(1);
+  });
+
+  test('conclusionIsPassing and completionIsRelevantToVerdict, directly', () => {
+    expect(conclusionIsPassing('success')).toBe(true);
+    expect(conclusionIsPassing('SUCCESS')).toBe(true);
+    expect(conclusionIsPassing('neutral')).toBe(true);
+    expect(conclusionIsPassing('skipped')).toBe(true);
+    expect(conclusionIsPassing('failure')).toBe(false);
+    expect(conclusionIsPassing('cancelled')).toBe(false);
+    expect(conclusionIsPassing(null)).toBe(false);
+    expect(conclusionIsPassing(undefined)).toBe(false);
+
+    // Matrix suffix: the verdict names the bare context, the event carries the
+    // matrix job name.
+    expect(
+      completionIsRelevantToVerdict(
+        { headSha: HEAD, disposition: 'changes_requested', summary: '[major] checks/test failed' },
+        { checkName: 'test (windows-latest)' }
+      )
+    ).toBe(true);
+    // A one- or two-letter stem must not match everything.
+    expect(
+      completionIsRelevantToVerdict(
+        { headSha: HEAD, disposition: 'changes_requested', summary: '[major] checks/build failed' },
+        { checkName: 'ci (x)' }
+      )
+    ).toBe(false);
+    // No summary at all on a changes_requested verdict: fail closed.
+    expect(
+      completionIsRelevantToVerdict(
+        { headSha: HEAD, disposition: 'changes_requested', summary: '' },
+        { checkName: 'test' }
+      )
+    ).toBe(false);
   });
 
   test('the idempotency key includes the check id, so it never collides with the push-path review row', () => {

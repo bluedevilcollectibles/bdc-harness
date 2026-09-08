@@ -167,6 +167,23 @@ export interface LatestCheckCompletion {
   conclusion: string | null;
   /** When it completed (ISO-8601). */
   completedAt: string;
+  /**
+   * Whether EVERY check run at this head has now concluded in a passing state
+   * (`success`, `neutral` or `skipped`), with none still running.
+   *
+   * WHY THE WHOLE SUITE, NOT JUST THE LATEST (#786 review @18df6323): the sweep
+   * used to enqueue whenever the latest completion was newer than the verdict,
+   * whatever it concluded. A job that failed again, or an unrelated job going
+   * green while the named one stayed red, therefore re-ran the reviewer against
+   * an unchanged head and could churn a valid CHANGES_REQUESTED.
+   *
+   * The sweep already pays one `checks.listForRef` per candidate, so the whole
+   * suite is already in hand -- this is a stricter test computed from data the
+   * read returns anyway, at no additional rate-budget cost. Optional so an
+   * older test double may omit it; absent is treated as NOT green, which is the
+   * fail-closed direction.
+   */
+  allChecksGreen?: boolean;
 }
 
 export interface StaleVerdictSweepDeps {
@@ -233,6 +250,12 @@ export interface StaleVerdictSweepResult {
    * still advances past them, but they are worth seeing.
    */
   discarded: number;
+  /**
+   * Candidates whose verdict was stale but whose checks are NOT all green, so
+   * no re-review was enqueued. Non-zero is the healthy signal that the sweep is
+   * declining to churn rejections whose evidence has not actually improved.
+   */
+  skippedNotGreen: number;
 }
 
 /**
@@ -272,6 +295,7 @@ export async function runStaleVerdictSweep(
     consumed: 0,
     afterSeq: 0,
     discarded: 0,
+    skippedNotGreen: 0,
   };
   if (max <= 0) return result;
 
@@ -385,6 +409,31 @@ export async function runStaleVerdictSweep(
       const completion = await deps.readLatestCheckCompletion(candidate);
       if (!completion) continue;
       if (!verdictIsStale(verdict, completion)) continue;
+
+      // THE EVIDENCE MUST ACTUALLY HAVE IMPROVED (#786 review @18df6323).
+      // Staleness alone only says "something completed after the reviewer
+      // spoke" -- it does not say the thing that completed was good news. A
+      // re-run that failed again, a cancelled job, or an unrelated check going
+      // green all satisfy the timestamp test while leaving the rejection
+      // exactly as valid as it was. Requiring the WHOLE suite to be green is
+      // the strict form of "the checks that blocked this verdict are no longer
+      // blocking", and it costs nothing extra: the suite came back with the
+      // read already spent above.
+      if (!completion.allChecksGreen) {
+        result.skippedNotGreen += 1;
+        log.info(
+          {
+            owner: candidate.owner,
+            repo: candidate.repo,
+            prNumber: candidate.prNumber,
+            headSha: candidate.headSha,
+            checkName: completion.checkName,
+            conclusion: completion.conclusion,
+          },
+          'rereview_skipped_check_not_success'
+        );
+        continue;
+      }
 
       const correlationId = recheckCorrelationId(candidate);
       const enqueued = await deps.enqueueRecheckWork({

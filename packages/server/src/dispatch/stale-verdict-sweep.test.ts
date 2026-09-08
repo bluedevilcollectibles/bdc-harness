@@ -42,6 +42,9 @@ const COMPLETION: LatestCheckCompletion = {
   checkName: 'test (windows-latest)',
   conclusion: 'success',
   completedAt: '2026-09-07T16:15:00.000Z',
+  // The whole suite is green: staleness alone no longer authorizes an enqueue
+  // (#786 review @18df6323), so the default fixture is the happy path.
+  allChecksGreen: true,
 };
 
 interface Recorded {
@@ -242,6 +245,7 @@ describe('runStaleVerdictSweep', () => {
       consumed: 0,
       afterSeq: 0,
       discarded: 0,
+      skippedNotGreen: 0,
     });
     expect(deps.listCandidates).not.toHaveBeenCalled();
   });
@@ -462,6 +466,68 @@ describe('cursor: the sweep window advances across heartbeats', () => {
     expect(new Set(requestedAfterSeq).size).toBe(requestedAfterSeq.length);
   });
 
+  /**
+   * Overseer review finding, PR #786 @18df6323: THE SWEEP ENQUEUED ON ANY
+   * NEWER COMPLETION.
+   *
+   * `verdictIsStale` is a timestamp comparison -- it says something completed
+   * after the reviewer spoke, not that the something was good news. A re-run
+   * that failed again, a cancelled job, or an unrelated check going green all
+   * satisfied it while leaving the rejection exactly as valid as it was.
+   */
+  test('a stale verdict whose named check is STILL RED is not swept', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps([candidate()], recorded, {
+      readLatestCheckCompletion: mock(async () => {
+        recorded.githubReads += 1;
+        // Newer than the verdict (so stale), but the suite is not green.
+        return { ...COMPLETION, conclusion: 'failure', allChecksGreen: false };
+      }),
+    });
+
+    const result = await runStaleVerdictSweep(deps, 3);
+
+    // THE REGRESSION GUARD: this enqueued before the fix.
+    expect(result.enqueued).toBe(0);
+    expect(recorded.enqueued).toHaveLength(0);
+    expect(result.skippedNotGreen).toBe(1);
+    // The GitHub read was still spent -- the budget accounting is unchanged.
+    expect(result.examined).toBe(1);
+    expect(recorded.githubReads).toBe(1);
+  });
+
+  test('a green LATEST check does not sweep while another check is still red', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps([candidate()], recorded, {
+      readLatestCheckCompletion: mock(async () => {
+        recorded.githubReads += 1;
+        // The latest completion passed, but the suite as a whole has not.
+        return { ...COMPLETION, conclusion: 'success', allChecksGreen: false };
+      }),
+    });
+
+    const result = await runStaleVerdictSweep(deps, 3);
+
+    expect(result.enqueued).toBe(0);
+    expect(result.skippedNotGreen).toBe(1);
+  });
+
+  test('a completion with no allChecksGreen field fails CLOSED', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps([candidate()], recorded, {
+      readLatestCheckCompletion: mock(async () => {
+        recorded.githubReads += 1;
+        const { allChecksGreen: _omitted, ...withoutFlag } = COMPLETION;
+        return withoutFlag;
+      }),
+    });
+
+    const result = await runStaleVerdictSweep(deps, 3);
+
+    expect(result.enqueued).toBe(0);
+    expect(result.skippedNotGreen).toBe(1);
+  });
+
   test('a verdict NEWER than the completion is not stale', async () => {
     const recorded: Recorded = { enqueued: [], githubReads: 0 };
     const deps = makeDeps([candidate()], recorded, {
@@ -516,6 +582,7 @@ describe('cursor: the sweep window advances across heartbeats', () => {
       consumed: 0,
       afterSeq: 0,
       discarded: 0,
+      skippedNotGreen: 0,
     });
   });
 
@@ -667,6 +734,65 @@ describe('selectLatestCompletion', () => {
       ])
     ).toBeNull();
     expect(selectLatestCompletion([])).toBeNull();
+  });
+
+  /**
+   * The whole-suite flag (#786 review @18df6323). Computed from the same list
+   * the latest-completion scan walks, so the stricter test costs no extra
+   * GitHub read.
+   */
+  test('allChecksGreen is true only when EVERY run completed in a passing state', () => {
+    const green = selectLatestCompletion([
+      {
+        id: 1,
+        name: 'lint',
+        status: 'completed',
+        conclusion: 'success',
+        completed_at: '2026-09-07T10:00:00Z',
+      },
+      {
+        id: 2,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'skipped',
+        completed_at: '2026-09-07T16:15:00Z',
+      },
+    ]);
+    expect(green?.allChecksGreen).toBe(true);
+
+    // One failure anywhere in the suite disqualifies the head, even though the
+    // LATEST completion passed.
+    const oneRed = selectLatestCompletion([
+      {
+        id: 1,
+        name: 'lint',
+        status: 'completed',
+        conclusion: 'failure',
+        completed_at: '2026-09-07T10:00:00Z',
+      },
+      {
+        id: 2,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'success',
+        completed_at: '2026-09-07T16:15:00Z',
+      },
+    ]);
+    expect(oneRed?.conclusion).toBe('success');
+    expect(oneRed?.allChecksGreen).toBe(false);
+
+    // A run still in flight also disqualifies: the suite is not settled.
+    const stillRunning = selectLatestCompletion([
+      {
+        id: 1,
+        name: 'test',
+        status: 'completed',
+        conclusion: 'success',
+        completed_at: '2026-09-07T16:15:00Z',
+      },
+      { id: 2, name: 'build', status: 'in_progress', conclusion: null, completed_at: null },
+    ]);
+    expect(stillRunning?.allChecksGreen).toBe(false);
   });
 
   test('skips runs with no usable completion timestamp', () => {
