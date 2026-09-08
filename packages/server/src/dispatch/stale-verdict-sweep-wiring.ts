@@ -24,6 +24,7 @@ import type {
 
 export {
   DEFAULT_STALE_SWEEP_MAX,
+  resetStaleSweepCursor,
   resolveStaleSweepMax,
   runStaleVerdictSweep,
   verdictIsStale,
@@ -31,6 +32,7 @@ export {
   type StaleVerdictSweepDeps,
   type StaleVerdictSweepResult,
   type SweepCandidate,
+  type SweepCursor,
 } from './stale-verdict-sweep';
 
 /**
@@ -44,11 +46,33 @@ export {
  *
  * Deduplicated by (repo, pr, head): a PR reviewed several times at one head has
  * one standing verdict, not several.
+ *
+ * ORDER AND OFFSET (Overseer review finding, PR #786 @939d42f7). `listMessages`
+ * with neither a `subject_key` nor `status: 'queued'` orders `created_at ASC`,
+ * so this walks the review queue OLDEST-FIRST and that order is stable across
+ * calls -- which is what makes a numeric offset a valid cursor rather than a
+ * way to skip rows. `offset` is applied to the DEDUPLICATED candidate sequence,
+ * not to the raw message rows, so the caller's cursor counts the same units the
+ * sweep loop consumes.
+ *
+ * ELIGIBILITY IS NOT FILTERED HERE, and cannot be: a candidate's disposition
+ * lives on a separate `pr_review_submit_receipt` row addressed to `operator`,
+ * not on the review work item this reads, so no single query over this table
+ * can express "changes_requested only". That is precisely why the caller needs
+ * a moving cursor -- the ineligible rows must be walked past, and something has
+ * to remember how far.
  */
-export async function listRealSweepCandidates(limit: number): Promise<SweepCandidate[]> {
+export async function listRealSweepCandidates(
+  limit: number,
+  offset = 0
+): Promise<SweepCandidate[]> {
+  // The scan window must cover the cursor's reach, not just one page, or an
+  // offset past the first 500 rows would return nothing forever. 500 is the
+  // hard cap `listMessages` enforces on its own limit.
   const messages = await dispatch.listMessages({ recipient: REVIEW_RECIPIENT, limit: 500 });
   const seen = new Set<string>();
   const candidates: SweepCandidate[] = [];
+  let index = 0;
   for (const message of messages) {
     if (message.task_type !== 'run_review') continue;
     if (message.status !== 'done') continue;
@@ -57,6 +81,9 @@ export async function listRealSweepCandidates(limit: number): Promise<SweepCandi
     const key = `${body.owner}/${body.repo}#${body.prNumber}@${body.headSha}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    // Dedupe FIRST, then skip: the offset counts distinct candidates so it
+    // stays aligned with what the sweep loop consumes.
+    if (index++ < offset) continue;
     candidates.push({
       owner: body.owner,
       repo: body.repo,
@@ -112,7 +139,7 @@ export function createRealStaleVerdictSweepDeps(config: ReviewRouteConfig): Stal
   const recheckDeps = createRealRecheckIngestDeps(config);
   const octokit = createRealOctokitClient();
   return {
-    listCandidates: listRealSweepCandidates,
+    listCandidates: (limit, offset) => listRealSweepCandidates(limit, offset),
     readStandingVerdict: candidate => recheckDeps.readStandingVerdict(candidate),
     async readLatestCheckCompletion(candidate): Promise<LatestCheckCompletion | null> {
       const runs = await octokit.checks.listForRef({

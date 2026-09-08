@@ -149,6 +149,30 @@ export interface SubmitOutcome {
   disposition: SubmitDisposition;
   reason?: string;
   event?: OverseerReviewEvent;
+  /**
+   * The review text the reviewer actually posted, for the terminal branches
+   * that formed a verdict (`approved`, `changes_requested`, and the
+   * `blocked_required_contexts_unavailable` COMMENT).
+   *
+   * WHY IT IS ON THE OUTCOME (#782 review finding, 2026-09-07): the worker
+   * persists `result_body: JSON.stringify(outcome)`, and the same-head recheck
+   * path has to decide whether a standing CHANGES_REQUESTED was caused by a
+   * CHECK (auto-clearable by a green re-run) or by a CODE finding (not). That
+   * question can only be answered from the reviewer's finding text -- and
+   * before this field existed the text was never persisted ANYWHERE: not on the
+   * outcome, and not on the submit receipt, whose recorded fields are
+   * disposition/event/reason only. `reason` is absent on a clean
+   * `changes_requested`, so `extractReviewSummary` returned null, every verdict
+   * failed `verdictAuthorizesRecheck`, and BOTH the webhook path and the stale
+   * sweep silently enqueued nothing -- the exact re-review this WO exists to
+   * deliver.
+   *
+   * Deliberately NOT set on the non-terminal deferrals (`checks_pending`,
+   * `rate_limited`, `transport_error`): no verdict was formed there, their
+   * `summary` is the empty string, and `checks_pending` already authorizes a
+   * recheck on its disposition alone.
+   */
+  summary?: string;
   /** Set only on `rate_limited`: when the item should become claimable again. */
   retryAfter?: string;
   /**
@@ -391,6 +415,7 @@ export async function runAndSubmitReview(
         ? 'required_contexts_unavailable_blocked'
         : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
       event: 'COMMENT',
+      ...summaryField(verdict),
     });
   }
 
@@ -439,7 +464,21 @@ export async function runAndSubmitReview(
   return finish(deps, work, work.headSha, {
     disposition: verdict.approved ? 'approved' : 'changes_requested',
     event,
+    ...summaryField(verdict),
   });
+}
+
+/**
+ * The reviewer's posted text, as an optional outcome field.
+ *
+ * Only emitted when the verdict actually carries text, so an outcome never
+ * gains an empty `summary` key that a consumer could mistake for evidence. The
+ * spread form keeps every terminal branch's shape identical to what it was
+ * before this field existed when there is nothing to carry.
+ */
+function summaryField(verdict: ReviewerVerdict): { summary?: string } {
+  const summary = verdict.summary?.trim() ?? '';
+  return summary.length > 0 ? { summary } : {};
 }
 
 function errorCode(error: unknown): string {

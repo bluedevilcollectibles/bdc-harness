@@ -16,6 +16,7 @@
  */
 import * as dispatch from '@archon/core/db/dispatch';
 import type { RecheckIngestDeps, StandingVerdict } from './pr-review-check-ingest.ts';
+import type { SubmitOutcome } from './pr-review-submit.ts';
 import { recheckCorrelationId } from './pr-review-check-ingest';
 import {
   REVIEW_RECIPIENT,
@@ -50,12 +51,13 @@ interface SubmitReceiptBody {
  * Non-terminal bookkeeping rows (`stale_head`, and anything whose head does not
  * match) are skipped rather than treated as the standing state.
  *
- * The verdict's `summary` is not on the receipt; what IS on it is the
- * `disposition` plus the `reason`, and for a `changes_requested` verdict the
- * receipt's `reason` is absent (the submit path records no reason on a clean
- * rejection). So the check-caused test reads the review body the reviewer
- * actually posted, which is carried on the ORIGINATING work item's result body
- * -- see `readStandingVerdict` below.
+ * The verdict's `summary` is not on the receipt. `SubmitDeps.recordReceipt`
+ * records disposition/event/reason only, and on a clean `changes_requested` the
+ * submit path sets no reason at all -- so the receipt can establish WHICH
+ * verdict stands at this head, never WHY. The check-caused test therefore reads
+ * the review text off the ORIGINATING work item's result body, where the
+ * persisted `SubmitOutcome.summary` carries it -- see `readStandingVerdict`
+ * below.
  */
 export function foldSubmitReceipts(
   receipts: { body: string; created_at: string }[],
@@ -85,22 +87,38 @@ export function foldSubmitReceipts(
  * Recover the review summary the reviewer posted for one head from the review
  * work item's stored result body.
  *
- * The worker writes `result_body: JSON.stringify(outcome)` when it finishes an
- * item, and the outcome carries the `reason`. For a check-caused rejection the
- * reviewer's finding text is what named the check -- so when the result body
- * offers nothing, the caller falls back to the receipt disposition alone and
- * the ingest's fail-closed default applies.
+ * THE PERSISTED SHAPE IS A `SubmitOutcome`. The review worker writes
+ * `result_body: JSON.stringify(outcome)` when it finishes an item
+ * (`review-worker-clock.ts`), so this function parses exactly that type and
+ * nothing else -- `summary` is the field `pr-review-submit` puts the reviewer's
+ * posted finding text on, for every terminal branch that formed a verdict.
+ *
+ * `reason` is retained ONLY as a compatibility fallback for outcomes persisted
+ * before `SubmitOutcome.summary` existed. It is not where a current
+ * `changes_requested` carries its evidence: that branch sets no `reason` at
+ * all, which is precisely why reading `reason` alone recovered nothing and the
+ * whole recheck path failed closed (#782 review finding, 2026-09-07).
+ *
+ * Returns null when the body is absent, unparseable, or carries no text; the
+ * caller then falls back to the receipt disposition alone and the ingest's
+ * fail-closed default applies.
  */
 export function extractReviewSummary(resultBody: string | null): string | null {
   if (!resultBody) return null;
+  let parsed: Pick<SubmitOutcome, 'summary' | 'reason'>;
   try {
-    const parsed = JSON.parse(resultBody) as { reason?: unknown; summary?: unknown };
-    if (typeof parsed.summary === 'string' && parsed.summary.length > 0) return parsed.summary;
-    if (typeof parsed.reason === 'string' && parsed.reason.length > 0) return parsed.reason;
-    return null;
+    parsed = JSON.parse(resultBody) as Pick<SubmitOutcome, 'summary' | 'reason'>;
   } catch {
     return null;
   }
+  if (typeof parsed?.summary === 'string' && parsed.summary.trim().length > 0) {
+    return parsed.summary;
+  }
+  // Legacy outcomes only -- see the doc comment above.
+  if (typeof parsed?.reason === 'string' && parsed.reason.trim().length > 0) {
+    return parsed.reason;
+  }
+  return null;
 }
 
 /**

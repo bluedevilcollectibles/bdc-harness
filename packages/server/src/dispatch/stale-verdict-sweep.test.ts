@@ -4,10 +4,11 @@
  * Headline stop condition: "the sweep enqueues once" -- one re-review per stale
  * candidate, and a second sweep over the same completion enqueues nothing.
  */
-import { describe, expect, mock, test } from 'bun:test';
+import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { StandingVerdict } from '@archon/overseer/pr-review-check-ingest';
 import {
   DEFAULT_STALE_SWEEP_MAX,
+  resetStaleSweepCursor,
   resolveStaleSweepMax,
   runStaleVerdictSweep,
   verdictIsStale,
@@ -16,6 +17,13 @@ import {
   type SweepCandidate,
 } from './stale-verdict-sweep';
 import { selectLatestCompletion } from './stale-verdict-sweep-wiring';
+
+// The sweep cursor is process-local and survives between calls by design, so a
+// test that does not pass its own cursor would otherwise inherit the offset the
+// previous test left behind.
+beforeEach(() => {
+  resetStaleSweepCursor();
+});
 
 const HEAD = '5ac93b765ac93b765ac93b765ac93b765ac93b76';
 
@@ -51,7 +59,9 @@ function makeDeps(
 ): StaleVerdictSweepDeps {
   const rows = new Map<string, string>();
   return {
-    listCandidates: mock(async limit => candidates.slice(0, limit)),
+    // Offset-aware, exactly like the real listing: the cursor is meaningless
+    // against a double that always returns the head of the list.
+    listCandidates: mock(async (limit, offset = 0) => candidates.slice(offset, offset + limit)),
     readStandingVerdict: mock(async () => STALE_VERDICT),
     readLatestCheckCompletion: mock(async () => {
       recorded.githubReads += 1;
@@ -218,7 +228,7 @@ describe('runStaleVerdictSweep', () => {
     const recorded: Recorded = { enqueued: [], githubReads: 0 };
     const deps = makeDeps([candidate()], recorded);
     const result = await runStaleVerdictSweep(deps, 0);
-    expect(result).toEqual({ examined: 0, enqueued: 0, duplicates: 0 });
+    expect(result).toEqual({ examined: 0, enqueued: 0, duplicates: 0, consumed: 0 });
     expect(deps.listCandidates).not.toHaveBeenCalled();
   });
 
@@ -252,6 +262,140 @@ describe('runStaleVerdictSweep', () => {
     const result = await runStaleVerdictSweep(deps, 3);
     expect(result.enqueued).toBe(0);
     expect(recorded.githubReads).toBe(0);
+  });
+});
+
+/**
+ * Overseer review finding, PR #786 @939d42f7: THE BACKSTOP COULD STARVE
+ * PERMANENTLY.
+ *
+ * The local eligibility check refunds its budget slot, so an ineligible
+ * candidate costs no GitHub read -- but it still consumes a slot in the
+ * `max + lookahead` FETCHED ARRAY. With a fixed window, a run of approved or
+ * code-rejected PRs at the window's start exhausted the array with the budget
+ * unspent, and every later heartbeat re-fetched the identical rows. An eligible
+ * stale verdict past the window was never examined, on any heartbeat, ever.
+ */
+describe('cursor: the sweep window advances across heartbeats', () => {
+  /**
+   * 20 completed reviews. The first 8 -- the whole default fetch window of
+   * max(3) + lookahead(5) -- are ineligible. The 9th is a checks-only
+   * CHANGES_REQUESTED at a now-green head, i.e. exactly what the backstop
+   * exists to find.
+   */
+  function starvationCandidates(): SweepCandidate[] {
+    return Array.from({ length: 20 }, (_, index) => candidate(index + 1, `head-${index + 1}`));
+  }
+
+  const ELIGIBLE_PR = 9;
+
+  function verdictFor(prNumber: number): StandingVerdict {
+    if (prNumber === ELIGIBLE_PR) return { ...STALE_VERDICT, headSha: `head-${prNumber}` };
+    // Ineligible: approved (first 8) or a code finding. Neither authorizes, and
+    // both refund their slot without a GitHub read.
+    return prNumber <= 8
+      ? {
+          headSha: `head-${prNumber}`,
+          disposition: 'approved',
+          summary: 'No blocking findings.',
+          recordedAt: '2026-09-07T12:07:00.000Z',
+        }
+      : {
+          headSha: `head-${prNumber}`,
+          disposition: 'changes_requested',
+          summary: '[blocker] src/index.ts: unhandled promise rejection',
+          recordedAt: '2026-09-07T12:07:00.000Z',
+        };
+  }
+
+  test('the 9th candidate is reached within a bounded number of heartbeats, never starved', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const candidates = starvationCandidates();
+    const deps = makeDeps(candidates, recorded, {
+      readStandingVerdict: mock(async input => verdictFor(input.prNumber)),
+    });
+
+    // A fresh cursor per test: the module-level one would leak between tests.
+    const cursor = { offset: 0 };
+    const max = 3;
+    const perHeartbeatReads: number[] = [];
+
+    let enqueuedTotal = 0;
+    // The documented bound: the window is max+5 = 8 wide and advances by what
+    // it consumes, so candidate 9 is reached on the SECOND heartbeat.
+    for (let heartbeat = 0; heartbeat < 2; heartbeat += 1) {
+      const before = recorded.githubReads;
+      const result = await runStaleVerdictSweep(deps, max, cursor);
+      perHeartbeatReads.push(recorded.githubReads - before);
+      enqueuedTotal += result.enqueued;
+    }
+
+    // THE REGRESSION GUARD: before the cursor this was 0 forever.
+    expect(enqueuedTotal).toBe(1);
+    expect(recorded.enqueued).toHaveLength(1);
+    expect(recorded.enqueued[0]?.prNumber).toBe(ELIGIBLE_PR);
+    // The GitHub-read bound is intact on every heartbeat.
+    for (const reads of perHeartbeatReads) expect(reads).toBeLessThanOrEqual(max);
+  });
+
+  test('the first heartbeat spends no budget yet still advances the cursor', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps(starvationCandidates(), recorded, {
+      readStandingVerdict: mock(async input => verdictFor(input.prNumber)),
+    });
+    const cursor = { offset: 0 };
+
+    const first = await runStaleVerdictSweep(deps, 3, cursor);
+
+    // All 8 fetched candidates were ineligible: nothing examined, no GitHub
+    // read, budget fully refunded -- and yet progress was made.
+    expect(first.examined).toBe(0);
+    expect(recorded.githubReads).toBe(0);
+    expect(first.consumed).toBe(8);
+    expect(cursor.offset).toBe(8);
+  });
+
+  test('the cursor rewinds at the end of the store so the sweep never stops', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    // Fewer candidates than one window: the page is short, so the sweep is
+    // already at the end and must rewind rather than walk off into empty
+    // offsets and stop sweeping forever.
+    const deps = makeDeps([candidate(1, 'head-1'), candidate(2, 'head-2')], recorded, {
+      readStandingVerdict: mock(async input => ({
+        headSha: input.headSha,
+        disposition: 'approved',
+        summary: 'No blocking findings.',
+        recordedAt: '2026-09-07T12:07:00.000Z',
+      })),
+    });
+    const cursor = { offset: 0 };
+
+    await runStaleVerdictSweep(deps, 3, cursor);
+    expect(cursor.offset).toBe(0);
+
+    // And from a cursor already past the end, it rewinds rather than sticking.
+    const past = { offset: 50 };
+    await runStaleVerdictSweep(deps, 3, past);
+    expect(past.offset).toBe(0);
+  });
+
+  test('the GitHub-read bound holds on every heartbeat of a full walk', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    // Every candidate eligible AND stale: the worst case for read volume.
+    const deps = makeDeps(starvationCandidates(), recorded, {
+      readStandingVerdict: mock(async input => ({
+        ...STALE_VERDICT,
+        headSha: input.headSha,
+      })),
+    });
+    const cursor = { offset: 0 };
+    const max = 3;
+
+    for (let heartbeat = 0; heartbeat < 10; heartbeat += 1) {
+      const before = recorded.githubReads;
+      await runStaleVerdictSweep(deps, max, cursor);
+      expect(recorded.githubReads - before).toBeLessThanOrEqual(max);
+    }
   });
 
   test('a verdict NEWER than the completion is not stale', async () => {
@@ -305,6 +449,7 @@ describe('runStaleVerdictSweep', () => {
       examined: 0,
       enqueued: 0,
       duplicates: 0,
+      consumed: 0,
     });
   });
 });

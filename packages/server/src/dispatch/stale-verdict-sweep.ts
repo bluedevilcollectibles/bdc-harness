@@ -73,6 +73,43 @@ export interface SweepCandidate {
   headSha: string;
 }
 
+/**
+ * How far into the candidate list the next heartbeat starts.
+ *
+ * WHY A CURSOR EXISTS (Overseer review finding, PR #786 @939d42f7): the local
+ * eligibility filter below REFUNDS its budget slot, so a candidate that is
+ * approved or code-rejected costs nothing -- but it still consumes a slot in
+ * the FETCHED ARRAY, which is only `max + CANDIDATE_LOOKAHEAD` long. With a
+ * fixed window, a run of ineligible candidates at the window's start exhausted
+ * the array with the budget unspent, and every subsequent heartbeat re-fetched
+ * the identical rows. An eligible stale verdict sitting past the window was
+ * never examined -- permanently, not just slowly.
+ *
+ * The cursor makes the window MOVE. Each heartbeat records how many candidates
+ * it consumed and starts the next one there, so the sweep walks the whole store
+ * across heartbeats instead of re-reading its head forever. The GitHub-read
+ * bound is untouched: `max` still caps reads per heartbeat: the cursor changes
+ * WHICH candidates a heartbeat sees, never HOW MANY it may touch.
+ */
+export interface SweepCursor {
+  /** Offset into the candidate ordering the next heartbeat resumes at. */
+  offset: number;
+}
+
+/**
+ * Process-local cursor. Deliberately in-memory rather than a database row: the
+ * sweep is a backstop whose only cost of restarting at zero is re-walking a
+ * bounded list a few heartbeats sooner, which is exactly the pre-cursor
+ * behavior and therefore never worse. Persisting it would add a write per
+ * heartbeat to buy nothing a restart does not already give back within a minute.
+ */
+const processCursor: SweepCursor = { offset: 0 };
+
+/** Test seam: reset the module cursor so heartbeats are independent. */
+export function resetStaleSweepCursor(): void {
+  processCursor.offset = 0;
+}
+
 /** The latest completed check at a head, as read from GitHub. */
 export interface LatestCheckCompletion {
   /** Stable id of the most recently completed check run at this head. */
@@ -85,10 +122,20 @@ export interface LatestCheckCompletion {
 
 export interface StaleVerdictSweepDeps {
   /**
-   * Open PRs with a standing Overseer verdict, newest first. Reads the LOCAL
-   * dispatch store -- never GitHub -- so building the candidate set is free.
+   * Open PRs with a standing Overseer verdict, in a STABLE order. Reads the
+   * LOCAL dispatch store -- never GitHub -- so building the candidate set is
+   * free.
+   *
+   * `offset` is how many candidates to skip before returning `limit` of them:
+   * it is what lets successive heartbeats walk past a run of ineligible
+   * candidates instead of re-reading them forever. The ordering must be stable
+   * across calls or the cursor would skip rows rather than advance through
+   * them.
+   *
+   * Returning fewer than `limit` rows means the store is exhausted at that
+   * offset, and the caller rewinds the cursor to the start.
    */
-  listCandidates(limit: number): Promise<SweepCandidate[]>;
+  listCandidates(limit: number, offset: number): Promise<SweepCandidate[]>;
   /** The standing verdict at that exact head, or null. Local read. */
   readStandingVerdict(candidate: SweepCandidate): Promise<StandingVerdict | null>;
   /**
@@ -121,6 +168,13 @@ export interface StaleVerdictSweepResult {
   enqueued: number;
   /** Candidates whose re-review row already existed (idempotent no-op). */
   duplicates: number;
+  /**
+   * Candidates this heartbeat walked past, INCLUDING the locally-ineligible
+   * ones that refunded their budget slot. This is what the cursor advances by,
+   * and it is reported so a heartbeat that spent no budget is still visibly
+   * making progress through the store.
+   */
+  consumed: number;
 }
 
 /**
@@ -150,11 +204,13 @@ export function verdictIsStale(
  */
 export async function runStaleVerdictSweep(
   deps: StaleVerdictSweepDeps,
-  max: number = resolveStaleSweepMax()
+  max: number = resolveStaleSweepMax(),
+  cursor: SweepCursor = processCursor
 ): Promise<StaleVerdictSweepResult> {
-  const result: StaleVerdictSweepResult = { examined: 0, enqueued: 0, duplicates: 0 };
+  const result: StaleVerdictSweepResult = { examined: 0, enqueued: 0, duplicates: 0, consumed: 0 };
   if (max <= 0) return result;
 
+  const startOffset = Math.max(0, cursor.offset);
   let candidates: SweepCandidate[];
   try {
     // Ask for exactly the budget, never a multiple of it. An earlier version
@@ -173,9 +229,20 @@ export async function runStaleVerdictSweep(
     // sweepable PRs sitting just past the end. The over-fetch is bounded and
     // additive (not multiplicative), and a listed-but-never-touched candidate
     // costs nothing -- `listCandidates` is a single local query.
-    candidates = await deps.listCandidates(max + CANDIDATE_LOOKAHEAD);
+    candidates = await deps.listCandidates(max + CANDIDATE_LOOKAHEAD, startOffset);
   } catch (error) {
     log.error({ err: error }, 'overseer_stale_verdict_sweep_candidates_failed');
+    return result;
+  }
+
+  // EXHAUSTED AT THIS OFFSET: the cursor has walked past the end of the store.
+  // Rewind to the start so the next heartbeat re-examines from the top -- rows
+  // skipped earlier as ineligible may have acquired a new verdict since, and a
+  // cursor that only ever moved forward would stop sweeping entirely once it
+  // reached the end.
+  if (candidates.length === 0) {
+    if (startOffset === 0) return result;
+    cursor.offset = 0;
     return result;
   }
 
@@ -186,10 +253,15 @@ export async function runStaleVerdictSweep(
   // ceiling on GitHub reads per heartbeat rather than a ceiling on the one
   // outcome that happens to be cheapest to reach.
   let remaining = max;
+  // How many candidates this heartbeat actually walked past, ineligible ones
+  // included. This -- not the budget -- is what the cursor advances by, because
+  // the starvation being fixed is about ARRAY slots consumed, not budget spent.
+  let consumed = 0;
 
   for (const candidate of candidates) {
     if (remaining <= 0) break;
     remaining -= 1;
+    consumed += 1;
     try {
       const verdict = await deps.readStandingVerdict(candidate);
       // Same authorization question as the webhook path, and deliberately the
@@ -258,5 +330,14 @@ export async function runStaleVerdictSweep(
       );
     }
   }
+
+  // ADVANCE THE WINDOW by what this heartbeat actually walked, so the next one
+  // resumes past it rather than re-reading the same rows. When the fetched page
+  // was shorter than requested we were already at the end of the store, so the
+  // cursor rewinds instead of running off into offsets that return nothing.
+  result.consumed = consumed;
+  const pageWasShort = candidates.length < max + CANDIDATE_LOOKAHEAD;
+  const reachedEndOfPage = consumed >= candidates.length;
+  cursor.offset = pageWasShort && reachedEndOfPage ? 0 : startOffset + consumed;
   return result;
 }
