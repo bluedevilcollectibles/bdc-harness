@@ -7,7 +7,6 @@ import { Database } from 'bun:sqlite';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
-const SQLITE_HOOK_TIMEOUT_MS = 30_000;
 
 mock.module('./connection', () => ({
   getDatabase: () => db,
@@ -36,12 +35,721 @@ import {
   recordResetAudit,
   resetTaskmaster,
   recordUsageSample,
+  registerExpectation,
+  listDueExpectations,
+  markMet,
+  markFailed,
+  claimRedispatchAttempt,
+  claimRecoveryReplay,
+  claimEscalation,
+  markEscalated,
+  markGivenUp,
+  getExpectationCounts,
   setPauseState,
   updateActionOutcome,
   upsertAdoptionRow,
   upsertHealthSample,
   type TmAdoptionRow,
 } from './taskmaster';
+
+describe('tm_expectations DAL', () => {
+  test('a fresh database creates tm_expectations with the unique index and escalating', async () => {
+    // The path that actually matters: tm_expectations ships for the first time
+    // in this WO, so every real database takes this one.
+    const createSql = await db.query<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+    );
+    expect(createSql.rows[0]?.sql).toContain('registration_key');
+    expect(createSql.rows[0]?.sql).toContain('escalating');
+    const indexes = await db.query<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
+      ['idx_tm_expectations_registration_key']
+    );
+    expect(indexes.rows).toHaveLength(1);
+    // And the intermediate state the CHECK exists for is actually usable.
+    const id = await registerExpectation({
+      action_ref: 'fresh-db',
+      dispatch_ref: 'fresh-dispatch',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    expect(await claimEscalation(id, 'tm:expectation:fresh:escalate')).toBe(true);
+  });
+
+  test('an EMPTY legacy-shaped table is recreated and registration works', async () => {
+    // Recreating an empty table is lossless, so the adapter just does it.
+    const legacyPath = join(tmpdir(), `taskmaster-empty-${Date.now()}-${Math.random()}.db`);
+    const seed = new Database(legacyPath);
+    // Outdated on all three counts: no registration_key, CHECK without
+    // 'escalating', no unique index.
+    seed.run(`CREATE TABLE tm_expectations (
+      id TEXT PRIMARY KEY,
+      dispatch_ref TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      due_at TEXT NOT NULL,
+      on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+      max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+      retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'met', 'failed', 'escalated', 'given_up')
+      ),
+      evidence_pointer TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`);
+    seed.close();
+
+    const upgraded = new SqliteAdapter(legacyPath);
+    try {
+      const previous = db;
+      db = upgraded;
+      try {
+        const createSql = await upgraded.query<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+        );
+        expect(createSql.rows[0]?.sql).toContain('escalating');
+        expect(createSql.rows[0]?.sql).toContain('registration_key');
+        const indexes = await upgraded.query<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
+          ['idx_tm_expectations_registration_key']
+        );
+        expect(indexes.rows).toHaveLength(1);
+
+        const id = await registerExpectation({
+          action_ref: 'after-recreate',
+          dispatch_ref: 'recreated',
+          recipient: 'xo',
+          evidence_json: '{}',
+          due_at: new Date(0).toISOString(),
+          on_absence: 'escalate',
+          max_retries: 0,
+        });
+        expect(await claimEscalation(id, 'tm:expectation:recreated:escalate')).toBe(true);
+      } finally {
+        db = previous;
+      }
+    } finally {
+      await upgraded.close();
+      cleanupDb(legacyPath);
+    }
+  });
+
+  test('a NON-EMPTY legacy-shaped table refuses startup and leaves rows untouched', async () => {
+    // THE DESIGN DECISION. Rather than deriving registration_key values -- every
+    // scheme that mixes preserved and derived keys can collide, and a collision
+    // fails the unique index and blocks startup anyway -- the adapter refuses
+    // loudly and names the one-off operator script. A human inspects the rows;
+    // a startup path does not guess at identities.
+    const legacyPath = join(tmpdir(), `taskmaster-nonempty-${Date.now()}-${Math.random()}.db`);
+    const seed = new Database(legacyPath);
+    seed.run(`CREATE TABLE tm_expectations (
+      id TEXT PRIMARY KEY,
+      dispatch_ref TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      due_at TEXT NOT NULL,
+      on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+      max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+      retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'met', 'failed', 'escalated', 'given_up')
+      ),
+      evidence_pointer TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`);
+    seed.run(
+      `INSERT INTO tm_expectations
+       (id, dispatch_ref, recipient, evidence_json, due_at, on_absence, max_retries, retries, status, created_at, updated_at)
+       VALUES ('older','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
+              ('newer','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-02-01T00:00:00.000Z','2026-02-01T00:00:00.000Z')`
+    );
+    seed.close();
+
+    // Startup fails, and the message is ACTIONABLE: table, row count, script.
+    expect(() => new SqliteAdapter(legacyPath)).toThrow(/tm_expectations/);
+    expect(() => new SqliteAdapter(legacyPath)).toThrow(/2 row\(s\)/);
+    expect(() => new SqliteAdapter(legacyPath)).toThrow(/repair-tm-expectations/);
+
+    // THE ROWS ARE UNTOUCHED -- refusing must not mutate anything.
+    const check = new Database(legacyPath);
+    try {
+      const rows = check
+        .query<{ id: string }, []>('SELECT id FROM tm_expectations ORDER BY id')
+        .all();
+      expect(rows.map(r => r.id)).toEqual(['newer', 'older']);
+      const sql = check
+        .query<
+          { sql: string },
+          []
+        >("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'")
+        .get();
+      // Still the ORIGINAL schema: no silent partial migration happened.
+      expect(sql?.sql).not.toContain('registration_key');
+    } finally {
+      check.close();
+    }
+    cleanupDb(legacyPath);
+  });
+
+  test('a second startup on a correct table is a no-op', async () => {
+    const path = join(tmpdir(), `taskmaster-noop-${Date.now()}-${Math.random()}.db`);
+    const first = new SqliteAdapter(path);
+    let firstSql: string | undefined;
+    try {
+      const previous = db;
+      db = first;
+      try {
+        await registerExpectation({
+          action_ref: 'noop-check',
+          dispatch_ref: 'noop-dispatch',
+          recipient: 'xo',
+          evidence_json: '{}',
+          due_at: new Date(0).toISOString(),
+          on_absence: 'escalate',
+          max_retries: 0,
+        });
+        firstSql = (
+          await first.query<{ sql: string }>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+          )
+        ).rows[0]?.sql;
+      } finally {
+        db = previous;
+      }
+    } finally {
+      await first.close();
+    }
+
+    // Reopening must neither recreate the table nor drop the row.
+    const second = new SqliteAdapter(path);
+    try {
+      const rows = await second.query<{ cnt: number }>(
+        'SELECT COUNT(*) AS cnt FROM tm_expectations'
+      );
+      expect(Number(rows.rows[0]?.cnt)).toBe(1);
+      const secondSql = (
+        await second.query<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+        )
+      ).rows[0]?.sql;
+      expect(secondSql).toBe(firstSql);
+    } finally {
+      await second.close();
+      cleanupDb(path);
+    }
+  });
+
+  test('registering twice for the same dispatch yields one row and the same id', async () => {
+    // REGRESSION. registerExpectation generated a random UUID per call and the
+    // schema had no uniqueness on the identity, so replaying an action after a
+    // crash between the dispatch and updateActionOutcome registered a SECOND
+    // expectation for the same dispatch -- different id, therefore different
+    // retry and escalation idempotency keys, therefore duplicate external work.
+    //
+    // Real sqlite, not a double.
+    const registration = {
+      action_ref: 'journal-action-1',
+      dispatch_ref: 'dispatch-abc',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch' as const,
+      max_retries: 2,
+    };
+    const first = await registerExpectation(registration);
+    // The replay: same journal action, same dispatch, called again verbatim.
+    const second = await registerExpectation(registration);
+    expect(second).toBe(first);
+
+    const rows = await db.query<{ cnt: number | string }>(
+      'SELECT COUNT(*) AS cnt FROM tm_expectations WHERE dispatch_ref = $1',
+      ['dispatch-abc']
+    );
+    expect(Number(rows.rows[0]?.cnt)).toBe(1);
+
+    // The retry/escalation keys the supervisor derives are therefore identical
+    // across the replay -- which is the whole point of the fix.
+    expect(`tm:expectation:${second}:retry:1`).toBe(`tm:expectation:${first}:retry:1`);
+    expect(`tm:expectation:${second}:escalate`).toBe(`tm:expectation:${first}:escalate`);
+
+    // The replay must not resurrect a closed expectation either.
+    expect(await markMet(first, 'https://example/proof')).toBe(true);
+    const third = await registerExpectation(registration);
+    expect(third).toBe(first);
+    const after = await db.query<{ cnt: number | string }>(
+      'SELECT COUNT(*) AS cnt FROM tm_expectations WHERE dispatch_ref = $1',
+      ['dispatch-abc']
+    );
+    expect(Number(after.rows[0]?.cnt)).toBe(1);
+    const status = await db.query<{ status: string }>(
+      'SELECT status FROM tm_expectations WHERE id = $1',
+      [first]
+    );
+    expect(status.rows[0]?.status).toBe('met');
+  });
+
+  test('different dispatches and different actions stay distinct expectations', async () => {
+    // The uniqueness must not over-collapse: two genuinely different pieces of
+    // work are two expectations, even when they share one half of the identity.
+    const base = {
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch' as const,
+      max_retries: 2,
+    };
+    const a = await registerExpectation({
+      ...base,
+      action_ref: 'action-1',
+      dispatch_ref: 'dispatch-1',
+    });
+    const sameActionOtherDispatch = await registerExpectation({
+      ...base,
+      action_ref: 'action-1',
+      dispatch_ref: 'dispatch-2',
+    });
+    const otherActionSameDispatch = await registerExpectation({
+      ...base,
+      action_ref: 'action-2',
+      dispatch_ref: 'dispatch-1',
+    });
+    expect(new Set([a, sameActionOtherDispatch, otherActionSameDispatch]).size).toBe(3);
+  });
+
+  test('registration without an action_ref falls back to the dispatch_ref identity', async () => {
+    // A caller with no journal action still gets idempotency, keyed on the
+    // dispatch alone.
+    const registration = {
+      dispatch_ref: 'dispatch-no-action',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate' as const,
+      max_retries: 0,
+    };
+    const first = await registerExpectation(registration);
+    const second = await registerExpectation(registration);
+    expect(second).toBe(first);
+    const rows = await db.query<{ cnt: number | string }>(
+      'SELECT COUNT(*) AS cnt FROM tm_expectations WHERE dispatch_ref = $1',
+      ['dispatch-no-action']
+    );
+    expect(Number(rows.rows[0]?.cnt)).toBe(1);
+  });
+
+  test('expectation_met_before_deadline', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-1',
+      recipient: 'xo',
+      evidence_json: JSON.stringify({ kind: 'issue_comment_exists', repo: 'x/y', number: 1 }),
+      due_at: new Date(Date.now() + 60_000).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    const active = await listDueExpectations(new Date().toISOString());
+    expect(active.map(row => row.id)).toContain(id);
+    await markMet(id, 'https://github.com/x/y/issues/1#issuecomment-1');
+    const row = await db.query<{ status: string; evidence_pointer: string }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]).toEqual({
+      status: 'met',
+      evidence_pointer: 'https://github.com/x/y/issues/1#issuecomment-1',
+    });
+  });
+
+  test('retry and escalation mutations are bounded state transitions', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-2',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBe(1);
+    expect(await markEscalated(id, 'dispatch:escalation')).toBe(true);
+    const row = await db.query<{ status: string; retries: number; evidence_pointer: string }>(
+      'SELECT status, retries, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]).toEqual({
+      status: 'escalated',
+      retries: 1,
+      evidence_pointer: 'dispatch:escalation',
+    });
+  });
+
+  test('give-up transition and aggregate counts include every status', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-give-up',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'give_up',
+      max_retries: 0,
+    });
+    await markGivenUp(id, 'deadline elapsed');
+    const counts = await getExpectationCounts();
+    expect(counts.given_up).toBe(1);
+    expect(counts.pending).toBe(0);
+    expect(counts.met).toBe(0);
+    expect(counts.failed).toBe(0);
+    expect(counts.escalated).toBe(0);
+  });
+
+  test('two concurrent claims on the same attempt: exactly one wins', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-cas',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    const dueAt = new Date(Date.now() + 60_000).toISOString();
+    // Both ticks observed retries=0 and race to claim attempt 1.
+    const [a, b] = await Promise.all([
+      claimRedispatchAttempt(id, 0, dueAt),
+      claimRedispatchAttempt(id, 0, dueAt),
+    ]);
+    // Fails on the old behaviour: the retry advance was an unconditional
+    // UPDATE ... WHERE id = $1, so both ticks advanced the counter and sent.
+    expect([a, b].filter(value => value !== null)).toEqual([1]);
+    const row = await db.query<{ retries: number }>(
+      'SELECT retries FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(Number(row.rows[0]?.retries)).toBe(1);
+  });
+
+  test('the claim advances the count before the send, so a crash cannot lose it', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-crash',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    const claimed = await claimRedispatchAttempt(id, 0, new Date().toISOString());
+    expect(claimed).toBe(1);
+    // Simulate the process dying here -- before any send. The counter is
+    // already durable, so the retry budget cannot be replayed from zero.
+    const row = await db.query<{ retries: number; status: string }>(
+      'SELECT retries, status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(Number(row.rows[0]?.retries)).toBe(1);
+    expect(row.rows[0]?.status).toBe('failed');
+    // A tick that still believes retries=0 cannot re-claim attempt 1.
+    expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBeNull();
+  });
+
+  test('two ticks race met vs failed: exactly one transition wins', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-race-met-failed',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    // Tick A verified the evidence; tick B saw the deadline pass. Both act on
+    // the same pending snapshot.
+    const [met, failed] = await Promise.all([markMet(id, 'https://example/proof'), markFailed(id)]);
+    // Fails on the old behaviour: both were blind UPDATE ... WHERE id = $1, so
+    // both "succeeded" and the later write silently won.
+    expect([met, failed].filter(Boolean)).toHaveLength(1);
+    const row = await db.query<{ status: string; evidence_pointer: string | null }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    // Whichever won, a terminal met must never be regressed to failed.
+    if (met) {
+      expect(row.rows[0]?.status).toBe('met');
+      expect(row.rows[0]?.evidence_pointer).toBe('https://example/proof');
+    } else {
+      expect(row.rows[0]?.status).toBe('failed');
+    }
+  });
+
+  test('a terminal met is never regressed by a stale worker', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-no-regress',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await markMet(id, 'https://example/proof')).toBe(true);
+    // Every other transition a stale tick could attempt must now be refused.
+    expect(await markFailed(id)).toBe(false);
+    expect(await markEscalated(id, 'dispatch:late')).toBe(false);
+    expect(await markGivenUp(id, 'late')).toBe(false);
+    expect(await markMet(id, 'https://example/second-observer')).toBe(false);
+    const row = await db.query<{ status: string; evidence_pointer: string | null }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('met');
+    expect(row.rows[0]?.evidence_pointer).toBe('https://example/proof');
+  });
+
+  test('two ticks race claim vs met: a verified expectation is never redispatched', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-race-claim-met',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    const [met, claimed] = await Promise.all([
+      markMet(id, 'https://example/proof'),
+      claimRedispatchAttempt(id, 0, new Date().toISOString()),
+    ]);
+    // Exactly one wins. The retry-counter CAS alone did NOT prevent this --
+    // the active-status predicate on the claim is what closes it.
+    expect([met, claimed !== null].filter(Boolean)).toHaveLength(1);
+    const row = await db.query<{ status: string; retries: number }>(
+      'SELECT status, retries FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    if (met) {
+      expect(claimed).toBeNull();
+      expect(row.rows[0]?.status).toBe('met');
+      expect(Number(row.rows[0]?.retries)).toBe(0);
+    } else {
+      expect(claimed).toBe(1);
+      expect(row.rows[0]?.status).toBe('failed');
+    }
+  });
+
+  test('a claim against an already-met expectation is refused outright', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-claim-after-met',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await markMet(id, 'https://example/proof')).toBe(true);
+    // The retry count is still 0 and under the cap, so the pre-repair CAS --
+    // which checked only retries -- would have claimed and redispatched work
+    // that had already succeeded.
+    expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBeNull();
+    const row = await db.query<{ status: string; retries: number }>(
+      'SELECT status, retries FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('met');
+    expect(Number(row.rows[0]?.retries)).toBe(0);
+  });
+
+  test('claimRecoveryReplay moves the deadline without spending a retry', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-recovery',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date(0).toISOString())).toBe(1);
+    const fresh = new Date(Date.now() + 900_000).toISOString();
+    expect(await claimRecoveryReplay(id, 1, fresh, new Date(0).toISOString())).toBe(true);
+    const row = await db.query<{ due_at: string; retries: number; status: string }>(
+      'SELECT due_at, retries, status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    // The deadline moved; the retry count did NOT -- recovery finishes an
+    // attempt already paid for rather than buying another.
+    expect(Date.parse(String(row.rows[0]?.due_at))).toBe(Date.parse(fresh));
+    expect(Number(row.rows[0]?.retries)).toBe(1);
+    expect(row.rows[0]?.status).toBe('failed');
+  });
+
+  test('two ticks race the recovery replay: exactly one wins', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-recovery-race',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date(0).toISOString())).toBe(1);
+    const fresh = new Date(Date.now() + 900_000).toISOString();
+    const [a, b] = await Promise.all([
+      claimRecoveryReplay(id, 1, fresh, new Date(0).toISOString()),
+      claimRecoveryReplay(id, 1, fresh, new Date(0).toISOString()),
+    ]);
+    // The claim is what makes the replay exclusive: both ticks see the same
+    // unsent attempt, only one may put it on the wire.
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+  });
+
+  test('recovery replay is refused once the expectation is terminal', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-recovery-met',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date(0).toISOString())).toBe(1);
+    expect(await markMet(id, 'https://example/proof')).toBe(true);
+    // A tick racing a concurrent verification must not replay a dispatch for
+    // work that already succeeded.
+    expect(
+      await claimRecoveryReplay(id, 1, new Date().toISOString(), new Date(0).toISOString())
+    ).toBe(false);
+  });
+
+  test('claimEscalation is exclusive and leaves the row selectable for replay', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-escalating',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    const [a, b] = await Promise.all([
+      claimEscalation(id, 'tm:expectation:x:escalate'),
+      claimEscalation(id, 'tm:expectation:x:escalate'),
+    ]);
+    // Exclusive: a worker that loses never sends.
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    const row = await db.query<{ status: string }>(
+      'SELECT status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('escalating');
+    // NOT terminal: the tick must still see it so an unconfirmed send is
+    // replayed rather than lost.
+    const due = await listDueExpectations(new Date().toISOString());
+    expect(due.map(r => r.id)).toContain(id);
+  });
+
+  test('markEscalated closes an escalating row, and escalating blocks a stale failure', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-escalating-close',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    expect(await claimEscalation(id, 'tm:expectation:y:escalate')).toBe(true);
+    // A stale worker cannot drag a claimed escalation back to failed.
+    expect(await markFailed(id)).toBe(false);
+    // The confirm closes it.
+    expect(await markEscalated(id, 'tm:expectation:y:escalate')).toBe(true);
+    const row = await db.query<{ status: string }>(
+      'SELECT status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('escalated');
+    // Terminal: gone from the due list, and no further transition succeeds.
+    const due = await listDueExpectations(new Date().toISOString());
+    expect(due.map(r => r.id)).not.toContain(id);
+    expect(await markEscalated(id, 'again')).toBe(false);
+  });
+
+  test('evidence during escalating closes the row as met, against the real DAL', async () => {
+    // REGRESSION. markMet used to accept only ['pending','failed'], so a row
+    // that had entered 'escalating' could never be closed by late evidence:
+    // markMet returned false, the supervisor continued past the rejected
+    // transition, and the row stayed 'escalating' forever with every later tick
+    // repeating the same failed close.
+    //
+    // This exercises the REAL sqlite DAL, not a double. The round-5 supervisor
+    // test asserted this behaviour through a markMet stub that always returned
+    // true, so it passed while the invariant underneath it was broken.
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-met-during-escalating',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    expect(await claimEscalation(id, 'tm:expectation:m:escalate')).toBe(true);
+    const claimed = await db.query<{ status: string }>(
+      'SELECT status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(claimed.rows[0]?.status).toBe('escalating');
+
+    // Late evidence must still close it.
+    expect(await markMet(id, 'https://example/late-proof')).toBe(true);
+    const row = await db.query<{ status: string; evidence_pointer: string | null }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('met');
+    expect(row.rows[0]?.evidence_pointer).toBe('https://example/late-proof');
+
+    // A subsequent tick must not re-escalate or re-send: the row is terminal,
+    // so it is gone from the due list and every further transition is refused.
+    const due = await listDueExpectations(new Date().toISOString());
+    expect(due.map(r => r.id)).not.toContain(id);
+    expect(await claimEscalation(id, 'tm:expectation:m:escalate')).toBe(false);
+    expect(await markEscalated(id, 'tm:expectation:m:escalate')).toBe(false);
+    expect(await markFailed(id)).toBe(false);
+    expect(await markMet(id, 'https://example/second-observer')).toBe(false);
+    const final = await db.query<{ status: string; evidence_pointer: string | null }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(final.rows[0]?.status).toBe('met');
+    expect(final.rows[0]?.evidence_pointer).toBe('https://example/late-proof');
+  });
+
+  test('claimEscalation is refused once the expectation is met', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-escalate-after-met',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    expect(await markMet(id, 'https://example/proof')).toBe(true);
+    // The round-4 guarantee, preserved: a worker racing a verification loses
+    // the claim and therefore never sends the blocker.
+    expect(await claimEscalation(id, 'tm:expectation:z:escalate')).toBe(false);
+  });
+
+  test('the claim refuses to exceed max_retries', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-cap',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 1,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date().toISOString())).toBe(1);
+    expect(await claimRedispatchAttempt(id, 1, new Date().toISOString())).toBeNull();
+    const row = await db.query<{ retries: number }>(
+      'SELECT retries FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(Number(row.rows[0]?.retries)).toBe(1);
+  });
+});
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -56,12 +764,12 @@ function cleanupDb(path: string): void {
 beforeEach(() => {
   currentDbPath = join(tmpdir(), `taskmaster-test-${Date.now()}-${Math.random()}.db`);
   db = new SqliteAdapter(currentDbPath);
-}, SQLITE_HOOK_TIMEOUT_MS);
+});
 
 afterEach(async () => {
   await db.close();
   cleanupDb(currentDbPath);
-}, SQLITE_HOOK_TIMEOUT_MS);
+});
 
 describe('tm_journal DAL', () => {
   test('reset winning before notice enqueue rejects the obsolete paused epoch', async () => {

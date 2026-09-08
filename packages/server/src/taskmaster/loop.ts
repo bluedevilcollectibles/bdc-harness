@@ -41,6 +41,7 @@ import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibi
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
 import { fireBackoffDecision } from './backoff';
+import { checkExpectations } from './expectations';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -81,6 +82,16 @@ export function isPauseEffectsExempt(proposalType: string, pauseScope: string | 
 const JOURNAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PROOF_DEADLINE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The only cascade run statuses that count as EVIDENCE of success.
+ *
+ * TERMINAL_WORKFLOW_STATUSES also contains failed / escalated / cancelled --
+ * those are terminal but they are the outcomes an expectation exists to catch,
+ * so they must NOT satisfy it. A run still pending or running does not satisfy
+ * it either: it is simply not yet proven, and the deadline decides.
+ */
+const CASCADE_SUCCESS_STATUSES: readonly string[] = ['completed'];
 
 export interface TaskmasterState {
   deadman: DeadmanState;
@@ -123,7 +134,16 @@ type TaskmasterDal = Pick<
   // Suppression accessors (M-155 WO 3) are optional on injected DALs so
   // pre-WO3 test doubles keep compiling; when absent, durable suppression
   // writes are inert (the pure grade-based check still applies).
-  Partial<Pick<typeof taskmasterDb, 'getSuppression' | 'setSuppression' | 'clearSuppression'>>;
+  Partial<
+    Pick<
+      typeof taskmasterDb,
+      | 'getSuppression'
+      | 'setSuppression'
+      | 'clearSuppression'
+      | 'registerExpectation'
+      | 'getExpectationCounts'
+    >
+  >;
 
 export interface GithubIssueEvidence {
   state: 'open' | 'closed';
@@ -149,7 +169,7 @@ export interface TaskmasterDeps {
   db?: TaskmasterDal;
   createTask?: typeof createAuthenticatedMessage;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
-  listThreads?: () => Promise<ThreadSnapshot[]>;
+  listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
   headroom?: () => Promise<HeadroomReading>;
   /** External-SOR check: does a dispatch row exist for this key, and when was it sent? */
   findEffectByIdempotencyKey?: (
@@ -169,6 +189,7 @@ export interface TaskmasterDeps {
   getHealthSample?: typeof taskmasterDb.getHealthSample;
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
+  checkExpectations?: (now: Date) => Promise<void>;
 }
 
 export interface TickResult {
@@ -230,7 +251,7 @@ async function defaultListUndeliveredRulings(): Promise<ThreadSnapshot[]> {
     }));
 }
 
-function priorityFromLabels(labels: string[]): ThreadPriority {
+export function priorityFromLabels(labels: string[]): ThreadPriority | null {
   for (const p of ['P0', 'P1', 'P2', 'P3'] as const) {
     if (
       labels.some(label => {
@@ -240,7 +261,7 @@ function priorityFromLabels(labels: string[]): ThreadPriority {
     )
       return p;
   }
-  return 'P2';
+  return null;
 }
 
 interface GithubIssue {
@@ -348,6 +369,8 @@ export interface ListedThread extends ThreadSnapshot {
   labels?: string[];
 }
 
+export type ListedThreadResult = ListedThread[] & { unlabelledPriorityTriage: string[] };
+
 export interface AdoptionRefreshResult {
   ran: boolean;
   failed: boolean;
@@ -376,13 +399,16 @@ function assertGithubRateLimit(response: Response, context: string): void {
  * production callers use the tick() default. `fetchImpl` is injectable for
  * tests only.
  */
-export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promise<ListedThread[]> {
+export async function defaultListThreads(
+  fetchImpl: typeof fetch = fetch
+): Promise<ListedThreadResult> {
   const repos = (process.env.TASKMASTER_GH_REPOS ?? 'thinmansoftware/bdc-xo')
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ListedThread[] = [];
+  const unlabelledPriorityTriage: string[] = [];
   for (const repo of repos) {
     const seen = new Set<number>();
     for (const label of WORK_LABELS) {
@@ -408,6 +434,12 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
           seen.add(issue.number);
           const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
           const priority = priorityFromLabels(labels);
+          if (priority === null) {
+            const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
+            unlabelledPriorityTriage.push(ref);
+            log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
+            continue;
+          }
           const normalizedLabels = labels.map(label => label.trim().toLowerCase());
           const hasClaimStatus = normalizedLabels.some(label =>
             ['status:building', 'status:review'].includes(label)
@@ -437,7 +469,7 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
       }
     }
   }
-  return threads;
+  return Object.assign(threads, { unlabelledPriorityTriage });
 }
 
 interface GithubIssueDetail extends GithubIssue {
@@ -642,7 +674,9 @@ export function buildSelfPauseNotice(
 function digestProposal(
   actions24h: taskmasterDb.TmJournalEntry[],
   control: taskmasterDb.TmControlState,
-  nowMs: number
+  nowMs: number,
+  expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
+  unlabelledPriorityTriage: string[] = []
 ): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
   const digestActions = actions24h.filter(action => action.thread_ref !== 'taskmaster:reset');
@@ -655,6 +689,19 @@ function digestProposal(
     control.pause_state === 'RUNNING'
       ? activity
       : `reason=${control.pause_reason ?? 'unspecified'}; reset with: ${RESET_COMMAND}`;
+  // Expectation registry counts and the unlabelled-priority triage list ride
+  // along on the same daily message (this WO); the canary's pause-state fields
+  // above are #757's. Both are load-bearing -- neither replaces the other.
+  const expectationSummary = expectationCounts
+    ? // `escalating` is reported alongside the rest: it is a NON-terminal state
+      // meaning an escalation was claimed but its operator notification is not
+      // yet confirmed sent. Omitting it hid outstanding escalation sends from
+      // the one daily message a human actually reads.
+      ` Expectations: pending=${expectationCounts.pending}, met=${expectationCounts.met}, failed=${expectationCounts.failed}, escalating=${expectationCounts.escalating}, escalated=${expectationCounts.escalated}, given_up=${expectationCounts.given_up}.`
+    : '';
+  const triageSummary = unlabelledPriorityTriage.length
+    ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
+    : '';
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
@@ -664,7 +711,9 @@ function digestProposal(
     body:
       `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
       `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
-      `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.`,
+      `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.` +
+      `${expectationSummary}${triageSummary} ` +
+      'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
   };
@@ -1022,6 +1071,14 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   recordTickAttempt(state.deadman, nowMs);
   let tickFailures = 0;
 
+  try {
+    if (deps.checkExpectations) await deps.checkExpectations(new Date(nowMs));
+    else if (!deps.db) await checkExpectations(new Date(nowMs));
+  } catch (error) {
+    tickFailures += 1;
+    log.warn({ err: error as Error }, 'taskmaster.expectations_tick_failed');
+  }
+
   // 1. Pause state + epoch captured.
   let control = await dal.getPauseState();
   const epoch = control.epoch;
@@ -1180,6 +1237,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   let rulings: ThreadSnapshot[] = [];
   let threads: ThreadSnapshot[] = [];
+  let unlabelledPriorityTriage: string[] = [];
   try {
     rulings = await (deps.listUndeliveredRulings ?? defaultListUndeliveredRulings)();
   } catch (error) {
@@ -1187,7 +1245,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     log.warn({ err: error as Error }, 'taskmaster.rulings_read_failed');
   }
   try {
-    threads = await (deps.listThreads ?? defaultListThreads)();
+    const listed = await (deps.listThreads ?? defaultListThreads)();
+    threads = listed;
+    unlabelledPriorityTriage =
+      'unlabelledPriorityTriage' in listed ? listed.unlabelledPriorityTriage : [];
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.threads_read_failed');
@@ -1327,7 +1388,23 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
 
   // Daily digest: one summary message per UTC day through the same path.
-  const digest = digestProposal(actions24h, control, nowMs);
+  let expectationCounts: Record<taskmasterDb.TmExpectationStatus, number> | undefined;
+  try {
+    expectationCounts = dal.getExpectationCounts
+      ? await dal.getExpectationCounts()
+      : deps.db
+        ? undefined
+        : await taskmasterDb.getExpectationCounts();
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
+  }
+  const digest = digestProposal(
+    actions24h,
+    control,
+    nowMs,
+    expectationCounts,
+    unlabelledPriorityTriage
+  );
   proposals.push(digest);
 
   // Exceptions first so the per-tick budget can never starve them.
@@ -1537,13 +1614,37 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           );
         });
         const admitted = await admission;
+        const registerExpectation =
+          dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
+        await registerExpectation?.({
+          // Deterministic identity: replaying this journal action after a crash
+          // between the cascade admission and updateActionOutcome reuses the
+          // SAME expectation rather than registering a second one with
+          // different retry/escalation keys.
+          action_ref: journalRow.id,
+          dispatch_ref: admitted.cascadeId,
+          recipient: proposal.recipient,
+          // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching on
+          // the admission row's existence alone is not evidence of anything:
+          // admission is what CREATES that row, so the expectation would be
+          // met the instant it was registered and a failed or stalled cascade
+          // would never escalate (review finding [major]).
+          evidence_json: JSON.stringify({
+            kind: 'db_row_exists',
+            table: 'remote_agent_workflow_runs',
+            where: { id: admitted.cascadeId, status: CASCADE_SUCCESS_STATUSES },
+          }),
+          due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+          on_absence: 'escalate',
+          max_retries: 0,
+        });
         await dal.updateActionOutcome(
           journalRow.id,
           'sent',
           JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
         );
       } else {
-        await createTask(
+        const dispatched = await createTask(
           { kind: 'system', sender: 'taskmaster' },
           {
             correlation_id: `tm-${journalRow.id}`,
@@ -1557,6 +1658,22 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
           }
         );
+        const registerExpectation =
+          dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
+        await registerExpectation?.({
+          // Deterministic identity -- see the cascade branch above.
+          action_ref: journalRow.id,
+          dispatch_ref: dispatched.id,
+          recipient: proposal.recipient,
+          evidence_json: JSON.stringify({
+            kind: 'dispatch_reply_exists',
+            correlation_id: `tm-${journalRow.id}`,
+            classification: 'succeeded',
+          }),
+          due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+          on_absence: proposal.type === 'digest' ? 'escalate' : 'redispatch',
+          max_retries: 2,
+        });
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
       journalRow.outcome = 'sent';

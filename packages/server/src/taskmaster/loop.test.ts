@@ -11,6 +11,7 @@ import {
   defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
+  priorityFromLabels,
   tick,
   resolveTaskmasterIntervalMs,
   resolveFireVerbEnabled,
@@ -26,6 +27,7 @@ import {
   type GithubIssueEvidence,
   type AdoptionRefreshResult,
 } from './loop';
+import { checkEvidence } from './expectations';
 import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
 import { MAX_INTERVENTIONS_PER_ITEM_24H, type ActionProposal, NUDGE_CLOCK_MS } from './rules';
 import type { TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
@@ -425,6 +427,57 @@ function ruling(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot {
   };
 }
 
+describe('expectation registry tick wiring', () => {
+  test('checks expectations, reports counts, and registers ordinary dispatch proof', async () => {
+    const world = makeWorld();
+    const checkedAt: Date[] = [];
+    const registered: Array<{ dispatch_ref: string; on_absence: string }> = [];
+    const deps = makeDeps(world, {
+      checkExpectations: async now => {
+        checkedAt.push(now);
+      },
+      listThreads: async () =>
+        Object.assign([], {
+          unlabelledPriorityTriage: ['gh:thinmansoftware/bdc-harness#404'],
+        }),
+    });
+    deps.db = {
+      ...deps.db!,
+      getExpectationCounts: async () => ({
+        pending: 2,
+        met: 3,
+        failed: 4,
+        escalating: 7,
+        escalated: 5,
+        given_up: 6,
+      }),
+      registerExpectation: async data => {
+        registered.push(data);
+        return 'expectation-digest';
+      },
+    };
+
+    await tick(createTaskmasterState(60_000), deps);
+
+    expect(checkedAt).toEqual([new Date(T0)]);
+    expect(registered).toHaveLength(1);
+    expect(registered[0]?.dispatch_ref).toBe('msg-1');
+    expect(registered[0]?.on_absence).toBe('escalate');
+    // The journal action id is the other half of the deterministic identity;
+    // without it a replayed action would register a second expectation.
+    expect(registered[0]?.action_ref).toBeTruthy();
+    const digest = world.sentMessages.find(message =>
+      message.idempotency_key.startsWith('tm:digest:')
+    );
+    // `escalating` is in the digest: a non-terminal claimed-but-unsent
+    // escalation is exactly the thing a human needs to see in the daily line.
+    expect(digest?.body).toContain(
+      'pending=2, met=3, failed=4, escalating=7, escalated=5, given_up=6'
+    );
+    expect(digest?.body).toContain('Needs priority triage: gh:thinmansoftware/bdc-harness#404');
+  });
+});
+
 describe('scenario 1: undelivered ruling is delivered exactly once (dedupe proven)', () => {
   test('two ticks produce one deliver_ruling row and one send; a third tick adds nothing', async () => {
     const world = makeWorld();
@@ -664,6 +717,14 @@ describe('fire_cauldron loop', () => {
           return record;
         }) as NonNullable<TaskmasterDeps['runCascade']>,
       });
+      const registered: Array<{ dispatch_ref: string; evidence_json: string }> = [];
+      deps.db = {
+        ...deps.db!,
+        registerExpectation: async data => {
+          registered.push(data);
+          return 'expectation-fire';
+        },
+      };
       const state = createTaskmasterState(60_000);
       await tick(state, deps);
       await tick(state, deps);
@@ -672,6 +733,38 @@ describe('fire_cauldron loop', () => {
       expect(fires).toHaveLength(1);
       expect(fires[0]?.outcome).toBe('sent');
       expect(fires[0]?.proposal_json).toContain('cascade-501');
+      expect(registered).toHaveLength(1);
+      expect(registered[0]?.dispatch_ref).toBe('cascade-501');
+      expect(registered[0]?.evidence_json).toContain('remote_agent_workflow_runs');
+      // Deterministic identity: the journal action id is passed so a replayed
+      // fire reuses this expectation instead of registering a second one.
+      expect(registered[0]?.action_ref).toBe(fires[0]?.id);
+
+      // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching only on
+      // the admission row's existence is self-fulfilling -- admission creates
+      // that row -- so a failed or stalled cascade would never escalate.
+      const spec = JSON.parse(registered[0]!.evidence_json) as {
+        where: Record<string, unknown>;
+      };
+      expect(spec.where.status).toEqual(['completed']);
+
+      // Run the registered spec against a run table to prove it: admitted but
+      // unfinished is NOT met, failed is NOT met, completed IS met.
+      const runs = [{ id: 'cascade-501', status: 'running' }];
+      const query = async <T>(_sql: string, params?: unknown[]) => {
+        const [id, ...statuses] = (params ?? []) as string[];
+        return {
+          rows: runs.filter(
+            run => run.id === id && statuses.includes(run.status)
+          ) as unknown as T[],
+        };
+      };
+      const evidence = spec as unknown as Parameters<typeof checkEvidence>[0];
+      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      runs[0]!.status = 'failed';
+      expect((await checkEvidence(evidence, { query })).ok).toBe(false);
+      runs[0]!.status = 'completed';
+      expect((await checkEvidence(evidence, { query })).ok).toBe(true);
       expect(world.sentMessages.some(message => message.body.includes('Unclaimed P0'))).toBe(false);
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
@@ -2187,12 +2280,20 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const byNumber = new Map(threads.map(thread => [Number(thread.ref.split('#')[1]), thread]));
     expect([10, 11, 12].map(number => byNumber.get(number)?.priority)).toEqual(['P1', 'P1', 'P1']);
     expect(byNumber.get(13)?.priority).toBe('P0');
-    expect(byNumber.get(14)?.priority).toBe('P2');
+    expect(byNumber.has(14)).toBe(false);
     expect(byNumber.get(15)?.isBlocked).toBe(true);
     expect(byNumber.get(16)?.isUnclaimedP0).toBe(false);
     expect(byNumber.get(17)?.isBlocked).toBe(false);
     expect(byNumber.get(17)?.isHeld).toBe(true);
     expect(byNumber.get(18)?.isUnclaimed).toBe(false);
+  });
+
+  test('unlabelled_priority_surfaces_for_triage', async () => {
+    const { fetchImpl } = fakeGithubFetch({ wo: [ghIssue(44, ['wo'])] });
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(0);
+    expect(threads.unlabelledPriorityTriage).toEqual(['gh:thinmansoftware/bdc-harness#44']);
+    expect(priorityFromLabels(['wo'])).toBeNull();
   });
 
   test('defaults to bdc-xo when TASKMASTER_GH_REPOS is unset', async () => {

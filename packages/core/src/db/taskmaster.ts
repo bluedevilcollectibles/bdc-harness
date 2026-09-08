@@ -33,6 +33,37 @@ export type TmGrade = 'useful' | 'noise' | 'harmful';
 export type TmPauseState = 'RUNNING' | 'PAUSED' | 'HARD_PAUSE';
 export type TmHealthState = 'healthy' | 'degraded' | 'dark' | 'unknown';
 export type TmUsageConfidence = 'high' | 'low' | 'none';
+export type TmExpectationAbsence = 'redispatch' | 'escalate' | 'give_up';
+/**
+ * `escalating` is an intermediate, NON-terminal state: the tick has exclusively
+ * claimed the right to send the operator escalation but the send is not yet
+ * confirmed. It remains selectable by listDueExpectations precisely so a send
+ * that threw (or a process that died mid-send) is replayed on a later tick
+ * under the deterministic escalation key. Only a confirmed send advances it to
+ * the terminal `escalated`.
+ */
+export type TmExpectationStatus =
+  | 'pending'
+  | 'met'
+  | 'failed'
+  | 'escalating'
+  | 'escalated'
+  | 'given_up';
+
+export interface TmExpectation {
+  id: string;
+  dispatch_ref: string;
+  recipient: string;
+  evidence_json: string;
+  due_at: string;
+  on_absence: TmExpectationAbsence;
+  max_retries: number;
+  retries: number;
+  status: TmExpectationStatus;
+  evidence_pointer: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 export interface TmJournalEntry {
   id: string;
@@ -117,6 +148,370 @@ function normalizeControl(row: TmControlRow): TmControlState {
     epoch: Number(row.epoch),
     updated_at: toIso(row.updated_at),
   };
+}
+
+function normalizeExpectation(row: TmExpectation): TmExpectation {
+  return {
+    ...row,
+    max_retries: row.max_retries,
+    retries: row.retries,
+    due_at: toIso(row.due_at),
+    created_at: toIso(row.created_at),
+    updated_at: toIso(row.updated_at),
+  };
+}
+
+/**
+ * Stable identity for one expectation, derived from the work that caused it.
+ *
+ * `registration_key` is what makes registration idempotent. It is NOT the
+ * random row id: a UUID differs on every call, so replaying an action after a
+ * crash between the dispatch and the journal finalization used to register a
+ * SECOND expectation for the same dispatch -- with a different id, and
+ * therefore different retry and escalation idempotency keys, which is duplicate
+ * external work rather than a harmless duplicate row.
+ *
+ * The pair (action_ref, dispatch_ref) is the identity: the same journal action
+ * dispatching the same thing is the same expectation, however many times the
+ * tick replays it. Callers without a journal action pass the dispatch_ref alone.
+ */
+export function expectationRegistrationKey(actionRef: string | null, dispatchRef: string): string {
+  return actionRef ? `${actionRef}:${dispatchRef}` : dispatchRef;
+}
+
+/**
+ * Register an expectation IDEMPOTENTLY.
+ *
+ * Two mechanisms, deliberately both: a deterministic identity (see
+ * expectationRegistrationKey) AND a database-enforced UNIQUE index on it, so
+ * the invariant survives a caller that forgets to pass action_ref and holds
+ * under concurrent ticks rather than depending on read-then-write timing.
+ *
+ * INSERT ... ON CONFLICT DO NOTHING RETURNING gives the existing row's id back
+ * on a replay, so the caller's retry/escalation keys stay identical across
+ * attempts. Returns the id of the expectation that now exists -- new or
+ * pre-existing.
+ */
+export async function registerExpectation(data: {
+  dispatch_ref: string;
+  recipient: string;
+  evidence_json: string;
+  due_at: string;
+  on_absence: TmExpectationAbsence;
+  max_retries: number;
+  /** Journal action id, when the registration is caused by one. */
+  action_ref?: string | null;
+}): Promise<string> {
+  const registrationKey = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  const inserted = await db.query<{ id: string }>(
+    `INSERT INTO tm_expectations
+     (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
+      max_retries, retries, status, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $9)
+     ON CONFLICT (registration_key) DO NOTHING
+     RETURNING id`,
+    [
+      randomUUID(),
+      registrationKey,
+      data.dispatch_ref,
+      data.recipient,
+      data.evidence_json,
+      data.due_at,
+      data.on_absence,
+      data.max_retries,
+      now,
+    ]
+  );
+  const row = inserted.rows[0];
+  if (row) return row.id;
+  // The conflict fired: an expectation for this exact work already exists.
+  // Return ITS id so every downstream key matches the first registration.
+  const existing = await db.query<{ id: string }>(
+    'SELECT id FROM tm_expectations WHERE registration_key = $1',
+    [registrationKey]
+  );
+  const existingRow = existing.rows[0];
+  if (!existingRow)
+    throw new Error('tm_expectations registration conflict without an existing row');
+  return existingRow.id;
+}
+
+/**
+ * Active expectations are returned even before due_at so success can close early.
+ *
+ * `escalating` is included deliberately. It is the claimed-but-unconfirmed
+ * escalation state, and a row sitting there means a send was authorized but may
+ * never have gone out (it threw, or the process died). Leaving it unselected is
+ * exactly how an escalation gets permanently lost, so the tick must keep seeing
+ * it until the send is confirmed.
+ */
+export async function listDueExpectations(_now: string): Promise<TmExpectation[]> {
+  const result = await getDatabase().query<TmExpectation>(
+    "SELECT * FROM tm_expectations WHERE status IN ('pending', 'failed', 'escalating') ORDER BY due_at ASC"
+  );
+  return result.rows.map(normalizeExpectation);
+}
+
+/**
+ * The only statuses an expectation can be transitioned OUT of.
+ *
+ * `met`, `escalated` and `given_up` are TERMINAL: once a tick has closed an
+ * expectation, no other tick may reopen or overwrite it. Every transition below
+ * names this set (or a narrower one) in its WHERE clause, so a stale worker
+ * cannot regress a closed row -- and, because each returns rowCount, cannot
+ * silently proceed to the external action that transition was gating either.
+ */
+const ACTIVE_EXPECTATION_STATUSES = ['pending', 'failed'] as const;
+
+/**
+ * Conditional state transition. The prior status is named in the WHERE clause
+ * and the affected-row count IS the answer: true means this caller owns the
+ * transition, false means another tick got there first and the caller must not
+ * perform whatever external action the transition was gating.
+ *
+ * A plain `UPDATE ... WHERE id = $1` (the pre-repair shape) let two overlapping
+ * ticks stamp conflicting statuses onto the same row -- one verifying evidence
+ * and marking it met, the other stamping failed over the top and redispatching
+ * work that had already succeeded.
+ */
+async function transitionExpectation(
+  id: string,
+  status: TmExpectationStatus,
+  fromStatuses: readonly TmExpectationStatus[],
+  evidencePointer?: string | null
+): Promise<boolean> {
+  const placeholders = fromStatuses.map((_, index) => `$${String(index + 4)}`).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET status = $1, evidence_pointer = $2, updated_at = $3
+      WHERE id = $${String(fromStatuses.length + 4)}
+        AND status IN (${placeholders})`,
+    [status, evidencePointer ?? null, new Date().toISOString(), ...fromStatuses, id]
+  );
+  return result.rowCount === 1;
+}
+
+/**
+ * Close an expectation as met. Returns false when another tick already closed
+ * it -- evidence arriving twice is not an error, but the second observer must
+ * not re-close the row.
+ *
+ * `escalating` is accepted alongside the active set. Evidence can legitimately
+ * arrive after a tick has claimed the escalation but before the operator
+ * notification is confirmed, and success is success however far escalation had
+ * progressed. Excluding it was a real bug: markMet returned false, the
+ * supervisor continued past the rejected transition, and the row stayed
+ * `escalating` forever with every later tick repeating the same failed close.
+ *
+ * The terminal states (`met`, `escalated`, `given_up`) are still excluded, so a
+ * stale worker cannot reopen a row that is genuinely closed.
+ */
+export async function markMet(id: string, evidencePointer: string): Promise<boolean> {
+  return transitionExpectation(
+    id,
+    'met',
+    [...ACTIVE_EXPECTATION_STATUSES, 'escalating'],
+    evidencePointer
+  );
+}
+
+/**
+ * Record that the deadline passed with no evidence. Conditioned on the row
+ * still being active, so a concurrent tick that has already marked it met (or
+ * escalated it, or given up on it) cannot be overwritten with `failed`.
+ * Returns false when the row was already closed; the caller MUST then skip the
+ * redispatch/escalate work that follows.
+ */
+export async function markFailed(id: string): Promise<boolean> {
+  return transitionExpectation(id, 'failed', ACTIVE_EXPECTATION_STATUSES);
+}
+
+// NOTE: there is deliberately no unconditional incrementRetry(). It existed
+// until this repair and was exactly the unsafe primitive the review flagged --
+// a blind `WHERE id = $1` that let a stale tick advance the counter on a row
+// another tick had already closed. claimRedispatchAttempt() is the only way to
+// advance retries, and it is a compare-and-set. Do not reintroduce a
+// non-conditional variant.
+
+/**
+ * Atomically CLAIM the next redispatch attempt (WO review finding: redispatch
+ * was neither atomic nor idempotent).
+ *
+ * The counter is advanced BEFORE the send, under a compare-and-set on BOTH the
+ * retry count and the active status the caller observed, and bounded by
+ * max_retries in the same statement. Consequences the caller relies on:
+ *
+ *  - Two overlapping ticks: only one UPDATE matches `retries = $expected`;
+ *    the loser gets null and MUST NOT send. No double-dispatch.
+ *  - A tick that raced a successful verification: the row is already `met`, so
+ *    it is no longer in the active set, no row matches, and no redispatch is
+ *    sent for work that has already succeeded. The retry-counter CAS alone did
+ *    NOT prevent this -- the status predicate is what closes it.
+ *  - A crash after the claim and before the send: the count is already
+ *    advanced, so the budget can never be exceeded and the count is never
+ *    lost. The caller replays the attempt under its deterministic
+ *    idempotency key, so recovery cannot double-send either.
+ *  - retries >= max_retries: no row matches, null is returned, and the caller
+ *    falls through to escalation instead of looping.
+ *
+ * Returns the claimed attempt number (1-based), or null when the claim lost.
+ */
+export async function claimRedispatchAttempt(
+  id: string,
+  expectedRetries: number,
+  dueAt: string
+): Promise<number | null> {
+  // ONE statement decides the claim, and its affected-row count IS the answer.
+  //
+  // Doing this as an UPDATE followed by a separate SELECT would be wrong even
+  // inside a transaction on some engines and is outright unusable here: two
+  // ticks would both re-read expected+1 and both believe they won. Wrapping it
+  // in withTransaction is also not an option -- the sqlite adapter runs on a
+  // single connection and rejects a nested BEGIN, so a caller that already
+  // holds a transaction would crash.
+  //
+  // A conditional UPDATE needs neither: on Postgres the row lock serializes the
+  // two writers and the loser's `retries = $expected` predicate no longer
+  // matches; on the single-connection sqlite adapter the statement is atomic by
+  // construction. rowCount is 1 for the winner and 0 for everyone else.
+  const activePlaceholders = ACTIVE_EXPECTATION_STATUSES.map(
+    (_, index) => `$${String(index + 5)}`
+  ).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET status = 'failed', retries = retries + 1, due_at = $1, updated_at = $2
+      WHERE id = $3
+        AND retries = $4
+        AND retries < max_retries
+        AND status IN (${activePlaceholders})`,
+    [dueAt, new Date().toISOString(), id, expectedRetries, ...ACTIVE_EXPECTATION_STATUSES]
+  );
+  return result.rowCount === 1 ? expectedRetries + 1 : null;
+}
+/**
+ * Atomically CLAIM the recovery replay of an already-claimed-but-unsent attempt
+ * AND set the fresh evidence deadline for it, in one conditional UPDATE.
+ *
+ * Recovery only runs once due_at has already elapsed (that is what brought the
+ * tick here), so replaying the send without moving the deadline left the row
+ * instantly overdue again: the very next tick would judge the just-recovered
+ * dispatch a failure and burn another retry -- or escalate -- without ever
+ * giving the recipient the configured response interval. The deadline must move
+ * with the replay, not after it.
+ *
+ * Conditioned on the retry count the caller observed and on the row still being
+ * active, so this doubles as an exclusive claim: two ticks that both see the
+ * same unsent attempt cannot both replay it, and a tick racing a concurrent
+ * markMet loses and sends nothing. rowCount is 1 for the winner, 0 for the rest.
+ *
+ * NOTE the deliberate asymmetry with claimRedispatchAttempt: this does NOT
+ * advance `retries`. The attempt being recovered was already paid for when it
+ * was claimed; recovery finishes it rather than buying another.
+ */
+export async function claimRecoveryReplay(
+  id: string,
+  expectedRetries: number,
+  dueAt: string,
+  expectedDueAt: string
+): Promise<boolean> {
+  // The predicate MUST include the observed due_at, and the UPDATE changes it.
+  //
+  // claimRedispatchAttempt gets exclusivity for free: its `retries = $expected`
+  // predicate is invalidated by its own `retries + 1`. This statement does not
+  // touch retries, so conditioning on retries alone leaves the predicate TRUE
+  // after the winner commits and BOTH ticks match -- caught by the "two ticks
+  // race the recovery replay" test, which saw two winners. Matching on the
+  // deadline this tick observed, and then moving it, is what makes the claim
+  // self-invalidating and therefore exclusive.
+  const activePlaceholders = ACTIVE_EXPECTATION_STATUSES.map(
+    (_, index) => `$${String(index + 6)}`
+  ).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET due_at = $1, updated_at = $2
+      WHERE id = $3
+        AND retries = $4
+        AND due_at = $5
+        AND status IN (${activePlaceholders})`,
+    [
+      dueAt,
+      new Date().toISOString(),
+      id,
+      expectedRetries,
+      expectedDueAt,
+      ...ACTIVE_EXPECTATION_STATUSES,
+    ]
+  );
+  return result.rowCount === 1;
+}
+
+/**
+ * CLAIM the right to send the operator escalation, without closing the row.
+ *
+ * This is the first half of a two-phase escalation, and it exists because both
+ * single-phase orderings are broken:
+ *
+ *  - send THEN transition: a worker that loses the transition has already put
+ *    an operator blocker on the wire and cannot retract it.
+ *  - transition THEN send: the row is terminal the instant the transition
+ *    commits, so a send that throws (or a crash right after) loses the
+ *    escalation forever -- listDueExpectations would never select it again.
+ *
+ * Claiming an intermediate NON-terminal `escalating` state gives both
+ * guarantees at once: it is exclusive (conditional on the active set, so a
+ * worker racing a concurrent markMet loses and never sends), and it is still
+ * selectable, so an unconfirmed send is replayed by a later tick under the
+ * deterministic escalation key. Returns false when the claim was lost.
+ */
+export async function claimEscalation(id: string, evidencePointer?: string): Promise<boolean> {
+  return transitionExpectation(id, 'escalating', ACTIVE_EXPECTATION_STATUSES, evidencePointer);
+}
+
+/**
+ * Close an expectation as escalated to a human -- the second half of the
+ * two-phase escalation, run only once the operator notification is CONFIRMED
+ * sent.
+ *
+ * Accepts the active set as well as `escalating` so that a tick which claimed
+ * and sent in one pass can close the row, and so a replay tick can close a row
+ * another worker left in `escalating`. The escalation dispatch is written under
+ * a deterministic idempotency key, so a replay reuses the existing row rather
+ * than creating a second operator task.
+ */
+export async function markEscalated(id: string, evidencePointer?: string): Promise<boolean> {
+  return transitionExpectation(
+    id,
+    'escalated',
+    [...ACTIVE_EXPECTATION_STATUSES, 'escalating'],
+    evidencePointer
+  );
+}
+
+/**
+ * Close an expectation as abandoned, with the reason as the pointer.
+ * Conditioned on the row still being active for the same reason as
+ * markEscalated. Returns false when the row was already closed.
+ */
+export async function markGivenUp(id: string, reason: string): Promise<boolean> {
+  return transitionExpectation(id, 'given_up', ACTIVE_EXPECTATION_STATUSES, reason);
+}
+
+export async function getExpectationCounts(): Promise<Record<TmExpectationStatus, number>> {
+  const counts: Record<TmExpectationStatus, number> = {
+    pending: 0,
+    met: 0,
+    failed: 0,
+    escalating: 0,
+    escalated: 0,
+    given_up: 0,
+  };
+  const result = await getDatabase().query<{ status: TmExpectationStatus; count: number | string }>(
+    'SELECT status, COUNT(*) AS count FROM tm_expectations GROUP BY status'
+  );
+  for (const row of result.rows) counts[row.status] = Number(row.count);
+  return counts;
 }
 
 /**

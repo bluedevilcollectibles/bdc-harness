@@ -16,6 +16,36 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+/**
+ * Canonical tm_expectations schema (migration 049), shared by the fresh-table
+ * path in initSchema and the empty-table recreate in migrateColumns so the two
+ * cannot drift apart.
+ */
+const TM_EXPECTATIONS_SCHEMA = `CREATE TABLE tm_expectations (
+  id TEXT PRIMARY KEY,
+  registration_key TEXT NOT NULL UNIQUE,
+  dispatch_ref TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  due_at TEXT NOT NULL,
+  on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+  max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+  retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (
+    status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
+  ),
+  evidence_pointer TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`;
+
+const TM_EXPECTATIONS_UNIQUE_INDEX =
+  'CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key ON tm_expectations(registration_key)';
+const TM_EXPECTATIONS_DUE_INDEX =
+  'CREATE INDEX IF NOT EXISTS idx_tm_expectations_due ON tm_expectations(status, due_at)';
+const TM_EXPECTATIONS_DISPATCH_REF_INDEX =
+  'CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref ON tm_expectations(dispatch_ref)';
+
 export class SqliteAdapter implements IDatabase {
   private db: Database;
   readonly dialect = 'sqlite' as const;
@@ -42,6 +72,10 @@ export class SqliteAdapter implements IDatabase {
 
     // Enable foreign keys
     this.db.run('PRAGMA foreign_keys = ON');
+
+    // Settle any outdated tm_expectations shape BEFORE initSchema, whose
+    // index creation would otherwise fail against the old table.
+    this.ensureTmExpectationsShape();
 
     // Initialize schema if needed
     this.initSchema();
@@ -231,6 +265,110 @@ export class SqliteAdapter implements IDatabase {
    * Always runs createSchema() since all statements use IF NOT EXISTS,
    * ensuring new tables from migrations are created in existing databases.
    */
+  /**
+   * Resolve an outdated tm_expectations BEFORE initSchema runs.
+   *
+   * Ordering matters: initSchema's CREATE TABLE IF NOT EXISTS is a no-op on
+   * an existing table, but its CREATE UNIQUE INDEX on registration_key is
+   * not -- against an outdated table that statement fails with
+   * "no such column: registration_key" before any check could run. So the
+   * shape is settled first.
+   */
+  private ensureTmExpectationsShape(): void {
+    // Taskmaster expectation registry shape check (migration 049).
+    //
+    // DESIGN NOTE -- why there is no automatic key-derivation repair here.
+    //
+    // tm_expectations ships for the FIRST TIME in this WO. It exists in no
+    // commit on origin/dev (`git log -S tm_expectations` returns only this
+    // branch's commits) and the live archon.db answers TABLE_ABSENT for
+    // `SELECT sql FROM sqlite_master WHERE name='tm_expectations'`. No deployed
+    // database can hold a legacy shape, so a backfill that derives
+    // registration_key values for pre-existing rows is surface with no caller --
+    // and five successive attempts to make such a derivation collision-free for
+    // every starting state each left another hole. Deriving keys is simply the
+    // wrong tool: any scheme that mixes preserved keys with derived ones can
+    // collide, and a collision fails index creation and blocks startup.
+    //
+    // So: recognise the current shape, recreate an EMPTY mismatched table, and
+    // REFUSE LOUDLY on a non-empty mismatched table rather than guessing. A
+    // human with the one-off script can inspect and decide; a startup path
+    // cannot. Refusing is safe because the only way to reach it is a database
+    // built from an intermediate revision of this branch.
+    try {
+      const expectationCols = this.pragmaAll("PRAGMA table_info('tm_expectations')") as {
+        name: string;
+      }[];
+      if (expectationCols.length > 0) {
+        const createSql =
+          (
+            this.pragmaAll(
+              "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+            ) as { sql?: string }[]
+          )[0]?.sql ?? '';
+        const uniqueIndex = this.pragmaAll(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_tm_expectations_registration_key'"
+        ) as { name?: string }[];
+
+        // Three independent facts define the current shape. The CHECK is only
+        // reachable through the stored CREATE TABLE text -- PRAGMA table_info
+        // does not expose it.
+        const hasRegistrationKey = expectationCols.some(c => c.name === 'registration_key');
+        const checkAllowsEscalating = createSql.includes('escalating');
+        const hasUniqueIndex = uniqueIndex.length > 0;
+        const shapeIsCurrent = hasRegistrationKey && checkAllowsEscalating && hasUniqueIndex;
+
+        if (!shapeIsCurrent) {
+          const rowCount =
+            (this.pragmaAll('SELECT COUNT(*) AS cnt FROM tm_expectations') as { cnt?: number }[])[0]
+              ?.cnt ?? 0;
+
+          if (rowCount > 0) {
+            // REFUSE. Never guess at keys for rows a human has not seen.
+            throw new Error(
+              `tm_expectations has an outdated schema and ${String(rowCount)} row(s), so startup ` +
+                'cannot continue: deriving registration_key values automatically risks ' +
+                'collisions that would silently break expectation registration. Run ' +
+                '`bun scripts/db/repair-tm-expectations.ts <path-to-db>` to inspect the rows, ' +
+                'export them to JSON, and recreate the table with the current schema. ' +
+                `Missing: ${[
+                  hasRegistrationKey ? null : 'registration_key column',
+                  checkAllowsEscalating ? null : "status CHECK allowing 'escalating'",
+                  hasUniqueIndex ? null : 'unique index on registration_key',
+                ]
+                  .filter(Boolean)
+                  .join(', ')}.`
+            );
+          }
+
+          // Empty and mismatched: recreating is lossless, so just do it.
+          this.db.run('BEGIN');
+          try {
+            this.db.run('DROP TABLE tm_expectations');
+            this.db.run(TM_EXPECTATIONS_SCHEMA);
+            this.db.run(TM_EXPECTATIONS_UNIQUE_INDEX);
+            this.db.run(TM_EXPECTATIONS_DUE_INDEX);
+            this.db.run(TM_EXPECTATIONS_DISPATCH_REF_INDEX);
+            this.db.run('COMMIT');
+          } catch (recreateError) {
+            this.db.run('ROLLBACK');
+            throw recreateError;
+          }
+          getLog().warn(
+            { table: 'tm_expectations' },
+            'db.sqlite_tm_expectations_empty_table_recreated'
+          );
+        }
+      }
+    } catch (e: unknown) {
+      // FAIL LOUDLY. A mismatched schema breaks expectation registration for
+      // the life of the process; a warning in a log nobody reads is not an
+      // acceptable outcome for a constraint the write path depends on.
+      getLog().error({ err: e as Error }, 'db.sqlite_tm_expectations_schema_check_failed');
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+  }
+
   private initSchema(): void {
     this.createSchema();
     this.migrateColumns();
@@ -1981,6 +2119,36 @@ export class SqliteAdapter implements IDatabase {
         confidence TEXT,
         is_unknown INTEGER NOT NULL DEFAULT 0 CHECK (is_unknown IN (0, 1))
       );
+
+      -- Taskmaster expectation registry (migration 049).
+      CREATE TABLE IF NOT EXISTS tm_expectations (
+        id TEXT PRIMARY KEY,
+        -- Stable identity for the causing work, normally
+        -- "<journal action id>:<dispatch_ref>". UNIQUE so a replayed action
+        -- cannot register a second expectation for the same dispatch (mirror
+        -- of migration 049).
+        registration_key TEXT NOT NULL UNIQUE,
+        dispatch_ref TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        due_at TEXT NOT NULL,
+        on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+        max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+        retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (
+          status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
+        ),
+        evidence_pointer TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key
+        ON tm_expectations(registration_key);
+      CREATE INDEX IF NOT EXISTS idx_tm_expectations_due
+        ON tm_expectations(status, due_at);
+      CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref
+        ON tm_expectations(dispatch_ref);
 
       INSERT OR IGNORE INTO tm_control (id, pause_state, epoch) VALUES (1, 'RUNNING', 0);
 

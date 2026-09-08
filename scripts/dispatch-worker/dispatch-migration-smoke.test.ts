@@ -23,10 +23,25 @@ import { pathToFileURL } from 'url';
 // 5015ms/5016ms against siblings measuring 4391ms, 2984ms and 2484ms). Ubuntu
 // was always green: this is runner speed, not a product defect.
 //
+// RAISED 30s -> 90s (2026-09-08). The same class recurred at the higher
+// threshold: on run 34193910325 (windows-latest) "migrates only a temporary
+// copy..." and "fails when the expected heartbeat count does not match" BOTH
+// hit the 30000ms wall (30016ms / 30015ms) and their spawned children were
+// killed -- the CLI exited 143, SIGTERM, with "killed 1 dangling process"
+// logged immediately before. On the SAME commit and the SAME run, ubuntu ran
+// those two tests in 1160.99ms and 769.99ms. A ~26x platform gap with no
+// product difference is runner contention, and the two slowest tests here are
+// the ones that spawn the migration CLI *and* run a real SqliteAdapter
+// migration inside that child.
+//
+// 90s is chosen against the observed 30s wall rather than the ~1s happy path,
+// so it absorbs a badly contended runner without letting a genuine hang sit
+// for minutes.
+//
 // Restating the default here makes this file honest under any invocation --
 // the pinned `bun test:dispatch-migration-smoke`, the core package suite, or a
 // direct run -- and independent of the Bun version in play.
-setDefaultTimeout(30_000);
+setDefaultTimeout(90_000);
 
 const temporaryDirectories: string[] = [];
 const scriptPath = join(import.meta.dir, 'dispatch-migration-smoke.ts');
@@ -754,7 +769,7 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(missingParent.stderr).not.toContain(missingParentOutput);
     expect(await sha256(dbPath)).toBe(beforeHash);
     expect(await Bun.file(missingParentOutput).exists()).toBe(false);
-  }, 15_000);
+  });
 
   test.skipIf(process.platform === 'win32')(
     'rejects dangling output aliases before migration',
@@ -779,8 +794,7 @@ describe('dispatch-migration-smoke CLI', () => {
       expect(dangling.stderr).not.toContain(danglingOutput);
       expect((await lstat(danglingOutput)).isSymbolicLink()).toBe(true);
       expect(await sha256(dbPath)).toBe(beforeHash);
-    },
-    15_000
+    }
   );
 
   test('does not export when migration validation fails', async () => {
@@ -844,5 +858,5 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(result.stderr).toContain('migrated_copy_export_failed');
     expect(result.stderr).not.toContain(outputPath);
     expect(await Bun.file(outputPath).exists()).toBe(false);
-  }, 15_000);
+  });
 });
