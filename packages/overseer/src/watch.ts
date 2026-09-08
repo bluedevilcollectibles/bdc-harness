@@ -420,12 +420,30 @@ export async function watchOnce(
 export async function watchLoop(
   deps: OverseerRunStoreDeps & GitHubClientDeps,
   onRecord: (record: WatchedRunRecord) => Promise<void>,
-  options: { intervalMs?: number; once?: boolean; signal?: AbortSignal } = {}
+  options: {
+    intervalMs?: number;
+    once?: boolean;
+    signal?: AbortSignal;
+    /**
+     * Forwarded to watchOnce. Production passes nothing and the sweep reads its
+     * repos/bases from env; tests supply explicit values so an integration test
+     * can drive the real watchLoop -> onRecord path deterministically instead of
+     * reimplementing the dispatch it is trying to verify.
+     */
+    discovery?: WatchOnceOptions['discovery'];
+    discoveryEnabled?: boolean;
+  } = {}
 ): Promise<void> {
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
+  const watchOptions: WatchOnceOptions = {
+    ...(options.discovery === undefined ? {} : { discovery: options.discovery }),
+    ...(options.discoveryEnabled === undefined
+      ? {}
+      : { discoveryEnabled: options.discoveryEnabled }),
+  };
   for (;;) {
     if (options.signal?.aborted) return;
-    const records = await watchOnce(deps);
+    const records = await watchOnce(deps, watchOptions);
     for (const record of records) {
       if (options.signal?.aborted) return;
       await onRecord(record);

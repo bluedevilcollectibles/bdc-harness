@@ -1149,17 +1149,43 @@ export type ReviewDecisionUnavailableReason =
   | 'graphql_empty_response';
 
 export interface ReviewDecisionLookup {
-  /** GitHub's aggregate decision per PR number. Empty when unavailable. */
+  /**
+   * GitHub's aggregate decision per PR number. Populated for every PR whose
+   * batch succeeded; a PR missing from this map falls back to the conservative
+   * REST derivation. Partial by design -- one failed batch no longer empties
+   * the answers the other batches did obtain.
+   */
   readonly decisions: Map<number, string | null>;
   /**
-   * Set when GitHub's aggregate could not be obtained for the whole batch, so
-   * every PR in it falls back to the conservative REST derivation. Null on a
-   * clean read. Named rather than boolean so the operator log says WHY.
+   * Set when at least one batch could not be read, so the PRs in THAT batch
+   * fall back to the conservative REST derivation. Null on a clean read. Named
+   * rather than boolean so the operator log says WHY. When several batches fail
+   * for different reasons this reports the first, with the counts below giving
+   * the shape.
    */
   readonly unavailableReason: ReviewDecisionUnavailableReason | null;
   /** Error class (constructor name) when `unavailableReason` is 'graphql_error'. */
   readonly errorClass?: string;
+  /** GraphQL requests issued for this sweep -- one per batch. */
+  readonly batchCount: number;
+  /** How many of those batches failed and fell back to REST. */
+  readonly failedBatchCount: number;
+  /** PR numbers whose batch failed, so the caller can count the degradation. */
+  readonly fallbackPrNumbers: readonly number[];
 }
+
+/**
+ * PRs per GraphQL request.
+ *
+ * One aliased field per PR in a single unbounded request was the bug (Overseer
+ * review of 8ada980c): GitHub costs a query by node count and complexity, so a
+ * large alias set is rejected WHOLESALE. With the open-PR listing now paginating
+ * to 1000, one bad request could dump every PR in the tick onto the sequential
+ * REST path -- up to 1000 round trips, each itself paginated. 50 keeps each
+ * query comfortably inside GitHub's limits and bounds the blast radius of any
+ * single failure to the PRs in that batch.
+ */
+const REVIEW_DECISION_BATCH_SIZE = 50;
 
 /**
  * Read GitHub's OWN aggregate `reviewDecision` for the listed PRs.
@@ -1169,13 +1195,17 @@ export interface ReviewDecisionLookup {
  * CODEOWNERS rules -- neither of which appears anywhere in the REST reviews
  * listing, and both of which the REST derivation was silently ignoring.
  *
- * On failure the decision map is EMPTY, which sends every PR to the
- * conservative REST derivation -- never to an assumed approval. That fallback
- * is safe, but it is also STRICTER than GitHub's own answer, so it can quietly
- * hold PRs GitHub considers approved (an expired token alone would do it).
- * `unavailableReason` therefore travels back to the caller, which logs it once
- * per tick and counts the affected PRs in the heartbeat. A silent degradation
- * to a stricter gate is exactly the kind of invisible stall #758 exists to end.
+ * A PR whose batch fails is simply ABSENT from the decision map, which sends it
+ * to the conservative REST derivation -- never to an assumed approval. That
+ * fallback is safe, but it is also STRICTER than GitHub's own answer, so it can
+ * quietly hold PRs GitHub considers approved (an expired token alone would do
+ * it). `unavailableReason` and the per-batch counts therefore travel back to the
+ * caller, which logs them once per tick and counts the affected PRs in the
+ * heartbeat. A silent degradation to a stricter gate is exactly the kind of
+ * invisible stall #758 exists to end.
+ *
+ * BATCHED at REVIEW_DECISION_BATCH_SIZE. Failures are isolated per batch: the
+ * PRs in a rejected request fall back, and every other batch keeps its answers.
  */
 export async function fetchReviewDecisions(
   octokit: RealGitHubOctokitLike,
@@ -1183,39 +1213,87 @@ export async function fetchReviewDecisions(
 ): Promise<ReviewDecisionLookup> {
   const decisions = new Map<number, string | null>();
   // Nothing to ask about is not a degradation -- there is nothing to fall back for.
-  if (input.prNumbers.length === 0) return { decisions, unavailableReason: null };
-  if (!octokit.graphql) return { decisions, unavailableReason: 'graphql_client_absent' };
-
-  // One aliased field per PR: GraphQL has no "pullRequests(numbers:)" filter,
-  // so aliasing is how a batch is requested in a single round trip.
-  const fields = input.prNumbers
-    .map(number => `  pr${number}: pullRequest(number: ${number}) { number reviewDecision }`)
-    .join('\n');
-  const query = `query($owner: String!, $repo: String!) {\n  repository(owner: $owner, name: $repo) {\n${fields}\n  }\n}`;
-
-  try {
-    // Invoked through `octokit` so a real client method keeps its receiver.
-    const response = (await octokit.graphql?.(query, {
-      owner: input.owner,
-      repo: input.repo,
-    })) as { repository?: Record<string, GraphQLReviewDecisionNode | null> } | null;
-    const repository = response?.repository;
-    if (!repository) return { decisions, unavailableReason: 'graphql_empty_response' };
-    for (const node of Object.values(repository)) {
-      if (!node || typeof node.number !== 'number') continue;
-      decisions.set(node.number, node.reviewDecision ?? null);
-    }
-  } catch (error) {
-    // A GraphQL outage must not admit anything: an empty map means every PR
-    // falls back to the conservative derivation, which fails closed -- but the
-    // caller is told, so the degradation is visible rather than silent.
+  if (input.prNumbers.length === 0) {
     return {
-      decisions: new Map<number, string | null>(),
-      unavailableReason: 'graphql_error',
-      errorClass: error instanceof Error ? error.constructor.name : typeof error,
+      decisions,
+      unavailableReason: null,
+      batchCount: 0,
+      failedBatchCount: 0,
+      fallbackPrNumbers: [],
     };
   }
-  return { decisions, unavailableReason: null };
+  if (!octokit.graphql) {
+    return {
+      decisions,
+      unavailableReason: 'graphql_client_absent',
+      batchCount: 0,
+      failedBatchCount: 0,
+      fallbackPrNumbers: [...input.prNumbers],
+    };
+  }
+
+  const batches: number[][] = [];
+  for (let start = 0; start < input.prNumbers.length; start += REVIEW_DECISION_BATCH_SIZE) {
+    batches.push([...input.prNumbers.slice(start, start + REVIEW_DECISION_BATCH_SIZE)]);
+  }
+
+  let unavailableReason: ReviewDecisionUnavailableReason | null = null;
+  let errorClass: string | undefined;
+  let failedBatchCount = 0;
+  const fallbackPrNumbers: number[] = [];
+
+  for (const batch of batches) {
+    // One aliased field per PR: GraphQL has no "pullRequests(numbers:)" filter,
+    // so aliasing is how a batch is requested in a single round trip.
+    const fields = batch
+      .map(number => `  pr${number}: pullRequest(number: ${number}) { number reviewDecision }`)
+      .join('\n');
+    const query = `query($owner: String!, $repo: String!) {\n  repository(owner: $owner, name: $repo) {\n${fields}\n  }\n}`;
+
+    try {
+      // Invoked through `octokit` so a real client method keeps its receiver.
+      const response = (await octokit.graphql?.(query, {
+        owner: input.owner,
+        repo: input.repo,
+      })) as { repository?: Record<string, GraphQLReviewDecisionNode | null> } | null;
+      const repository = response?.repository;
+      if (!repository) {
+        // This batch answered nothing usable. Only ITS PRs fall back.
+        failedBatchCount += 1;
+        fallbackPrNumbers.push(...batch);
+        unavailableReason ??= 'graphql_empty_response';
+        continue;
+      }
+      for (const node of Object.values(repository)) {
+        if (!node || typeof node.number !== 'number') continue;
+        decisions.set(node.number, node.reviewDecision ?? null);
+      }
+      // A batch that answered, but omitted PRs we asked about, leaves those PRs
+      // absent from the map -- which is exactly the fallback signal. Count them
+      // so a partially-answering batch is not reported as a clean read.
+      const missing = batch.filter(number => !decisions.has(number));
+      if (missing.length > 0) {
+        fallbackPrNumbers.push(...missing);
+        unavailableReason ??= 'graphql_empty_response';
+      }
+    } catch (error) {
+      // A GraphQL failure must not admit anything, and must not discard the
+      // batches that DID succeed: only this batch's PRs fall back.
+      failedBatchCount += 1;
+      fallbackPrNumbers.push(...batch);
+      unavailableReason ??= 'graphql_error';
+      errorClass ??= error instanceof Error ? error.constructor.name : typeof error;
+    }
+  }
+
+  return {
+    decisions,
+    unavailableReason,
+    ...(errorClass === undefined ? {} : { errorClass }),
+    batchCount: batches.length,
+    failedBatchCount,
+    fallbackPrNumbers,
+  };
 }
 
 /**
@@ -1403,6 +1481,11 @@ export function createRealListOpenPullRequests(
     // merging. That looks identical to a quiet backlog, which is the exact
     // failure mode #758 exists to end -- so it is said out loud, with the error
     // class and how many PRs it affected.
+    //
+    // `prsAffected` counts only the PRs whose OWN batch failed, not every PR in
+    // the sweep: the query is batched, so a rejected request degrades its 50 and
+    // leaves the rest with GitHub's real answer. Reporting the whole sweep here
+    // would overstate the outage every time one batch of many failed.
     if (lookup.unavailableReason) {
       logger.warn(
         {
@@ -1410,12 +1493,17 @@ export function createRealListOpenPullRequests(
           repo: input.repo,
           reason: lookup.unavailableReason,
           errorClass: lookup.errorClass,
-          prsAffected: evaluatedNumbers.length,
+          prsAffected: lookup.fallbackPrNumbers.length,
+          batchCount: lookup.batchCount,
+          failedBatchCount: lookup.failedBatchCount,
         },
         'merge-coordinator.review_decision_graphql_unavailable'
       );
     }
-    const usedFallback = lookup.unavailableReason !== null;
+    // Per-PR, not per-sweep: a PR absent from the decision map is the one that
+    // fell back. Flagging every PR because some other batch failed would report
+    // a degraded gate for PRs that got GitHub's authoritative answer.
+    const fellBackToRest = new Set(lookup.fallbackPrNumbers);
 
     const discovered: DiscoveredPullRequest[] = [];
     for (const pr of listedPulls) {
@@ -1474,8 +1562,10 @@ export function createRealListOpenPullRequests(
         woId: extractWoId(pr.title, pr.body),
         // Only meaningful for PRs whose decision was actually resolved: a PR on
         // an unwatched base never consults reviews at all, so it is not a
-        // fallback casualty and is not counted as one.
-        reviewDecisionFromFallback: usedFallback,
+        // fallback casualty and is not counted as one. Set per PR rather than
+        // per sweep, so a PR whose own batch succeeded is not mislabelled as
+        // degraded because a different batch failed.
+        reviewDecisionFromFallback: fellBackToRest.has(pr.number),
         ...(listingComplete ? {} : { listingTruncated: true }),
       });
     }

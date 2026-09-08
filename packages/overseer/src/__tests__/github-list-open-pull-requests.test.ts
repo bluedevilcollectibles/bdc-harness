@@ -58,6 +58,23 @@ interface OctokitFakeOptions {
   readonly reviewPageLog?: number[];
   /** Record every pulls.list page requested, to assert the listing paginated. */
   readonly pullPageLog?: number[];
+  /**
+   * Record the PR numbers asked for in each GraphQL request, one entry per
+   * request, so tests can assert the query was BATCHED rather than sent as one
+   * unbounded alias set.
+   */
+  readonly graphqlBatchLog?: number[][];
+  /**
+   * Fail any GraphQL request that asks about one of these PR numbers, leaving
+   * every other batch to succeed. Models GitHub rejecting a single query on
+   * node/complexity grounds.
+   */
+  readonly graphqlFailForPrNumbers?: readonly number[];
+}
+
+/** PR numbers a batched review-decision query is asking about. */
+function prNumbersInQuery(query: string): number[] {
+  return [...query.matchAll(/pullRequest\(number: (\d+)\)/g)].map(match => Number(match[1]));
 }
 
 function octokitWith(
@@ -103,19 +120,30 @@ function octokitWith(
   };
 
   if (options.graphqlThrows) {
-    client.graphql = async () => {
+    client.graphql = async (query: string) => {
+      options.graphqlBatchLog?.push(prNumbersInQuery(query));
       throw new Error('graphql unavailable');
     };
   } else if (options.graphqlDecisions) {
     const decisions = options.graphqlDecisions;
-    client.graphql = async () => ({
-      repository: Object.fromEntries(
-        Object.entries(decisions).map(([number, reviewDecision]) => [
-          `pr${number}`,
-          { number: Number(number), reviewDecision },
-        ])
-      ),
-    });
+    const failFor = new Set(options.graphqlFailForPrNumbers ?? []);
+    // Answers ONLY what the query asked about. A double that returned every
+    // decision regardless of the request could not tell a batched query from an
+    // unbounded one, and would hide the batching entirely.
+    client.graphql = async (query: string) => {
+      const asked = prNumbersInQuery(query);
+      options.graphqlBatchLog?.push(asked);
+      if (asked.some(number => failFor.has(number))) {
+        throw new Error('graphql query too complex');
+      }
+      return {
+        repository: Object.fromEntries(
+          asked
+            .filter(number => Object.hasOwn(decisions, number))
+            .map(number => [`pr${number}`, { number, reviewDecision: decisions[number] }])
+        ),
+      };
+    };
   }
 
   return client as unknown as RealGitHubOctokitLike;
@@ -1116,5 +1144,269 @@ describe('fetchAllOpenPullRequests', () => {
 
     expect(result.complete).toBe(true);
     expect(result.pulls).toHaveLength(0);
+  });
+});
+
+/**
+ * REVIEW-DECISION QUERY BATCHING (Overseer review of 8ada980c).
+ *
+ * `fetchReviewDecisions` interpolated one aliased field per PR into a SINGLE
+ * unbounded GraphQL request. GitHub costs a query by node count and complexity
+ * and rejects a large alias set WHOLESALE -- and the old failure path emptied
+ * the whole decision map, so one rejected request dumped every PR in the tick
+ * onto the sequential REST derivation. With the open-PR listing now paginating
+ * to 1000, that is up to 1000 REST lookups, each itself paginated, in one tick.
+ *
+ * The query is now batched, and a failure is isolated to its own batch.
+ */
+describe('review decision query batching', () => {
+  function decisionsFor(
+    count: number,
+    value: string | null = 'APPROVED'
+  ): Record<number, string | null> {
+    const out: Record<number, string | null> = {};
+    for (let number = 1; number <= count; number += 1) out[number] = value;
+    return out;
+  }
+
+  // THE HEADLINE. 120 PRs at 50 per request is 3 requests, not 1 unbounded one.
+  test('120 PRs are asked for in 3 batched GraphQL requests', async () => {
+    const graphqlBatchLog: number[][] = [];
+    const octokit = octokitWith([], {}, { graphqlDecisions: decisionsFor(120), graphqlBatchLog });
+
+    const lookup = await fetchReviewDecisions(octokit, {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumbers: Array.from({ length: 120 }, (_unused, index) => index + 1),
+    });
+
+    expect(graphqlBatchLog).toHaveLength(3);
+    expect(graphqlBatchLog[0]).toHaveLength(50);
+    expect(graphqlBatchLog[1]).toHaveLength(50);
+    expect(graphqlBatchLog[2]).toHaveLength(20);
+    // Every PR is covered exactly once across the batches -- none dropped, none
+    // asked for twice.
+    const asked = graphqlBatchLog.flat().sort((a, b) => a - b);
+    expect(asked).toHaveLength(120);
+    expect(new Set(asked).size).toBe(120);
+
+    expect(lookup.batchCount).toBe(3);
+    expect(lookup.failedBatchCount).toBe(0);
+    expect(lookup.unavailableReason).toBeNull();
+    expect(lookup.decisions.size).toBe(120);
+    expect(lookup.fallbackPrNumbers).toHaveLength(0);
+  });
+
+  // THE ISOLATION. One rejected batch must not discard the answers the other
+  // batches obtained -- that is what turned a single complexity rejection into
+  // a whole-tick REST stampede.
+  test('one failing batch falls back only for its own PRs', async () => {
+    const graphqlBatchLog: number[][] = [];
+    const octokit = octokitWith(
+      [],
+      {},
+      {
+        graphqlDecisions: decisionsFor(120),
+        // PR 60 sits in the second batch (51-100).
+        graphqlFailForPrNumbers: [60],
+        graphqlBatchLog,
+      }
+    );
+
+    const lookup = await fetchReviewDecisions(octokit, {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumbers: Array.from({ length: 120 }, (_unused, index) => index + 1),
+    });
+
+    // All three requests were still issued: a failure does not abort the walk.
+    expect(lookup.batchCount).toBe(3);
+    expect(lookup.failedBatchCount).toBe(1);
+    expect(lookup.unavailableReason).toBe('graphql_error');
+
+    // The two healthy batches kept their answers.
+    expect(lookup.decisions.size).toBe(70);
+    expect(lookup.decisions.get(1)).toBe('APPROVED');
+    expect(lookup.decisions.get(120)).toBe('APPROVED');
+
+    // Only the failed batch's 50 PRs fall back.
+    expect(lookup.fallbackPrNumbers).toHaveLength(50);
+    expect(lookup.fallbackPrNumbers).toContain(60);
+    expect(lookup.fallbackPrNumbers).not.toContain(1);
+    expect(lookup.fallbackPrNumbers).not.toContain(120);
+    // A PR in a healthy batch is NOT absent from the map -- absence is the
+    // fallback signal, so this is the assertion that proves isolation.
+    expect(lookup.decisions.has(1)).toBe(true);
+    expect(lookup.decisions.has(60)).toBe(false);
+  });
+
+  test('a single batch under the size bound issues exactly one request', async () => {
+    const graphqlBatchLog: number[][] = [];
+    const octokit = octokitWith([], {}, { graphqlDecisions: decisionsFor(10), graphqlBatchLog });
+
+    const lookup = await fetchReviewDecisions(octokit, {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumbers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    });
+
+    expect(graphqlBatchLog).toHaveLength(1);
+    expect(lookup.batchCount).toBe(1);
+    expect(lookup.decisions.size).toBe(10);
+  });
+
+  test('exactly 50 PRs is one batch, 51 is two', async () => {
+    const logAt50: number[][] = [];
+    await fetchReviewDecisions(
+      octokitWith([], {}, { graphqlDecisions: decisionsFor(51), graphqlBatchLog: logAt50 }),
+      {
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumbers: Array.from({ length: 50 }, (_unused, index) => index + 1),
+      }
+    );
+    expect(logAt50).toHaveLength(1);
+
+    const logAt51: number[][] = [];
+    await fetchReviewDecisions(
+      octokitWith([], {}, { graphqlDecisions: decisionsFor(51), graphqlBatchLog: logAt51 }),
+      {
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        prNumbers: Array.from({ length: 51 }, (_unused, index) => index + 1),
+      }
+    );
+    expect(logAt51).toHaveLength(2);
+    expect(logAt51[1]).toEqual([51]);
+  });
+
+  // Every batch failing is the old whole-sweep outage, and must still report as
+  // one: nothing was learned, everything falls back.
+  test('every batch failing falls back for every PR', async () => {
+    const octokit = octokitWith([], {}, { graphqlThrows: true });
+
+    const lookup = await fetchReviewDecisions(octokit, {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumbers: Array.from({ length: 120 }, (_unused, index) => index + 1),
+    });
+
+    expect(lookup.batchCount).toBe(3);
+    expect(lookup.failedBatchCount).toBe(3);
+    expect(lookup.decisions.size).toBe(0);
+    expect(lookup.fallbackPrNumbers).toHaveLength(120);
+    expect(lookup.unavailableReason).toBe('graphql_error');
+  });
+
+  // A batch that answers but OMITS a PR leaves it absent from the map, which is
+  // the fallback signal -- it must be counted, not silently treated as clean.
+  test('a PR omitted by an answering batch is counted as fallen back', async () => {
+    // Decisions cover 1 and 3 but not 2, so the response omits pr2.
+    const octokit = octokitWith([], {}, { graphqlDecisions: { 1: 'APPROVED', 3: 'APPROVED' } });
+
+    const lookup = await fetchReviewDecisions(octokit, {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumbers: [1, 2, 3],
+    });
+
+    expect(lookup.decisions.has(1)).toBe(true);
+    expect(lookup.decisions.has(2)).toBe(false);
+    expect(lookup.fallbackPrNumbers).toEqual([2]);
+    // No request THREW, so this is not an error -- it is an incomplete answer.
+    expect(lookup.failedBatchCount).toBe(0);
+    expect(lookup.unavailableReason).toBe('graphql_empty_response');
+  });
+
+  test('no PRs asks nothing and reports a clean read', async () => {
+    const graphqlBatchLog: number[][] = [];
+    const lookup = await fetchReviewDecisions(
+      octokitWith([], {}, { graphqlDecisions: {}, graphqlBatchLog }),
+      { owner: 'thinmansoftware', repo: 'bdc-harness', prNumbers: [] }
+    );
+
+    expect(graphqlBatchLog).toHaveLength(0);
+    expect(lookup.batchCount).toBe(0);
+    expect(lookup.unavailableReason).toBeNull();
+    expect(lookup.fallbackPrNumbers).toHaveLength(0);
+  });
+
+  test('an absent GraphQL client falls back for every PR without issuing a request', async () => {
+    const lookup = await fetchReviewDecisions(octokitWith([]), {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumbers: [1, 2, 3],
+    });
+
+    expect(lookup.unavailableReason).toBe('graphql_client_absent');
+    expect(lookup.batchCount).toBe(0);
+    expect(lookup.fallbackPrNumbers).toEqual([1, 2, 3]);
+  });
+});
+
+/**
+ * The batching must reach the discovery path, not just the helper: a PR whose
+ * own batch succeeded must NOT be flagged as having used the stricter REST
+ * fallback merely because some other batch failed.
+ */
+describe('per-PR fallback flagging through discovery', () => {
+  function openPullsFor(count: number): FakePullRequest[] {
+    return Array.from({ length: count }, (_unused, index) => {
+      const number = index + 1;
+      return {
+        number,
+        title: `feat: pr ${number}`,
+        state: 'open',
+        html_url: `https://example.invalid/${number}`,
+        head: { sha: `head-${number}`, ref: `feat/pr-${number}` },
+        base: { ref: 'dev' },
+      };
+    });
+  }
+
+  test('only the PRs in the failed batch are marked reviewDecisionFromFallback', async () => {
+    const decisions: Record<number, string | null> = {};
+    for (let number = 1; number <= 120; number += 1) decisions[number] = 'APPROVED';
+    const warnings: { obj: Record<string, unknown>; msg: string }[] = [];
+
+    const list = createRealListOpenPullRequests(
+      octokitWith(
+        openPullsFor(120),
+        {},
+        {
+          graphqlDecisions: decisions,
+          graphqlFailForPrNumbers: [60],
+        }
+      ),
+      { logger: { warn: (obj, msg) => warnings.push({ obj, msg }) } }
+    );
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    expect(discovered).toHaveLength(120);
+    const first = discovered.find(pr => pr.prNumber === 1);
+    const failed = discovered.find(pr => pr.prNumber === 60);
+    // The healthy batch kept GitHub's authoritative answer and is NOT degraded.
+    expect(first?.reviewDecision).toBe('APPROVED');
+    expect(first?.reviewDecisionFromFallback).toBe(false);
+    // The failed batch's PRs fell back to the stricter derivation.
+    expect(failed?.reviewDecisionFromFallback).toBe(true);
+
+    // The warn line reports the BATCH shape, and counts only the PRs actually
+    // affected rather than the whole sweep.
+    const degraded = warnings.filter(
+      entry => entry.msg === 'merge-coordinator.review_decision_graphql_unavailable'
+    );
+    expect(degraded).toHaveLength(1);
+    expect(degraded[0]?.obj).toMatchObject({
+      reason: 'graphql_error',
+      prsAffected: 50,
+      batchCount: 3,
+      failedBatchCount: 1,
+    });
   });
 });

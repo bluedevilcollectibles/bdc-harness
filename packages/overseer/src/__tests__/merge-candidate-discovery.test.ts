@@ -22,13 +22,16 @@ import {
   summarizeExclusions,
   DEFAULT_WATCHED_BASE_BRANCHES,
 } from '../merge-candidate-discovery.ts';
-import { watchOnce } from '../watch.ts';
+import { watchLoop, watchOnce } from '../watch.ts';
+import { handleRecord } from '../service.ts';
 import type {
   DiscoveredPullRequest,
   GitHubClientDeps,
   MergeCandidateDiscoveryDeps,
+  OverseerActionsDeps,
   OverseerRunStoreDeps,
   PullRequestEvidence,
+  WatchedRunRecord,
 } from '../types.ts';
 
 const OWNER = 'thinmansoftware';
@@ -706,5 +709,184 @@ describe('merge candidate discovery -- fallback review decision counter', () => 
     const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
     expect(heartbeat?.obj.prsFallbackDecision).toBe(1);
     expect(heartbeat?.obj.prsEvaluated).toBe(2);
+  });
+});
+
+/**
+ * DISCOVERED CANDIDATES REACH THE MERGE MANAGER IN THE SAME TICK.
+ *
+ * The Overseer review of 8ada980c raised this as a [major]: that discovered
+ * candidates are "appended only AFTER the run-processing/merge-manager loop has
+ * completed ... never passed to the merge manager in that tick", giving a
+ * perpetual rediscovery loop.
+ *
+ * That is not how the code is wired, and these tests are the proof. `watchOnce`
+ * does not invoke the merge manager for ANY candidate -- run-derived or
+ * discovered. It is a pure producer: it returns records. `watchLoop` then hands
+ * every returned record to the caller's `onRecord`, and in production that
+ * callback is `handleRecord` (service.ts), which dispatches
+ * `action === 'merge_ready'` to `mergeCoordinator`. There is no separate
+ * "merge-manager loop" inside the tick for discovered candidates to miss, and
+ * no branch anywhere on discovery: a discovered record takes the identical path
+ * a run-derived one takes.
+ *
+ * The reviewer's underlying ASK was still right, and is what these tests add:
+ * the prior integration test stopped at the returned outcome and never asserted
+ * the merge manager actually ran. So it is asserted here, through the real
+ * watchLoop -> handleRecord -> mergeCoordinator path rather than a stub of it.
+ */
+describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', () => {
+  const emptyRunStore: OverseerRunStoreDeps = {
+    listRunsForWatch: async () => [],
+    listRunEvents: async () => [],
+  };
+
+  function mergePathDeps(
+    pullRequests: readonly DiscoveredPullRequest[],
+    evidenceByNumber: Record<number, PullRequestEvidence>
+  ): OverseerRunStoreDeps & GitHubClientDeps & OverseerActionsDeps {
+    const discovery = discoveryDeps(pullRequests, evidenceByNumber);
+    return {
+      ...emptyRunStore,
+      findPullRequest: discovery.findPullRequest,
+      listOpenPullRequests: discovery.listOpenPullRequests,
+      mergePullRequest: async () => ({ merged: true }),
+      insertOverseerAction: async () => undefined,
+    };
+  }
+
+  // THE ASSERTION THE REVIEWER ASKED FOR: not merely that a merge_ready outcome
+  // is returned, but that the merge manager was INVOKED for it, in this tick.
+  test('the merge manager is invoked for a discovered candidate in the same tick', async () => {
+    const deps = mergePathDeps([pr({ prNumber: 730 })], { 730: greenEvidence(730) });
+    const mergeCalls: WatchedRunRecord[] = [];
+
+    // The real production wiring: watchLoop feeds every record to handleRecord,
+    // which is what dispatches to the merge coordinator.
+    await watchLoop(
+      deps,
+      record =>
+        handleRecord(record, deps, false, 'test-actor', async candidate => {
+          mergeCalls.push(candidate);
+        }),
+      { once: true, discovery: { watchedBases: WATCHED_BASES, repos: REPOS } }
+    );
+
+    expect(mergeCalls).toHaveLength(1);
+    expect(mergeCalls[0]?.prEvidence.pr?.number).toBe(730);
+    expect(mergeCalls[0]?.action).toBe('merge_ready');
+    // It arrived as the discovered candidate, not some run-derived substitute.
+    expect(mergeCalls[0]?.runId).toBe('pr-discovery:thinmansoftware/bdc-harness#730');
+  });
+
+  // A merged PR stops being open, so the next sweep does not see it at all --
+  // which is what "does not rediscover" means for a PR-first sweep. This pins
+  // that the second tick produces no merge call rather than looping forever.
+  test('a merged PR is not rediscovered on the next tick', async () => {
+    const open: DiscoveredPullRequest[] = [pr({ prNumber: 730 })];
+    const evidence: Record<number, PullRequestEvidence> = { 730: greenEvidence(730) };
+    const discovery = discoveryDeps(open, evidence);
+    const mergeCalls: WatchedRunRecord[] = [];
+
+    const deps: OverseerRunStoreDeps & GitHubClientDeps & OverseerActionsDeps = {
+      ...emptyRunStore,
+      findPullRequest: discovery.findPullRequest,
+      // Re-reads `open` each call, so removing the PR models GitHub no longer
+      // listing it once merged.
+      listOpenPullRequests: async input =>
+        open.filter(candidate => candidate.owner === input.owner && candidate.repo === input.repo),
+      mergePullRequest: async () => ({ merged: true }),
+      insertOverseerAction: async () => undefined,
+    };
+
+    const runTick = async (): Promise<void> => {
+      await watchLoop(
+        deps,
+        record =>
+          handleRecord(record, deps, false, 'test-actor', async candidate => {
+            mergeCalls.push(candidate);
+            // The merge landed: the PR is no longer open.
+            const index = open.findIndex(o => o.prNumber === candidate.prEvidence.pr?.number);
+            if (index >= 0) open.splice(index, 1);
+          }),
+        { once: true, discovery: { watchedBases: WATCHED_BASES, repos: REPOS } }
+      );
+    };
+
+    await runTick();
+    expect(mergeCalls).toHaveLength(1);
+
+    // Second tick: the PR is merged and gone, so nothing is rediscovered and
+    // the merge manager is not asked to merge it again.
+    await runTick();
+    expect(mergeCalls).toHaveLength(1);
+  });
+
+  // Run-derived and discovered candidates go through ONE dispatch, so a tick
+  // carrying both hands both to the merge manager -- there is no second pass a
+  // discovered candidate could be appended after.
+  test('run-derived and discovered candidates share the same dispatch in one tick', async () => {
+    const discovery = discoveryDeps([pr({ prNumber: 730 })], { 730: greenEvidence(730) });
+    const runRecord = {
+      id: 'run-real-1',
+      woId: 'WO-REAL-01',
+      owner: OWNER,
+      repo: REPO,
+      status: 'failed',
+      headBranch: 'feat/real',
+      workingPath: '/archon/worktrees/run-real-1',
+      metadata: {},
+    };
+    const mergeCalls: WatchedRunRecord[] = [];
+
+    const deps = {
+      listRunsForWatch: async () => [runRecord],
+      listRunEvents: async () => [],
+      findPullRequest: discovery.findPullRequest,
+      listOpenPullRequests: discovery.listOpenPullRequests,
+      mergePullRequest: async () => ({ merged: true }),
+      insertOverseerAction: async () => undefined,
+    } as unknown as OverseerRunStoreDeps & GitHubClientDeps & OverseerActionsDeps;
+
+    await watchLoop(
+      deps,
+      record =>
+        handleRecord(record, deps, false, 'test-actor', async candidate => {
+          mergeCalls.push(candidate);
+        }),
+      { once: true, discovery: { watchedBases: WATCHED_BASES, repos: REPOS } }
+    );
+
+    // The discovered PR reached the merge manager even though a run was also
+    // processed in the same tick.
+    expect(mergeCalls.some(call => call.runId.startsWith('pr-discovery:'))).toBe(true);
+  });
+
+  // The sweep already dedupes against PRs the run-derived pass covered, so a PR
+  // reachable BOTH ways is handed to the merge manager once, not twice.
+  test('a PR covered by a run is not also merged as a discovered candidate', async () => {
+    const discovery = discoveryDeps([pr({ prNumber: 730 })], { 730: greenEvidence(730) });
+    const mergeCalls: WatchedRunRecord[] = [];
+    const deps = mergePathDeps([pr({ prNumber: 730 })], { 730: greenEvidence(730) });
+
+    await watchLoop(
+      deps,
+      record =>
+        handleRecord(record, deps, false, 'test-actor', async candidate => {
+          mergeCalls.push(candidate);
+        }),
+      {
+        once: true,
+        discovery: {
+          watchedBases: WATCHED_BASES,
+          repos: REPOS,
+          // The run-derived pass already covered this PR this tick.
+          alreadyCoveredPullRequests: new Set([pullRequestKey(OWNER, REPO, 730)]),
+        },
+      }
+    );
+
+    expect(discovery).toBeDefined();
+    expect(mergeCalls).toHaveLength(0);
   });
 });
