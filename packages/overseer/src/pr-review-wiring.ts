@@ -15,6 +15,7 @@
  * events when it is not configured. Enabling the App's `pull_request` event
  * subscription remains a separate, external step.
  */
+import { randomUUID } from 'node:crypto';
 import * as dispatch from '@archon/core/db/dispatch';
 import { createLogger } from '@archon/paths';
 import {
@@ -182,6 +183,169 @@ function collectVerdicts(
 }
 
 /**
+ * Comment pages scanned when looking for the cap-exhausted marker (#803 review).
+ *
+ * Five pages is 500 comments, well past any real PR thread (the longest in this
+ * org is under 200), and bounds the scan so a pathological thread cannot spend
+ * the rate budget. The scan stops early on the first short page, so the normal
+ * cost is one call. Running out of pages without finding the marker falls
+ * through to posting, which is the safe direction: a duplicate comment is
+ * recoverable, a block nobody was told about is the bug being fixed.
+ */
+export const CAP_COMMENT_MAX_COMMENT_PAGES = 5;
+
+/** Durable per-head key that decides which caller posts the cap comment. */
+export function capCommentIdempotencyKey(input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+}): string {
+  return `pr-review-rereview-cap-comment:${input.owner}/${input.repo}#${input.prNumber}@${input.headSha}`;
+}
+
+/** Correlation prefix the claim's winning nonce is appended to. */
+export function capCommentCorrelationPrefix(input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+}): string {
+  return `${capCommentIdempotencyKey(input)}:`;
+}
+
+/**
+ * Search the PR's comments for the per-head marker, PAGINATED.
+ *
+ * Review finding (Overseer, PR #803): scanning a single 100-comment page misses
+ * a marker on any thread longer than that -- and a PR that has already burned
+ * three re-review rounds is precisely the long-thread case.
+ */
+async function hasMarkerComment(
+  octokit: ReturnType<typeof createRealOctokitClient>,
+  input: { owner: string; repo: string; prNumber: number; marker: string }
+): Promise<boolean> {
+  const issues = octokit.issues;
+  if (!issues?.listComments) return false;
+  for (let page = 1; page <= CAP_COMMENT_MAX_COMMENT_PAGES; page += 1) {
+    // Called through the object, not via a detached reference: Octokit's
+    // endpoint methods are bound to their client.
+    const response = await issues.listComments({
+      owner: input.owner,
+      repo: input.repo,
+      issue_number: input.prNumber,
+      per_page: 100,
+      page,
+    });
+    if (response.data.some(comment => (comment.body ?? '').includes(input.marker))) return true;
+    if (response.data.length < 100) return false;
+  }
+  return false;
+}
+
+export interface CapCommentInput {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+  body: string;
+  marker: string;
+}
+
+export interface CapCommentSeams {
+  octokit: () => ReturnType<typeof createRealOctokitClient>;
+  /**
+   * Claim the exclusive right to post this head's comment. Returns true for
+   * EXACTLY ONE caller across every process, or true for all callers when the
+   * claim store itself is unavailable (see the fallback rationale below).
+   */
+  claim: (input: CapCommentInput) => Promise<boolean>;
+}
+
+/**
+ * ONE COMMENT PER HEAD, enforced by TWO independent mechanisms (#803 review).
+ *
+ * Review finding (Overseer, PR #803): a single 100-comment page plus a
+ * list-then-create sequence guarantees nothing. A long PR pushes the marker off
+ * page one, and two concurrent webhook deliveries both read "absent" before
+ * either writes.
+ *
+ * 1. A DURABLE CLAIM decides the winner. `agent_dispatch_messages` has a UNIQUE
+ *    idempotency_key and inserts ON CONFLICT DO NOTHING, so exactly one caller
+ *    can claim a given per-head key. This is the race fix, and unlike a
+ *    process-local lock it holds across worker processes and restarts.
+ * 2. A PAGINATED MARKER SEARCH decides whether one already exists, covering the
+ *    case the reviewer named: a marker beyond the first page.
+ *
+ * Either alone is insufficient. Together, a duplicate needs the claim row AND
+ * every scanned page of comments to be wrong at the same moment.
+ *
+ * Extracted from the deps object so both halves are testable without a GitHub
+ * credential -- the seams are the only reason this is a free function.
+ */
+export async function postCapExhaustedCommentWith(
+  seams: CapCommentSeams,
+  input: CapCommentInput
+): Promise<{ posted: boolean }> {
+  if (!(await seams.claim(input))) return { posted: false };
+
+  const octokit = seams.octokit();
+  // `listComments` is optional on the narrow client interface; without it we
+  // cannot prove absence, and posting blind would risk spamming the thread --
+  // so we decline rather than duplicate.
+  if (!octokit.issues?.listComments || !octokit.issues?.createComment) {
+    return { posted: false };
+  }
+  if (await hasMarkerComment(octokit, input)) return { posted: false };
+  await octokit.issues.createComment({
+    owner: input.owner,
+    repo: input.repo,
+    issue_number: input.prNumber,
+    body: input.body,
+  });
+  return { posted: true };
+}
+
+/**
+ * The durable claim, backed by the dispatch store's UNIQUE idempotency_key.
+ *
+ * The insert RETURNS a row only for the winner; a loser is handed the EXISTING
+ * row back, whose correlation_id carries the winner's nonce -- so comparing the
+ * returned correlation id against this call's own nonce identifies the winner
+ * without needing the DAL to report which branch it took.
+ */
+export async function claimCapCommentViaDispatch(input: CapCommentInput): Promise<boolean> {
+  const nonce = randomUUID();
+  try {
+    const claim = await dispatch.createAuthenticatedMessage(
+      { kind: 'system', sender: REVIEW_SENDER },
+      {
+        correlation_id: `${capCommentCorrelationPrefix(input)}${nonce}`,
+        idempotency_key: capCommentIdempotencyKey(input),
+        task_type: 'run_report',
+        recipient: 'operator',
+        subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+        body: JSON.stringify({
+          kind: 'pr_review_rereview_cap_comment_claim',
+          owner: input.owner,
+          repo: input.repo,
+          prNumber: input.prNumber,
+          headSha: input.headSha,
+          nonce,
+        }),
+      }
+    );
+    return claim?.correlation_id?.endsWith(nonce) ?? false;
+  } catch {
+    // The claim store is unavailable. Fall back to the marker search alone
+    // rather than staying silent: an UN-ANNOUNCED BLOCK is the defect this
+    // whole path exists to fix, and a rare duplicate comment is a far smaller
+    // harm than a PR the reviewer quietly stopped answering.
+    return true;
+  }
+}
+
+/**
  * Binds the pure ingest dependencies to the live dispatch queue.
  *
  * Reuses `agent_dispatch_messages` with `task_type: 'run_review'`. Its UNIQUE
@@ -207,37 +371,19 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
     reviewerIdentity: config.reviewerIdentity,
 
     async postCapExhaustedComment(input): Promise<{ posted: boolean }> {
-      // The client is built HERE, not at deps-construction time.
-      // `createRealOctokitClient` throws without GH_TOKEN, and ingest has
-      // always been constructible without one -- the integration suite builds
-      // these deps against a real SqliteAdapter and no GitHub credential.
-      // Constructing eagerly would make every ingest path require a token to
-      // exist at all, which is a far larger behaviour change than this issue.
-      const commentOctokit = createRealOctokitClient();
-      // IDEMPOTENT PER HEAD. GitHub redelivers, and a push storm at one head
-      // can drive several ingests, so the marker is searched for before any
-      // comment is created. `listComments` is optional on the narrow client
-      // interface; without it we cannot prove absence, and posting blind would
-      // risk spamming the thread -- so we decline rather than duplicate.
-      if (!commentOctokit.issues?.listComments || !commentOctokit.issues?.createComment) {
-        return { posted: false };
-      }
-      const existing = await commentOctokit.issues.listComments({
-        owner: input.owner,
-        repo: input.repo,
-        issue_number: input.prNumber,
-        per_page: 100,
-      });
-      if (existing.data.some(comment => (comment.body ?? '').includes(input.marker))) {
-        return { posted: false };
-      }
-      await commentOctokit.issues.createComment({
-        owner: input.owner,
-        repo: input.repo,
-        issue_number: input.prNumber,
-        body: input.body,
-      });
-      return { posted: true };
+      return postCapExhaustedCommentWith(
+        {
+          // The client is built HERE, not at deps-construction time.
+          // `createRealOctokitClient` throws without GH_TOKEN, and ingest has
+          // always been constructible without one -- the integration suite
+          // builds these deps against a real SqliteAdapter and no GitHub
+          // credential. Constructing eagerly would make every ingest path
+          // require a token to exist at all.
+          octokit: () => createRealOctokitClient(),
+          claim: claimCapCommentViaDispatch,
+        },
+        input
+      );
     },
 
     async listPriorReviewWork(input): Promise<PriorReviewWork[]> {

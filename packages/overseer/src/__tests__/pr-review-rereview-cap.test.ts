@@ -25,6 +25,12 @@ import {
   type IngestDeps,
   type PriorReviewWork,
 } from '../pr-review-ingest.ts';
+import {
+  CAP_COMMENT_MAX_COMMENT_PAGES,
+  capCommentIdempotencyKey,
+  postCapExhaustedCommentWith,
+  type CapCommentInput,
+} from '../pr-review-wiring.ts';
 
 const SECRET = 'rereview-cap-secret';
 const NEW_HEAD = 'a'.repeat(40);
@@ -214,6 +220,65 @@ describe('#797 -- the count is CONSECUTIVE, so a hand nudge resets it', () => {
     );
   });
 
+  test('an UNJUDGED automatic row does not consume the budget', async () => {
+    // Review finding (Overseer, PR #803): the first cut counted every
+    // `isAutoRereview` row before asking whether it had been judged. A row
+    // exists from the moment work is QUEUED, so three fast pushes created three
+    // unjudged auto rows and exhausted the budget before a single automatic
+    // re-review had actually run -- the opposite of the guard's purpose, since
+    // an unjudged row burned no judge budget at all.
+    const inFlight = autoAttempts(MAX_REREVIEW_ATTEMPTS).map(row => ({
+      ...row,
+      status: 'queued' as const,
+      verdict: null,
+      verdictId: null,
+    }));
+    expect(countConsecutiveAutoRereviews(inFlight)).toBe(0);
+
+    const fake = deps([...inFlight, work()]);
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+  });
+
+  test('a DEFERRED automatic row (verdict other) does not consume the budget either', () => {
+    // `classifyVerdict` maps every non-approve/non-changes_requested submit
+    // disposition to 'other', and receipts are written for the DEFERRALS
+    // checks_pending and transport_error too. Counting those would let a PR
+    // whose CI is merely slow, or whose judge host blipped, burn its whole
+    // budget without one review having happened.
+    const deferred = autoAttempts(MAX_REREVIEW_ATTEMPTS).map(row => ({
+      ...row,
+      verdict: 'other' as const,
+    }));
+    expect(countConsecutiveAutoRereviews(deferred)).toBe(0);
+  });
+
+  test('a mixed history counts only the judged automatic rows', () => {
+    const mixed = [
+      // newest: still queued, never judged -- not an attempt
+      { ...autoAttempts(1)[0]!, messageId: 'in-flight', verdict: null, verdictId: null },
+      // deferred, no judge was reached -- not an attempt
+      { ...autoAttempts(1)[0]!, messageId: 'deferred', verdict: 'other' as const },
+      // two real judged auto re-reviews -- these ARE attempts
+      { ...autoAttempts(1)[0]!, messageId: 'judged-1' },
+      { ...autoAttempts(1)[0]!, messageId: 'judged-2' },
+      // the operator's look, which stops the walk
+      work({ messageId: 'hand-nudge', headSha: 'e'.repeat(40) }),
+      ...autoAttempts(3),
+    ];
+    expect(countConsecutiveAutoRereviews(mixed)).toBe(2);
+  });
+
+  test('a non-auto row that only DEFERRED does not reset the budget', () => {
+    // Symmetric to the rule above: 'other' is not the operator look the reset
+    // represents, so it must not re-arm the budget either.
+    const prior = [
+      work({ messageId: 'deferred-nudge', headSha: 'd'.repeat(40), verdict: 'other' }),
+      ...autoAttempts(MAX_REREVIEW_ATTEMPTS),
+      work({ messageId: 'initial' }),
+    ];
+    expect(countConsecutiveAutoRereviews(prior)).toBe(MAX_REREVIEW_ATTEMPTS);
+  });
+
   test('a cancelled row is skipped entirely -- it neither spends nor restores', () => {
     const prior = [
       work({ messageId: 'cancelled', status: 'cancelled', verdict: null, verdictId: null }),
@@ -302,5 +367,171 @@ describe('#797 -- the block is VISIBLE on the pull request', () => {
 
     expect(result.disposition).toBe('queued');
     expect(fake.captured.comments).toHaveLength(0);
+  });
+});
+
+/**
+ * The ADAPTER's half of the one-comment-per-head guarantee (#803 review).
+ *
+ * The tests above pin what ingest does with the seam; these pin the seam
+ * itself, which is where the reviewer found two real holes: a single 100-comment
+ * page misses a marker on a long thread, and list-then-create races.
+ */
+describe('#797 -- the cap comment is idempotent for real, not just in the happy case', () => {
+  const capInput: CapCommentInput = {
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    prNumber: 790,
+    headSha: NEW_HEAD,
+    body: buildRereviewCapComment(NEW_HEAD, 3),
+    marker: rereviewCapCommentMarker(NEW_HEAD),
+  };
+
+  /** An octokit whose comment thread spans `pages`, counting every call. */
+  function commentOctokit(pages: string[][]): {
+    client: () => never;
+    created: string[];
+    pagesRead: number[];
+  } {
+    const created: string[] = [];
+    const pagesRead: number[] = [];
+    const client = {
+      issues: {
+        listComments: async (input: { page?: number }) => {
+          const page = input.page ?? 1;
+          pagesRead.push(page);
+          return { data: (pages[page - 1] ?? []).map(body => ({ body })) };
+        },
+        createComment: async (input: { body: string }) => {
+          created.push(input.body);
+          return { data: {} };
+        },
+      },
+    };
+    return { client: () => client as never, created, pagesRead };
+  }
+
+  /** 100 unrelated comments -- a full page, forcing the scan to continue. */
+  function fullPageOfNoise(tag: string): string[] {
+    return Array.from({ length: 100 }, (_, index) => `unrelated comment ${tag}-${index}`);
+  }
+
+  test('a marker on PAGE 2 is found, and no duplicate is posted', async () => {
+    const octokit = commentOctokit([fullPageOfNoise('p1'), [capInput.marker]]);
+
+    const result = await postCapExhaustedCommentWith(
+      { octokit: octokit.client, claim: async () => true },
+      capInput
+    );
+
+    // The exact hole the reviewer named: pre-fix this scanned page 1 only,
+    // saw no marker, and posted a second identical comment.
+    expect(result.posted).toBe(false);
+    expect(octokit.created).toHaveLength(0);
+    expect(octokit.pagesRead).toEqual([1, 2]);
+  });
+
+  test('the scan stops at the first SHORT page rather than walking the cap', async () => {
+    const octokit = commentOctokit([['just one comment']]);
+
+    await postCapExhaustedCommentWith(
+      { octokit: octokit.client, claim: async () => true },
+      capInput
+    );
+
+    // A short page means the thread ended; the normal cost stays one call.
+    expect(octokit.pagesRead).toEqual([1]);
+    expect(octokit.created).toHaveLength(1);
+  });
+
+  test('the scan is BOUNDED so a pathological thread cannot spend the rate budget', async () => {
+    const octokit = commentOctokit(
+      Array.from({ length: CAP_COMMENT_MAX_COMMENT_PAGES + 4 }, (_, index) =>
+        fullPageOfNoise(`p${index}`)
+      )
+    );
+
+    await postCapExhaustedCommentWith(
+      { octokit: octokit.client, claim: async () => true },
+      capInput
+    );
+
+    expect(octokit.pagesRead).toHaveLength(CAP_COMMENT_MAX_COMMENT_PAGES);
+    // Falling off the end posts rather than staying silent: a duplicate comment
+    // is recoverable, a block nobody was told about is the bug being fixed.
+    expect(octokit.created).toHaveLength(1);
+  });
+
+  test('TWO CONCURRENT calls produce exactly ONE comment', async () => {
+    // A durable single-winner claim, standing in for the dispatch store's
+    // UNIQUE idempotency_key. Both callers race it; only one may proceed.
+    const claimed = new Set<string>();
+    const claim = async (input: CapCommentInput): Promise<boolean> => {
+      const key = capCommentIdempotencyKey(input);
+      // Yield first, so both calls genuinely interleave before either claims --
+      // otherwise the test would pass on a purely sequential implementation.
+      await Promise.resolve();
+      if (claimed.has(key)) return false;
+      claimed.add(key);
+      return true;
+    };
+    // The comment thread is EMPTY for both, which is exactly the race: neither
+    // marker search can see the other's not-yet-created comment.
+    const octokit = commentOctokit([[]]);
+
+    const results = await Promise.all([
+      postCapExhaustedCommentWith({ octokit: octokit.client, claim }, capInput),
+      postCapExhaustedCommentWith({ octokit: octokit.client, claim }, capInput),
+    ]);
+
+    expect(octokit.created).toHaveLength(1);
+    expect(results.filter(result => result.posted)).toHaveLength(1);
+  });
+
+  test('a DIFFERENT head claims separately, so a later exhaustion is still announced', async () => {
+    const claimed = new Set<string>();
+    const claim = async (input: CapCommentInput): Promise<boolean> => {
+      const key = capCommentIdempotencyKey(input);
+      if (claimed.has(key)) return false;
+      claimed.add(key);
+      return true;
+    };
+    const octokit = commentOctokit([[]]);
+
+    await postCapExhaustedCommentWith({ octokit: octokit.client, claim }, capInput);
+    await postCapExhaustedCommentWith(
+      { octokit: octokit.client, claim },
+      { ...capInput, headSha: OLD_HEAD, marker: rereviewCapCommentMarker(OLD_HEAD) }
+    );
+
+    expect(octokit.created).toHaveLength(2);
+    expect(capCommentIdempotencyKey(capInput)).toContain(NEW_HEAD);
+  });
+
+  test('losing the claim skips the GitHub calls entirely', async () => {
+    const octokit = commentOctokit([[]]);
+
+    const result = await postCapExhaustedCommentWith(
+      { octokit: octokit.client, claim: async () => false },
+      capInput
+    );
+
+    expect(result.posted).toBe(false);
+    expect(octokit.pagesRead).toHaveLength(0);
+    expect(octokit.created).toHaveLength(0);
+  });
+
+  test('a client with no listComments declines rather than posting blind', async () => {
+    const created: string[] = [];
+    const octokit = (): never =>
+      ({ issues: { createComment: async () => created.push('x') } }) as never;
+
+    const result = await postCapExhaustedCommentWith(
+      { octokit, claim: async () => true },
+      capInput
+    );
+
+    expect(result.posted).toBe(false);
+    expect(created).toHaveLength(0);
   });
 });

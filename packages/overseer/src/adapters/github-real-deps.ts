@@ -172,6 +172,7 @@ export interface RealGitHubOctokitLike {
       repo: string;
       issue_number: number;
       per_page: number;
+      page?: number;
     }): Promise<{ data: { body?: string | null }[] }>;
   };
   checks: {

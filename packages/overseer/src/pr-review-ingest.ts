@@ -148,15 +148,50 @@ export function resolveMaxRereviewAttempts(
 export function countConsecutiveAutoRereviews(prior: PriorReviewWork[]): number {
   let count = 0;
   for (const work of prior) {
+    // A ROW WITH NO VERDICT IS NOT AN ATTEMPT, automatic or not.
+    //
+    // Review finding (Overseer, PR #803): the first cut counted every
+    // `isAutoRereview` row before asking whether it had been judged, which
+    // contradicted this function's own documented rule and was worse than a
+    // doc mismatch. A row exists from the moment work is QUEUED, so a rapid
+    // push sequence -- push, push, push before any review completes -- created
+    // three unjudged auto rows and exhausted the whole budget before a single
+    // automatic re-review had actually run. That is the exact opposite of the
+    // guard's purpose: the cap exists to stop a PR that never converges from
+    // burning judge budget, and an unjudged row burned none.
+    //
+    // The test is now symmetric. Only a row that reached a verdict counts, in
+    // either direction: an auto verdict spends the budget, a non-auto verdict
+    // (a hand nudge, or the initial review) restores it, and anything still in
+    // flight or cancelled before judging is skipped entirely.
+    if (!isJudgedVerdict(work.verdict)) continue;
     if (work.isAutoRereview) {
       count += 1;
       continue;
     }
-    // A non-auto row that reached a verdict is the reset point.
-    if (work.verdict !== null) return count;
-    // Anything else (queued/claimed/cancelled, never judged) is skipped.
+    // A non-auto review that RAN is the reset point.
+    return count;
   }
   return count;
+}
+
+/**
+ * True only when a prior row's verdict means A MODEL ACTUALLY JUDGED THE CODE.
+ *
+ * `null` is the obvious case (queued, claimed, or cancelled before completion).
+ * `'other'` is the subtle one, and it matters: `classifyVerdict` maps EVERY
+ * non-approve/non-changes_requested submit disposition to `'other'`, and the
+ * submit path writes a receipt for all of them -- including the DEFERRALS
+ * `checks_pending` and `transport_error`, where no judge was reached and no
+ * verdict was formed (#789, #790). Counting those as attempts would let a PR
+ * whose CI is merely slow, or whose judge host is briefly unreachable, burn its
+ * entire re-review budget without a single review having happened.
+ *
+ * Symmetrically, `'other'` must not RESET the budget either: a non-auto row
+ * that only deferred is not the operator look the reset represents.
+ */
+function isJudgedVerdict(verdict: PriorReviewWork['verdict']): boolean {
+  return verdict === 'approved' || verdict === 'changes_requested';
 }
 
 /**
