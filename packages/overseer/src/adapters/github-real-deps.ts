@@ -212,6 +212,64 @@ export interface RealGitHubOctokitLike {
   };
 }
 
+/**
+ * COMPILE-TIME GUARD on the method NAMES above (#777 review).
+ *
+ * `RealGitHubOctokitLike` is a hand-written structural stand-in, and the real
+ * clients reach it through `as unknown as RealGitHubOctokitLike` -- a cast that
+ * asserts the shape rather than checking it. Two things therefore used to be
+ * invisible: a method we name that Octokit does not actually have, and a method
+ * Octokit renames out from under us. Either one makes `bindRepoMethod` return
+ * `undefined` at runtime, which silently disables positive unprotected-branch
+ * detection: the probe never answers, the counter climbs, and a genuinely
+ * unprotected base gets BLOCKED instead of resolving to an authoritative empty
+ * set. The hand mocks in the tests cannot catch it either, because they
+ * implement whatever name we invented.
+ *
+ * `RealOctokitReposMethodName` is every optional method name we declare, and it
+ * is constrained to `keyof RealOctokitRepos`. If a name here does not exist on
+ * the installed @octokit/rest, this file fails to compile with a clear error
+ * instead of failing quietly in production. Verified 2026-09-08 against
+ * @octokit/rest 22.0.1 / plugin-rest-endpoint-methods 17.0.0: `repos` exposes
+ * `getBranchRules` (route `GET /repos/{owner}/{repo}/rules/branches/{branch}`).
+ * There is no `getRulesForBranch` on this version.
+ */
+type RealOctokitRepos = InstanceType<typeof Octokit>['repos'];
+
+/**
+ * A name that exists on BOTH our stand-in and the real client.
+ *
+ * Constrained against `keyof RealOctokitRepos` DIRECTLY, not via `Extract`. An
+ * earlier cut of this guard used `Extract<ours, theirs>`, which silently DROPS a
+ * name the real client lacks instead of rejecting it -- so the bad name simply
+ * vanished from the union and everything still compiled. Verified by
+ * substituting `getRulesForBranch` and watching tsc exit 0. The constraint below
+ * has nowhere to put an unknown name, so it errors instead.
+ */
+type RealOctokitReposMethodName = keyof RealOctokitRepos;
+
+/**
+ * Every name we bind, checked against the real client at COMPILE time.
+ *
+ * `satisfies` is what does the work: each literal must be assignable to
+ * `RealOctokitReposMethodName`, so a method the installed @octokit/rest does not
+ * expose -- a typo, an invention, or a name Octokit later renames -- fails the
+ * build here rather than returning `undefined` in production.
+ */
+export const BOUND_REPOS_METHODS = [
+  'getAllStatusCheckContexts',
+  'getBranchRules',
+  'getBranch',
+] as const satisfies readonly RealOctokitReposMethodName[];
+
+/**
+ * The bound names, additionally required to exist on our own stand-in so
+ * `bindRepoMethod` can index it. Both halves are enforced: `satisfies` above
+ * pins them to the real client, this pins them to the interface.
+ */
+export type BoundReposMethodName = (typeof BOUND_REPOS_METHODS)[number] &
+  keyof NonNullable<RealGitHubOctokitLike['repos']>;
+
 export interface ExactHeadPullRequestEvidence {
   diff: string;
   checks: { name: string; status: string; conclusion: string | null }[];
@@ -264,7 +322,7 @@ export interface ExactHeadPullRequestEvidence {
  * reference would invoke it detached. Binding here also satisfies
  * `@typescript-eslint/unbound-method`, which flags exactly this hazard.
  */
-function bindRepoMethod<K extends 'getAllStatusCheckContexts' | 'getBranchRules' | 'getBranch'>(
+function bindRepoMethod<K extends BoundReposMethodName>(
   client: RealGitHubOctokitLike | undefined,
   method: K
 ): NonNullable<NonNullable<RealGitHubOctokitLike['repos']>[K]> | undefined {
