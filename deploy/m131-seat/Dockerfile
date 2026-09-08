@@ -31,24 +31,30 @@ WORKDIR /app
 # Provider CLI, pinned. Installed BEFORE the source copy so the expensive
 # download is not invalidated by every worker-source edit.
 #
-# WHY 0.2.118 AND NOT THE LATEST STABLE (decided 2026-09-08, from the wire):
-#   grok 1.0.13 (current stable) DROPPED API-key auth over ACP. Asking each
-#   build to `initialize` and print its authMethods shows the difference:
+# WHY 0.2.101 AND NOT THE LATEST STABLE (decided 2026-09-08, from the wire):
+#   grok 1.x changed ACP auth. Probing each build with an ACP `initialize`
+#   shows what it will accept:
 #
-#     0.2.101: authMethods = [xai.api_key, grok.com]
-#              defaultAuthMethodId = "xai.api_key"
-#     1.0.13:  authMethods = [grok.com]
-#              defaultAuthMethodId = null
+#     0.2.101 in archon-app-1: authMethods = [xai.api_key, grok.com]
+#                              defaultAuthMethodId = "xai.api_key"
+#     1.0.13:                  authMethods = [grok.com]
+#                              defaultAuthMethodId = null
 #
-#   The grok seat is meant to run unattended on XAI_API_KEY with no
-#   subscription and no interactive sign-in. On 1.0.13 that is impossible:
-#   ACP conformance fails every scenario with "Authentication required"
-#   even with a valid XAI_API_KEY in the environment (verified). 0.2.118 is
-#   the build the grok-acp adapter documents as ACP-proven, and it still
-#   advertises xai.api_key as its DEFAULT auth method.
+#   The grok seat is meant to run unattended on a key, with no subscription
+#   and no interactive sign-in. Verified against a built 1.0.13 image: every
+#   ACP conformance scenario fails "Authentication required" even with a
+#   valid XAI_API_KEY in the environment. So 1.x is not a seat candidate.
 #
-#   Revisit only when a 1.x build re-advertises xai.api_key -- re-run the
-#   initialize probe above before moving this pin.
+#   0.2.101 is pinned because it is the exact build proven working in
+#   archon-app-1 today.
+#
+#   NOTE for whoever bumps this pin: whether a build advertises xai.api_key
+#   also depends on the RUNTIME vendor config (~/.grok/config.toml api_key /
+#   env_key), not on the image alone. A bare container of ANY version --
+#   0.2.101 included -- advertises only grok.com. That is why it is NOT
+#   asserted at build time: it is a property of the mounted vendor profile,
+#   and belongs to seat bring-up. Re-run the initialize probe against a
+#   fully-configured seat before trusting a new pin.
 #
 # The version is an ARG so a rebuild can move the pin deliberately; it is
 # never "latest" implicitly.
@@ -59,12 +65,11 @@ WORKDIR /app
 # deliberately NOT piped to a shell here -- we fetch the pinned artifact
 # directly. Credentials reach the seat only at run time, by bind mount / env.
 #
-# The build verifies the pin landed, that `grok agent stdio` starts, and that
-# the build still advertises xai.api_key -- the property the seat depends on.
-# A seat that ships without a working, key-authenticable CLI fails closed at
-# seat_provider_command_unavailable or at every prompt, which are far more
-# expensive places to discover this than the build.
-ARG GROK_VERSION=0.2.118
+# The build verifies the pin landed and that `grok agent stdio` starts. A seat
+# that ships without a working provider CLI fails closed at
+# seat_provider_command_unavailable, which is a far more expensive place to
+# discover this than the build.
+ARG GROK_VERSION=0.2.101
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl; \
@@ -86,13 +91,7 @@ RUN set -eux; \
     installed="$(/usr/local/bin/grok --version)"; \
     echo "$installed" | grep -q "${GROK_VERSION}" \
       || { echo "grok pin mismatch: wanted ${GROK_VERSION}, got ${installed}" >&2; exit 1; }; \
-    /usr/local/bin/grok agent stdio --help >/dev/null; \
-    printf %s \
-      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' \
-      | timeout 30 /usr/local/bin/grok agent stdio > /tmp/acp-init.json 2>/dev/null || true; \
-    grep -q '"xai.api_key"' /tmp/acp-init.json \
-      || { echo "grok ${GROK_VERSION} does not advertise xai.api_key over ACP; the seat cannot run unattended on an API key" >&2; exit 1; }; \
-    rm -f /tmp/acp-init.json
+    /usr/local/bin/grok agent stdio --help >/dev/null
 
 # Worker source + the minimal dependency set it imports at runtime.
 #

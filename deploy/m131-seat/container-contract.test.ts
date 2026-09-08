@@ -105,14 +105,17 @@ describe('m131-seat Dockerfile contract', () => {
     expect(dockerfile).toContain('grok agent stdio --help');
   });
 
-  // The grok seat runs unattended on XAI_API_KEY, so the pinned build MUST
-  // still advertise xai.api_key over ACP. grok 1.0.13 dropped it (authMethods
-  // = [grok.com], defaultAuthMethodId = null) and every ACP conformance
-  // scenario then fails "Authentication required" even with a valid key. The
-  // build probes initialize and refuses a build that cannot key-auth.
-  test('verifies the pinned CLI can authenticate with an API key', () => {
-    expect(dockerfile).toContain('xai.api_key');
-    expect(dockerfile).toContain('initialize');
+  // The pin must stay on the 0.2.x line. grok 1.x dropped xai.api_key from its
+  // ACP authMethods (1.0.13: authMethods = [grok.com], default = null) and a
+  // built 1.0.13 image fails every ACP conformance scenario with
+  // "Authentication required" even with a valid XAI_API_KEY present. Whether a
+  // build advertises xai.api_key ALSO depends on the runtime vendor config, so
+  // that is a seat-bring-up check, not a build-time one -- what the image can
+  // honestly guarantee is the pinned line.
+  test('pins the grok CLI to the 0.2.x line, not 1.x', () => {
+    const pin = /^ARG GROK_VERSION=(\d+\.\d+\.\d+)$/m.exec(dockerfile);
+    expect(pin).not.toBeNull();
+    expect(pin![1]).toStartWith('0.2.');
   });
 
   // The image must stay credential-free: credentials arrive at RUN time by
