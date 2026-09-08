@@ -63,12 +63,47 @@ export interface PrReviewResult {
    * spin the worker every tick.
    */
   retry_after_ms?: number;
+  /**
+   * Which ladder rungs were actually attempted, in order (#798).
+   *
+   * An INDETERMINATE says nothing about WHERE it gave up. With a two-rung
+   * ladder, "the first rung timed out and the second returned garbage" and
+   * "only one rung is configured and it returned garbage" produce the same
+   * `error` but need different fixes.
+   */
+  ladder_tried?: string[];
+  /** Wall-clock milliseconds spent invoking the ladder (#798). */
+  duration_ms?: number;
+  /**
+   * Judge stderr tails keyed by binary, for rungs that timed out, exited
+   * non-zero, or returned unparseable output (#798).
+   *
+   * OPERATOR-ONLY. This is the raw tail of a subprocess's stderr: it can carry
+   * provider internals and, in the worst case, credential fragments echoed by a
+   * failing CLI. It travels on the dispatch receipt body under the store's
+   * existing redaction and MUST NOT be placed in a PR body or any other public
+   * surface.
+   */
+  judge_stderr?: Record<string, string>;
 }
 
 export interface PrReviewModelResult {
   exitCode: number;
   stdout: string;
   timedOut: boolean;
+  /**
+   * Last `MAX_JUDGE_STDERR_BYTES` of the judge process's stderr (#798).
+   *
+   * The judge's own diagnostics were previously read only as a stdout FALLBACK
+   * (`payload = stdout || stderr`) and discarded entirely whenever stdout had
+   * content, so a rung that exited non-zero after printing a real error left no
+   * trace anywhere. This field carries that text to the operator record.
+   *
+   * NEVER reaches GitHub. It is stored on the dispatch receipt body, which the
+   * operator reads from the event store; the PR body gets only the error code
+   * (see `reviewErrorCode`).
+   */
+  stderrTail?: string;
 }
 
 export interface PrReviewDeps {
@@ -188,20 +223,48 @@ export function buildReviewPrompt(input: {
   ].join('\n');
 }
 
+/**
+ * Diagnostics gathered while walking the judge ladder (#798).
+ *
+ * Attached to whichever terminal/deferring result the walk produces so the
+ * reason for a non-verdict survives past the function that discovered it.
+ */
+interface LadderDiagnostics {
+  ladderTried: string[];
+  durationMs: number;
+  judgeStderr: Record<string, string>;
+}
+
+function withDiagnostics(result: PrReviewResult, diagnostics?: LadderDiagnostics): PrReviewResult {
+  if (!diagnostics) return result;
+  return {
+    ...result,
+    ladder_tried: diagnostics.ladderTried,
+    duration_ms: diagnostics.durationMs,
+    ...(Object.keys(diagnostics.judgeStderr).length > 0
+      ? { judge_stderr: diagnostics.judgeStderr }
+      : {}),
+  };
+}
+
 function indeterminate(
   input: PrReviewInput,
   deps: PrReviewDeps,
   acceptanceCriteriaAvailable: boolean,
-  error: string
+  error: string,
+  diagnostics?: LadderDiagnostics
 ): PrReviewResult {
-  return {
-    verdict: 'INDETERMINATE',
-    findings: [],
-    reviewed_head_sha: input.head_sha,
-    reviewer: deps.reviewer,
-    acceptance_criteria_available: acceptanceCriteriaAvailable,
-    error,
-  };
+  return withDiagnostics(
+    {
+      verdict: 'INDETERMINATE',
+      findings: [],
+      reviewed_head_sha: input.head_sha,
+      reviewer: deps.reviewer,
+      acceptance_criteria_available: acceptanceCriteriaAvailable,
+      error,
+    },
+    diagnostics
+  );
 }
 
 /**
@@ -264,17 +327,21 @@ function transportError(
   input: PrReviewInput,
   deps: PrReviewDeps,
   acceptanceCriteriaAvailable: boolean,
-  error: string
+  error: string,
+  diagnostics?: LadderDiagnostics
 ): PrReviewResult {
-  return {
-    verdict: 'TRANSPORT_ERROR',
-    findings: [],
-    reviewed_head_sha: input.head_sha,
-    reviewer: deps.reviewer,
-    acceptance_criteria_available: acceptanceCriteriaAvailable,
-    error,
-    retry_after_ms: TRANSPORT_ERROR_RETRY_MS,
-  };
+  return withDiagnostics(
+    {
+      verdict: 'TRANSPORT_ERROR',
+      findings: [],
+      reviewed_head_sha: input.head_sha,
+      reviewer: deps.reviewer,
+      acceptance_criteria_available: acceptanceCriteriaAvailable,
+      error,
+      retry_after_ms: TRANSPORT_ERROR_RETRY_MS,
+    },
+    diagnostics
+  );
 }
 
 /**
@@ -445,8 +512,23 @@ export async function evaluatePullRequest(
   let reachedAnyRung = false;
   let nonTransportFailure = false;
   let transportFailure: string | null = null;
+  // #798: every non-verdict outcome below now carries WHERE the ladder gave up
+  // and what the failing rung printed, so an INDETERMINATE is diagnosable from
+  // the receipt alone instead of requiring a source read.
+  const startedAt = Date.now();
+  const ladderTried: string[] = [];
+  const judgeStderr: Record<string, string> = {};
+  const diagnostics = (): LadderDiagnostics => ({
+    ladderTried,
+    durationMs: Date.now() - startedAt,
+    judgeStderr,
+  });
+  const recordStderr = (binary: string, tail: string | undefined): void => {
+    if (nonEmpty(tail)) judgeStderr[binary] = tail.slice(-MAX_JUDGE_STDERR_BYTES);
+  };
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
+    ladderTried.push(binary);
     try {
       const result = await deps.invokeModel(binary, prompt);
       if (result.timedOut) {
@@ -454,23 +536,32 @@ export async function evaluatePullRequest(
         // delivered anything to judge, so this rung was not reached.
         lastError = `model_timeout:${binary}`;
         transportFailure ??= lastError;
+        recordStderr(binary, result.stderrTail);
         continue;
       }
       // The process ran and returned. Whatever happens below is judgment.
       reachedAnyRung = true;
       if (result.exitCode !== 0) {
         lastError = `model_exit_nonzero:${binary}`;
+        recordStderr(binary, result.stderrTail);
         continue;
       }
       const parsed = parseReviewVerdict(result.stdout);
       if (!parsed) {
         lastError = `model_output_invalid:${binary}`;
+        recordStderr(binary, result.stderrTail);
         continue;
       }
       try {
         assertCandidateIsCurrentHead(input.head_sha, parsed.reviewed_head_sha);
       } catch {
-        return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
+        return indeterminate(
+          input,
+          deps,
+          acceptanceCriteriaAvailable,
+          'reviewed_head_mismatch',
+          diagnostics()
+        );
       }
       return {
         ...parsed,
@@ -494,9 +585,15 @@ export async function evaluatePullRequest(
   // (`reachedAnyRung`) and nothing threw a non-transport error
   // (`nonTransportFailure`). Either one makes the outcome terminal.
   if (transportFailure && !reachedAnyRung && !nonTransportFailure) {
-    return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
+    return transportError(
+      input,
+      deps,
+      acceptanceCriteriaAvailable,
+      transportFailure,
+      diagnostics()
+    );
   }
-  return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
+  return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError, diagnostics());
 }
 
 function defaultReviewLadder(): string[] {
@@ -514,6 +611,16 @@ export function configuredReviewIdentity(): ReviewAgentIdentity {
 
 /** Default judge wall clock; override with OVERSEER_REVIEW_MODEL_TIMEOUT_MS. */
 export const DEFAULT_REVIEW_MODEL_TIMEOUT_MS = 60_000;
+
+/**
+ * How much judge stderr is retained on a failed rung (#798).
+ *
+ * The TAIL, not the head: a CLI that fails prints its usage banner first and
+ * the actual error last, so the last bytes are the diagnostic ones. Two
+ * kilobytes is enough for a stack tail or an API error body while staying far
+ * inside the dispatch body budget even with a full ladder failing.
+ */
+export const MAX_JUDGE_STDERR_BYTES = 2_048;
 
 export function resolveReviewModelTimeoutMs(
   env: Record<string, string | undefined> = process.env
@@ -666,6 +773,22 @@ export async function runReviewModelProcess(
   // OVERSEER_REVIEW_MODEL_TIMEOUT_MS bounded only the model's THINKING time, not
   // the call, and a non-consuming child hung the review worker indefinitely with
   // no timeout, no verdict and no deferral.
+  // #798: the judge's stderr is read into this slot as soon as the stream
+  // closes, so BOTH the settled path and the timeout path can report it. The
+  // timeout path cannot simply await the stream -- that is the hang the wall
+  // clock exists to prevent -- so it reports whatever had already arrived when
+  // the child was killed, which for a hung CLI is exactly its startup output.
+  let stderrTail = '';
+  const stderrRead = subprocess.stderr
+    ? new Response(subprocess.stderr)
+        .text()
+        .then(text => {
+          stderrTail = text.slice(-MAX_JUDGE_STDERR_BYTES);
+          return text;
+        })
+        .catch(() => '')
+    : Promise.resolve('');
+
   let timeout: Timer | undefined;
   let timedOut = false;
   const timeoutResult = new Promise<PrReviewModelResult>(resolve => {
@@ -677,7 +800,7 @@ export async function runReviewModelProcess(
       // EPIPE/abort rejection, swallowed below) instead of hanging on.
       subprocess.kill();
       destroyStdin(subprocess.stdin);
-      resolve({ exitCode: 124, stdout: '', timedOut: true });
+      resolve({ exitCode: 124, stdout: '', timedOut: true, stderrTail });
     }, timeoutMs);
   });
 
@@ -697,14 +820,22 @@ export async function runReviewModelProcess(
     void delivery;
     const [exitCode, stdout, stderr] = await Promise.all([
       subprocess.exited,
-      new Response(subprocess.stdout).text(),
-      new Response(subprocess.stderr).text(),
+      subprocess.stdout ? new Response(subprocess.stdout).text() : Promise.resolve(''),
+      // Reuse the single reader armed above: a ReadableStream may only be
+      // consumed once, so reading it a second time here would throw.
+      stderrRead,
     ]);
     const payload = stdout.trim().length > 0 ? stdout : stderr;
+    const tail = stderr.slice(-MAX_JUDGE_STDERR_BYTES);
     // A kill fired by the timeout also settles `exited`; report that as the
     // timeout it is rather than as a spurious non-zero exit.
-    if (timedOut) return { exitCode: 124, stdout: '', timedOut: true };
-    return { exitCode, stdout: normalizeModelOutput(binary, payload), timedOut: false };
+    if (timedOut) return { exitCode: 124, stdout: '', timedOut: true, stderrTail: tail };
+    return {
+      exitCode,
+      stdout: normalizeModelOutput(binary, payload),
+      timedOut: false,
+      stderrTail: tail,
+    };
   })();
   const result = await Promise.race([processResult, timeoutResult]);
   if (timeout) clearTimeout(timeout);

@@ -64,6 +64,21 @@ export interface ReviewerVerdict {
   reasonCode?: string;
   /** Milliseconds to wait before the item becomes claimable again. */
   retryAfterMs?: number;
+  /**
+   * The evaluator's FULL error string (#798), e.g. `model_timeout:codex`.
+   *
+   * OPERATOR-ONLY, persisted on the receipt. Never post it: the detail half of
+   * some codes carries model output and API messages. The redacted public form
+   * is already inside `summary`.
+   *
+   * Distinct from `reasonCode`, which is the safe code alone and exists to
+   * classify a TRANSPORT_ERROR deferral.
+   */
+  reasonDetail?: string;
+  /** Judge stderr tails by binary (#798). Operator-only, receipt-bound. */
+  judgeStderr?: Record<string, string>;
+  /** Ladder rungs attempted, in order (#798). */
+  ladderTried?: string[];
 }
 
 export interface ReviewWorkItem {
@@ -153,6 +168,15 @@ export interface SubmitDeps {
     disposition: SubmitDisposition;
     event?: OverseerReviewEvent;
     reason?: string;
+    /**
+     * The evaluator's full error string and the failing judges' stderr tails
+     * (#798). Present on every disposition reached after the reviewer ran.
+     * Operator-only: this is the record an operator reads from the event store
+     * to tell a timed-out judge from an unparseable response.
+     */
+    reasonDetail?: string;
+    judgeStderr?: Record<string, string>;
+    ladderTried?: string[];
   }): Promise<void>;
 }
 
@@ -233,23 +257,35 @@ export async function runAndSubmitReview(
   // there is no reviewed head to compare and a stale-head classification here
   // would be false.
   if (verdict.transportError) {
-    return finish(deps, work, work.headSha, {
-      disposition: 'transport_error',
-      reason: verdict.reasonCode
-        ? `review_transport_error:${verdict.reasonCode}`
-        : 'review_transport_error',
-      ...(typeof verdict.retryAfterMs === 'number' ? { retryAfterMs: verdict.retryAfterMs } : {}),
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'transport_error',
+        reason: verdict.reasonCode
+          ? `review_transport_error:${verdict.reasonCode}`
+          : 'review_transport_error',
+        ...(typeof verdict.retryAfterMs === 'number' ? { retryAfterMs: verdict.retryAfterMs } : {}),
+      },
+      verdict
+    );
   }
 
   // CHECKS PENDING: CI on the bound head is not terminal yet, so no verdict was
   // formed. This is NOT a rejection -- submit nothing and let the worker release
   // and retry later. Nothing was evaluated, so there is no head to re-read/bind.
   if (verdict.checksPending) {
-    return finish(deps, work, work.headSha, {
-      disposition: 'checks_pending',
-      reason: 'checks_not_terminal',
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'checks_pending',
+        reason: 'checks_not_terminal',
+      },
+      verdict
+    );
   }
 
   // EXACT-HEAD BINDING: the reviewer must have examined the bound head.
@@ -264,15 +300,27 @@ export async function runAndSubmitReview(
     // head. Report it as superseded: the block is suppressed, this item
     // finishes, and ingest's fresh item covers the head that is actually live.
     if (verdict.requiredContextsUnavailable) {
-      return finish(deps, work, work.headSha, {
-        disposition: 'superseded_head',
-        reason: 'reviewer_examined_different_head_before_required_contexts_block',
-      });
+      return finish(
+        deps,
+        work,
+        work.headSha,
+        {
+          disposition: 'superseded_head',
+          reason: 'reviewer_examined_different_head_before_required_contexts_block',
+        },
+        verdict
+      );
     }
-    return finish(deps, work, work.headSha, {
-      disposition: 'stale_head',
-      reason: 'reviewer_examined_different_head',
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'stale_head',
+        reason: 'reviewer_examined_different_head',
+      },
+      verdict
+    );
   }
 
   // A push during review invalidates the verdict; do not land it on a head
@@ -285,10 +333,16 @@ export async function runAndSubmitReview(
       prNumber: work.prNumber,
     });
   } catch (error) {
-    return finish(deps, work, work.headSha, {
-      disposition: 'submission_failed',
-      reason: `head_recheck_failed:${errorCode(error)}`,
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'submission_failed',
+        reason: `head_recheck_failed:${errorCode(error)}`,
+      },
+      verdict
+    );
   }
   if (liveHead !== work.headSha) {
     // The PR moved while we were evaluating. For a required-contexts BLOCK this
@@ -298,15 +352,27 @@ export async function runAndSubmitReview(
     // item still finishes -- head B is covered by the item ingest enqueues for
     // it, not by re-running this one against a SHA that no longer exists.
     if (verdict.requiredContextsUnavailable) {
-      return finish(deps, work, work.headSha, {
-        disposition: 'superseded_head',
-        reason: 'head_advanced_before_required_contexts_block',
-      });
+      return finish(
+        deps,
+        work,
+        work.headSha,
+        {
+          disposition: 'superseded_head',
+          reason: 'head_advanced_before_required_contexts_block',
+        },
+        verdict
+      );
     }
-    return finish(deps, work, work.headSha, {
-      disposition: 'stale_head',
-      reason: 'head_advanced_during_review',
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'stale_head',
+        reason: 'head_advanced_during_review',
+      },
+      verdict
+    );
   }
 
   // REQUIRED CONTEXTS UNAVAILABLE (#775): bounded deferral has been exhausted,
@@ -332,13 +398,19 @@ export async function runAndSubmitReview(
     } catch (error) {
       submitMessage = errorCode(error);
     }
-    return finish(deps, work, work.headSha, {
-      disposition: 'blocked_required_contexts_unavailable',
-      reason: submitted
-        ? 'required_contexts_unavailable_blocked'
-        : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
-      event: 'COMMENT',
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'blocked_required_contexts_unavailable',
+        reason: submitted
+          ? 'required_contexts_unavailable_blocked'
+          : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
+        event: 'COMMENT',
+      },
+      verdict
+    );
   }
 
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
@@ -346,11 +418,17 @@ export async function runAndSubmitReview(
 
   // A rejection with no evidence is not actionable; refuse before the call.
   if (!verdict.approved && verdict.summary.trim().length === 0) {
-    return finish(deps, work, work.headSha, {
-      disposition: 'submission_failed',
-      reason: 'request_changes_missing_evidence',
-      event,
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'submission_failed',
+        reason: 'request_changes_missing_evidence',
+        event,
+      },
+      verdict
+    );
   }
 
   let submission: SubmitPullRequestReviewResult;
@@ -368,25 +446,43 @@ export async function runAndSubmitReview(
       commitId: work.headSha,
     });
   } catch (error) {
-    return finish(deps, work, work.headSha, {
-      disposition: 'submission_failed',
-      reason: `submit_threw:${errorCode(error)}`,
-      event,
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'submission_failed',
+        reason: `submit_threw:${errorCode(error)}`,
+        event,
+      },
+      verdict
+    );
   }
 
   if (!submission.submitted) {
-    return finish(deps, work, work.headSha, {
-      disposition: 'submission_failed',
-      reason: submission.message ?? 'submit_rejected',
-      event,
-    });
+    return finish(
+      deps,
+      work,
+      work.headSha,
+      {
+        disposition: 'submission_failed',
+        reason: submission.message ?? 'submit_rejected',
+        event,
+      },
+      verdict
+    );
   }
 
-  return finish(deps, work, work.headSha, {
-    disposition: verdict.approved ? 'approved' : 'changes_requested',
-    event,
-  });
+  return finish(
+    deps,
+    work,
+    work.headSha,
+    {
+      disposition: verdict.approved ? 'approved' : 'changes_requested',
+      event,
+    },
+    verdict
+  );
 }
 
 function errorCode(error: unknown): string {
@@ -394,11 +490,32 @@ function errorCode(error: unknown): string {
   return 'unknown_error';
 }
 
+/**
+ * Pulls the operator-only diagnostics off a verdict for the receipt (#798).
+ *
+ * Only the fields that actually exist are spread, so a verdict from a
+ * dependency double that models none of them produces a receipt identical to
+ * the pre-#798 shape rather than one padded with undefined keys.
+ */
+function verdictDiagnostics(verdict: ReviewerVerdict | undefined): {
+  reasonDetail?: string;
+  judgeStderr?: Record<string, string>;
+  ladderTried?: string[];
+} {
+  if (!verdict) return {};
+  return {
+    ...(verdict.reasonDetail ? { reasonDetail: verdict.reasonDetail } : {}),
+    ...(verdict.judgeStderr ? { judgeStderr: verdict.judgeStderr } : {}),
+    ...(verdict.ladderTried ? { ladderTried: verdict.ladderTried } : {}),
+  };
+}
+
 async function finish(
   deps: SubmitDeps,
   work: ReviewWorkItem,
   headSha: string,
-  outcome: SubmitOutcome
+  outcome: SubmitOutcome,
+  verdict?: ReviewerVerdict
 ): Promise<SubmitOutcome> {
   try {
     await deps.recordReceipt({
@@ -411,6 +528,7 @@ async function finish(
       disposition: outcome.disposition,
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
+      ...verdictDiagnostics(verdict),
     });
   } catch {
     // Receipt failure never converts a classified outcome into a throw.

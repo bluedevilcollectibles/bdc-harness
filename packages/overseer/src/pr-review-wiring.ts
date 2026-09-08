@@ -401,9 +401,41 @@ export function buildRequiredContextsBlockedSummary(error: string | undefined): 
  */
 export function buildIndeterminateSummary(error: string | undefined): string {
   const code = reviewErrorCode(error);
-  return code
-    ? `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.`
-    : INDETERMINATE_REVIEW_SUMMARY;
+  if (!code) return INDETERMINATE_REVIEW_SUMMARY;
+  return `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.\n\nReason: ${publicReviewReason(error) ?? code}`;
+}
+
+/**
+ * Codes whose detail half is a LADDER BINARY NAME and nothing else (#798).
+ *
+ * `model_timeout:codex` is built as `${code}:${binary}` from the configured
+ * ladder in the evaluator, so its suffix is a short identifier the operator
+ * chose -- safe to post, and the single most useful fact about an
+ * INDETERMINATE ("which judge died"). Every other code's suffix is free text
+ * from a model, an API, or an exception message and stays code-only.
+ */
+const BINARY_SUFFIX_CODES: ReadonlySet<string> = new Set([
+  'model_timeout',
+  'model_exit_nonzero',
+  'model_output_invalid',
+]);
+
+/**
+ * The reason string that may appear in a PUBLIC review body.
+ *
+ * Whitelist, not blacklist: the suffix is emitted only for codes whose detail
+ * half is known to be a ladder binary name, and only after it passes the same
+ * conservative identifier charset `reviewErrorCode` applies to the code. Every
+ * other error -- `evidence_error:<api message>`, `model_error:<exception>` --
+ * degrades to its bare code, because those suffixes carry text this code did
+ * not construct and cannot vouch for.
+ */
+export function publicReviewReason(error: string | undefined): string | null {
+  const code = reviewErrorCode(error);
+  if (!code) return null;
+  if (!BINARY_SUFFIX_CODES.has(code)) return code;
+  const detail = (error ?? '').slice(code.length + 1).trim();
+  return /^[A-Za-z0-9_.-]{1,40}$/.test(detail) ? `${code}:${detail}` : code;
 }
 
 /**
@@ -452,6 +484,36 @@ export function createRealSubmitDeps(
           invokeModel: overrides.invokeModel ?? invokeConfiguredReviewModel,
         }
       );
+      // ONE structured line per evaluation (#798). Emitted before the verdict
+      // mapping below so it covers EVERY branch -- including the early returns
+      // for CHECKS_PENDING / CHECKS_UNAVAILABLE / TRANSPORT_ERROR, which
+      // previously left no record of why the reviewer declined to judge.
+      //
+      // The full `reason` is safe HERE and only here: container logs are an
+      // operator surface, unlike the PR body, which gets the redacted form.
+      log.info(
+        {
+          correlationId: work.correlationId,
+          owner: work.owner,
+          repo: work.repo,
+          prNumber: work.prNumber,
+          headSha: work.headSha,
+          verdict: result.verdict,
+          reason: result.error ?? null,
+          ladderTried: result.ladder_tried ?? [],
+          durationMs: result.duration_ms ?? null,
+          judgeStderrRungs: Object.keys(result.judge_stderr ?? {}),
+        },
+        'overseer_pr_review_verdict'
+      );
+      // The reason and the judge's own stderr travel on EVERY verdict so the
+      // submit path can persist them on the receipt. Read `reasonDetail` and
+      // `judgeStderr` as operator-only; the PR body uses `summary`.
+      const diagnostics = {
+        ...(result.error ? { reasonDetail: result.error } : {}),
+        ...(result.judge_stderr ? { judgeStderr: result.judge_stderr } : {}),
+        ...(result.ladder_tried ? { ladderTried: result.ladder_tried } : {}),
+      };
       // CHECKS_PENDING is a non-terminal defer, NOT a verdict. Surface it as a
       // distinct signal so the submit path can release-and-retry rather than
       // fall through to the summary/`approved` mapping below, which would
@@ -463,6 +525,7 @@ export function createRealSubmitDeps(
           summary: '',
           reviewedHeadSha: result.reviewed_head_sha,
           checksPending: true,
+          ...diagnostics,
         };
       }
       // CHECKS_UNAVAILABLE (#775): terminal, never approving. Carries its own
@@ -474,6 +537,7 @@ export function createRealSubmitDeps(
           summary: buildRequiredContextsBlockedSummary(result.error),
           reviewedHeadSha: result.reviewed_head_sha,
           requiredContextsUnavailable: true,
+          ...diagnostics,
         };
       }
       // TRANSPORT_ERROR is a deferral for the same reason CHECKS_PENDING is: no
@@ -493,6 +557,7 @@ export function createRealSubmitDeps(
           ...(typeof result.retry_after_ms === 'number'
             ? { retryAfterMs: result.retry_after_ms }
             : {}),
+          ...diagnostics,
         };
       }
       const summary =
@@ -507,6 +572,7 @@ export function createRealSubmitDeps(
         approved: result.verdict === 'APPROVE',
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
+        ...diagnostics,
       };
     },
     submitReview: createRealSubmitPullRequestReview(octokit),
