@@ -52,6 +52,17 @@ export interface ExpectationDeps {
   markMet?: (id: string, evidencePointer: string) => Promise<boolean | undefined>;
   markFailed?: (id: string) => Promise<boolean | undefined>;
   claimRedispatchAttempt?: typeof taskmasterDb.claimRedispatchAttempt;
+  /**
+   * Claims the recovery replay and moves the evidence deadline in one write.
+   * `undefined` is accepted so a double that does not model contention still
+   * compiles; only an explicit `false` is treated as a lost claim.
+   */
+  claimRecoveryReplay?: (
+    id: string,
+    expectedRetries: number,
+    dueAt: string,
+    expectedDueAt: string
+  ) => Promise<boolean | undefined>;
   markEscalated?: (id: string, evidencePointer?: string) => Promise<boolean | undefined>;
   markGivenUp?: (id: string, reason: string) => Promise<boolean | undefined>;
   getMessage?: (id: string) => Promise<DispatchMessage | null>;
@@ -342,12 +353,35 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
           );
           continue;
         }
+        // MOVE THE DEADLINE WITH THE REPLAY, NOT AFTER IT.
+        //
+        // Recovery only runs once due_at has elapsed, so replaying without
+        // advancing it left the row instantly overdue: the next tick would call
+        // the just-recovered dispatch a failure and burn another retry, or
+        // escalate, without ever granting the configured response interval.
+        // This also serves as the exclusive claim for the replay -- two ticks
+        // seeing the same unsent attempt cannot both send, and a tick racing a
+        // concurrent markMet loses here and sends nothing.
+        const recoveryDueAt = new Date(
+          now.getTime() + (deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)
+        ).toISOString();
+        const claimedRecovery = await (
+          deps.claimRecoveryReplay ?? taskmasterDb.claimRecoveryReplay
+        )(expectation.id, expectation.retries, recoveryDueAt, expectation.due_at);
+        if (claimedRecovery === false) {
+          log.warn(
+            { expectationId: expectation.id, idempotencyKey: claimedKey },
+            'taskmaster.expectation_recovery_claim_lost'
+          );
+          continue;
+        }
         await sendRedispatch(expectation, original, expectation.retries, deps);
         log.warn(
           {
             expectationId: expectation.id,
             idempotencyKey: claimedKey,
             attempt: expectation.retries,
+            dueAt: recoveryDueAt,
           },
           'taskmaster.expectation_redispatch_recovered'
         );
@@ -418,20 +452,24 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       );
       continue;
     }
-    const escalation = await (deps.createTask ?? createAuthenticatedMessage)(
-      { kind: 'system', sender: 'taskmaster' },
-      {
-        correlation_id: `tm-expectation-${expectation.id}`,
-        idempotency_key: `tm:expectation:${expectation.id}:escalate`,
-        task_type: 'agent_message',
-        recipient: 'operator',
-        priority: 'blocker',
-        body: `Taskmaster expectation exhausted: ${JSON.stringify(expectation)}`,
-      }
-    );
+    // ACQUIRE THE TERMINAL TRANSITION BEFORE SENDING, NOT AFTER.
+    //
+    // markFailed is NOT an exclusive claim: 'failed' is itself in the active
+    // set, so failed -> failed succeeds and two workers can both pass it. Nor
+    // does winning it lock the row -- markMet permits failed -> met. So a
+    // worker could win markFailed, have a concurrent worker verify the evidence
+    // and mark the row met, and STILL put an operator blocker on the wire; the
+    // losing markEscalated afterwards could not retract that external action.
+    //
+    // markEscalated IS exclusive (active -> escalated, conditional). Taking it
+    // first makes the terminal state the gate on the send: a worker that loses
+    // it never dispatches anything. Ordering an irreversible external action
+    // after the transition that authorizes it is the general rule here -- the
+    // same reason the redispatch claim precedes its send.
+    const escalationPointer = `tm:expectation:${expectation.id}:escalate`;
     const escalated = await (deps.markEscalated ?? taskmasterDb.markEscalated)(
       expectation.id,
-      `dispatch:${escalation.id}`
+      escalationPointer
     );
     if (escalated === false) {
       log.warn(
@@ -440,6 +478,20 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       );
       continue;
     }
+    // Deterministic key: if this send throws, the next tick cannot re-send it
+    // (the row is already terminal), so the escalation is recorded by pointer
+    // and the key is stable for any manual replay.
+    await (deps.createTask ?? createAuthenticatedMessage)(
+      { kind: 'system', sender: 'taskmaster' },
+      {
+        correlation_id: `tm-expectation-${expectation.id}`,
+        idempotency_key: escalationPointer,
+        task_type: 'agent_message',
+        recipient: 'operator',
+        priority: 'blocker',
+        body: `Taskmaster expectation exhausted: ${JSON.stringify(expectation)}`,
+      }
+    );
     log.error({ expectationId: expectation.id }, 'taskmaster.expectation_escalated');
   }
 }

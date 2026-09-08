@@ -41,6 +41,7 @@ import {
   markMet,
   markFailed,
   claimRedispatchAttempt,
+  claimRecoveryReplay,
   markEscalated,
   markGivenUp,
   getExpectationCounts,
@@ -263,6 +264,67 @@ describe('tm_expectations DAL', () => {
     );
     expect(row.rows[0]?.status).toBe('met');
     expect(Number(row.rows[0]?.retries)).toBe(0);
+  });
+
+  test('claimRecoveryReplay moves the deadline without spending a retry', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-recovery',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date(0).toISOString())).toBe(1);
+    const fresh = new Date(Date.now() + 900_000).toISOString();
+    expect(await claimRecoveryReplay(id, 1, fresh, new Date(0).toISOString())).toBe(true);
+    const row = await db.query<{ due_at: string; retries: number; status: string }>(
+      'SELECT due_at, retries, status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    // The deadline moved; the retry count did NOT -- recovery finishes an
+    // attempt already paid for rather than buying another.
+    expect(Date.parse(String(row.rows[0]?.due_at))).toBe(Date.parse(fresh));
+    expect(Number(row.rows[0]?.retries)).toBe(1);
+    expect(row.rows[0]?.status).toBe('failed');
+  });
+
+  test('two ticks race the recovery replay: exactly one wins', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-recovery-race',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date(0).toISOString())).toBe(1);
+    const fresh = new Date(Date.now() + 900_000).toISOString();
+    const [a, b] = await Promise.all([
+      claimRecoveryReplay(id, 1, fresh, new Date(0).toISOString()),
+      claimRecoveryReplay(id, 1, fresh, new Date(0).toISOString()),
+    ]);
+    // The claim is what makes the replay exclusive: both ticks see the same
+    // unsent attempt, only one may put it on the wire.
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+  });
+
+  test('recovery replay is refused once the expectation is terminal', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-recovery-met',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch',
+      max_retries: 2,
+    });
+    expect(await claimRedispatchAttempt(id, 0, new Date(0).toISOString())).toBe(1);
+    expect(await markMet(id, 'https://example/proof')).toBe(true);
+    // A tick racing a concurrent verification must not replay a dispatch for
+    // work that already succeeded.
+    expect(
+      await claimRecoveryReplay(id, 1, new Date().toISOString(), new Date(0).toISOString())
+    ).toBe(false);
   });
 
   test('the claim refuses to exceed max_retries', async () => {

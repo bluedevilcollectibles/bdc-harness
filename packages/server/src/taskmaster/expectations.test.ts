@@ -428,6 +428,7 @@ describe('expectation supervisor', () => {
         throw new Error('markFailed must not run: a never-sent attempt is not a failure');
       },
       findEffectByIdempotencyKey: async () => null,
+      claimRecoveryReplay: async () => true,
       getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
       createTask: async (_context, data) => {
         keys.push(data.idempotency_key);
@@ -468,6 +469,7 @@ describe('expectation supervisor', () => {
         return true;
       },
       findEffectByIdempotencyKey: async () => null,
+      claimRecoveryReplay: async () => true,
       getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
       createTask: async (_context, data) => {
         keys.push(data.idempotency_key);
@@ -480,6 +482,169 @@ describe('expectation supervisor', () => {
     // -- the seat has not been given its last chance until the message lands.
     expect(keys).toEqual(['tm:expectation:expectation-1:retry:2']);
     expect(escalations).toEqual([]);
+  });
+
+  test('evidence met between markFailed and the escalation send blocks the blocker', async () => {
+    // THE ESCALATION ORDERING RACE. markFailed is NOT an exclusive claim
+    // (failed -> failed is permitted) and winning it does not lock the row
+    // (markMet permits failed -> met). A concurrent worker verifies the
+    // evidence in that window; this worker must NOT put an operator blocker on
+    // the wire, because a losing markEscalated afterwards could not retract it.
+    const keys: string[] = [];
+    const order: string[] = [];
+    let rowClosedAsMet = false;
+    const exhausted: TmExpectation = { ...base, retries: 2, max_retries: 2, status: 'failed' };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [exhausted],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => {
+        order.push('markFailed');
+        // The concurrent worker lands its markMet right here.
+        rowClosedAsMet = true;
+        return true;
+      },
+      findEffectByIdempotencyKey: async () => ({
+        id: 'sent-2',
+        status: 'queued',
+        createdAt: new Date(0).toISOString(),
+      }),
+      markEscalated: async () => {
+        order.push('markEscalated');
+        // Conditional on the active set: the row is now 'met', so this loses.
+        return rowClosedAsMet ? false : true;
+      },
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        order.push(`send:${data.idempotency_key}`);
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    } as never);
+    // NO escalation dispatch row is created. Fails on the old behaviour, which
+    // sent first and only then discovered the transition was lost.
+    expect(keys).toEqual([]);
+    // And the transition is acquired BEFORE any send is attempted.
+    expect(order).toEqual(['markFailed', 'markEscalated']);
+  });
+
+  test('a won escalation acquires the terminal transition before it sends', async () => {
+    const order: string[] = [];
+    const exhausted: TmExpectation = { ...base, retries: 2, max_retries: 2, status: 'failed' };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [exhausted],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      findEffectByIdempotencyKey: async () => ({
+        id: 'sent-2',
+        status: 'queued',
+        createdAt: new Date(0).toISOString(),
+      }),
+      markEscalated: async () => {
+        order.push('markEscalated');
+        return true;
+      },
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        order.push(`send:${data.idempotency_key}`);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    } as never);
+    expect(order).toEqual(['markEscalated', 'send:tm:expectation:expectation-1:escalate']);
+  });
+
+  test('recovery advances the deadline, so a tick inside the interval does nothing', async () => {
+    // Recovery only runs after due_at has elapsed. If the replay does not move
+    // the deadline, the next tick instantly judges the recovered dispatch a
+    // failure and burns another retry or escalates, never granting the
+    // configured response interval.
+    const RESPONSE_INTERVAL_MS = 15 * 60 * 1000;
+    const t0 = new Date('2026-09-08T00:00:00.000Z');
+    const keys: string[] = [];
+    const claims: string[] = [];
+    // due_at already elapsed; attempt 1 claimed but never sent.
+    let row: TmExpectation = {
+      ...base,
+      retries: 1,
+      max_retries: 2,
+      status: 'failed',
+      due_at: new Date(t0.getTime() - 1000).toISOString(),
+    };
+    const sentKeys = new Set<string>();
+    const deps = {
+      listDueExpectations: async () => [row],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => {
+        claims.push('markFailed');
+        return true;
+      },
+      markEscalated: async () => {
+        claims.push('markEscalated');
+        return true;
+      },
+      findEffectByIdempotencyKey: async (key: string) =>
+        sentKeys.has(key)
+          ? { id: 'sent', status: 'queued', createdAt: new Date(0).toISOString() }
+          : null,
+      claimRecoveryReplay: async (_id: string, _expected: number, dueAt: string) => {
+        claims.push('claimRecoveryReplay');
+        row = { ...row, due_at: dueAt };
+        return true;
+      },
+      claimRedispatchAttempt: async () => {
+        claims.push('claimRedispatchAttempt');
+        return 2;
+      },
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context: never, data: { idempotency_key: string }) => {
+        keys.push(data.idempotency_key);
+        sentKeys.add(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: RESPONSE_INTERVAL_MS,
+    };
+
+    // Tick 1: recovers the unsent attempt and moves the deadline forward.
+    await checkExpectations(t0, deps as never);
+    expect(keys).toEqual(['tm:expectation:expectation-1:retry:1']);
+    expect(claims).toEqual(['claimRecoveryReplay']);
+    expect(Date.parse(row.due_at)).toBe(t0.getTime() + RESPONSE_INTERVAL_MS);
+
+    // Tick 2, INSIDE the response interval: does nothing at all. No retry
+    // burned, no escalation, no send. Fails on the old behaviour, where the
+    // stale elapsed deadline made this tick act immediately.
+    await checkExpectations(new Date(t0.getTime() + 60_000), deps as never);
+    expect(keys).toEqual(['tm:expectation:expectation-1:retry:1']);
+    expect(claims).toEqual(['claimRecoveryReplay']);
+
+    // Tick 3, AFTER the interval with evidence still absent: now it acts.
+    await checkExpectations(new Date(t0.getTime() + RESPONSE_INTERVAL_MS + 1000), deps as never);
+    expect(claims).toContain('markFailed');
+    expect(keys).toContain('tm:expectation:expectation-1:retry:2');
+  });
+
+  test('a tick that loses the recovery claim replays nothing', async () => {
+    const keys: string[] = [];
+    const crashed: TmExpectation = { ...base, retries: 1, status: 'failed' };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [crashed],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      findEffectByIdempotencyKey: async () => null,
+      claimRecoveryReplay: async () => true,
+      // A concurrent tick already recovered this attempt (or marked it met).
+      claimRecoveryReplay: async () => false,
+      markFailed: async () => {
+        throw new Error('markFailed must not run when the recovery claim is lost');
+      },
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    } as never);
+    expect(keys).toEqual([]);
   });
 
   test('once the last attempt is confirmed sent and evidence stays absent, it escalates', async () => {
@@ -515,12 +680,22 @@ describe('expectation supervisor', () => {
   });
 
   test('recovery then escalation across two ticks sends the last attempt exactly once', async () => {
-    // The full arc the review describes, driven end to end: crash on the final
-    // attempt -> tick A replays it -> tick B (evidence still absent) escalates.
+    // The full arc, driven end to end: crash on the final attempt -> tick A
+    // replays it and moves the deadline -> tick B, AFTER the response interval
+    // with evidence still absent, escalates. The recipient gets its configured
+    // window before the blocker is raised.
+    const RESPONSE_INTERVAL_MS = 15 * 60 * 1000;
+    const t0 = new Date('2026-09-08T00:00:00.000Z');
     const keys: string[] = [];
     const escalations: string[] = [];
-    let sentKeys = new Set<string>();
-    const row: TmExpectation = { ...base, retries: 2, max_retries: 2, status: 'failed' };
+    const sentKeys = new Set<string>();
+    let row: TmExpectation = {
+      ...base,
+      retries: 2,
+      max_retries: 2,
+      status: 'failed',
+      due_at: new Date(t0.getTime() - 1000).toISOString(),
+    };
     const deps = {
       listDueExpectations: async () => [row],
       checkEvidence: async () => ({ ok: false, pointer: null }),
@@ -533,6 +708,10 @@ describe('expectation supervisor', () => {
         sentKeys.has(key)
           ? { id: 'sent', status: 'queued', createdAt: new Date(0).toISOString() }
           : null,
+      claimRecoveryReplay: async (_id: string, _expected: number, dueAt: string) => {
+        row = { ...row, due_at: dueAt };
+        return true;
+      },
       getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
       createTask: async (_context: never, data: { idempotency_key: string }) => {
         keys.push(data.idempotency_key);
@@ -540,18 +719,27 @@ describe('expectation supervisor', () => {
         return { id: 'd' } as never;
       },
       claimRedispatchAttempt: async () => null,
-      retryDelayMs: 0,
+      retryDelayMs: RESPONSE_INTERVAL_MS,
     };
-    await checkExpectations(new Date(), deps as never);
-    await checkExpectations(new Date(), deps as never);
+    // Tick A: recover the unsent final attempt, deadline moves forward.
+    await checkExpectations(t0, deps as never);
+    expect(keys).toEqual(['tm:expectation:expectation-1:retry:2']);
+    expect(escalations).toEqual([]);
+
+    // A tick inside the interval must do nothing -- no escalation yet.
+    await checkExpectations(new Date(t0.getTime() + 60_000), deps as never);
+    expect(keys).toEqual(['tm:expectation:expectation-1:retry:2']);
+    expect(escalations).toEqual([]);
+
+    // Tick B, past the interval: evidence still absent, so escalate.
+    await checkExpectations(new Date(t0.getTime() + RESPONSE_INTERVAL_MS + 1000), deps as never);
     expect(keys).toEqual([
       'tm:expectation:expectation-1:retry:2',
       'tm:expectation:expectation-1:escalate',
     ]);
-    // Exactly one send of the final attempt across both ticks.
+    // Exactly one send of the final attempt across every tick.
     expect(keys.filter(key => key === 'tm:expectation:expectation-1:retry:2')).toHaveLength(1);
     expect(escalations).toEqual(['escalated']);
-    sentKeys = new Set();
   });
 
   test('a replay failure leaves the attempt recoverable rather than stranded', async () => {
@@ -565,6 +753,7 @@ describe('expectation supervisor', () => {
         listDueExpectations: async () => [crashed],
         checkEvidence: async () => ({ ok: false, pointer: null }),
         findEffectByIdempotencyKey: async () => null,
+        claimRecoveryReplay: async () => true,
         getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
         createTask: async () => {
           throw new Error('dispatch unavailable');

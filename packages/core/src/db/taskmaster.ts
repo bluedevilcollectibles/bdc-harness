@@ -306,6 +306,63 @@ export async function claimRedispatchAttempt(
   return result.rowCount === 1 ? expectedRetries + 1 : null;
 }
 /**
+ * Atomically CLAIM the recovery replay of an already-claimed-but-unsent attempt
+ * AND set the fresh evidence deadline for it, in one conditional UPDATE.
+ *
+ * Recovery only runs once due_at has already elapsed (that is what brought the
+ * tick here), so replaying the send without moving the deadline left the row
+ * instantly overdue again: the very next tick would judge the just-recovered
+ * dispatch a failure and burn another retry -- or escalate -- without ever
+ * giving the recipient the configured response interval. The deadline must move
+ * with the replay, not after it.
+ *
+ * Conditioned on the retry count the caller observed and on the row still being
+ * active, so this doubles as an exclusive claim: two ticks that both see the
+ * same unsent attempt cannot both replay it, and a tick racing a concurrent
+ * markMet loses and sends nothing. rowCount is 1 for the winner, 0 for the rest.
+ *
+ * NOTE the deliberate asymmetry with claimRedispatchAttempt: this does NOT
+ * advance `retries`. The attempt being recovered was already paid for when it
+ * was claimed; recovery finishes it rather than buying another.
+ */
+export async function claimRecoveryReplay(
+  id: string,
+  expectedRetries: number,
+  dueAt: string,
+  expectedDueAt: string
+): Promise<boolean> {
+  // The predicate MUST include the observed due_at, and the UPDATE changes it.
+  //
+  // claimRedispatchAttempt gets exclusivity for free: its `retries = $expected`
+  // predicate is invalidated by its own `retries + 1`. This statement does not
+  // touch retries, so conditioning on retries alone leaves the predicate TRUE
+  // after the winner commits and BOTH ticks match -- caught by the "two ticks
+  // race the recovery replay" test, which saw two winners. Matching on the
+  // deadline this tick observed, and then moving it, is what makes the claim
+  // self-invalidating and therefore exclusive.
+  const activePlaceholders = ACTIVE_EXPECTATION_STATUSES.map(
+    (_, index) => `$${String(index + 6)}`
+  ).join(', ');
+  const result = await getDatabase().query(
+    `UPDATE tm_expectations
+        SET due_at = $1, updated_at = $2
+      WHERE id = $3
+        AND retries = $4
+        AND due_at = $5
+        AND status IN (${activePlaceholders})`,
+    [
+      dueAt,
+      new Date().toISOString(),
+      id,
+      expectedRetries,
+      expectedDueAt,
+      ...ACTIVE_EXPECTATION_STATUSES,
+    ]
+  );
+  return result.rowCount === 1;
+}
+
+/**
  * Close an expectation as escalated to a human. Conditioned on the row still
  * being active so a tick cannot escalate an expectation another tick has
  * already verified as met. Returns false when the row was already closed.
