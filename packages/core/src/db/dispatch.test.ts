@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { existsSync, mkdtempSync, rmSync, unlinkSync } from 'fs';
+import { existsSync, mkdtempSync, unlinkSync } from 'fs';
+import { removeTempDirWithRetry } from '../test/temp-dir';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { pathToFileURL } from 'url';
@@ -259,7 +260,7 @@ describe('dispatch db', () => {
     cleanupDb(currentDbPath);
     while (raceHomes.length > 0) {
       const raceHome = raceHomes.pop();
-      if (raceHome) rmSync(raceHome, { recursive: true, force: true });
+      if (raceHome) removeTempDirWithRetry(raceHome);
     }
   });
 

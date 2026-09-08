@@ -11,6 +11,7 @@ import { describe, it, expect, spyOn, afterEach, beforeEach } from 'bun:test';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { mkdirSync, rmSync } from 'fs';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import * as git from '@archon/git';
 import {
   checkClaudeBinary,
@@ -168,11 +169,7 @@ describe('checkWorkspaceWritable', () => {
     } else {
       process.env.ARCHON_HOME = originalHome;
     }
-    try {
-      rmSync(TMP, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors
-    }
+    removeTempDirWithRetry(TMP);
   });
 
   it('returns pass when directory is writable', async () => {

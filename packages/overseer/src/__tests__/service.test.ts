@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync } from 'fs';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
@@ -86,7 +87,7 @@ async function withTempDatabase<T>(work: () => Promise<T>): Promise<T> {
   } finally {
     await closeDatabase();
     resetDatabase();
-    rmSync(home, { recursive: true, force: true });
+    removeTempDirWithRetry(home);
   }
 }
 

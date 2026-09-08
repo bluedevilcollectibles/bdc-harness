@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
+import { removeTempDirWithRetry } from '../../../packages/core/src/test/temp-dir';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -42,7 +43,7 @@ async function restoreHome(): Promise<void> {
   if (savedDatabaseUrl === undefined) delete process.env.DATABASE_URL;
   else process.env.DATABASE_URL = savedDatabaseUrl;
   try {
-    rmSync(testHome, { recursive: true, force: true });
+    removeTempDirWithRetry(testHome);
   } catch {
     // Best-effort temp cleanup.
   }

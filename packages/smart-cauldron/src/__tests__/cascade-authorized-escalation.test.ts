@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync } from 'fs';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
@@ -95,7 +96,7 @@ async function withPersistentPermit(
   } finally {
     await closeDatabase();
     resetDatabase();
-    rmSync(home, { recursive: true, force: true });
+    removeTempDirWithRetry(home);
   }
 }
 
