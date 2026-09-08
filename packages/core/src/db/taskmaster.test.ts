@@ -53,6 +53,105 @@ import {
 } from './taskmaster';
 
 describe('tm_expectations DAL', () => {
+  test('the 049 repair rebuilds a legacy status CHECK so escalating is accepted', async () => {
+    // REGRESSION. A CHECK cannot be altered in place in SQLite, so a table
+    // whose status CHECK predates 'escalating' would reject claimEscalation at
+    // runtime however many columns were added -- the two-phase escalation would
+    // be dead on arrival. The repair rebuilds such a table.
+    //
+    // REACHABILITY: no deployed database can hold this shape today.
+    // tm_expectations ships for the first time in this PR (absent from every
+    // commit on origin/dev; the live archon.db reports TABLE_ABSENT). This
+    // covers a database created from an intermediate revision of this branch,
+    // and proves the repair is correct for any shape it meets.
+    const legacyPath = join(tmpdir(), `taskmaster-oldcheck-${Date.now()}-${Math.random()}.db`);
+    const seed = new Database(legacyPath);
+    // The OLD schema verbatim: no registration_key, and a status CHECK with no
+    // 'escalating'.
+    seed.run(`CREATE TABLE tm_expectations (
+      id TEXT PRIMARY KEY,
+      dispatch_ref TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      due_at TEXT NOT NULL,
+      on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+      max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+      retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'met', 'failed', 'escalated', 'given_up')
+      ),
+      evidence_pointer TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`);
+    // Two rows sharing a dispatch_ref, so the rebuild's key backfill is
+    // exercised at the same time as the CHECK upgrade.
+    seed.run(
+      `INSERT INTO tm_expectations
+       (id, dispatch_ref, recipient, evidence_json, due_at, on_absence, max_retries, retries, status, created_at, updated_at)
+       VALUES ('older','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
+              ('newer','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'failed','2026-02-01T00:00:00.000Z','2026-02-01T00:00:00.000Z')`
+    );
+    seed.close();
+
+    const upgraded = new SqliteAdapter(legacyPath);
+    try {
+      const previous = db;
+      db = upgraded;
+      try {
+        // The CHECK now permits the intermediate state.
+        const createSql = await upgraded.query<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+        );
+        expect(createSql.rows[0]?.sql).toContain('escalating');
+
+        // THE POINT: claimEscalation succeeds instead of hitting a constraint
+        // violation.
+        expect(await claimEscalation('older', 'tm:expectation:older:escalate')).toBe(true);
+        const status = await upgraded.query<{ status: string }>(
+          'SELECT status FROM tm_expectations WHERE id = $1',
+          ['older']
+        );
+        expect(status.rows[0]?.status).toBe('escalating');
+
+        // The unique index survived the rebuild (indexes are dropped with the
+        // old table, so they must be recreated).
+        const indexes = await upgraded.query<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
+          ['idx_tm_expectations_registration_key']
+        );
+        expect(indexes.rows).toHaveLength(1);
+
+        // Rows preserved with collision-free keys -- nothing dropped.
+        const rows = await upgraded.query<{ id: string; registration_key: string }>(
+          'SELECT id, registration_key FROM tm_expectations ORDER BY id'
+        );
+        expect(rows.rows).toHaveLength(2);
+        const byId = new Map(rows.rows.map(r => [r.id, r.registration_key]));
+        expect(byId.get('older')).toBe('dup');
+        expect(byId.get('newer')).toBe('dup:legacy:newer');
+
+        // And registration still works on the rebuilt table.
+        expect(
+          await registerExpectation({
+            action_ref: 'a1',
+            dispatch_ref: 'fresh-after-rebuild',
+            recipient: 'xo',
+            evidence_json: '{}',
+            due_at: new Date(0).toISOString(),
+            on_absence: 'escalate',
+            max_retries: 0,
+          })
+        ).toBeTruthy();
+      } finally {
+        db = previous;
+      }
+    } finally {
+      await upgraded.close();
+      cleanupDb(legacyPath);
+    }
+  });
+
   test('the 049 repair de-duplicates legacy dispatch_ref collisions and still registers', async () => {
     // REGRESSION, and the live archon.db is the target of this repair.
     //

@@ -460,17 +460,88 @@ export class SqliteAdapter implements IDatabase {
     // the one a future registerExpectation reuses -- and every later duplicate
     // gets a collision-free "<dispatch_ref>:legacy:<id>" key, preserved and
     // inspectable but out of the way.
+    // A CHECK constraint cannot be altered in place in SQLite, so a table whose
+    // status CHECK predates 'escalating' would reject claimEscalation at
+    // runtime no matter how many columns are added. Such a table is repaired by
+    // the documented rebuild pattern (create new, INSERT ... SELECT, drop,
+    // rename) rather than by ALTER.
+    //
+    // NOTE ON REACHABILITY: no deployed database can currently hold that shape.
+    // tm_expectations ships for the first time in THIS PR -- it exists in no
+    // commit on origin/dev, and the live archon.db reports TABLE_ABSENT. The
+    // rebuild is therefore defensive, for a database created from an
+    // intermediate revision of this branch, and it is written to be a no-op on
+    // both a fresh table and an already-current one.
     try {
       const expectationCols = this.pragmaAll("PRAGMA table_info('tm_expectations')") as {
         name: string;
       }[];
       if (expectationCols.length > 0) {
         const expectationColNames = new Set(expectationCols.map(c => c.name));
-        if (!expectationColNames.has('registration_key')) {
+        const createSql =
+          (
+            this.pragmaAll(
+              "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+            ) as { sql?: string }[]
+          )[0]?.sql ?? '';
+        // The CHECK is only reachable through the stored CREATE TABLE text;
+        // PRAGMA table_info does not expose it.
+        const statusCheckIsStale = !createSql.includes('escalating');
+
+        if (statusCheckIsStale) {
+          // REBUILD. One transaction: any failure leaves the original table
+          // untouched rather than half-migrated.
+          this.db.run('BEGIN');
+          try {
+            this.db.run(`CREATE TABLE tm_expectations_new (
+              id TEXT PRIMARY KEY,
+              registration_key TEXT NOT NULL UNIQUE,
+              dispatch_ref TEXT NOT NULL,
+              recipient TEXT NOT NULL,
+              evidence_json TEXT NOT NULL,
+              due_at TEXT NOT NULL,
+              on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+              max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+              retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+              status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
+              ),
+              evidence_pointer TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )`);
+            // Carry every row across with the same collision-free key rule:
+            // oldest row per dispatch_ref keeps the bare key, later duplicates
+            // get a ":legacy:<id>" suffix. A pre-existing registration_key
+            // (from a partially-upgraded table) is preserved as-is.
+            const keyExpression = expectationColNames.has('registration_key')
+              ? `COALESCE(registration_key, CASE WHEN ROW_NUMBER() OVER (
+                   PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
+                 ) = 1 THEN dispatch_ref ELSE dispatch_ref || ':legacy:' || id END)`
+              : `CASE WHEN ROW_NUMBER() OVER (
+                   PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
+                 ) = 1 THEN dispatch_ref ELSE dispatch_ref || ':legacy:' || id END`;
+            this.db.run(`INSERT INTO tm_expectations_new (
+              id, registration_key, dispatch_ref, recipient, evidence_json, due_at,
+              on_absence, max_retries, retries, status, evidence_pointer, created_at, updated_at
+            )
+            SELECT id, ${keyExpression}, dispatch_ref, recipient, evidence_json, due_at,
+                   on_absence, max_retries, retries, status, evidence_pointer, created_at, updated_at
+              FROM tm_expectations`);
+            this.db.run('DROP TABLE tm_expectations');
+            this.db.run('ALTER TABLE tm_expectations_new RENAME TO tm_expectations');
+            this.db.run('COMMIT');
+          } catch (rebuildError) {
+            this.db.run('ROLLBACK');
+            throw rebuildError;
+          }
+        } else if (!expectationColNames.has('registration_key')) {
           this.db.run('ALTER TABLE tm_expectations ADD COLUMN registration_key TEXT');
         }
+
         // Oldest row per dispatch_ref (ties broken by id so the choice is
-        // deterministic across runs) keeps the bare dispatch_ref.
+        // deterministic across runs) keeps the bare dispatch_ref. A no-op after
+        // a rebuild, which already assigned every key.
         this.db.run(
           `UPDATE tm_expectations SET registration_key = dispatch_ref
              WHERE registration_key IS NULL
@@ -489,9 +560,19 @@ export class SqliteAdapter implements IDatabase {
               SET registration_key = dispatch_ref || ':legacy:' || id
             WHERE registration_key IS NULL`
         );
+        // Indexes live outside the table definition, so the rebuild drops them
+        // with the old table; recreate all three unconditionally.
         this.db.run(
           `CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key
              ON tm_expectations(registration_key)`
+        );
+        this.db.run(
+          `CREATE INDEX IF NOT EXISTS idx_tm_expectations_due
+             ON tm_expectations(status, due_at)`
+        );
+        this.db.run(
+          `CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref
+             ON tm_expectations(dispatch_ref)`
         );
       }
     } catch (e: unknown) {

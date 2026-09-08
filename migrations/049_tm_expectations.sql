@@ -65,3 +65,41 @@ ALTER TABLE tm_expectations ALTER COLUMN registration_key SET NOT NULL;
 -- The write path depends on this constraint; creating it must not be optional.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key
   ON tm_expectations(registration_key);
+
+-- Upgrade the status CHECK so it permits the intermediate 'escalating' state.
+-- Adding a column cannot change a CHECK, so a table created from an earlier
+-- shape of this migration would reject claimEscalation at runtime with a
+-- constraint violation -- the two-phase escalation would be dead on arrival.
+--
+-- The CHECK in the CREATE TABLE above is inline and therefore auto-named
+-- (tm_expectations_status_check by PostgreSQL's convention, but that is not
+-- guaranteed), so the old constraint is discovered from the catalogue rather
+-- than assumed, dropped, and replaced with an explicitly named one. Idempotent:
+-- re-running finds tm_expectations_status_allowed already present and skips.
+DO $$
+DECLARE
+  existing_name TEXT;
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint
+     WHERE conrelid = 'tm_expectations'::regclass
+       AND conname = 'tm_expectations_status_allowed'
+  ) THEN
+    RETURN;
+  END IF;
+
+  FOR existing_name IN
+    SELECT conname FROM pg_constraint
+     WHERE conrelid = 'tm_expectations'::regclass
+       AND contype = 'c'
+       AND pg_get_constraintdef(oid) ILIKE '%status%'
+  LOOP
+    EXECUTE format('ALTER TABLE tm_expectations DROP CONSTRAINT IF EXISTS %I', existing_name);
+  END LOOP;
+
+  ALTER TABLE tm_expectations
+    ADD CONSTRAINT tm_expectations_status_allowed CHECK (
+      status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
+    );
+END
+$$;
