@@ -53,121 +53,38 @@ import {
 } from './taskmaster';
 
 describe('tm_expectations DAL', () => {
-  test('the 049 repair is restart-safe when registration_key is partially populated', async () => {
-    // REGRESSION. The backfill used to rank only rows whose key was NULL, so a
-    // partially populated table -- reachable if startup stopped between the
-    // non-transactional backfill statements and index creation -- could assign
-    // `dispatch_ref` to a NULL row while its sibling already owned that exact
-    // key. Reproduced before fixing: both rows ended up 'dup' and
-    // CREATE UNIQUE INDEX failed with "UNIQUE constraint failed", blocking
-    // startup entirely.
-    const legacyPath = join(tmpdir(), `taskmaster-partial-${Date.now()}-${Math.random()}.db`);
-    const seed = new Database(legacyPath);
-    // Current-shape table (status CHECK already includes 'escalating', so the
-    // rebuild path is NOT taken) but with a half-finished backfill.
-    seed.run(`CREATE TABLE tm_expectations (
-      id TEXT PRIMARY KEY,
-      registration_key TEXT,
-      dispatch_ref TEXT NOT NULL,
-      recipient TEXT NOT NULL,
-      evidence_json TEXT NOT NULL,
-      due_at TEXT NOT NULL,
-      on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
-      max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
-      retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
-      status TEXT NOT NULL DEFAULT 'pending' CHECK (
-        status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
-      ),
-      evidence_pointer TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`);
-    // THE PARTIAL STATE: 'older' already owns the bare key; its duplicate-ref
-    // sibling 'newer' is still NULL. No unique index yet.
-    seed.run(
-      `INSERT INTO tm_expectations
-       (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence, max_retries, retries, status, created_at, updated_at)
-       VALUES ('older','dup','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
-              ('newer',NULL,'dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-02-01T00:00:00.000Z','2026-02-01T00:00:00.000Z')`
+  test('a fresh database creates tm_expectations with the unique index and escalating', async () => {
+    // The path that actually matters: tm_expectations ships for the first time
+    // in this WO, so every real database takes this one.
+    const createSql = await db.query<{ sql: string }>(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
     );
-    seed.close();
-
-    const upgraded = new SqliteAdapter(legacyPath);
-    try {
-      const previous = db;
-      db = upgraded;
-      try {
-        // The unique index exists -- startup was not blocked.
-        const indexes = await upgraded.query<{ name: string }>(
-          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
-          ['idx_tm_expectations_registration_key']
-        );
-        expect(indexes.rows).toHaveLength(1);
-
-        // Both rows kept, keys DISTINCT. The already-keyed row is untouched.
-        const rows = await upgraded.query<{ id: string; registration_key: string }>(
-          'SELECT id, registration_key FROM tm_expectations ORDER BY id'
-        );
-        expect(rows.rows).toHaveLength(2);
-        const byId = new Map(rows.rows.map(r => [r.id, r.registration_key]));
-        expect(byId.get('older')).toBe('dup');
-        expect(byId.get('newer')).toBe('dup:legacy:newer');
-        expect(new Set(byId.values()).size).toBe(2);
-      } finally {
-        db = previous;
-      }
-    } finally {
-      await upgraded.close();
-    }
-
-    // IDEMPOTENT: a second startup over the repaired database changes nothing.
-    const second = new SqliteAdapter(legacyPath);
-    try {
-      const previous = db;
-      db = second;
-      try {
-        const rows = await second.query<{ id: string; registration_key: string }>(
-          'SELECT id, registration_key FROM tm_expectations ORDER BY id'
-        );
-        const byId = new Map(rows.rows.map(r => [r.id, r.registration_key]));
-        expect(byId.get('older')).toBe('dup');
-        expect(byId.get('newer')).toBe('dup:legacy:newer');
-        // And the table is still usable for new registrations.
-        expect(
-          await registerExpectation({
-            action_ref: 'after-partial-repair',
-            dispatch_ref: 'fresh',
-            recipient: 'xo',
-            evidence_json: '{}',
-            due_at: new Date(0).toISOString(),
-            on_absence: 'escalate',
-            max_retries: 0,
-          })
-        ).toBeTruthy();
-      } finally {
-        db = previous;
-      }
-    } finally {
-      await second.close();
-      cleanupDb(legacyPath);
-    }
+    expect(createSql.rows[0]?.sql).toContain('registration_key');
+    expect(createSql.rows[0]?.sql).toContain('escalating');
+    const indexes = await db.query<{ name: string }>(
+      "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
+      ['idx_tm_expectations_registration_key']
+    );
+    expect(indexes.rows).toHaveLength(1);
+    // And the intermediate state the CHECK exists for is actually usable.
+    const id = await registerExpectation({
+      action_ref: 'fresh-db',
+      dispatch_ref: 'fresh-dispatch',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    expect(await claimEscalation(id, 'tm:expectation:fresh:escalate')).toBe(true);
   });
 
-  test('the 049 repair rebuilds a legacy status CHECK so escalating is accepted', async () => {
-    // REGRESSION. A CHECK cannot be altered in place in SQLite, so a table
-    // whose status CHECK predates 'escalating' would reject claimEscalation at
-    // runtime however many columns were added -- the two-phase escalation would
-    // be dead on arrival. The repair rebuilds such a table.
-    //
-    // REACHABILITY: no deployed database can hold this shape today.
-    // tm_expectations ships for the first time in this PR (absent from every
-    // commit on origin/dev; the live archon.db reports TABLE_ABSENT). This
-    // covers a database created from an intermediate revision of this branch,
-    // and proves the repair is correct for any shape it meets.
-    const legacyPath = join(tmpdir(), `taskmaster-oldcheck-${Date.now()}-${Math.random()}.db`);
+  test('an EMPTY legacy-shaped table is recreated and registration works', async () => {
+    // Recreating an empty table is lossless, so the adapter just does it.
+    const legacyPath = join(tmpdir(), `taskmaster-empty-${Date.now()}-${Math.random()}.db`);
     const seed = new Database(legacyPath);
-    // The OLD schema verbatim: no registration_key, and a status CHECK with no
-    // 'escalating'.
+    // Outdated on all three counts: no registration_key, CHECK without
+    // 'escalating', no unique index.
     seed.run(`CREATE TABLE tm_expectations (
       id TEXT PRIMARY KEY,
       dispatch_ref TEXT NOT NULL,
@@ -184,14 +101,6 @@ describe('tm_expectations DAL', () => {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )`);
-    // Two rows sharing a dispatch_ref, so the rebuild's key backfill is
-    // exercised at the same time as the CHECK upgrade.
-    seed.run(
-      `INSERT INTO tm_expectations
-       (id, dispatch_ref, recipient, evidence_json, due_at, on_absence, max_retries, retries, status, created_at, updated_at)
-       VALUES ('older','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
-              ('newer','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'failed','2026-02-01T00:00:00.000Z','2026-02-01T00:00:00.000Z')`
-    );
     seed.close();
 
     const upgraded = new SqliteAdapter(legacyPath);
@@ -199,50 +108,27 @@ describe('tm_expectations DAL', () => {
       const previous = db;
       db = upgraded;
       try {
-        // The CHECK now permits the intermediate state.
         const createSql = await upgraded.query<{ sql: string }>(
           "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
         );
         expect(createSql.rows[0]?.sql).toContain('escalating');
-
-        // THE POINT: claimEscalation succeeds instead of hitting a constraint
-        // violation.
-        expect(await claimEscalation('older', 'tm:expectation:older:escalate')).toBe(true);
-        const status = await upgraded.query<{ status: string }>(
-          'SELECT status FROM tm_expectations WHERE id = $1',
-          ['older']
-        );
-        expect(status.rows[0]?.status).toBe('escalating');
-
-        // The unique index survived the rebuild (indexes are dropped with the
-        // old table, so they must be recreated).
+        expect(createSql.rows[0]?.sql).toContain('registration_key');
         const indexes = await upgraded.query<{ name: string }>(
           "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
           ['idx_tm_expectations_registration_key']
         );
         expect(indexes.rows).toHaveLength(1);
 
-        // Rows preserved with collision-free keys -- nothing dropped.
-        const rows = await upgraded.query<{ id: string; registration_key: string }>(
-          'SELECT id, registration_key FROM tm_expectations ORDER BY id'
-        );
-        expect(rows.rows).toHaveLength(2);
-        const byId = new Map(rows.rows.map(r => [r.id, r.registration_key]));
-        expect(byId.get('older')).toBe('dup');
-        expect(byId.get('newer')).toBe('dup:legacy:newer');
-
-        // And registration still works on the rebuilt table.
-        expect(
-          await registerExpectation({
-            action_ref: 'a1',
-            dispatch_ref: 'fresh-after-rebuild',
-            recipient: 'xo',
-            evidence_json: '{}',
-            due_at: new Date(0).toISOString(),
-            on_absence: 'escalate',
-            max_retries: 0,
-          })
-        ).toBeTruthy();
+        const id = await registerExpectation({
+          action_ref: 'after-recreate',
+          dispatch_ref: 'recreated',
+          recipient: 'xo',
+          evidence_json: '{}',
+          due_at: new Date(0).toISOString(),
+          on_absence: 'escalate',
+          max_retries: 0,
+        });
+        expect(await claimEscalation(id, 'tm:expectation:recreated:escalate')).toBe(true);
       } finally {
         db = previous;
       }
@@ -252,106 +138,109 @@ describe('tm_expectations DAL', () => {
     }
   });
 
-  test('the 049 repair de-duplicates legacy dispatch_ref collisions and still registers', async () => {
-    // REGRESSION, and the live archon.db is the target of this repair.
-    //
-    // A legacy tm_expectations can already hold two rows sharing a
-    // dispatch_ref -- that duplicate IS the bug this WO fixes. Backfilling
-    // registration_key = dispatch_ref for every row would then make
-    // CREATE UNIQUE INDEX fail; the failure used to be only logged, startup
-    // continued without the constraint, and every later registerExpectation
-    // using ON CONFLICT (registration_key) failed -- registration disabled.
-    const legacyPath = join(tmpdir(), `taskmaster-legacy-${Date.now()}-${Math.random()}.db`);
+  test('a NON-EMPTY legacy-shaped table refuses startup and leaves rows untouched', async () => {
+    // THE DESIGN DECISION. Rather than deriving registration_key values -- every
+    // scheme that mixes preserved and derived keys can collide, and a collision
+    // fails the unique index and blocks startup anyway -- the adapter refuses
+    // loudly and names the one-off operator script. A human inspects the rows;
+    // a startup path does not guess at identities.
+    const legacyPath = join(tmpdir(), `taskmaster-nonempty-${Date.now()}-${Math.random()}.db`);
     const seed = new Database(legacyPath);
-    // Legacy shape: no registration_key column at all.
     seed.run(`CREATE TABLE tm_expectations (
       id TEXT PRIMARY KEY,
       dispatch_ref TEXT NOT NULL,
       recipient TEXT NOT NULL,
       evidence_json TEXT NOT NULL,
       due_at TEXT NOT NULL,
-      on_absence TEXT NOT NULL,
-      max_retries INTEGER NOT NULL DEFAULT 0,
-      retries INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'pending',
+      on_absence TEXT NOT NULL CHECK (on_absence IN ('redispatch', 'escalate', 'give_up')),
+      max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
+      retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
+      status TEXT NOT NULL DEFAULT 'pending' CHECK (
+        status IN ('pending', 'met', 'failed', 'escalated', 'given_up')
+      ),
       evidence_pointer TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     )`);
-    // TWO rows sharing one dispatch_ref -- the collision that broke the repair.
     seed.run(
       `INSERT INTO tm_expectations
        (id, dispatch_ref, recipient, evidence_json, due_at, on_absence, max_retries, retries, status, created_at, updated_at)
-       VALUES ('older','dup-dispatch','xo','{}','1970-01-01T00:00:00.000Z','redispatch',2,1,'failed','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
-              ('newer','dup-dispatch','xo','{}','1970-01-01T00:00:00.000Z','redispatch',2,0,'pending','2026-02-01T00:00:00.000Z','2026-02-01T00:00:00.000Z'),
-              ('solo','solo-dispatch','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-03-01T00:00:00.000Z','2026-03-01T00:00:00.000Z')`
+       VALUES ('older','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
+              ('newer','dup','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-02-01T00:00:00.000Z','2026-02-01T00:00:00.000Z')`
     );
     seed.close();
 
-    // Opening the adapter runs the repair. It must NOT throw on the duplicate.
-    const upgraded = new SqliteAdapter(legacyPath);
+    // Startup fails, and the message is ACTIONABLE: table, row count, script.
+    expect(() => new SqliteAdapter(legacyPath)).toThrow(/tm_expectations/);
+    expect(() => new SqliteAdapter(legacyPath)).toThrow(/2 row\(s\)/);
+    expect(() => new SqliteAdapter(legacyPath)).toThrow(/repair-tm-expectations/);
+
+    // THE ROWS ARE UNTOUCHED -- refusing must not mutate anything.
+    const check = new Database(legacyPath);
+    try {
+      const rows = check
+        .query<{ id: string }, []>('SELECT id FROM tm_expectations ORDER BY id')
+        .all();
+      expect(rows.map(r => r.id)).toEqual(['newer', 'older']);
+      const sql = check
+        .query<
+          { sql: string },
+          []
+        >("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'")
+        .get();
+      // Still the ORIGINAL schema: no silent partial migration happened.
+      expect(sql?.sql).not.toContain('registration_key');
+    } finally {
+      check.close();
+    }
+    cleanupDb(legacyPath);
+  });
+
+  test('a second startup on a correct table is a no-op', async () => {
+    const path = join(tmpdir(), `taskmaster-noop-${Date.now()}-${Math.random()}.db`);
+    const first = new SqliteAdapter(path);
+    let firstSql: string | undefined;
     try {
       const previous = db;
-      db = upgraded;
+      db = first;
       try {
-        // The unique index exists -- the whole point.
-        const indexes = await upgraded.query<{ name: string }>(
-          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
-          ['idx_tm_expectations_registration_key']
-        );
-        expect(indexes.rows).toHaveLength(1);
-
-        // Oldest row per dispatch_ref keeps the clean key; the later duplicate
-        // gets a collision-free suffixed key. Nothing is deleted.
-        const keys = await upgraded.query<{ id: string; registration_key: string }>(
-          'SELECT id, registration_key FROM tm_expectations ORDER BY id'
-        );
-        const byId = new Map(keys.rows.map(r => [r.id, r.registration_key]));
-        expect(byId.get('older')).toBe('dup-dispatch');
-        expect(byId.get('newer')).toBe('dup-dispatch:legacy:newer');
-        expect(byId.get('solo')).toBe('solo-dispatch');
-        expect(keys.rows).toHaveLength(3);
-
-        // And registration still works against the repaired database --
-        // including reusing the OLDEST legacy row for that dispatch.
-        const reused = await registerExpectation({
-          dispatch_ref: 'dup-dispatch',
-          recipient: 'xo',
-          evidence_json: '{}',
-          due_at: new Date(0).toISOString(),
-          on_absence: 'redispatch',
-          max_retries: 2,
-        });
-        expect(reused).toBe('older');
-
-        const fresh = await registerExpectation({
-          action_ref: 'action-after-repair',
-          dispatch_ref: 'brand-new-dispatch',
+        await registerExpectation({
+          action_ref: 'noop-check',
+          dispatch_ref: 'noop-dispatch',
           recipient: 'xo',
           evidence_json: '{}',
           due_at: new Date(0).toISOString(),
           on_absence: 'escalate',
           max_retries: 0,
         });
-        expect(fresh).toBeTruthy();
-        // Idempotent on the repaired database too.
-        expect(
-          await registerExpectation({
-            action_ref: 'action-after-repair',
-            dispatch_ref: 'brand-new-dispatch',
-            recipient: 'xo',
-            evidence_json: '{}',
-            due_at: new Date(0).toISOString(),
-            on_absence: 'escalate',
-            max_retries: 0,
-          })
-        ).toBe(fresh);
+        firstSql = (
+          await first.query<{ sql: string }>(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+          )
+        ).rows[0]?.sql;
       } finally {
         db = previous;
       }
     } finally {
-      await upgraded.close();
-      cleanupDb(legacyPath);
+      await first.close();
+    }
+
+    // Reopening must neither recreate the table nor drop the row.
+    const second = new SqliteAdapter(path);
+    try {
+      const rows = await second.query<{ cnt: number }>(
+        'SELECT COUNT(*) AS cnt FROM tm_expectations'
+      );
+      expect(Number(rows.rows[0]?.cnt)).toBe(1);
+      const secondSql = (
+        await second.query<{ sql: string }>(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_expectations'"
+        )
+      ).rows[0]?.sql;
+      expect(secondSql).toBe(firstSql);
+    } finally {
+      await second.close();
+      cleanupDb(path);
     }
   });
 
