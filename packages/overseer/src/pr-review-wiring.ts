@@ -29,6 +29,7 @@ import {
   configuredReviewIdentity,
   evaluatePullRequest,
   invokeConfiguredReviewModel,
+  reviewErrorCode,
 } from './pr-review-evaluator';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
@@ -384,6 +385,28 @@ export function buildRequiredContextsBlockedSummary(error: string | undefined): 
 }
 
 /**
+ * The INDETERMINATE summary, plus the evaluator's error CODE when there is one.
+ *
+ * An INDETERMINATE review used to post the bare sentence above, so a blocked PR
+ * carried no clue why -- the author could not tell a bad model response from an
+ * unreachable judge (#789). The CODE (the identifier before the first colon:
+ * `model_error`, `model_timeout`, `model_output_invalid`, `evidence_error`,
+ * `reviewed_head_mismatch`) is enough to act on.
+ *
+ * ONLY the code. The detail half of the error carries model output, API
+ * messages, and binary names that may embed tokens or provider internals, and
+ * `reviewErrorCode` additionally refuses anything outside a conservative
+ * identifier charset, so a malformed error string cannot smuggle text into a
+ * public review body.
+ */
+export function buildIndeterminateSummary(error: string | undefined): string {
+  const code = reviewErrorCode(error);
+  return code
+    ? `${INDETERMINATE_REVIEW_SUMMARY} Reason code: ${code}.`
+    : INDETERMINATE_REVIEW_SUMMARY;
+}
+
+/**
  * Bind WO-2's evaluator into WO-1's injected submit-side reviewer seam.
  * `reviewerIdentity` is specifically the GitHub actor used for custody checks;
  * the model identity is captured separately from the configured model ladder.
@@ -453,13 +476,32 @@ export function createRealSubmitDeps(
           requiredContextsUnavailable: true,
         };
       }
+      // TRANSPORT_ERROR is a deferral for the same reason CHECKS_PENDING is: no
+      // model was ever reached, so no verdict was formed. It must NOT be
+      // collapsed into `approved: false` (a de facto REQUEST_CHANGES on
+      // argument-size or spawn grounds -- the #789 bug) nor into the terminal
+      // INDETERMINATE summary below. The retry delay travels with it so the
+      // worker requeues instead of spinning.
+      if (result.verdict === 'TRANSPORT_ERROR') {
+        const reasonCode = reviewErrorCode(result.error);
+        return {
+          approved: false,
+          summary: '',
+          reviewedHeadSha: result.reviewed_head_sha,
+          transportError: true,
+          ...(reasonCode ? { reasonCode } : {}),
+          ...(typeof result.retry_after_ms === 'number'
+            ? { retryAfterMs: result.retry_after_ms }
+            : {}),
+        };
+      }
       const summary =
         result.findings.length > 0
           ? result.findings
               .map(finding => `[${finding.severity}] ${finding.scope}: ${finding.summary}`)
               .join('\n')
           : result.verdict === 'INDETERMINATE'
-            ? INDETERMINATE_REVIEW_SUMMARY
+            ? buildIndeterminateSummary(result.error)
             : 'No blocking findings.';
       return {
         approved: result.verdict === 'APPROVE',

@@ -108,7 +108,7 @@ describe('launchSession', () => {
       workflowId: string;
     };
     expect(hints).toEqual({ workflowType: 'thread', workflowId: 'conv-1' });
-  }, 15000);
+  });
 
   // Scenario 2: Reuse -- same conversation id resolves via the same key.
   test('reuses the same isolation key across repeated launches (reconnect)', async () => {
@@ -128,7 +128,7 @@ describe('launchSession', () => {
     const key2 = mockValidateAndResolveIsolation.mock.calls[1][4] as { workflowId: string };
     expect(key1.workflowId).toBe('conv-reuse');
     expect(key2.workflowId).toBe(key1.workflowId);
-  }, 15000);
+  });
 
   // Scenario 3, case A: creation failed -> IsolationBlockedError -> fail closed.
   test('refuses (fail closed) with a "primary checkout" message when isolation is blocked', async () => {
@@ -148,7 +148,7 @@ describe('launchSession', () => {
     }
     // No cwd is ever returned on refusal (nothing to fall through to).
     expect(result).not.toHaveProperty('cwd');
-  }, 15000);
+  });
 
   // Scenario 3, case B: defense-in-depth -- resolved cwd equals the primary checkout.
   test('refuses when the resolved cwd is the shared primary checkout', async () => {
@@ -167,7 +167,7 @@ describe('launchSession', () => {
       expect(result.message).toContain('primary checkout');
       expect(result.message).toContain('/repos/test-repo');
     }
-  }, 15000);
+  });
 
   // Scenario 3, case B (alias): the resolver hands back a SYMLINK alias that
   // resolves to the primary checkout. A lexical string compare would treat the
@@ -206,7 +206,7 @@ describe('launchSession', () => {
         expect(result.message).toContain('primary checkout');
         expect(result.message).toContain(primary);
       }
-    }, 15000);
+    });
 
     test('allows a genuinely distinct worktree that is not an alias of the primary', async () => {
       const primary = join(realDir, 'primary-checkout');
@@ -227,7 +227,7 @@ describe('launchSession', () => {
       if (!result.refused) {
         expect(result.cwd).toBe(worktree);
       }
-    }, 15000);
+    });
 
     // Case-insensitive-filesystem guard. On win32 a differently cased spelling
     // of the same directory is the SAME directory, so it must be refused. On
@@ -278,7 +278,7 @@ describe('launchSession', () => {
     if (!resultA.refused && !resultB.refused) {
       expect(resultA.cwd).not.toBe(resultB.cwd);
     }
-  }, 15000);
+  });
 
   // A non-IsolationBlockedError propagates (fail fast -- not swallowed).
   test('re-throws non-isolation errors instead of masking them as refusals', async () => {
@@ -292,5 +292,5 @@ describe('launchSession', () => {
     await expect(launchSession(conversation, codebase, platform, 'web-conv-1')).rejects.toThrow(
       'database exploded'
     );
-  }, 15000);
+  });
 });

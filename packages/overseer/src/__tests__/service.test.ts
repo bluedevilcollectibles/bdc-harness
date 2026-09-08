@@ -493,7 +493,7 @@ describe('service', () => {
       expect(cards.items[0]?.card.run_id).toBe('run-default-escalation');
       expect(cards.items[0]?.jobs).toHaveLength(3);
     });
-  }, 15000);
+  });
 
   test('escalation runs and delivers a card even when dryRun is true (2026-07-18 fix)', async () => {
     // Root cause fixed 2026-07-18: dryRun previously short-circuited handleRecord
@@ -562,7 +562,7 @@ describe('service', () => {
       expect(cards.items).toHaveLength(1);
       expect(cards.items[0]?.card.run_id).toBe('run-dryrun-escalation');
     });
-  }, 30_000);
+  });
 
   test('canary: real validator_sdk_contradiction failure delivers a determined-outcome operator card under dryRun', async () => {
     // The determined-outcome canary requested 2026-07-18: a synthetic run
@@ -633,7 +633,7 @@ describe('service', () => {
       expect(card?.payload?.blocker).toContain('SDK returned a success/error contradiction');
       expect(card?.payload?.next_permitted_action).toBe('await operator ruling');
     });
-  }, 30_000);
+  });
 
   test('merge_ready stays fully gated by dryRun (no regression)', async () => {
     await withTempDatabase(async () => {

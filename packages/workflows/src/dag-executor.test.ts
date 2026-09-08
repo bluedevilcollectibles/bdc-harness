@@ -2925,7 +2925,7 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     // Node was called at least twice (first fails transiently, second succeeds)
     expect(callCount).toBeGreaterThanOrEqual(2);
     expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).not.toHaveBeenCalled();
-  }, 5_000);
+  });
 
   it('workflow fails after exhausting all node retries', async () => {
     let callCount = 0;
@@ -2961,7 +2961,7 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
     // max_attempts: 2 = 2 retries -> 3 total attempts (delay_ms: 1 keeps test fast)
     expect(callCount).toBe(3);
     expect(mockDeps.store.failWorkflowRun as ReturnType<typeof mock>).toHaveBeenCalled();
-  }, 5_000);
+  });
 
   it('node with FATAL error does not retry (call count = 1)', async () => {
     let callCount = 0;
@@ -3040,7 +3040,7 @@ describe('executeDagWorkflow -- node-level retry for transient errors', () => {
         typeof call[1] === 'string' && (call[1] as string).includes('transient error')
     );
     expect(retryMessages.length).toBeGreaterThan(0);
-  }, 5_000);
+  });
 });
 
 describe('executeDagWorkflow -- tool_called event persistence', () => {
@@ -9495,7 +9495,7 @@ describe('executeDagWorkflow -- script nodes', () => {
     // Workflow fails because the only node failed (timeout)
     const failMsg = messages.find((m: string) => m.includes('no successful nodes'));
     expect(failMsg).toBeDefined();
-  }, 10000);
+  });
 
   it('stderr output is sent to the user', async () => {
     const mockDeps = createMockDeps();

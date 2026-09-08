@@ -50,7 +50,7 @@ interface ResultMapping {
 }
 
 function mapSubmitOutcome(
-  disposition: Exclude<SubmitDisposition, 'checks_pending'>
+  disposition: Exclude<SubmitDisposition, 'checks_pending' | 'transport_error'>
 ): ResultMapping {
   switch (disposition) {
     // `stale_head` and `superseded_head` both mean the head this item is BOUND
@@ -152,6 +152,26 @@ export async function tickReviewWorkerClock(
             worker_id: REVIEW_WORKER_ID,
             fencing_token: claimed.fencing_token,
             not_before: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
+          });
+          continue;
+        }
+        // TRANSPORT ERROR (#789) is non-terminal for the same reason: the judge
+        // process was never reached, so nothing about the code was evaluated.
+        // Terminating here would post CHANGES_REQUESTED for a review that never
+        // ran -- the bug this fixes. The backoff comes from the evaluator so a
+        // persistent spawn failure cannot spin the worker every tick.
+        if (outcome.disposition === 'transport_error') {
+          log.warn(
+            { messageId: claimed.id, reason: outcome.reason },
+            'overseer_review_transport_error_deferred'
+          );
+          await deps.releaseMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            not_before: new Date(
+              Date.now() + (outcome.retryAfterMs ?? CHECKS_PENDING_BACKOFF_MS)
+            ).toISOString(),
           });
           continue;
         }

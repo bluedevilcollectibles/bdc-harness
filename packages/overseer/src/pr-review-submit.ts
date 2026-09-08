@@ -50,6 +50,20 @@ export interface ReviewerVerdict {
    * `blocked_required_contexts_unavailable`, which the worker escalates.
    */
   requiredContextsUnavailable?: boolean;
+  /**
+   * True when the judge process could not be reached at all -- the prompt
+   * exceeded the argv limit (E2BIG), the binary failed to spawn, or every rung
+   * timed out -- so no evidence was read and no verdict formed (#789).
+   * NON-TERMINAL, exactly like `checksPending`: the item is released with a
+   * backoff and retried. It must never collapse into `approved: false`, which
+   * posted CHANGES_REQUESTED at the head with no stated reason on #776 and #786
+   * on 2026-09-07.
+   */
+  transportError?: boolean;
+  /** Safe error code (no detail) explaining the deferral, for the receipt. */
+  reasonCode?: string;
+  /** Milliseconds to wait before the item becomes claimable again. */
+  retryAfterMs?: number;
 }
 
 export interface ReviewWorkItem {
@@ -95,12 +109,27 @@ export type SubmitDisposition =
    * live. Distinct from `checks_pending` (non-terminal, retried) and from
    * `changes_requested` (a real code finding).
    */
-  | 'blocked_required_contexts_unavailable';
+  | 'blocked_required_contexts_unavailable'
+  /**
+   * NON-TERMINAL (#789). The judge process was never reached (E2BIG on the
+   * prompt argument, spawn failure, or every rung timing out). Released with a
+   * backoff and retried, exactly like `checks_pending` -- never terminal,
+   * because terminating here posts a CHANGES_REQUESTED for a review that was
+   * never actually performed.
+   *
+   * Overlaps by design with the `rate_limited` disposition on PR #786: both are
+   * "no verdict was formed, come back later" deferrals with the same shape.
+   * Whichever lands second should consider folding them into one
+   * transport-class deferral.
+   */
+  | 'transport_error';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
   reason?: string;
   event?: OverseerReviewEvent;
+  /** Set only on `transport_error`: milliseconds until the item is retried. */
+  retryAfterMs?: number;
 }
 
 export interface SubmitDeps {
@@ -195,6 +224,21 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'reviewer_failed',
       reason: `reviewer_error:${errorCode(error)}`,
+    });
+  }
+
+  // TRANSPORT ERROR (#789): the judge was never reached, so no evidence was
+  // read and no verdict formed. Submit nothing; the worker defers and retries.
+  // Checked BEFORE the exact-head gates on purpose: nothing was evaluated, so
+  // there is no reviewed head to compare and a stale-head classification here
+  // would be false.
+  if (verdict.transportError) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'transport_error',
+      reason: verdict.reasonCode
+        ? `review_transport_error:${verdict.reasonCode}`
+        : 'review_transport_error',
+      ...(typeof verdict.retryAfterMs === 'number' ? { retryAfterMs: verdict.retryAfterMs } : {}),
     });
   }
 
