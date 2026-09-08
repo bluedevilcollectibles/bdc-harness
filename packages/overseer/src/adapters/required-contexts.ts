@@ -507,6 +507,52 @@ function logSourceOnce(key: string, fields: Record<string, unknown>, message: st
 }
 
 /**
+ * How long a proven-unprotected base is trusted without re-asking (#796).
+ *
+ * Ten minutes is deliberately short. Protection is a thing a human turns ON to
+ * stop bad merges, so the cost of noticing late is real -- but one work item
+ * polls roughly every 40 seconds, so ten minutes still collapses ~15 identical
+ * calls into one. Reviews that matter re-ask within the same working session.
+ */
+export const UNPROTECTED_CACHE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * Bases proven unprotected, with the wall-clock time the proof expires.
+ *
+ * IN MEMORY, not a table. The entry is a pure API-load optimisation over an
+ * answer that is re-derivable at any moment, so losing it on a container
+ * rebuild costs one extra lookup and nothing else -- unlike the ATTEMPT
+ * COUNTER, whose whole purpose (#777) is to outlive the process. Adding a
+ * migration for a ten-minute cache would be storage for its own sake.
+ *
+ * Cached POSITIVE ONLY: `hasPositiveUnprotectedEvidence` requires two agreeing
+ * probes, so an entry here is an authoritative answer, never an inferred one.
+ */
+const unprotectedBranchCache = new Map<string, number>();
+
+function isCachedUnprotected(key: string, now: number = Date.now()): boolean {
+  const expiresAt = unprotectedBranchCache.get(key);
+  if (expiresAt === undefined) return false;
+  if (expiresAt <= now) {
+    unprotectedBranchCache.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function cacheUnprotected(key: string, now: number = Date.now()): void {
+  unprotectedBranchCache.set(key, now + UNPROTECTED_CACHE_TTL_MS);
+}
+
+/**
+ * Drop every cached unprotected answer. For tests, and for any caller that has
+ * just CHANGED a branch's protection and does not want to wait out the TTL.
+ */
+export function resetUnprotectedBranchCache(): void {
+  unprotectedBranchCache.clear();
+}
+
+/**
  * Resolve the base branch's required status-check contexts.
  *
  * Order: env override -> App client -> PAT client (on permission failure only)
@@ -546,6 +592,21 @@ export async function resolveRequiredContexts(
       'overseer.required_contexts.resolved'
     );
     return { state: 'known', contexts: overrideContexts, source: 'env_override' };
+  }
+
+  // UNPROTECTED CACHE (#796). Checked BEFORE any fetch attempt, because the
+  // call being spared is the protection lookup itself. On 2026-09-08 the
+  // reviewer sent 45 GET .../branches/master/protection calls in 30 minutes for
+  // shopops/master -- one every ~40 seconds, each answered "Branch not
+  // protected" -- because a queued work item re-asked the same settled question
+  // on every tick. Checking after the fetchers would spare only the two cheap
+  // probes and leave the poll exactly as it was.
+  //
+  // Below the ENV OVERRIDE on purpose: an explicit override is a deliberate
+  // operator statement and must always win over a cached observation.
+  if (isCachedUnprotected(key)) {
+    await store.clear(counterKey);
+    return { state: 'known', contexts: [], source: 'unprotected_branch' };
   }
 
   const attempts: { source: 'app_client' | 'pat_client'; fetch: StatusCheckContextsFetcher }[] = [];
@@ -604,6 +665,11 @@ export async function resolveRequiredContexts(
   // is a real answer, not a fallback: it says "nothing is required here".
   if (await hasPositiveUnprotectedEvidence(input, baseRef)) {
     await store.clear(counterKey);
+    // Cached POSITIVE-ONLY. An unprotected answer is derived from two
+    // agreeing probes, so it is authoritative and safe to reuse briefly. A
+    // FAILED lookup is never cached: that would turn a transient API fault
+    // into a sticky wrong answer, and the attempt counter already bounds it.
+    cacheUnprotected(key);
     logSourceOnce(
       `unprotected:${key}`,
       { owner, repo, baseRef, source: 'unprotected_branch', lastReason },

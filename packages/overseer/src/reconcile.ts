@@ -28,6 +28,13 @@ const DEFAULT_ORG = 'thinmansoftware';
 const DEFAULT_TRACKER_REPO = 'bdc-xo';
 const DEFAULT_LOOKBACK_DAYS = 14;
 const DONE_LABEL = 'wo:done';
+/**
+ * Merged-PR searches per pass: one `in:title`, one `in:body` (#796).
+ *
+ * FIXED, and the only searches reconcile now makes. The per-stem tracker search
+ * that used to sit on top of these is gone -- see `createTrackerIndex`.
+ */
+export const MERGED_PR_SEARCH_QUERIES = 2;
 
 export interface ReconcileMergedPullRequest {
   owner: string;
@@ -95,6 +102,13 @@ export interface ReconcileDeps {
   listPullRequestFiles?: (pr: ReconcileMergedPullRequest) => Promise<string[]>;
   now?: () => Date;
   log?: ReconcileLogger;
+  /**
+   * Emit the per-pass GitHub call counts (#796). Called once at the end of
+   * every pass, including a skipped one, so the search count is visible in the
+   * container log without correlating raw API traffic. Optional: a deps object
+   * that predates the counter simply logs nothing.
+   */
+  reportGitHubCallsPerPass?: () => void;
 }
 
 interface OctokitLike {
@@ -110,6 +124,19 @@ interface OctokitLike {
           repository_url?: string;
         }[];
       };
+    }>;
+  };
+  issues: {
+    createComment(input: Record<string, unknown>): Promise<unknown>;
+    addLabels(input: Record<string, unknown>): Promise<unknown>;
+    update(input: Record<string, unknown>): Promise<unknown>;
+    /**
+     * Open issues in the tracker repo, paginated. This is the CORE-budget
+     * replacement for the per-stem SEARCH that #796 removes -- see
+     * `createTrackerIndex`.
+     */
+    listForRepo(input: Record<string, unknown>): Promise<{
+      data: { number: number; title: string; state: string; pull_request?: unknown }[];
     }>;
   };
   pulls: {
@@ -128,11 +155,6 @@ interface OctokitLike {
       };
     }>;
   };
-  issues: {
-    createComment(input: Record<string, unknown>): Promise<unknown>;
-    addLabels(input: Record<string, unknown>): Promise<unknown>;
-    update(input: Record<string, unknown>): Promise<unknown>;
-  };
 }
 
 export interface RunReconcileInput {
@@ -150,6 +172,24 @@ export interface ReconcileResult {
 
 export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<ReconcileResult> {
   const deps = input.deps ?? createDefaultReconcileDeps();
+  try {
+    return await reconcilePass(input, deps);
+  } finally {
+    // In a `finally` so the counts are reported on EVERY exit -- including the
+    // rate-limit and transport skips, which are exactly the passes an operator
+    // is trying to explain (#796).
+    try {
+      deps.reportGitHubCallsPerPass?.();
+    } catch {
+      // Reporting never changes the pass outcome.
+    }
+  }
+}
+
+async function reconcilePass(
+  input: RunReconcileInput,
+  deps: ReconcileDeps
+): Promise<ReconcileResult> {
   const logger = deps.log ?? log;
   const org = input.org ?? DEFAULT_ORG;
   const since = await resolveSearchSince(input, deps);
@@ -482,10 +522,28 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     );
     return octokit;
   };
+  // #796: the tracker lookup is a per-pass LISTING, not a per-stem search.
+  const trackerIndex = createTrackerIndex(getOctokit, log);
   return {
     readCursor: readReconcileCursorFromActions,
     searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
-    findTrackerIssueByStem: async stem => findTrackerIssueByStem(await getOctokit(), stem),
+    findTrackerIssueByStem: trackerIndex.findTrackerIssueByStem,
+    reportGitHubCallsPerPass: (): void => {
+      // SEARCHES PER PASS -- the number the issue asks to see logged. It is now
+      // a fixed 2 (the title and body merged-PR queries) regardless of how many
+      // WO stems the lookback window holds; it used to grow by one per stem,
+      // which is what crossed search's 30/minute cap.
+      const stats = trackerIndex.stats();
+      log.info?.(
+        {
+          searches: MERGED_PR_SEARCH_QUERIES + stats.searches,
+          mergedPrSearches: MERGED_PR_SEARCH_QUERIES,
+          stemSearches: stats.searches,
+          trackerListPages: stats.listPages,
+        },
+        'overseer.reconcile.github_calls_per_pass'
+      );
+    },
     listPullRequestFiles: async (pr): Promise<string[]> => {
       const client = await getOctokit();
       // per_page 100: a spec-only PR is 1-2 files, so the first page is always
@@ -588,22 +646,102 @@ async function searchMergedPullRequests(
   return [...results.values()];
 }
 
-async function findTrackerIssueByStem(
-  octokit: OctokitLike,
-  stem: string
-): Promise<ReconcileTrackerIssue | null> {
-  const search = await octokit.search.issuesAndPullRequests({
-    q: `repo:${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO} is:issue ${stem} in:title`,
-    per_page: 10,
-  });
-  const exact = search.data.items.find(item => item.title === stem && !item.pull_request);
-  if (!exact) return null;
+/** Issues per `issues.listForRepo` page. GitHub's maximum. */
+const TRACKER_PAGE_SIZE = 100;
+
+/**
+ * Hard ceiling on tracker-index pages per pass (#796).
+ *
+ * Ten pages is 1,000 open issues, comfortably past the live tracker's size, and
+ * bounds a pathological repo to ten CORE calls rather than an unbounded walk.
+ * Hitting it is logged, because a truncated index silently stops closing
+ * trackers -- which looks exactly like reconcile working and finding nothing.
+ */
+export const TRACKER_INDEX_MAX_PAGES = 10;
+
+/**
+ * ONE listing of the tracker repo per pass, replacing ONE SEARCH PER WO STEM.
+ *
+ * The defect (#796, as corrected 2026-09-08): `findTrackerIssueByStem` issued a
+ * GitHub SEARCH for every stem of every merged PR in the lookback window. Search
+ * has its own cap of 30 requests per minute per user -- separate from, and far
+ * smaller than, the 5,000/hour core budget -- and a pass over a window holding
+ * more than thirty stems crossed it in seconds. Seven `rate_limit_skip` blocks
+ * were logged between 04:15 and 04:46Z on 2026-09-08 while `gh api rate_limit`
+ * showed core at 4,999/5,000, which is what proved the cap being hit was the
+ * search one.
+ *
+ * `issues.listForRepo` is a CORE-budget endpoint, so one pass now costs a
+ * handful of core calls (one per page of open trackers) and ZERO searches, no
+ * matter how many stems the window holds.
+ *
+ * Behaviour is preserved exactly. The old lookup already required an EXACT
+ * title match (`item.title === stem`) and already rejected pull requests, so
+ * matching those same two conditions against a local index returns the same
+ * issue for the same stem. `state: 'open'` is requested because every caller
+ * skips a non-open tracker on the very next line; a stem with no open tracker
+ * yields null, exactly as an unmatched search did.
+ *
+ * The index is built LAZILY -- a pass whose PRs name no stems (the common case
+ * for a quiet window) performs no listing at all -- and once per deps object,
+ * which `createDefaultReconcileDeps` creates per pass.
+ */
+export function createTrackerIndex(
+  getOctokit: () => Promise<OctokitLike>,
+  logger: ReconcileLogger = log
+): {
+  findTrackerIssueByStem: (stem: string) => Promise<ReconcileTrackerIssue | null>;
+  stats: () => { searches: number; listPages: number };
+} {
+  let index: Promise<Map<string, ReconcileTrackerIssue>> | null = null;
+  let listPages = 0;
+
+  const build = async (): Promise<Map<string, ReconcileTrackerIssue>> => {
+    const octokit = await getOctokit();
+    const byTitle = new Map<string, ReconcileTrackerIssue>();
+    let truncated = false;
+    for (let page = 1; page <= TRACKER_INDEX_MAX_PAGES; page += 1) {
+      const response = await octokit.issues.listForRepo({
+        owner: DEFAULT_ORG,
+        repo: DEFAULT_TRACKER_REPO,
+        state: 'open',
+        per_page: TRACKER_PAGE_SIZE,
+        page,
+      });
+      listPages += 1;
+      for (const item of response.data) {
+        // listForRepo returns PRs as issues too; the old search excluded them
+        // with the same `pull_request` check.
+        if (item.pull_request) continue;
+        if (byTitle.has(item.title)) continue;
+        byTitle.set(item.title, {
+          owner: DEFAULT_ORG,
+          repo: DEFAULT_TRACKER_REPO,
+          number: item.number,
+          title: item.title,
+          state: item.state === 'open' ? 'open' : 'closed',
+        });
+      }
+      if (response.data.length < TRACKER_PAGE_SIZE) break;
+      truncated = page === TRACKER_INDEX_MAX_PAGES;
+    }
+    if (truncated) {
+      // Loud on purpose: a truncated index silently stops closing the trackers
+      // that fell off the end, which is indistinguishable from a clean pass.
+      logger.warn(
+        { maxPages: TRACKER_INDEX_MAX_PAGES, indexed: byTitle.size },
+        'overseer.reconcile.tracker_index_truncated'
+      );
+    }
+    return byTitle;
+  };
+
   return {
-    owner: DEFAULT_ORG,
-    repo: DEFAULT_TRACKER_REPO,
-    number: exact.number,
-    title: exact.title,
-    state: exact.state === 'open' ? 'open' : 'closed',
+    findTrackerIssueByStem: async (stem): Promise<ReconcileTrackerIssue | null> => {
+      index ??= build();
+      return (await index).get(stem) ?? null;
+    },
+    stats: () => ({ searches: 0, listPages }),
   };
 }
 
