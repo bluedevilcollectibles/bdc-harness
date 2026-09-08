@@ -140,8 +140,37 @@ export type DispatchQueryExecutor = <T>(sql: string, params?: unknown[]) => Prom
 export const DEFAULT_WORKER_STALE_AFTER_MS = 120_000;
 const DEFAULT_LEASE_DURATION_MS = 300_000;
 
+/**
+ * Strictly-increasing insertion timestamp.
+ *
+ * `created_at` is the ONLY ordering key the dispatch queue has -- `id` is a
+ * random UUID, so it carries no insertion order, and the table has no
+ * autoincrement column (Postgres has no portable `rowid`). But
+ * `Date.toISOString()` has millisecond resolution while consecutive inserts
+ * complete well inside one millisecond: measured on this codebase, two
+ * back-to-back `createMessage` calls land in the SAME millisecond ~100% of the
+ * time. Ties then fell through to the random-UUID tiebreak, which ordered them
+ * correctly only ~50% of the time -- a coin flip on every platform, not just
+ * Windows.
+ *
+ * That is a correctness bug in production, not only in tests:
+ * `collectVerdicts` (packages/overseer/src/pr-review-wiring.ts) documents that
+ * receipts MUST arrive newest-first because the first receipt seen for a
+ * message wins, so a coin-flipped tie can let an older failed attempt outrank
+ * the later authoritative verdict. Retry loops write receipts milliseconds
+ * apart, so the tie is reachable in the live store.
+ *
+ * Bumping to the next millisecond when the clock has not advanced keeps the
+ * exact ISO-8601 TEXT format every existing query, index, and comparison
+ * depends on, while guaranteeing distinct, correctly-ordered values. Drift is
+ * bounded by the insert rate and self-corrects the moment the wall clock
+ * catches up.
+ */
+let lastIssuedNowMs = 0;
 function nowIso(): string {
-  return new Date().toISOString();
+  const wall = Date.now();
+  lastIssuedNowMs = wall > lastIssuedNowMs ? wall : lastIssuedNowMs + 1;
+  return new Date(lastIssuedNowMs).toISOString();
 }
 
 function normalizeTimestamp(value: unknown): string {
@@ -596,6 +625,13 @@ function escapeLikeLiteral(value: string): string {
  * `subject_key IS NULL` is part of the predicate on purpose: rows that DO have
  * a subject_key are already reachable by the indexed query, so excluding them
  * here keeps this strictly a legacy path and keeps the result set small.
+ */
+/**
+ * Newest-first ordering note: created_at is strictly increasing per writer
+ * (see nowIso), so it alone expresses insertion order. The trailing id DESC is
+ * only a total-order tiebreak for rows written by different processes within
+ * the same millisecond -- id is a random UUID and carries no insertion order,
+ * so it must never be the key that decides newest-first on its own.
  */
 export async function listMessagesByCorrelationPrefixWithoutSubjectKey(filters: {
   recipient: string;

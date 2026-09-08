@@ -2261,6 +2261,38 @@ describe('dispatch db', () => {
       expect(found.map(message => message.id)).toEqual([second, first]);
     });
 
+    /**
+     * Regression: two receipts written inside the same wall-clock millisecond
+     * must still come back newest-first.
+     *
+     * Before the `nowIso` fix, consecutive inserts shared a `created_at` (~100%
+     * of the time) and the ORDER BY fell through to `id DESC` -- a random UUID
+     * -- so this ordering was a coin flip that failed ~50% of runs. It surfaced
+     * as a flaky Windows CI failure on PR #790, but it was never
+     * platform-specific, and `collectVerdicts` depends on the newest-first
+     * contract to keep an older failed attempt from outranking a later verdict.
+     */
+    test('orders same-millisecond rows newest-first, not by random UUID', async () => {
+      const ids: string[] = [];
+      for (let index = 0; index < 12; index++) {
+        ids.push(await legacyReceipt(`tie-${index}`, `pr-review:o/r#900@${index}`));
+      }
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#900@',
+      });
+
+      // Exact reverse insertion order, every time -- no dependence on how the
+      // UUIDs happened to sort.
+      expect(found.map(message => message.id)).toEqual([...ids].reverse());
+      // And the timestamps are strictly decreasing, which is what makes the
+      // ordering real rather than incidental.
+      const timestamps = found.map(message => message.created_at);
+      expect([...timestamps].sort().reverse()).toEqual(timestamps);
+      expect(new Set(timestamps).size).toBe(timestamps.length);
+    });
+
     test('reaches a row far beyond the listMessages page cap', async () => {
       // listMessages caps limit at 500 and has no offset, so a client-side
       // scan cannot see this row. The SQL predicate can.
