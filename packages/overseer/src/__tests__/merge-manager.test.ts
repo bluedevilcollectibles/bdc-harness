@@ -601,6 +601,280 @@ describe('merge manager', () => {
 });
 
 /**
+ * PR-DISCOVERED CANDIDATES AND PROVENANCE (John, 2026-09-07).
+ *
+ * The ruling: "always merge on green, you do not need to ask me." A pull
+ * request found by the PR-first sweep (bdc-harness#758) has NO originating
+ * Cauldron run, so it has no engine-written worktree for the provenance gate to
+ * bind a head SHA against. That gate could therefore only ever answer
+ * `working_path_missing` for such a candidate -- holding every one of them
+ * permanently and recreating, one layer down, the exact deadlock #758 was
+ * written to clear.
+ *
+ * So an ABSENT run is now the named condition `provenance_no_run` and does not
+ * hold. Everything else still gates: exact-head approval by the Review Gate
+ * identity, required checks SUCCESS, CLEAN mergeable state, allowed bases, the
+ * production-effect hold, and the Grok judge.
+ */
+describe('merge manager -- PR-discovered candidates with no originating run', () => {
+  const PR_HEAD_SHA = 'd'.repeat(40);
+
+  /** A candidate exactly as the PR-first sweep mints it: no run, no worktree. */
+  const discoveredRecord: WatchedRunRecord = {
+    runId: 'pr-discovery:thinmansoftware/bdc-harness#730',
+    woId: 'gh:thinmansoftware/bdc-harness#730',
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    status: 'pr_discovered',
+    headBranch: 'test/reviewer-live-fire',
+    // No workingPath: there is no run, so there is no engine-written worktree.
+    metadata: {
+      discovery_source: 'pr_first_sweep',
+      base_branch: 'dev',
+      head_sha: PR_HEAD_SHA,
+      pr_number: '730',
+    },
+    action: 'merge_ready',
+    reason: 'discovered by PR-first sweep',
+    prEvidence: {
+      exists: true,
+      state: 'open',
+      checks: { total: 3, passed: 3, failed: 0, pending: 0 },
+      mergeable: true,
+      pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 730 },
+      prTitle: 'test: reviewer live-fire',
+      filesChangedCount: 1,
+      diffStat: '+1 -0',
+      headSha: PR_HEAD_SHA,
+    },
+  };
+
+  function discoveredEvidence(
+    overrides: Partial<QualifiedMergeEvidence> = {}
+  ): QualifiedMergeEvidence {
+    return {
+      ...evidence(),
+      record: discoveredRecord,
+      base_branch: 'dev',
+      resulting_deployment_effect: 'none',
+      pr_number: 730,
+      head_sha: PR_HEAD_SHA,
+      required_checks: [{ name: 'ci', conclusion: 'success', head_sha: PR_HEAD_SHA }],
+      ...overrides,
+    };
+  }
+
+  /** Reading a worktree must never even be attempted for a record with no run. */
+  const worktreeMustNotBeRead = async (): Promise<string | null> => {
+    throw new Error('provenance must not read a worktree for a PR-discovered candidate');
+  };
+
+  test('an approved, green, clean PR with no run MERGES on dev and logs provenance_no_run', async () => {
+    const assembled = discoveredEvidence();
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true, message: 'fake_merge_accepted' }));
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-overseer[bot]',
+      // Exact-head approval by the Review Gate identity -- still required.
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: PR_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => discoveredRecord.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha: worktreeMustNotBeRead,
+    });
+
+    const result = await manager(discoveredRecord);
+
+    // THE RULING: no run does not hold the merge.
+    expect(result.status).toBe('executed');
+    expect(execute).toHaveBeenCalledWith(assembled);
+
+    // ...and the relaxation is NAMED and RECORDED, never silent.
+    const actions = insertOverseerAction.mock.calls.map(
+      call => (call[0] as { action: string }).action
+    );
+    expect(actions).toContain('provenance_no_run');
+    expect(actions).toContain('merged');
+  });
+
+  // The same PR against master is refused BEFORE provenance is ever consulted:
+  // a main/master base is a production effect and holds for John.
+  test('the same PR against master is still refused on the production hold', async () => {
+    const assembled = discoveredEvidence({
+      base_branch: 'master',
+      resulting_deployment_effect: 'production',
+    });
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-overseer[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: PR_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => discoveredRecord.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha: worktreeMustNotBeRead,
+    });
+
+    const result = await manager({
+      ...discoveredRecord,
+      metadata: { ...discoveredRecord.metadata, base_branch: 'master' },
+    });
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('production_effect_held_for_john');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // A non-production base that is nonetheless outside the allowed list is
+  // refused at the precondition gate. Discovery relaxed provenance only.
+  test('a base outside MERGE_MANAGER_ALLOWED_BASES is still refused', async () => {
+    const assembled = discoveredEvidence({ base_branch: 'sandbox' });
+    const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-overseer[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: PR_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => discoveredRecord.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha: worktreeMustNotBeRead,
+    });
+
+    const result = await manager(discoveredRecord);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('base_branch_not_allowed');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // The Review Gate is untouched: no exact-head approval from the gate identity
+  // still refuses, run or no run.
+  test('a PR with no Review Gate approval on the head is still refused', async () => {
+    const assembled = discoveredEvidence();
+    const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-overseer[bot]',
+      // Approved -- but on a SUPERSEDED commit.
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: 'f'.repeat(40) },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => discoveredRecord.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha: worktreeMustNotBeRead,
+    });
+
+    const result = await manager(discoveredRecord);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('review_gate_approval_missing_for_head');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // THE LINE THAT MUST NOT MOVE. A REAL run whose worktree was swept still
+  // fails closed: it HAS a run, so "which commit did that run produce" is a
+  // real question we merely could not answer. Only a genuinely run-less
+  // candidate takes the relaxed path.
+  test('a real run with a missing worktree still holds -- the relaxation is not a bypass', async () => {
+    const assembled = evidence({ resulting_deployment_effect: 'none' });
+    const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-overseer[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      // Worktree swept.
+      readWorktreeHeadSha: async () => null,
+    });
+
+    const result = await manager(record);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('provenance_worktree_unavailable');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  // And a record that merely LOOKS discovered cannot claim the relaxed path:
+  // both the synthetic runId prefix and the discovery metadata are required.
+  test('a run-derived record cannot impersonate a discovered candidate', async () => {
+    const impostor: WatchedRunRecord = {
+      ...record,
+      // Discovery metadata, but a REAL run id -- not a pr-discovery: one.
+      metadata: { discovery_source: 'pr_first_sweep' },
+      workingPath: undefined,
+    };
+    const assembled = evidence({ resulting_deployment_effect: 'none', record: impostor });
+    const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-overseer[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => impostor.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha: async () => null,
+    });
+
+    const result = await manager(impostor);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('provenance_working_path_missing');
+    expect(execute).not.toHaveBeenCalled();
+  });
+});
+
+/**
  * Per-repo base-effect overrides (John 2026-09-07, "yes add main", scoped by the XO to
  * repos whose main is not a production surface).
  *
