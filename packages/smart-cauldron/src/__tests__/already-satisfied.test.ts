@@ -40,6 +40,49 @@ describe('textClaimsWoId', () => {
       )
     ).toBe(true);
   });
+
+  test('ignores a WO id listed under an "explicitly out of scope" heading (#1795)', () => {
+    // Real text from shopops-comic-theme PR #62's body.
+    const body = [
+      '## Files explicitly out of scope',
+      '- `sections/product.liquid` (PDP -- committed-intent, spec says out of scope)',
+      '- `comic-card.liquid` body/actions block (owned by WO-COMICTHEME-CARD-MODERN-PARITY-01)',
+      '- Locale/translation files -- none needed',
+      '',
+      '## Verification commands',
+      'grep -c foo bar.liquid',
+    ].join('\n');
+    expect(textClaimsWoId(body, 'WO-COMICTHEME-CARD-MODERN-PARITY-01')).toBe(false);
+  });
+
+  test('still matches the same WO id when it appears OUTSIDE an exclusion section', () => {
+    const body = [
+      '## Summary',
+      'Implements WO-COMICTHEME-CARD-MODERN-PARITY-01.',
+      '',
+      '## Files explicitly out of scope',
+      '- none',
+    ].join('\n');
+    expect(textClaimsWoId(body, 'WO-COMICTHEME-CARD-MODERN-PARITY-01')).toBe(true);
+  });
+
+  test('exclusion applies only until the next heading, not to the rest of the doc', () => {
+    const body = [
+      '## Files explicitly out of scope',
+      '- unrelated line',
+      '',
+      '## Files modified',
+      '- WO-COMICTHEME-CARD-MODERN-PARITY-01 actually implemented here',
+    ].join('\n');
+    expect(textClaimsWoId(body, 'WO-COMICTHEME-CARD-MODERN-PARITY-01')).toBe(true);
+  });
+
+  test('recognizes "not in scope" and "explicitly excluded" heading variants', () => {
+    expect(textClaimsWoId('## Not in scope\n- WO-FOO-BAR-01 (deferred)', 'WO-FOO-BAR-01')).toBe(
+      false
+    );
+    expect(textClaimsWoId('### Explicitly Excluded\n- WO-FOO-BAR-01', 'WO-FOO-BAR-01')).toBe(false);
+  });
 });
 
 describe('resolveGithubRepo', () => {

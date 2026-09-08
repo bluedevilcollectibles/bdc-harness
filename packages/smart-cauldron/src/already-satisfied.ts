@@ -50,13 +50,56 @@ export function resolveGithubRepo(project: string): string {
 }
 
 /**
- * True when text contains the exact WO_ID as a token (not a longer sibling id).
- * "WO-FOO-01" must not match "WO-FOO-010". Branch suffixes like "-thread-abc"
- * after the id are allowed (hyphen is a boundary). Case-insensitive.
+ * Markdown headings that mark following lines as explicitly OUT of scope for
+ * the PR that contains them -- a WO id mentioned there is a disclaimer
+ * ("I deliberately did not touch this"), not a claim of having done it.
+ *
+ * Anchor: bdc-xo#1795 -- shopops-comic-theme PR #62
+ * (WO-COMICTHEME-CARD-GUARANTEE-SCOPE-FIX-01) listed
+ * "comic-card.liquid body/actions block (owned by WO-COMICTHEME-CARD-MODERN-PARITY-01)"
+ * under "## Files explicitly out of scope". textClaimsWoId read that mention
+ * as a claim and permanently blocked WO-COMICTHEME-CARD-MODERN-PARITY-01 from
+ * firing. Mechanism was correct (real match); the inference was wrong
+ * (ownership disclaimer, not completion claim).
+ */
+const EXCLUSION_HEADING_RE =
+  /^\s{0,3}#{1,6}\s*(files?\s+)?(explicitly\s+)?(out\s+of\s+scope|not\s+in\s+scope|explicitly\s+excluded)\b/i;
+/** Any markdown heading (# through ######) closes an exclusion section. */
+const ANY_HEADING_RE = /^\s{0,3}#{1,6}\s+\S/;
+
+/**
+ * Strip lines that fall under an "out of scope" / "not in scope" /
+ * "explicitly excluded" heading, up to the next heading of any level (or
+ * end of text). Applied before the WO-id scan so exclusion-listed mentions
+ * never reach the matcher.
+ */
+function stripExclusionSections(text: string): string {
+  if (!text) return text;
+  const lines = text.split('\n');
+  const kept: string[] = [];
+  let inExclusion = false;
+  for (const line of lines) {
+    if (EXCLUSION_HEADING_RE.test(line)) {
+      inExclusion = true;
+      continue;
+    }
+    if (inExclusion && ANY_HEADING_RE.test(line)) {
+      inExclusion = false;
+    }
+    if (!inExclusion) kept.push(line);
+  }
+  return kept.join('\n');
+}
+
+/**
+ * True when text contains the exact WO_ID as a token (not a longer sibling id),
+ * OUTSIDE any "explicitly out of scope" section. "WO-FOO-01" must not match
+ * "WO-FOO-010". Branch suffixes like "-thread-abc" after the id are allowed
+ * (hyphen is a boundary). Case-insensitive.
  */
 export function textClaimsWoId(text: string, woId: string): boolean {
   if (!woId || !text) return false;
-  const hay = text.toLowerCase();
+  const hay = stripExclusionSections(text).toLowerCase();
   const needle = woId.toLowerCase();
   let from = 0;
   while (from <= hay.length) {
