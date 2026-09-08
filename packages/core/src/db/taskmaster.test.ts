@@ -53,6 +53,109 @@ import {
 } from './taskmaster';
 
 describe('tm_expectations DAL', () => {
+  test('the 049 repair de-duplicates legacy dispatch_ref collisions and still registers', async () => {
+    // REGRESSION, and the live archon.db is the target of this repair.
+    //
+    // A legacy tm_expectations can already hold two rows sharing a
+    // dispatch_ref -- that duplicate IS the bug this WO fixes. Backfilling
+    // registration_key = dispatch_ref for every row would then make
+    // CREATE UNIQUE INDEX fail; the failure used to be only logged, startup
+    // continued without the constraint, and every later registerExpectation
+    // using ON CONFLICT (registration_key) failed -- registration disabled.
+    const legacyPath = join(tmpdir(), `taskmaster-legacy-${Date.now()}-${Math.random()}.db`);
+    const seed = new Database(legacyPath);
+    // Legacy shape: no registration_key column at all.
+    seed.run(`CREATE TABLE tm_expectations (
+      id TEXT PRIMARY KEY,
+      dispatch_ref TEXT NOT NULL,
+      recipient TEXT NOT NULL,
+      evidence_json TEXT NOT NULL,
+      due_at TEXT NOT NULL,
+      on_absence TEXT NOT NULL,
+      max_retries INTEGER NOT NULL DEFAULT 0,
+      retries INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      evidence_pointer TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`);
+    // TWO rows sharing one dispatch_ref -- the collision that broke the repair.
+    seed.run(
+      `INSERT INTO tm_expectations
+       (id, dispatch_ref, recipient, evidence_json, due_at, on_absence, max_retries, retries, status, created_at, updated_at)
+       VALUES ('older','dup-dispatch','xo','{}','1970-01-01T00:00:00.000Z','redispatch',2,1,'failed','2026-01-01T00:00:00.000Z','2026-01-01T00:00:00.000Z'),
+              ('newer','dup-dispatch','xo','{}','1970-01-01T00:00:00.000Z','redispatch',2,0,'pending','2026-02-01T00:00:00.000Z','2026-02-01T00:00:00.000Z'),
+              ('solo','solo-dispatch','xo','{}','1970-01-01T00:00:00.000Z','escalate',0,0,'pending','2026-03-01T00:00:00.000Z','2026-03-01T00:00:00.000Z')`
+    );
+    seed.close();
+
+    // Opening the adapter runs the repair. It must NOT throw on the duplicate.
+    const upgraded = new SqliteAdapter(legacyPath);
+    try {
+      const previous = db;
+      db = upgraded;
+      try {
+        // The unique index exists -- the whole point.
+        const indexes = await upgraded.query<{ name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND name = $1",
+          ['idx_tm_expectations_registration_key']
+        );
+        expect(indexes.rows).toHaveLength(1);
+
+        // Oldest row per dispatch_ref keeps the clean key; the later duplicate
+        // gets a collision-free suffixed key. Nothing is deleted.
+        const keys = await upgraded.query<{ id: string; registration_key: string }>(
+          'SELECT id, registration_key FROM tm_expectations ORDER BY id'
+        );
+        const byId = new Map(keys.rows.map(r => [r.id, r.registration_key]));
+        expect(byId.get('older')).toBe('dup-dispatch');
+        expect(byId.get('newer')).toBe('dup-dispatch:legacy:newer');
+        expect(byId.get('solo')).toBe('solo-dispatch');
+        expect(keys.rows).toHaveLength(3);
+
+        // And registration still works against the repaired database --
+        // including reusing the OLDEST legacy row for that dispatch.
+        const reused = await registerExpectation({
+          dispatch_ref: 'dup-dispatch',
+          recipient: 'xo',
+          evidence_json: '{}',
+          due_at: new Date(0).toISOString(),
+          on_absence: 'redispatch',
+          max_retries: 2,
+        });
+        expect(reused).toBe('older');
+
+        const fresh = await registerExpectation({
+          action_ref: 'action-after-repair',
+          dispatch_ref: 'brand-new-dispatch',
+          recipient: 'xo',
+          evidence_json: '{}',
+          due_at: new Date(0).toISOString(),
+          on_absence: 'escalate',
+          max_retries: 0,
+        });
+        expect(fresh).toBeTruthy();
+        // Idempotent on the repaired database too.
+        expect(
+          await registerExpectation({
+            action_ref: 'action-after-repair',
+            dispatch_ref: 'brand-new-dispatch',
+            recipient: 'xo',
+            evidence_json: '{}',
+            due_at: new Date(0).toISOString(),
+            on_absence: 'escalate',
+            max_retries: 0,
+          })
+        ).toBe(fresh);
+      } finally {
+        db = previous;
+      }
+    } finally {
+      await upgraded.close();
+      cleanupDb(legacyPath);
+    }
+  });
+
   test('registering twice for the same dispatch yields one row and the same id', async () => {
     // REGRESSION. registerExpectation generated a random UUID per call and the
     // schema had no uniqueness on the identity, so replaying an action after a

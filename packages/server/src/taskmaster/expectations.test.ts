@@ -914,7 +914,6 @@ describe('expectation supervisor', () => {
       listDueExpectations: async () => [crashed],
       checkEvidence: async () => ({ ok: false, pointer: null }),
       findEffectByIdempotencyKey: async () => null,
-      claimRecoveryReplay: async () => true,
       // A concurrent tick already recovered this attempt (or marked it met).
       claimRecoveryReplay: async () => false,
       markFailed: async () => {

@@ -441,9 +441,25 @@ export class SqliteAdapter implements IDatabase {
     // Taskmaster expectation registration key (migration 049). CREATE TABLE IF
     // NOT EXISTS will not add the column to a database that already carries an
     // earlier shape of tm_expectations, so backfill it and enforce the
-    // uniqueness that makes registration idempotent. The backfill uses the
-    // dispatch_ref, which is the identity for rows written before action_ref
-    // existed.
+    // uniqueness that makes registration idempotent.
+    //
+    // The backfill MUST be collision-free. A legacy table can already hold two
+    // rows sharing a dispatch_ref -- that duplicate IS the bug this WO fixes, a
+    // replayed action registering twice -- and a naive
+    // "registration_key = dispatch_ref" for every row would then make
+    // CREATE UNIQUE INDEX fail. Previously that failure was only logged and
+    // startup continued, which is the worst outcome: no unique constraint, so
+    // every later registerExpectation using ON CONFLICT (registration_key)
+    // fails and registration is disabled entirely.
+    //
+    // Duplicates are NOT folded. They are semantically the same expectation
+    // (dispatch_ref is a cascade run id or a dispatch message id, unique per
+    // dispatch), but each row carries its own retry counter and terminal state,
+    // and deleting rows during a startup repair would destroy audit history.
+    // Instead the OLDEST row per dispatch_ref keeps the clean key -- so it is
+    // the one a future registerExpectation reuses -- and every later duplicate
+    // gets a collision-free "<dispatch_ref>:legacy:<id>" key, preserved and
+    // inspectable but out of the way.
     try {
       const expectationCols = this.pragmaAll("PRAGMA table_info('tm_expectations')") as {
         name: string;
@@ -452,17 +468,42 @@ export class SqliteAdapter implements IDatabase {
         const expectationColNames = new Set(expectationCols.map(c => c.name));
         if (!expectationColNames.has('registration_key')) {
           this.db.run('ALTER TABLE tm_expectations ADD COLUMN registration_key TEXT');
-          this.db.run(
-            'UPDATE tm_expectations SET registration_key = dispatch_ref WHERE registration_key IS NULL'
-          );
         }
+        // Oldest row per dispatch_ref (ties broken by id so the choice is
+        // deterministic across runs) keeps the bare dispatch_ref.
+        this.db.run(
+          `UPDATE tm_expectations SET registration_key = dispatch_ref
+             WHERE registration_key IS NULL
+               AND id IN (
+                 SELECT id FROM (
+                   SELECT id, ROW_NUMBER() OVER (
+                     PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
+                   ) AS rn
+                   FROM tm_expectations WHERE registration_key IS NULL
+                 ) WHERE rn = 1
+               )`
+        );
+        // Every remaining legacy row gets a suffixed, collision-free key.
+        this.db.run(
+          `UPDATE tm_expectations
+              SET registration_key = dispatch_ref || ':legacy:' || id
+            WHERE registration_key IS NULL`
+        );
         this.db.run(
           `CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key
              ON tm_expectations(registration_key)`
         );
       }
     } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_tm_expectations_columns_failed');
+      // FAIL LOUDLY. Without this index, registration is silently broken for
+      // the life of the process; a warning in a log nobody reads is not an
+      // acceptable outcome for a constraint the write path depends on.
+      getLog().error({ err: e as Error }, 'db.sqlite_migration_tm_expectations_columns_failed');
+      throw new Error(
+        'tm_expectations registration_key repair failed: the unique index is required for ' +
+          'idempotent expectation registration and the database cannot be used without it. ' +
+          `Cause: ${e instanceof Error ? e.message : String(e)}`
+      );
     }
 
     // Dispatch board-motion and agent messaging columns
