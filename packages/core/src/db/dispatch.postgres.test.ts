@@ -140,6 +140,16 @@ beforeAll(async () => {
     'utf8'
   );
   await db.query(migration);
+  // 047 adds the `seq` insertion counter that every newest-first read orders by
+  // and that createMessage writes. Production applies migrations in order, so
+  // this fixture must too -- without it the inserts under test fail with
+  // 'column "seq" of relation "agent_dispatch_messages" does not exist'.
+  await db.query(
+    readFileSync(
+      resolve(import.meta.dir, '../../../../migrations/047_agent_dispatch_seq.sql'),
+      'utf8'
+    )
+  );
 });
 
 afterAll(async () => {

@@ -42,6 +42,12 @@ beforeAll(async () => {
     '040_agent_messaging_phase0.sql',
     '042_agent_messaging_phase1.sql',
     '043_agent_messaging_phase15.sql',
+    // 047 adds the `seq` insertion counter that createMessage writes on every
+    // insert and every newest-first read orders by. Production applies
+    // migrations in order, so this fixture must too -- without it the dispatch
+    // inserts in this suite fail with
+    // 'column "seq" of relation "agent_dispatch_messages" does not exist'.
+    '047_agent_dispatch_seq.sql',
   ]) {
     await primary.query(
       readFileSync(resolve(import.meta.dir, '../../../../migrations', migration), 'utf8')

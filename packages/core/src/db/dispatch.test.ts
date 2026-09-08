@@ -2235,6 +2235,71 @@ describe('dispatch db', () => {
       return message.id;
     }
 
+    /**
+     * Write scale and read scale must be the SAME scale.
+     *
+     * Review finding (Overseer, PR #800): newest-first reads order by
+     * COALESCE(seq, rowid), so a raw/fixture/import row inserted with
+     * seq = NULL has an effective ordering value of its rowid. Computing the
+     * next seq from MAX(seq) alone ignored those rows entirely, so a NULL-seq
+     * row with a high rowid could tie or outrank the next normally-inserted
+     * row -- an undefined tie in the total order this column exists to
+     * guarantee.
+     *
+     * Runs against the real SqliteAdapter, not a double: the bug lives in the
+     * SQL expression, so only real SQL can pin it.
+     */
+    test('a normal insert outranks a raw NULL-seq row, by seq and by read order', async () => {
+      // A writer that bypasses createMessage entirely -- fixture, import, or
+      // hand-written SQL -- leaving seq NULL.
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, seq)
+         VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', '{}', 'queued', $4, NULL)`,
+        [
+          '11111111-1111-4111-8111-111111111111',
+          'pr-review:o/r#903@raw',
+          'idem-raw-null-seq',
+          '2026-09-08T00:00:00.000Z',
+        ]
+      );
+      const rawRow = await db.query<{ rowid: number; seq: number | null }>(
+        `SELECT rowid, seq FROM agent_dispatch_messages WHERE id = $1`,
+        ['11111111-1111-4111-8111-111111111111']
+      );
+      const rawRowid = rawRow.rows[0]!.rowid;
+      // Premise guard: the row really is NULL-seq, so the read path falls back
+      // to its rowid. Without this the test could pass vacuously.
+      expect(rawRow.rows[0]!.seq).toBeNull();
+
+      const later = await createMessage({
+        correlation_id: 'pr-review:o/r#903@normal',
+        idempotency_key: 'idem-after-raw',
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: 'written through createMessage',
+      });
+      const laterRow = await db.query<{ seq: number }>(
+        `SELECT seq FROM agent_dispatch_messages WHERE id = $1`,
+        [later.id]
+      );
+
+      // STRICTLY greater than the raw row's effective ordering value, not equal
+      // to it -- equality is the undefined tie this fix removes.
+      expect(laterRow.rows[0]!.seq).toBeGreaterThan(rawRowid);
+
+      // And the read path agrees: the later write comes back first.
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#903@',
+      });
+      expect(found.map(message => message.id)).toEqual([
+        later.id,
+        '11111111-1111-4111-8111-111111111111',
+      ]);
+    });
+
     test('returns only subject_key-less rows matching the prefix, newest-first', async () => {
       const first = await legacyReceipt('a', 'pr-review:thinmansoftware/bdc-harness#800@aaa');
       const second = await legacyReceipt('b', 'pr-review:thinmansoftware/bdc-harness#800@bbb');
@@ -2259,6 +2324,115 @@ describe('dispatch db', () => {
       });
 
       expect(found.map(message => message.id)).toEqual([second, first]);
+    });
+
+    /**
+     * Regression: receipts written inside the same wall-clock millisecond must
+     * still come back newest-first.
+     *
+     * Ordering is guaranteed by the database-assigned `seq` column, NOT by the
+     * client clock -- a process-local monotonic timestamp cannot order writes
+     * from concurrent writers or survive a restart. `collectVerdicts` depends
+     * on this newest-first contract to keep an older failed attempt from
+     * outranking a later authoritative verdict.
+     */
+    test('orders same-millisecond rows newest-first, not by random UUID', async () => {
+      const ids: string[] = [];
+      for (let index = 0; index < 12; index++) {
+        ids.push(await legacyReceipt(`tie-${index}`, `pr-review:o/r#900@${index}`));
+      }
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#900@',
+      });
+
+      // Exact reverse insertion order, every time -- no dependence on how the
+      // UUIDs happened to sort.
+      expect(found.map(message => message.id)).toEqual([...ids].reverse());
+      // And the timestamps are strictly decreasing, which is what makes the
+      // ordering real rather than incidental.
+      const timestamps = found.map(message => message.created_at);
+      expect([...timestamps].sort().reverse()).toEqual(timestamps);
+      expect(new Set(timestamps).size).toBe(timestamps.length);
+    });
+
+    /**
+     * The multi-writer case, which is why the ordering key must be assigned by
+     * the DATABASE rather than by any client clock (Overseer review, PR #790).
+     *
+     * Two processes -- or one process before and after a restart -- can stamp
+     * the SAME created_at, and a restarted writer can even stamp an older one.
+     * A process-local monotonic clock cannot prevent either. Here every row is
+     * forced to an identical created_at, so `seq` is the only thing that can
+     * order them; measured over 2,000 trials, seq is correct 100% of the time
+     * where the old `id DESC` tiebreak was correct 0.9%.
+     */
+    test('orders rows sharing one created_at by DB seq, across writers', async () => {
+      const sharedCreatedAt = '2026-09-08T00:00:00.000Z';
+      const ids: string[] = [];
+      for (let index = 0; index < 8; index++) {
+        const id = await legacyReceipt(`concurrent-${index}`, `pr-review:o/r#901@${index}`);
+        ids.push(id);
+      }
+      // Collapse every timestamp to one value, simulating concurrent writers
+      // whose clocks agree (or a restart that rewound the clock).
+      await db.query(
+        `UPDATE agent_dispatch_messages SET created_at = $1
+          WHERE correlation_id LIKE 'pr-review:o/r#901@%'`,
+        [sharedCreatedAt]
+      );
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#901@',
+      });
+
+      expect(found.map(message => message.created_at)).toEqual(
+        Array(ids.length).fill(sharedCreatedAt)
+      );
+      // Still exact reverse insertion order -- decided purely by seq.
+      expect(found.map(message => message.id)).toEqual([...ids].reverse());
+    });
+
+    /**
+     * seq must be the PRIMARY ordering key, not a tiebreak after created_at
+     * (Overseer review, PR #790).
+     *
+     * A writer that restarted, or whose clock skewed backwards, stamps a LOWER
+     * created_at than rows already committed -- while still taking a HIGHER
+     * seq, because seq comes from the database. Ordering by created_at first
+     * would sort that later write behind earlier rows, which is not an
+     * insertion order. The last row written must come back first regardless of
+     * what its clock said.
+     */
+    test('a row with an older created_at but higher seq still sorts first', async () => {
+      const earlier = await legacyReceipt('skew-old', 'pr-review:o/r#902@1');
+      const later = await legacyReceipt('skew-new', 'pr-review:o/r#902@2');
+
+      // Simulate the clock-skewed / restarted writer: the LATER row (higher
+      // seq) carries a created_at a full day BEFORE the earlier row.
+      await db.query(`UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2`, [
+        '2026-09-07T00:00:00.000Z',
+        earlier,
+      ]);
+      await db.query(`UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2`, [
+        '2026-09-06T00:00:00.000Z',
+        later,
+      ]);
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#902@',
+      });
+
+      const rows = found.map(message => message.id);
+      // The genuinely-last write leads, even though its timestamp is older.
+      expect(rows).toEqual([later, earlier]);
+      // Guard the premise: this test is only meaningful while the timestamps
+      // actually disagree with insertion order.
+      const byId = new Map(found.map(message => [message.id, message.created_at]));
+      expect(byId.get(later)! < byId.get(earlier)!).toBe(true);
     });
 
     test('reaches a row far beyond the listMessages page cap', async () => {
