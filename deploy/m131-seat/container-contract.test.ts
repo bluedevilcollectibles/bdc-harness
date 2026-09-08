@@ -9,6 +9,7 @@
  * build-SHA wiring.
  */
 import { describe, expect, test } from 'bun:test';
+import { readdir } from 'node:fs/promises';
 import { join } from 'path';
 import { parse } from 'yaml';
 
@@ -63,6 +64,56 @@ describe('m131-seat Dockerfile contract', () => {
   test('healthcheck is the sanitized seat preflight instrument', () => {
     expect(dockerfile).toMatch(/^HEALTHCHECK/m);
     expect(dockerfile).toContain('scripts/dispatch-worker/seat-preflight.ts');
+  });
+
+  // REGRESSION (bdc-xo#1813): the image copied only the root package.json and
+  // bun.lock, but the root package.json declares workspaces: [packages/*] and
+  // the monorepo lockfile depends on every workspace manifest. bun install
+  // --frozen-lockfile therefore failed and the image never built from a clean
+  // clone. Derived from the tree, not a hardcoded list, so adding a workspace
+  // package without updating the Dockerfile fails here rather than in a build.
+  test('copies every workspace package.json before bun install', async () => {
+    const repoRoot = join(dir, '..', '..');
+    const workspaces: string[] = [];
+    for (const entry of await readdir(join(repoRoot, 'packages'), { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (await Bun.file(join(repoRoot, 'packages', entry.name, 'package.json')).exists()) {
+        workspaces.push(entry.name);
+      }
+    }
+    expect(workspaces.length).toBeGreaterThan(1);
+
+    // Anchor on the RUN instruction itself, not prose mentioning bun install.
+    const installMatch = /^RUN bun install .*$/m.exec(dockerfile);
+    expect(installMatch).not.toBeNull();
+    const beforeInstall = dockerfile.slice(0, installMatch!.index);
+    for (const name of workspaces) {
+      expect(beforeInstall).toContain(`packages/${name}/package.json`);
+    }
+  });
+
+  // REGRESSION (bdc-xo#1813): the image installed no provider CLI at all.
+  // seat-preflight resolves the provider command with Bun.which(), so every
+  // seat failed closed at seat_provider_command_unavailable and no board seat
+  // could run anywhere but the operator desktop.
+  test('installs the grok provider CLI at a pinned version', () => {
+    expect(dockerfile).toMatch(/^ARG GROK_VERSION=\d+\.\d+\.\d+$/m);
+    expect(dockerfile).toContain('/usr/local/bin/grok');
+    // Pinned, never an implicit "latest": the URL must carry the version.
+    expect(dockerfile).toContain('grok-${GROK_VERSION}-linux-');
+    // The build proves the CLI works rather than trusting the download.
+    expect(dockerfile).toContain('grok agent stdio --help');
+  });
+
+  // The image must stay credential-free: credentials arrive at RUN time by
+  // bind mount / env, exactly as archon-app-1 does it today. In particular the
+  // vendor installer is not piped to a shell -- it reads ~/.grok/auth.json and
+  // writes a proxy auth header.
+  test('bakes no credential into the image', () => {
+    expect(dockerfile).not.toMatch(/x\.ai\/cli\/install\.sh/);
+    expect(dockerfile).not.toMatch(/GROK_DEPLOYMENT_KEY/);
+    expect(dockerfile).not.toMatch(/XAI_API_KEY\s*=/);
+    expect(dockerfile).not.toMatch(/^ENV\s+\w*(API_KEY|TOKEN|SECRET)\w*=/m);
   });
 });
 
