@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { checkEvidence, checkExpectations, nextPageUrl, type EvidenceSpec } from './expectations';
+import {
+  checkEvidence,
+  checkExpectations,
+  EvidenceProbeCapped,
+  nextPageUrl,
+  type EvidenceSpec,
+} from './expectations';
 import type { TmExpectation } from '@archon/core/db/taskmaster';
 
 const base: TmExpectation = {
@@ -75,6 +81,39 @@ describe('expectation evidence', () => {
     expect(result).toEqual({ ok: true, pointer: 'https://example/the-claim' });
     expect(requested).toHaveLength(2);
     expect(requested[1]).toContain('page=2');
+  });
+
+  test('issue_comment_exists raises UNKNOWN when the page cap is hit with more pages left', async () => {
+    // REGRESSION. Exhausting the cap while GitHub still advertises a next page
+    // used to return a bare { ok: false } -- indistinguishable from proven
+    // absence, so the supervisor would redispatch or escalate for an
+    // expectation whose evidence may sit one page further on.
+    const noise = Array.from({ length: 100 }, (_, i) => ({
+      body: `noise ${String(i)}`,
+      html_url: `https://example/c${String(i)}`,
+      user: { login: 'someone' },
+    }));
+    const requested: string[] = [];
+    await expect(
+      checkEvidence(
+        { kind: 'issue_comment_exists', repo: 'x/y', number: 7, marker: 'CLAIM' },
+        {
+          fetch: ((url: string) => {
+            requested.push(url);
+            // 21 pages advertised: every page keeps offering a next one, so the
+            // cap binds before the search is exhausted.
+            return Promise.resolve(
+              new Response(JSON.stringify(noise), {
+                status: 200,
+                headers: { link: '<https://api.github.com/x?per_page=100&page=99>; rel="next"' },
+              })
+            );
+          }) as unknown as typeof fetch,
+        }
+      )
+    ).rejects.toBeInstanceOf(EvidenceProbeCapped);
+    // Bounded: it stopped at the cap rather than following pages forever.
+    expect(requested).toHaveLength(20);
   });
 
   test('issue_comment_exists reports absent after exhausting 2 pages with no match', async () => {
@@ -1050,6 +1089,63 @@ describe('expectation supervisor', () => {
       } as never)
     ).rejects.toThrow('dispatch unavailable');
     expect(claims).toEqual([]);
+  });
+
+  test('a capped evidence probe does nothing this tick and leaves the row untouched', async () => {
+    // The supervisor half of the cap fix: an UNKNOWN probe must not be treated
+    // as absence. No markFailed, no redispatch, no escalation, no close -- the
+    // row stays exactly as it was and the deadline is re-judged next tick.
+    const calls: string[] = [];
+    const keys: string[] = [];
+    const row: TmExpectation = { ...base, retries: 1, max_retries: 2, status: 'failed' };
+    const snapshot = { ...row };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [row],
+      checkEvidence: async () => {
+        throw new EvidenceProbeCapped('x/y', 7, 20);
+      },
+      markMet: async () => {
+        calls.push('markMet');
+        return true;
+      },
+      markFailed: async () => {
+        calls.push('markFailed');
+        return true;
+      },
+      markGivenUp: async () => {
+        calls.push('markGivenUp');
+        return true;
+      },
+      claimEscalation: async () => {
+        calls.push('claimEscalation');
+        return true;
+      },
+      markEscalated: async () => {
+        calls.push('markEscalated');
+        return true;
+      },
+      claimRedispatchAttempt: async () => {
+        calls.push('claimRedispatchAttempt');
+        return 2;
+      },
+      claimRecoveryReplay: async () => {
+        calls.push('claimRecoveryReplay');
+        return true;
+      },
+      findEffectByIdempotencyKey: async () => null,
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        keys.push(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    } as never);
+    // Nothing was attempted at all -- not even a state transition.
+    expect(calls).toEqual([]);
+    // Nothing was put on the wire: no redispatch, no operator blocker.
+    expect(keys).toEqual([]);
+    // The row is byte-for-byte what it was.
+    expect(row).toEqual(snapshot);
   });
 
   test('an unreadable recovery probe does not blind-replay', async () => {

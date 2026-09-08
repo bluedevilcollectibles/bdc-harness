@@ -89,10 +89,42 @@ export interface ExpectationDeps {
  * Page cap for the issue-comment evidence read. 20 pages x 100 = 2000 comments,
  * far beyond any real WO thread, so the cap should never bind in practice --
  * it exists so a pathological issue cannot spend the whole GitHub rate budget
- * on one expectation check. Reaching it is logged with its reason rather than
- * silently reported as absent evidence.
+ * on one expectation check.
+ *
+ * Exhausting it raises EvidenceProbeCapped rather than returning absence: see
+ * that class for why "we stopped looking" must never be reported as "it is not
+ * there".
  */
 const MAX_COMMENT_PAGES = 20;
+
+/**
+ * The probe gave up before it could answer. UNKNOWN, not absent.
+ *
+ * A capped pagination read has NOT proven the evidence missing -- it has only
+ * proven that we stopped looking while GitHub was still offering pages. The two
+ * are indistinguishable in a bare `{ ok: false }`, and the difference is
+ * expensive: absence drives a redispatch or an operator escalation, so
+ * reporting a cap as absence sends duplicate work, or wakes a human, for an
+ * expectation whose evidence may well exist one page further on.
+ *
+ * Thrown so the supervisor's existing catch treats it exactly as it treats the
+ * recovery probe's UNKNOWN: log, leave the row active and untouched, and retry
+ * on the next tick. It is caught inside the per-expectation loop, so it never
+ * escapes the tick or stops the other expectations from being checked.
+ */
+export class EvidenceProbeCapped extends Error {
+  constructor(
+    readonly repo: string,
+    readonly issueNumber: number,
+    readonly pagesRead: number
+  ) {
+    super(
+      `expectation_evidence_probe_capped:${repo}#${String(issueNumber)}:` +
+        `${String(pagesRead)} pages read with a next page still advertised`
+    );
+    this.name = 'EvidenceProbeCapped';
+  }
+}
 
 /**
  * Next page URL from a GitHub `Link` header, or null on the last page.
@@ -156,21 +188,24 @@ export async function checkEvidence(
       // and every skipped request is GitHub rate budget preserved.
       if (match) return { ok: true, pointer: match.html_url ?? null };
       const next = nextPageUrl(response.headers.get('link'));
+      // No next page: the search really is exhausted, so absence is PROVEN.
       if (!next) return { ok: false, pointer: null };
       url = next;
       if (page === MAX_COMMENT_PAGES) {
-        // Bounded, and the bound is REPORTED. Returning a bare "absent" after
-        // giving up would be indistinguishable from genuinely-absent evidence
-        // and would silently trigger a redispatch or escalation.
+        // A next page is still advertised and we are out of budget, so the
+        // answer is UNKNOWN. Raising it routes to the supervisor's
+        // do-nothing-this-tick path instead of asserting a false absence that
+        // would redispatch or escalate.
         log.warn(
           {
             repo: spec.repo,
             number: spec.number,
             pagesRead: MAX_COMMENT_PAGES,
-            reason: 'comment pagination cap reached before a match or the last page',
+            reason: 'comment pagination cap reached with a next page still advertised',
           },
-          'taskmaster.expectation_comment_pagination_capped'
+          'taskmaster.expectation_evidence_probe_capped'
         );
+        throw new EvidenceProbeCapped(spec.repo, spec.number, MAX_COMMENT_PAGES);
       }
     }
     return { ok: false, pointer: null };
