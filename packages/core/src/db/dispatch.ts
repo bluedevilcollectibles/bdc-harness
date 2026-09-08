@@ -141,30 +141,21 @@ export const DEFAULT_WORKER_STALE_AFTER_MS = 120_000;
 const DEFAULT_LEASE_DURATION_MS = 300_000;
 
 /**
- * Strictly-increasing insertion timestamp.
+ * Insertion timestamp, nudged forward when the wall clock has not ticked.
  *
- * `created_at` is the ONLY ordering key the dispatch queue has -- `id` is a
- * random UUID, so it carries no insertion order, and the table has no
- * autoincrement column (Postgres has no portable `rowid`). But
- * `Date.toISOString()` has millisecond resolution while consecutive inserts
- * complete well inside one millisecond: measured on this codebase, two
- * back-to-back `createMessage` calls land in the SAME millisecond ~100% of the
- * time. Ties then fell through to the random-UUID tiebreak, which ordered them
- * correctly only ~50% of the time -- a coin flip on every platform, not just
- * Windows.
+ * This is a NICETY, NOT THE ORDERING GUARANTEE. `created_at` has millisecond
+ * resolution while consecutive inserts complete well inside one millisecond
+ * (measured: ~100% of back-to-back inserts share a timestamp), so this bump
+ * keeps timestamps distinct and readable within a single process. It CANNOT
+ * establish a total order, because it is process-local: two concurrent writers
+ * (server plus worker, or two server instances) still issue identical values,
+ * and a restarted writer can emit timestamps OLDER than rows its predecessor
+ * already committed.
  *
- * That is a correctness bug in production, not only in tests:
- * `collectVerdicts` (packages/overseer/src/pr-review-wiring.ts) documents that
- * receipts MUST arrive newest-first because the first receipt seen for a
- * message wins, so a coin-flipped tie can let an older failed attempt outrank
- * the later authoritative verdict. Retry loops write receipts milliseconds
- * apart, so the tie is reachable in the live store.
- *
- * Bumping to the next millisecond when the clock has not advanced keeps the
- * exact ISO-8601 TEXT format every existing query, index, and comparison
- * depends on, while guaranteeing distinct, correctly-ordered values. Drift is
- * bounded by the insert rate and self-corrects the moment the wall clock
- * catches up.
+ * The actual ordering guarantee is the database-assigned `seq` column
+ * (Postgres IDENTITY via migration 047, SQLite rowid) -- the database is the
+ * only serialization point every writer shares. Newest-first queries order by
+ * (created_at DESC, seq DESC); `seq` is what decides ties.
  */
 let lastIssuedNowMs = 0;
 function nowIso(): string {
@@ -587,7 +578,10 @@ export async function listMessages(filters: {
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   const order =
     filters.subject_key !== undefined
-      ? 'ORDER BY created_at DESC, id DESC'
+      ? // seq (DB-assigned insertion counter) breaks created_at ties; see
+        // listMessagesByCorrelationPrefixWithoutSubjectKey. collectVerdicts
+        // depends on this newest-first contract holding across writers.
+        'ORDER BY created_at DESC, seq DESC'
       : filters.status === 'queued'
         ? "ORDER BY CASE priority WHEN 'blocker' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, created_at ASC"
         : 'ORDER BY created_at ASC';
@@ -633,6 +627,14 @@ function escapeLikeLiteral(value: string): string {
  * the same millisecond -- id is a random UUID and carries no insertion order,
  * so it must never be the key that decides newest-first on its own.
  */
+/**
+ * Newest-first ordering note: ties on created_at (millisecond resolution, and
+ * consecutive inserts routinely share one) are broken by `seq`, the
+ * database-assigned insertion counter -- Postgres IDENTITY, SQLite rowid. It is
+ * the only key that is correct across CONCURRENT WRITERS and across restarts,
+ * which a client-side clock can never be. `id` is a random UUID and must never
+ * decide ordering.
+ */
 export async function listMessagesByCorrelationPrefixWithoutSubjectKey(filters: {
   recipient: string;
   correlationPrefix: string;
@@ -644,7 +646,7 @@ export async function listMessagesByCorrelationPrefixWithoutSubjectKey(filters: 
      WHERE recipient = $1
        AND subject_key IS NULL
        AND correlation_id LIKE $2 ESCAPE '\\'
-     ORDER BY created_at DESC, id DESC
+     ORDER BY created_at DESC, seq DESC
      LIMIT $3`,
     [
       canonicalizePrincipal(filters.recipient),

@@ -522,6 +522,7 @@ export class SqliteAdapter implements IDatabase {
     }
 
     this.migrateDispatchSenderPrincipalIdempotency();
+    this.migrateDispatchSeq();
 
     try {
       const actionCols = this.db
@@ -546,6 +547,69 @@ export class SqliteAdapter implements IDatabase {
    * idempotency constraint with two partial unique indexes. Rebuild is fatal on
    * failure -- it must not be swallowed by the best-effort migration warn path.
    */
+  /**
+   * Database-assigned total order for the dispatch queue (mirrors Postgres
+   * migration 047_agent_dispatch_seq.sql).
+   *
+   * `created_at` has millisecond resolution while consecutive inserts finish
+   * inside one millisecond, and `id` is a random UUID, so newest-first ordering
+   * used to be decided at random on a tie. A process-local monotonic clock
+   * cannot fix that: concurrent writers still collide and a restarted writer can
+   * emit timestamps older than rows already committed. Only the database sees
+   * every writer, so the database assigns the order.
+   *
+   * SQLite's implicit `rowid` is already a monotonically increasing insertion
+   * key (the table is not WITHOUT ROWID), so it is the natural source. It cannot
+   * be exposed by adding an AUTOINCREMENT column -- SQLite's ALTER TABLE ADD
+   * COLUMN rejects AUTOINCREMENT and non-constant defaults -- so `seq` is a
+   * plain INTEGER backfilled from rowid, and inserts stamp it from rowid via
+   * the trigger below. That keeps a single source of truth for the order rather
+   * than a second counter that could drift.
+   */
+  private migrateDispatchSeq(): void {
+    try {
+      const tableExists = this.db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+        )
+        .get() as { name?: string } | null;
+      if (!tableExists?.name) return;
+
+      const colNames = new Set(
+        (
+          this.db.prepare("PRAGMA table_info('agent_dispatch_messages')").all() as {
+            name: string;
+          }[]
+        ).map(c => c.name)
+      );
+      if (!colNames.has('seq')) {
+        this.db.run('ALTER TABLE agent_dispatch_messages ADD COLUMN seq INTEGER');
+      }
+
+      // Backfill in rowid order -- the order the rows were actually inserted.
+      this.db.run('UPDATE agent_dispatch_messages SET seq = rowid WHERE seq IS NULL');
+
+      // Stamp seq on every future insert from the same rowid counter, so the
+      // ordering key is assigned by the database at commit time rather than by
+      // any client clock.
+      this.db.run(`
+        CREATE TRIGGER IF NOT EXISTS trg_agent_dispatch_messages_seq
+        AFTER INSERT ON agent_dispatch_messages
+        FOR EACH ROW WHEN NEW.seq IS NULL
+        BEGIN
+          UPDATE agent_dispatch_messages SET seq = NEW.rowid WHERE rowid = NEW.rowid;
+        END
+      `);
+
+      this.db.run(
+        `CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_created_seq
+           ON agent_dispatch_messages (recipient, created_at DESC, seq DESC)`
+      );
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_seq_failed');
+    }
+  }
+
   private migrateDispatchSenderPrincipalIdempotency(): void {
     const tableExists = this.db
       .prepare(

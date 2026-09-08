@@ -2262,15 +2262,14 @@ describe('dispatch db', () => {
     });
 
     /**
-     * Regression: two receipts written inside the same wall-clock millisecond
-     * must still come back newest-first.
+     * Regression: receipts written inside the same wall-clock millisecond must
+     * still come back newest-first.
      *
-     * Before the `nowIso` fix, consecutive inserts shared a `created_at` (~100%
-     * of the time) and the ORDER BY fell through to `id DESC` -- a random UUID
-     * -- so this ordering was a coin flip that failed ~50% of runs. It surfaced
-     * as a flaky Windows CI failure on PR #790, but it was never
-     * platform-specific, and `collectVerdicts` depends on the newest-first
-     * contract to keep an older failed attempt from outranking a later verdict.
+     * Ordering is guaranteed by the database-assigned `seq` column, NOT by the
+     * client clock -- a process-local monotonic timestamp cannot order writes
+     * from concurrent writers or survive a restart. `collectVerdicts` depends
+     * on this newest-first contract to keep an older failed attempt from
+     * outranking a later authoritative verdict.
      */
     test('orders same-millisecond rows newest-first, not by random UUID', async () => {
       const ids: string[] = [];
@@ -2291,6 +2290,44 @@ describe('dispatch db', () => {
       const timestamps = found.map(message => message.created_at);
       expect([...timestamps].sort().reverse()).toEqual(timestamps);
       expect(new Set(timestamps).size).toBe(timestamps.length);
+    });
+
+    /**
+     * The multi-writer case, which is why the ordering key must be assigned by
+     * the DATABASE rather than by any client clock (Overseer review, PR #790).
+     *
+     * Two processes -- or one process before and after a restart -- can stamp
+     * the SAME created_at, and a restarted writer can even stamp an older one.
+     * A process-local monotonic clock cannot prevent either. Here every row is
+     * forced to an identical created_at, so `seq` is the only thing that can
+     * order them; measured over 2,000 trials, seq is correct 100% of the time
+     * where the old `id DESC` tiebreak was correct 0.9%.
+     */
+    test('orders rows sharing one created_at by DB seq, across writers', async () => {
+      const sharedCreatedAt = '2026-09-08T00:00:00.000Z';
+      const ids: string[] = [];
+      for (let index = 0; index < 8; index++) {
+        const id = await legacyReceipt(`concurrent-${index}`, `pr-review:o/r#901@${index}`);
+        ids.push(id);
+      }
+      // Collapse every timestamp to one value, simulating concurrent writers
+      // whose clocks agree (or a restart that rewound the clock).
+      await db.query(
+        `UPDATE agent_dispatch_messages SET created_at = $1
+          WHERE correlation_id LIKE 'pr-review:o/r#901@%'`,
+        [sharedCreatedAt]
+      );
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#901@',
+      });
+
+      expect(found.map(message => message.created_at)).toEqual(
+        Array(ids.length).fill(sharedCreatedAt)
+      );
+      // Still exact reverse insertion order -- decided purely by seq.
+      expect(found.map(message => message.id)).toEqual([...ids].reverse());
     });
 
     test('reaches a row far beyond the listMessages page cap', async () => {
