@@ -245,14 +245,25 @@ function pruneAttemptCounters(now: number, incomingKey: string): void {
 }
 
 /**
- * Forget every counter for one head across all base branches. Called when a
- * lookup finally succeeds: that head's deferrals are over, whichever base it
- * targets. Scoped to the head so a sibling PR's in-flight count survives.
+ * Forget every counter for one head within ONE repository, across all of that
+ * repository's base branches. Called when a lookup finally succeeds: that
+ * head's deferrals are over, whichever base it targets. Scoped to the head so
+ * a sibling PR's in-flight count survives.
+ *
+ * The owner/repo scope is load-bearing (#777 review finding). A counter key is
+ * `owner/repo@baseRef#headSha`, and matching on the `#headSha` suffix alone
+ * matched EVERY repository's entry for that sha. Identical commits routinely
+ * exist across forks and mirrors, so one repo's successful lookup would reset
+ * another repo's deferral counter -- and a repo whose counter keeps being reset
+ * never reaches the configured attempt bound, which is the exact
+ * forever-deferral this bound was added to end. Matching the `owner/repo@`
+ * prefix as well as the head keeps each repository's bound independent.
  */
-function clearAttemptsForHead(headSha: string): void {
+function clearAttemptsForHead(owner: string, repo: string, headSha: string): void {
+  const prefix = `${owner}/${repo}@`;
   const suffix = `#${headSha}`;
   for (const key of unknownAttempts.keys()) {
-    if (key.endsWith(suffix)) unknownAttempts.delete(key);
+    if (key.startsWith(prefix) && key.endsWith(suffix)) unknownAttempts.delete(key);
   }
 }
 
@@ -444,7 +455,7 @@ export async function resolveRequiredContexts(
   // "nothing is required", and treating it as absent would send a deliberately
   // unblocked branch back to the API that could not answer.
   if (overrideContexts !== undefined) {
-    clearAttemptsForHead(headSha);
+    clearAttemptsForHead(owner, repo, headSha);
     logSourceOnce(
       `override:${key}`,
       { owner, repo, baseRef, contexts: overrideContexts, source: 'env_override' },
@@ -474,7 +485,7 @@ export async function resolveRequiredContexts(
         failureKind = 'transient';
         continue;
       }
-      clearAttemptsForHead(headSha);
+      clearAttemptsForHead(owner, repo, headSha);
       logSourceOnce(
         `${attempt.source}:${key}`,
         { owner, repo, baseRef, contexts, source: attempt.source },
@@ -508,7 +519,7 @@ export async function resolveRequiredContexts(
   // that to UNKNOWN is what parked its PRs forever. An authoritative EMPTY set
   // is a real answer, not a fallback: it says "nothing is required here".
   if (await hasPositiveUnprotectedEvidence(input, baseRef)) {
-    clearAttemptsForHead(headSha);
+    clearAttemptsForHead(owner, repo, headSha);
     logSourceOnce(
       `unprotected:${key}`,
       { owner, repo, baseRef, source: 'unprotected_branch', lastReason },

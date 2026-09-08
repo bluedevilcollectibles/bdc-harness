@@ -523,6 +523,50 @@ describe('resolveRequiredContexts -- concurrent PRs on one base keep separate bo
     expect((await resolveRequiredContexts(failingFor(HEAD_A, BASE), env)).state).toBe('exhausted');
   });
 
+  // #777 review finding [major]: the clear matched on the `#headSha` suffix
+  // alone, so it swept EVERY repository's entry for that sha. Identical commits
+  // routinely exist across forks and mirrors, so one repo's success reset
+  // another repo's counter -- and a repo whose counter keeps being reset never
+  // reaches the bound, which is the forever-deferral the bound exists to end.
+  test('35b a success in one repo leaves another repo counter for the same head intact', async () => {
+    const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '3' };
+    const OTHER_REPO = 'bdc-harness-fork';
+
+    // The SAME head sha under two repositories -- a fork carrying the identical
+    // commit. Both accumulate deferrals independently.
+    await resolveRequiredContexts(failingFor(HEAD_A), env);
+    await resolveRequiredContexts(
+      baseInput({
+        repo: OTHER_REPO,
+        headSha: HEAD_A,
+        fetchWithAppClient: async () => {
+          throw appPermissionError();
+        },
+      }),
+      env
+    );
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(1);
+    expect(peekRequiredContextsAttempts(OWNER, OTHER_REPO, BASE, HEAD_A)).toBe(1);
+
+    // The fork's lookup succeeds. Only the fork's counter may clear.
+    await resolveRequiredContexts(
+      baseInput({
+        repo: OTHER_REPO,
+        headSha: HEAD_A,
+        fetchWithAppClient: async () => ({ data: ['test'] }),
+      }),
+      env
+    );
+    expect(peekRequiredContextsAttempts(OWNER, OTHER_REPO, BASE, HEAD_A)).toBe(0);
+    // Under the unscoped clear this read was 0: the fork's success wiped this
+    // repo's progress, and repeating that every tick meant the bound never came.
+    expect(peekRequiredContextsAttempts(OWNER, REPO, BASE, HEAD_A)).toBe(1);
+
+    // So this repo still reaches its own bound on its own second and third ticks.
+    expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('unknown');
+    expect((await resolveRequiredContexts(failingFor(HEAD_A), env)).state).toBe('exhausted');
+  });
+
   test('36 stale counters are pruned by age, not by another head arriving', async () => {
     const env = { [REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]: '5' };
     const realNow = Date.now;
