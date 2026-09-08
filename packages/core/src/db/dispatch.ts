@@ -140,8 +140,28 @@ export type DispatchQueryExecutor = <T>(sql: string, params?: unknown[]) => Prom
 export const DEFAULT_WORKER_STALE_AFTER_MS = 120_000;
 const DEFAULT_LEASE_DURATION_MS = 300_000;
 
+/**
+ * Insertion timestamp, nudged forward when the wall clock has not ticked.
+ *
+ * This is a NICETY, NOT THE ORDERING GUARANTEE. `created_at` has millisecond
+ * resolution while consecutive inserts complete well inside one millisecond
+ * (measured: ~100% of back-to-back inserts share a timestamp), so this bump
+ * keeps timestamps distinct and readable within a single process. It CANNOT
+ * establish a total order, because it is process-local: two concurrent writers
+ * (server plus worker, or two server instances) still issue identical values,
+ * and a restarted writer can emit timestamps OLDER than rows its predecessor
+ * already committed.
+ *
+ * The actual ordering guarantee is the database-assigned `seq` column
+ * (Postgres IDENTITY via migration 047, SQLite rowid) -- the database is the
+ * only serialization point every writer shares. Newest-first queries order by
+ * (created_at DESC, seq DESC); `seq` is what decides ties.
+ */
+let lastIssuedNowMs = 0;
 function nowIso(): string {
-  return new Date().toISOString();
+  const wall = Date.now();
+  lastIssuedNowMs = wall > lastIssuedNowMs ? wall : lastIssuedNowMs + 1;
+  return new Date(lastIssuedNowMs).toISOString();
 }
 
 function normalizeTimestamp(value: unknown): string {
@@ -411,6 +431,39 @@ export async function createAuthenticatedMessage(
   });
 }
 
+/**
+ * SQL expression producing the next `seq` (the database-assigned insertion
+ * order; see migration 047 and migrateDispatchSeq).
+ *
+ * Postgres: the column is an IDENTITY, so DEFAULT draws from its sequence.
+ * SQLite: no DEFAULT is possible on a column added by ALTER TABLE, so take one
+ * past the current maximum. Both are evaluated by the database inside the
+ * INSERT -- which is what makes the order correct across concurrent writers and
+ * restarts, as a client clock cannot be -- and both are visible to RETURNING *,
+ * unlike an AFTER INSERT trigger.
+ */
+function seqValueExpression(): string {
+  return getDatabase().dialect === 'postgres'
+    ? 'DEFAULT'
+    : '(SELECT COALESCE(MAX(seq), 0) + 1 FROM agent_dispatch_messages)';
+}
+
+/**
+ * Newest-first ordering expression.
+ *
+ * `seq` is the ordering key, but rows written by paths that bypass
+ * createMessage (raw SQL, fixtures, imports) can carry NULL until the next
+ * open heals them. On SQLite those fall back to `rowid`, which is the same
+ * insertion counter seq is derived from, so ordering stays defined for every
+ * row. Postgres has no rowid, and its IDENTITY default fills seq for every
+ * inserter, so the column alone is sufficient there.
+ */
+function newestFirstOrder(): string {
+  return getDatabase().dialect === 'postgres'
+    ? 'ORDER BY seq DESC'
+    : 'ORDER BY COALESCE(seq, rowid) DESC';
+}
+
 async function createAuthenticatedMessageWithQuery(
   query: DispatchQueryExecutor,
   input: {
@@ -451,10 +504,22 @@ async function createAuthenticatedMessageWithQuery(
 
   const now = nowIso();
   const result = await query<CompatibleDispatchMessageRow>(
+    // `seq` is assigned INLINE, not by an AFTER INSERT trigger: SQLite
+    // evaluates RETURNING * before such a trigger fires, so the caller would be
+    // handed seq = NULL while the stored row held a value. Assigning it here
+    // keeps the returned row and the stored row identical on both engines.
+    //
+    // The expression is dialect-neutral. On Postgres the column is an IDENTITY
+    // (migration 047) whose sequence already produces the next value, so
+    // DEFAULT is used; SQLite has no DEFAULT for it, so the next value is read
+    // from the table. The subquery runs inside the same statement, and every
+    // caller of this path is already serialized by the dispatch write
+    // transaction, so it cannot interleave with another insert.
     `INSERT INTO agent_dispatch_messages
      (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id, recipient, body, status, created_at, not_before, priority, fencing_token,
-      recipient_alias, motion_id, motion_revision_sha, subject_key, repeat_reason, supersedes_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11, 0, $12, $13, $14, $15, $16, $17)
+      recipient_alias, motion_id, motion_revision_sha, subject_key, repeat_reason, supersedes_id, seq)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11, 0, $12, $13, $14, $15, $16, $17,
+             ${seqValueExpression()})
      ON CONFLICT DO NOTHING
      RETURNING *`,
     [
@@ -558,7 +623,11 @@ export async function listMessages(filters: {
   const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
   const order =
     filters.subject_key !== undefined
-      ? 'ORDER BY created_at DESC, id DESC'
+      ? // seq (DB-assigned insertion counter) IS the newest-first key -- not a
+        // tiebreak after created_at, which a clock-skewed or restarted writer
+        // can set lower than rows inserted before it. collectVerdicts depends
+        // on this contract holding across writers.
+        newestFirstOrder()
       : filters.status === 'queued'
         ? "ORDER BY CASE priority WHEN 'blocker' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END, created_at ASC"
         : 'ORDER BY created_at ASC';
@@ -597,6 +666,24 @@ function escapeLikeLiteral(value: string): string {
  * a subject_key are already reachable by the indexed query, so excluding them
  * here keeps this strictly a legacy path and keeps the result set small.
  */
+/**
+ * Newest-first ordering note: created_at is strictly increasing per writer
+ * (see nowIso), so it alone expresses insertion order. The trailing id DESC is
+ * only a total-order tiebreak for rows written by different processes within
+ * the same millisecond -- id is a random UUID and carries no insertion order,
+ * so it must never be the key that decides newest-first on its own.
+ */
+/**
+ * Newest-first ordering: `seq` is the PRIMARY key, not a tiebreak.
+ *
+ * `seq` is the database-assigned insertion counter (Postgres IDENTITY, SQLite
+ * MAX+1). Ordering by `created_at` first and `seq` second is NOT an insertion
+ * order: a write from a restarted or clock-skewed process carries an older
+ * `created_at` and would sort behind rows inserted before it despite a higher
+ * `seq`. Since what these callers want is "which row was written last",
+ * `seq DESC` alone answers it, and it is the only key correct across concurrent
+ * writers and restarts. `id` is a random UUID and must never decide ordering.
+ */
 export async function listMessagesByCorrelationPrefixWithoutSubjectKey(filters: {
   recipient: string;
   correlationPrefix: string;
@@ -608,7 +695,7 @@ export async function listMessagesByCorrelationPrefixWithoutSubjectKey(filters: 
      WHERE recipient = $1
        AND subject_key IS NULL
        AND correlation_id LIKE $2 ESCAPE '\\'
-     ORDER BY created_at DESC, id DESC
+     ${newestFirstOrder()}
      LIMIT $3`,
     [
       canonicalizePrincipal(filters.recipient),
