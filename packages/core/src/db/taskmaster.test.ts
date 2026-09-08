@@ -7,7 +7,6 @@ import { Database } from 'bun:sqlite';
 
 let db: SqliteAdapter;
 let currentDbPath = '';
-const SQLITE_HOOK_TIMEOUT_MS = 30_000;
 
 mock.module('./connection', () => ({
   getDatabase: () => db,
@@ -426,12 +425,12 @@ function cleanupDb(path: string): void {
 beforeEach(() => {
   currentDbPath = join(tmpdir(), `taskmaster-test-${Date.now()}-${Math.random()}.db`);
   db = new SqliteAdapter(currentDbPath);
-}, SQLITE_HOOK_TIMEOUT_MS);
+});
 
 afterEach(async () => {
   await db.close();
   cleanupDb(currentDbPath);
-}, SQLITE_HOOK_TIMEOUT_MS);
+});
 
 describe('tm_journal DAL', () => {
   test('reset winning before notice enqueue rejects the obsolete paused epoch', async () => {
