@@ -168,6 +168,75 @@ describe('#789 -- a reached rung makes the failure terminal, not a deferral', ()
     expect(result.retry_after_ms).toBeUndefined();
   });
 
+  /**
+   * Review finding (Overseer, PR #799): a transport failure on an earlier rung
+   * wrongly dominated a later NON-transport exception. A throw sets neither
+   * `reachedAnyRung` (nothing was returned to judge) nor, previously, anything
+   * else, so `codex` ENOENT followed by `grok` throwing `401 unauthorized`
+   * deferred and retried forever -- even though `isTransportError` classifies
+   * the 401 as non-transport and no retry could ever fix it.
+   *
+   * Both orderings are covered: the flags are set-once and never cleared, so
+   * rung ORDER must not change the classification.
+   */
+  test('transport rung THEN non-transport throw is terminal, not a deferral', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async binary => {
+          if (binary === 'codex') {
+            const error = new Error('spawn codex ENOENT') as Error & { code: string };
+            error.code = 'ENOENT';
+            throw error;
+          }
+          throw new Error('401 unauthorized');
+        },
+      })
+    );
+
+    expect(result.verdict).toBe('INDETERMINATE');
+    expect(reviewErrorCode(result.error)).toBe('model_error');
+    // No retry budget: a 401 will recur on every attempt.
+    expect(result.retry_after_ms).toBeUndefined();
+  });
+
+  test('non-transport throw THEN transport rung is also terminal (order-independent)', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async binary => {
+          if (binary === 'codex') throw new Error('401 unauthorized');
+          throw e2bigError();
+        },
+      })
+    );
+
+    expect(result.verdict).toBe('INDETERMINATE');
+    expect(result.retry_after_ms).toBeUndefined();
+  });
+
+  test('ALL rungs failing on transport still defers', async () => {
+    // The control for the two tests above: with nothing but transport failures
+    // the deferral must survive, or the fix would have broken E2BIG handling.
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async binary => {
+          if (binary === 'codex') throw e2bigError();
+          const error = new Error('spawn grok ENOENT') as Error & { code: string };
+          error.code = 'ENOENT';
+          throw error;
+        },
+      })
+    );
+
+    expect(result.verdict).toBe('TRANSPORT_ERROR');
+    expect(result.retry_after_ms).toBeGreaterThan(0);
+  });
+
   test('a dead rung before a nonzero-exit rung is also terminal', async () => {
     const result = await evaluatePullRequest(
       input,

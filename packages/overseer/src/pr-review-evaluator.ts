@@ -389,18 +389,28 @@ export async function evaluatePullRequest(
   let lastError = 'model_unavailable';
   // TRANSPORT vs JUDGMENT across the whole ladder.
   //
-  // The attempt defers ONLY when NO rung was ever successfully reached. If any
-  // rung ran and produced output to judge -- even bad output -- the failure is
-  // one of judgment and stays TERMINAL (INDETERMINATE), because a judgment
-  // failure that deferred would retry forever and never post a verdict.
+  // Deferral requires that EVERY rung failed on transport. A single
+  // non-transport failure anywhere makes the whole attempt TERMINAL
+  // (INDETERMINATE), because a judgment failure that deferred would retry
+  // forever and never post a verdict.
   //
-  // Review finding (Overseer, PR #790): tracking this as a sticky
-  // "sawTransportFailure" flag was wrong -- a permanently dead rung (codex
-  // ENOENT) would outvote a later rung that ran and returned invalid output,
-  // classifying a genuine `model_output_invalid` as transport and looping.
-  // `reachedAnyRung` is the correct predicate: it can only be set by a rung
-  // that actually ran, and it is never cleared.
+  // Two distinct ways a rung can prove the failure is NOT purely transport:
+  //   - `reachedAnyRung`: the process ran and returned output to judge, so
+  //     anything after that (bad output, non-zero exit) is judgment.
+  //   - `nonTransportFailure`: the rung threw, but `isTransportError` says the
+  //     throw was not a transport problem -- e.g. `401 unauthorized`. Nothing
+  //     was returned, so `reachedAnyRung` stays false, yet retrying forever is
+  //     still wrong because the error will recur.
+  //
+  // Review findings (Overseer, PR #790 then #799): a sticky "saw transport"
+  // flag was wrong twice over. First a dead rung (codex ENOENT) outvoted a
+  // later rung that ran and returned invalid output; `reachedAnyRung` fixed
+  // that. Then a dead rung still outvoted a later rung that threw a
+  // NON-transport error (ENOENT then 401), because a throw sets neither flag --
+  // which `nonTransportFailure` fixes. Both flags are set-once and never
+  // cleared, so rung ORDER cannot change the classification.
   let reachedAnyRung = false;
+  let nonTransportFailure = false;
   let transportFailure: string | null = null;
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
@@ -436,14 +446,21 @@ export async function evaluatePullRequest(
       };
     } catch (error) {
       lastError = `model_error:${errorMessage(error)}`;
-      // E2BIG and friends: the process never ran, so this rung was not reached.
-      if (isTransportError(error)) transportFailure ??= lastError;
+      if (isTransportError(error)) {
+        // E2BIG and friends: the process never ran, so this rung was not reached.
+        transportFailure ??= lastError;
+      } else {
+        // A real error from a rung that was reachable (401, refused request,
+        // provider fault). Retrying cannot help, so this makes the attempt
+        // terminal even if another rung failed on transport.
+        nonTransportFailure = true;
+      }
     }
   }
-  // Defer only when the ladder was never reached at all. A rung that ran and
-  // returned something to judge makes this terminal, whichever rung failed
-  // first.
-  if (transportFailure && !reachedAnyRung) {
+  // Defer ONLY when every rung failed on transport: nothing was ever judged
+  // (`reachedAnyRung`) and nothing threw a non-transport error
+  // (`nonTransportFailure`). Either one makes the outcome terminal.
+  if (transportFailure && !reachedAnyRung && !nonTransportFailure) {
     return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
   }
   return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
