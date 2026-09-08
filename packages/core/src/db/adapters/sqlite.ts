@@ -488,14 +488,25 @@ export class SqliteAdapter implements IDatabase {
         // PRAGMA table_info does not expose it.
         const statusCheckIsStale = !createSql.includes('escalating');
 
-        if (statusCheckIsStale) {
-          // REBUILD. One transaction: any failure leaves the original table
-          // untouched rather than half-migrated.
-          this.db.run('BEGIN');
-          try {
+        // ONE TRANSACTION FOR THE WHOLE REPAIR. Column add, backfill and index
+        // creation must commit together: if startup stopped between the
+        // backfill and CREATE UNIQUE INDEX, the database would persist with
+        // keys assigned but no constraint -- and the next boot would re-run a
+        // backfill against a partially populated table. Wrapping everything
+        // means a crash rolls back to the pre-repair shape and the next start
+        // simply repeats it from scratch.
+        this.db.run('BEGIN');
+        try {
+          if (statusCheckIsStale) {
             this.db.run(`CREATE TABLE tm_expectations_new (
               id TEXT PRIMARY KEY,
-              registration_key TEXT NOT NULL UNIQUE,
+              -- Deliberately NOT NULL-free here: rows are copied across with
+              -- their existing (possibly NULL) keys and the single backfill
+              -- below assigns them. Declaring NOT NULL would fire during the
+              -- copy, before the backfill can run. Uniqueness -- the constraint
+              -- the write path actually depends on -- is enforced by
+              -- idx_tm_expectations_registration_key, created below.
+              registration_key TEXT,
               dispatch_ref TEXT NOT NULL,
               recipient TEXT NOT NULL,
               evidence_json TEXT NOT NULL,
@@ -510,70 +521,98 @@ export class SqliteAdapter implements IDatabase {
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             )`);
-            // Carry every row across with the same collision-free key rule:
-            // oldest row per dispatch_ref keeps the bare key, later duplicates
-            // get a ":legacy:<id>" suffix. A pre-existing registration_key
-            // (from a partially-upgraded table) is preserved as-is.
-            const keyExpression = expectationColNames.has('registration_key')
-              ? `COALESCE(registration_key, CASE WHEN ROW_NUMBER() OVER (
-                   PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
-                 ) = 1 THEN dispatch_ref ELSE dispatch_ref || ':legacy:' || id END)`
-              : `CASE WHEN ROW_NUMBER() OVER (
-                   PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
-                 ) = 1 THEN dispatch_ref ELSE dispatch_ref || ':legacy:' || id END`;
+            // Copy rows across verbatim, keys included. The single backfill
+            // below is what assigns and de-duplicates keys, so the rebuild does
+            // not need its own copy of that logic -- one implementation, not
+            // two that can drift apart.
+            const keySelect = expectationColNames.has('registration_key')
+              ? 'registration_key'
+              : 'NULL';
             this.db.run(`INSERT INTO tm_expectations_new (
               id, registration_key, dispatch_ref, recipient, evidence_json, due_at,
               on_absence, max_retries, retries, status, evidence_pointer, created_at, updated_at
             )
-            SELECT id, ${keyExpression}, dispatch_ref, recipient, evidence_json, due_at,
+            SELECT id, ${keySelect}, dispatch_ref, recipient, evidence_json, due_at,
                    on_absence, max_retries, retries, status, evidence_pointer, created_at, updated_at
               FROM tm_expectations`);
             this.db.run('DROP TABLE tm_expectations');
             this.db.run('ALTER TABLE tm_expectations_new RENAME TO tm_expectations');
-            this.db.run('COMMIT');
-          } catch (rebuildError) {
-            this.db.run('ROLLBACK');
-            throw rebuildError;
+          } else if (!expectationColNames.has('registration_key')) {
+            this.db.run('ALTER TABLE tm_expectations ADD COLUMN registration_key TEXT');
           }
-        } else if (!expectationColNames.has('registration_key')) {
-          this.db.run('ALTER TABLE tm_expectations ADD COLUMN registration_key TEXT');
-        }
 
-        // Oldest row per dispatch_ref (ties broken by id so the choice is
-        // deterministic across runs) keeps the bare dispatch_ref. A no-op after
-        // a rebuild, which already assigned every key.
-        this.db.run(
-          `UPDATE tm_expectations SET registration_key = dispatch_ref
-             WHERE registration_key IS NULL
-               AND id IN (
-                 SELECT id FROM (
-                   SELECT id, ROW_NUMBER() OVER (
-                     PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
-                   ) AS rn
-                   FROM tm_expectations WHERE registration_key IS NULL
-                 ) WHERE rn = 1
-               )`
-        );
-        // Every remaining legacy row gets a suffixed, collision-free key.
-        this.db.run(
-          `UPDATE tm_expectations
-              SET registration_key = dispatch_ref || ':legacy:' || id
-            WHERE registration_key IS NULL`
-        );
-        // Indexes live outside the table definition, so the rebuild drops them
-        // with the old table; recreate all three unconditionally.
-        this.db.run(
-          `CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key
-             ON tm_expectations(registration_key)`
-        );
-        this.db.run(
-          `CREATE INDEX IF NOT EXISTS idx_tm_expectations_due
-             ON tm_expectations(status, due_at)`
-        );
-        this.db.run(
-          `CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref
-             ON tm_expectations(dispatch_ref)`
-        );
+          // ONE backfill, correct under ANY starting state: all-NULL, fully
+          // populated, or partially populated.
+          //
+          // The previous version ranked only rows whose key was NULL, so with a
+          // partially populated table it could hand `dispatch_ref` to a NULL row
+          // while a sibling already owned that exact key -- a duplicate that
+          // then made CREATE UNIQUE INDEX fail and blocked startup. Reproduced
+          // before fixing: two rows sharing 'dup', one keyed and one NULL, both
+          // ended up 'dup'.
+          //
+          // Ranking now covers EVERY row per dispatch_ref, so a row only takes
+          // the bare key if it is the winner of that whole partition; everyone
+          // else deterministically takes `<dispatch_ref>:legacy:<id>`, which is
+          // unique because id is the primary key. An existing key is kept only
+          // when it is already unique across the table -- a pre-existing
+          // duplicate is re-derived by the same rule rather than preserved,
+          // which is what makes the repair converge instead of failing.
+          //
+          // Deterministic and therefore idempotent: a second run computes the
+          // same assignment and writes nothing.
+          this.db.run(
+            `WITH ranked AS (
+               SELECT id,
+                      dispatch_ref,
+                      registration_key,
+                      ROW_NUMBER() OVER (
+                        PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
+                      ) AS rn
+                 FROM tm_expectations
+             ),
+             resolved AS (
+               SELECT id,
+                      CASE
+                        WHEN registration_key IS NOT NULL
+                         AND NOT EXISTS (
+                               SELECT 1 FROM tm_expectations other
+                                WHERE other.registration_key = ranked.registration_key
+                                  AND other.id <> ranked.id
+                             )
+                          THEN registration_key
+                        WHEN rn = 1 THEN dispatch_ref
+                        ELSE dispatch_ref || ':legacy:' || id
+                      END AS resolved_key
+                 FROM ranked
+             )
+             UPDATE tm_expectations
+                SET registration_key = (
+                      SELECT resolved_key FROM resolved WHERE resolved.id = tm_expectations.id
+                    )
+              WHERE registration_key IS DISTINCT FROM (
+                      SELECT resolved_key FROM resolved WHERE resolved.id = tm_expectations.id
+                    )`
+          );
+          // Indexes live outside the table definition, so the rebuild drops
+          // them with the old table; recreate all three unconditionally.
+          this.db.run(
+            `CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key
+               ON tm_expectations(registration_key)`
+          );
+          this.db.run(
+            `CREATE INDEX IF NOT EXISTS idx_tm_expectations_due
+               ON tm_expectations(status, due_at)`
+          );
+          this.db.run(
+            `CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref
+               ON tm_expectations(dispatch_ref)`
+          );
+          this.db.run('COMMIT');
+        } catch (repairError) {
+          this.db.run('ROLLBACK');
+          throw repairError;
+        }
       }
     } catch (e: unknown) {
       // FAIL LOUDLY. Without this index, registration is silently broken for

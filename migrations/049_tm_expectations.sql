@@ -1,4 +1,14 @@
 -- Taskmaster expectation registry (WO-HARNESS-TASKMASTER-EXPECTATION-REGISTRY-01).
+--
+-- ONE TRANSACTION for the whole migration. These are applied with
+-- `psql $DATABASE_URL < migrations/NNN.sql` (see the database reference doc),
+-- which is autocommit PER STATEMENT -- so without an explicit BEGIN, an
+-- interruption between the backfill and the unique index would leave the
+-- database with keys assigned and no constraint, exactly the partially-repaired
+-- state this migration must never produce. Wrapping it means an interruption
+-- rolls back to the pre-migration shape and the migration is simply re-run.
+BEGIN;
+
 CREATE TABLE IF NOT EXISTS tm_expectations (
   id UUID PRIMARY KEY,
   -- Stable identity for the work that caused this expectation, normally
@@ -38,27 +48,48 @@ CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref ON tm_expectations(d
 -- registration disabled, silently. This mirrors the sqlite adapter repair.
 ALTER TABLE tm_expectations ADD COLUMN IF NOT EXISTS registration_key TEXT;
 
--- Collision-free backfill. A legacy table can hold two rows sharing a
--- dispatch_ref (the replayed-registration bug this WO fixes), so assigning the
--- bare dispatch_ref to every row would make the unique index below fail.
--- Duplicates are NOT folded -- each row owns its retry counter and terminal
--- state, and a migration must not destroy audit history. The OLDEST row per
--- dispatch_ref keeps the clean key so future registrations reuse it; later
--- duplicates get a suffixed key, preserved but out of the way.
-UPDATE tm_expectations SET registration_key = dispatch_ref
- WHERE registration_key IS NULL
-   AND id IN (
-     SELECT id FROM (
-       SELECT id, ROW_NUMBER() OVER (
-         PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
-       ) AS rn
-       FROM tm_expectations WHERE registration_key IS NULL
-     ) ranked WHERE rn = 1
-   );
-
+-- Collision-free backfill, correct under ANY starting state: all-NULL, fully
+-- populated, or PARTIALLY populated.
+--
+-- Ranking only the NULL-key rows was wrong: with a partially populated table it
+-- could hand `dispatch_ref` to a NULL row while a sibling already owned that
+-- exact key, and the duplicate then made the unique index below fail. Ranking
+-- covers EVERY row per dispatch_ref, so a row takes the bare key only if it
+-- wins its whole partition; everyone else takes `<dispatch_ref>:legacy:<id>`,
+-- unique because id is the primary key. An existing key is kept only when it is
+-- already unique -- a pre-existing duplicate is re-derived by the same rule
+-- rather than preserved, which is what makes this converge instead of failing.
+--
+-- Duplicates are NOT folded away: each row owns its retry counter and terminal
+-- state, and a migration must not destroy audit history. Deterministic, so
+-- re-running writes nothing.
+WITH ranked AS (
+  SELECT id, dispatch_ref, registration_key,
+         ROW_NUMBER() OVER (
+           PARTITION BY dispatch_ref ORDER BY created_at ASC, id ASC
+         ) AS rn
+    FROM tm_expectations
+),
+resolved AS (
+  SELECT ranked.id,
+         CASE
+           WHEN ranked.registration_key IS NOT NULL
+            AND NOT EXISTS (
+                  SELECT 1 FROM tm_expectations other
+                   WHERE other.registration_key = ranked.registration_key
+                     AND other.id <> ranked.id
+                )
+             THEN ranked.registration_key
+           WHEN ranked.rn = 1 THEN ranked.dispatch_ref
+           ELSE ranked.dispatch_ref || ':legacy:' || ranked.id::text
+         END AS resolved_key
+    FROM ranked
+)
 UPDATE tm_expectations
-   SET registration_key = dispatch_ref || ':legacy:' || id::text
- WHERE registration_key IS NULL;
+   SET registration_key = resolved.resolved_key
+  FROM resolved
+ WHERE resolved.id = tm_expectations.id
+   AND tm_expectations.registration_key IS DISTINCT FROM resolved.resolved_key;
 
 ALTER TABLE tm_expectations ALTER COLUMN registration_key SET NOT NULL;
 
@@ -103,3 +134,5 @@ BEGIN
     );
 END
 $$;
+
+COMMIT;
