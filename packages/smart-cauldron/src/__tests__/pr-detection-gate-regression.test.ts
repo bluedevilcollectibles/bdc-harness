@@ -255,7 +255,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
     expect(result.status).toBe('won');
     expect(result.attempts).toHaveLength(1);
     expect(fireCalls).toBe(1);
-  }, 30000);
+  });
 
   test('Scenario 2: PR found only after the branch-lookup retry -> still wins on entry tier, no climb', async () => {
     globalThis.fetch = (async () =>
@@ -284,7 +284,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
     expect(result.status).toBe('won');
     expect(result.attempts).toHaveLength(1);
     expect(fireCalls).toBe(1);
-  }, 30000);
+  });
 
   test('Scenario 4: genuine no-PR -> ladder climbs (fail-closed, true negative preserved)', async () => {
     globalThis.fetch = (async () =>
@@ -311,5 +311,5 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
     expect(result.attempts[0]?.gateFailReason).toContain('no PR opened after completed run');
     expect(result.attempts.length).toBeGreaterThan(1);
     expect(fireCalls).toBeGreaterThan(1);
-  }, 30000);
+  });
 });

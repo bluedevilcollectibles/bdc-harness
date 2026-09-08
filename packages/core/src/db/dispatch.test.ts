@@ -841,7 +841,7 @@ describe('dispatch db', () => {
     } finally {
       await inspectionDb.close();
     }
-  }, 30_000);
+  });
 
   test('returns every acknowledgement conflict outcome', async () => {
     const mailbox = await createMessage({
@@ -980,7 +980,7 @@ describe('dispatch db', () => {
     } finally {
       await inspectionDb.close();
     }
-  }, 30_000);
+  });
 
   test('addressing revalidates final status when a guarded update loses to cancellation', async () => {
     const message = await createMessage({

@@ -92,5 +92,5 @@ describe('WorktreeProvider restart persistence', () => {
     expect(adopted.workingPath).toBe(created.workingPath);
     expect(adopted.metadata.adopted).toBe(true);
     expect(await readFile(uncommittedPath, 'utf8')).toBe('uncommitted and preserved\n');
-  }, 30_000);
+  });
 });

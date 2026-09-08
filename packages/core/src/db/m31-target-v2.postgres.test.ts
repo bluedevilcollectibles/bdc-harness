@@ -298,5 +298,5 @@ describe('M31 target v2 PostgreSQL 17 behavior', () => {
       );
       expect(await rejectsDatabaseWrite(db.query(`DELETE FROM ${table}`))).toBe(true);
     }
-  }, 20_000);
+  });
 });

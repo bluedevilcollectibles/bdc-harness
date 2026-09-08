@@ -297,7 +297,7 @@ describe('F-7C: remote-search fallback when origin ref is missing', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('Recovered push target from remote: archon/thread-abc123');
     expect(result.stdout).toContain('UNIQUE_BRANCH=archon/thread-abc123');
-  }, 15000);
+  });
 
   it('exits 1 with the original error when no remote ref matches local HEAD', () => {
     // Local commit was never pushed anywhere. Fallback should find nothing
