@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, stat, writeFile } from 'fs/promises';
 import { tmpdir, hostname, homedir } from 'os';
-import { join, resolve } from 'path';
+import { isAbsolute, join, resolve } from 'path';
 import { spawn } from 'bun';
 import { createHash } from 'crypto';
 import { isBoardAliasMessage, renderBoardMotionPrompt } from './board-motion';
@@ -358,24 +358,102 @@ export async function writeTranscript(data: Record<string, unknown>): Promise<st
  * cancellation all land as 'failed' with the reason stated in the result body
  * rather than being reported as completed work.
  */
+export interface ResolvedAgentCwd {
+  /** The directory the agent process will actually run in. */
+  cwd: string;
+  /** How that directory was chosen. */
+  source: 'configured' | 'temp';
+  /** Set when a configured cwd was rejected; the reason belongs in the log. */
+  warning?: string;
+}
+
+/**
+ * Decide the working directory for one dispatch leg.
+ *
+ * John's directive 2026-09-08: board seats must get context. A seat with
+ * `cwd` pointing at a real checkout runs there, so it can read the repo, the
+ * wiki, and its skills instead of answering a ballot from an empty scratch
+ * directory. Every other agent keeps the previous behaviour -- a fresh
+ * mkdtemp scratch per dispatch.
+ *
+ * Safety: the configured directory is only ever entered, never created,
+ * written to, or removed by the worker. A configured path that is missing or
+ * is not a directory falls back to mkdtemp with a warning rather than failing
+ * the dispatch, so a moved worktree degrades to today's behaviour instead of
+ * taking a seat offline.
+ */
+export async function resolveAgentCwd(
+  agentConfig: AgentConfig,
+  tempPrefix: string
+): Promise<ResolvedAgentCwd> {
+  const configured = agentConfig.cwd?.trim();
+  if (configured) {
+    if (!isAbsolute(configured)) {
+      return {
+        cwd: await mkdtemp(join(tmpdir(), tempPrefix)),
+        source: 'temp',
+        warning: `configured cwd is not an absolute path: ${configured}`,
+      };
+    }
+    let isDirectory = false;
+    try {
+      isDirectory = (await stat(configured)).isDirectory();
+    } catch {
+      isDirectory = false;
+    }
+    if (isDirectory) return { cwd: configured, source: 'configured' };
+    return {
+      cwd: await mkdtemp(join(tmpdir(), tempPrefix)),
+      source: 'temp',
+      warning: `configured cwd does not exist or is not a directory: ${configured}`,
+    };
+  }
+  return { cwd: await mkdtemp(join(tmpdir(), tempPrefix)), source: 'temp' };
+}
+
+/**
+ * One log line per run naming the effective cwd, so a seat answering with no
+ * context is diagnosable from the worker log alone.
+ */
+function reportAgentCwd(
+  resolved: ResolvedAgentCwd,
+  transport: 'acp' | 'mcp' | 'cli',
+  message: DispatchMessage,
+  log?: WorkerLog
+): void {
+  const line = `${transport} leg for ${message.recipient} (${message.id}) cwd=${resolved.cwd} source=${resolved.source}`;
+  if (resolved.warning) {
+    const warned = `${line} WARNING ${resolved.warning}`;
+    if (log) void log.error(warned);
+    else console.error(warned);
+    return;
+  }
+  if (log) void log.info(line);
+  else console.error(line);
+}
+
 async function runAcpLeg(
   agentConfig: AgentConfig,
   message: DispatchMessage,
   cancel: ReturnType<typeof createCancelController>,
   persistReplyText = false,
-  replyTextCapBytes = REPLY_TEXT_CAP_BYTES
+  replyTextCapBytes = REPLY_TEXT_CAP_BYTES,
+  log?: WorkerLog
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
   taskOutcome: DispatchTaskOutcome | null;
   run: AcpRunResult;
 }> {
-  const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-acp-${message.recipient}-`));
+  const resolvedCwd = await resolveAgentCwd(agentConfig, `bdc-dispatch-acp-${message.recipient}-`);
+  reportAgentCwd(resolvedCwd, 'acp', message, log);
+  const cwd = resolvedCwd.cwd;
   const run = await runAcpAgent(
     {
       command: agentConfig.command,
       args: agentConfig.args,
       cwd,
+      ...(agentConfig.env ? { env: agentConfig.env } : {}),
       ...(agentConfig.acp?.authMethodId !== undefined
         ? { authMethodId: agentConfig.acp.authMethodId }
         : {}),
@@ -447,19 +525,23 @@ async function runMcpLeg(
   message: DispatchMessage,
   cancel: ReturnType<typeof createMcpCancelController>,
   persistReplyText = false,
-  replyTextCapBytes = REPLY_TEXT_CAP_BYTES
+  replyTextCapBytes = REPLY_TEXT_CAP_BYTES,
+  log?: WorkerLog
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
   taskOutcome: DispatchTaskOutcome | null;
   run: McpRunResult;
 }> {
-  const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-mcp-${message.recipient}-`));
+  const resolvedCwd = await resolveAgentCwd(agentConfig, `bdc-dispatch-mcp-${message.recipient}-`);
+  reportAgentCwd(resolvedCwd, 'mcp', message, log);
+  const cwd = resolvedCwd.cwd;
   const run = await runMcpAgent(
     {
       command: agentConfig.command,
       args: agentConfig.args,
       cwd,
+      ...(agentConfig.env ? { env: agentConfig.env } : {}),
       idleTimeoutMs: agentConfig.mcp?.idleTimeoutMs ?? ACP_DEFAULT_IDLE_TIMEOUT_MS,
       wallClockMs: agentConfig.mcp?.wallClockMs ?? ACP_DEFAULT_WALL_CLOCK_MS,
       killGraceMs: agentConfig.mcp?.killGraceMs ?? ACP_DEFAULT_KILL_GRACE_MS,
@@ -525,13 +607,17 @@ export async function runAgent(
   message: DispatchMessage,
   cancel?: ReturnType<typeof createCancelController>,
   persistReplyText = false,
-  replyTextCapBytes = REPLY_TEXT_CAP_BYTES
+  replyTextCapBytes = REPLY_TEXT_CAP_BYTES,
+  log?: WorkerLog
 ): Promise<{
   resultBody: string;
   status: 'done' | 'failed';
   taskOutcome: DispatchTaskOutcome | null;
 }> {
-  const cwd = await mkdtemp(join(tmpdir(), `bdc-dispatch-${message.recipient}-`));
+  const tempPrefix = `bdc-dispatch-${message.recipient}-`;
+  const resolvedCwd = await resolveAgentCwd(config, tempPrefix);
+  reportAgentCwd(resolvedCwd, 'cli', message, log);
+  const cwd = resolvedCwd.cwd;
   let command = config.command;
   let args: string[];
   let promptBody: string | undefined;
@@ -570,13 +656,20 @@ export async function runAgent(
   const usesPromptFile =
     config.kind !== 'fusion' && config.promptDelivery === 'prompt-file' && promptBody !== undefined;
   if (usesPromptFile && promptBody !== undefined) {
-    const promptFilePath = join(cwd, 'dispatch-prompt.txt');
+    // The prompt file is worker-owned scratch and must NEVER be written into a
+    // configured cwd -- that would drop an untracked file into a real
+    // checkout. When cwd came from config, take a separate temp directory for
+    // it; when cwd is already a per-run temp dir, reuse it as before.
+    const promptDir =
+      resolvedCwd.source === 'configured' ? await mkdtemp(join(tmpdir(), tempPrefix)) : cwd;
+    const promptFilePath = join(promptDir, 'dispatch-prompt.txt');
     await writeFile(promptFilePath, promptBody, 'utf8');
     args = args.map(arg => (arg === PROMPT_FILE_PLACEHOLDER ? promptFilePath : arg));
   }
   const proc = spawn({
     cmd: [command, ...args],
     cwd,
+    ...(config.env ? { env: { ...process.env, ...config.env } } : {}),
     stdout: 'pipe',
     stderr: 'pipe',
     stdin: config.kind === 'fusion' || usesPromptFile ? 'ignore' : 'pipe',
@@ -724,7 +817,8 @@ async function processMessage(
               claimed,
               cancel,
               config.persist_reply_text,
-              REPLY_TEXT_CAP_BYTES
+              REPLY_TEXT_CAP_BYTES,
+              log
             )
           : agentConfig.kind === 'mcp'
             ? await runMcpLeg(
@@ -732,14 +826,16 @@ async function processMessage(
                 claimed,
                 cancel,
                 config.persist_reply_text,
-                REPLY_TEXT_CAP_BYTES
+                REPLY_TEXT_CAP_BYTES,
+                log
               )
             : await runAgent(
                 agentConfig,
                 claimed,
                 cancel,
                 config.persist_reply_text,
-                REPLY_TEXT_CAP_BYTES
+                REPLY_TEXT_CAP_BYTES,
+                log
               );
     } finally {
       clearInterval(renewTimer);
