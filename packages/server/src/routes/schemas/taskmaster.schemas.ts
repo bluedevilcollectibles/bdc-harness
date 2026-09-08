@@ -35,6 +35,7 @@ export const taskmasterPauseBodySchema = z
 export const taskmasterResumeBodySchema = z
   .object({
     actor: z.string().max(200).default('john'),
+    reason: z.string().max(2000).optional(),
   })
   .openapi('TaskmasterResumeBody');
 
@@ -43,6 +44,7 @@ export const taskmasterControlResponseSchema = z
     pause_state: taskmasterPauseStateSchema,
     epoch: z.number(),
     expired_proposals: z.number().optional(),
+    audit_id: z.string().optional(),
   })
   .openapi('TaskmasterControlResponse');
 

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
+import { mkdtempSync } from 'fs';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
@@ -184,7 +185,7 @@ async function withPersistentEscalationPermit(
   } finally {
     await closeDatabase();
     resetDatabase();
-    rmSync(home, { recursive: true, force: true });
+    removeTempDirWithRetry(home);
   }
 }
 
@@ -256,7 +257,7 @@ describe('handleNodeFailure authorization boundary', () => {
       const durableCreate = deps.store.createDurableWorkflowEvent as ReturnType<typeof mock>;
       expect(durableCreate).toHaveBeenCalledTimes(1);
     });
-  }, 15000);
+  });
 
   it('durable event persistence failure creates no card, jobs, or authorization attempt', async () => {
     await withPersistentEscalationPermit(async permit => {
@@ -281,5 +282,5 @@ describe('handleNodeFailure authorization boundary', () => {
       );
       expect(attempts).toHaveLength(0);
     });
-  }, 15000);
+  });
 });

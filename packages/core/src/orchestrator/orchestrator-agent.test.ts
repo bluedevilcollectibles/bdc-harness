@@ -2054,7 +2054,7 @@ describe('handleMessage -- per-session worktree isolation', () => {
     expect(mockSendQuery.mock.calls[0][1]).toBe('/worktrees/conv-A');
     expect(mockSendQuery.mock.calls[1][1]).toBe('/worktrees/conv-B');
     expect(mockSendQuery.mock.calls[0][1]).not.toBe(mockSendQuery.mock.calls[1][1]);
-  }, 15000);
+  });
 
   // Refusal fails closed: the user is told, and the AI is NEVER invoked in the
   // shared checkout as a fallback.
@@ -2077,7 +2077,7 @@ describe('handleMessage -- per-session worktree isolation', () => {
     expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusalMessage);
     // Fail closed -- no fallback to ensureArchonWorkspacesPath()/the shared clone.
     expect(mockSendQuery).not.toHaveBeenCalled();
-  }, 15000);
+  });
 
   // The system prompt must describe the isolated worktree, not the primary checkout.
   test('project-scoped prompt uses the resolved worktree cwd, not codebase.default_cwd', async () => {
@@ -2094,7 +2094,7 @@ describe('handleMessage -- per-session worktree isolation', () => {
     const scopedArg = mockBuildProjectScopedPrompt.mock.calls[0][0] as { default_cwd: string };
     expect(scopedArg.default_cwd).toBe('/worktrees/conv-prompt');
     expect(scopedArg.default_cwd).not.toBe('/repos/shared');
-  }, 15000);
+  });
 
   // Conversations with no codebase attached keep today's behavior -- no isolation.
   test('does not allocate a worktree for a conversation with no codebase', async () => {
@@ -2108,7 +2108,7 @@ describe('handleMessage -- per-session worktree isolation', () => {
     expect(mockLaunchSession).not.toHaveBeenCalled();
     // Falls back to the workspaces root (unchanged behavior).
     expect(mockSendQuery.mock.calls[0][1]).toBe('/home/test/.archon/workspaces');
-  }, 15000);
+  });
 });
 
 // --- Gap #2: chat-triggered workflow dispatch keys on conversation id ----------
@@ -2161,5 +2161,5 @@ describe('dispatchOrchestratorWorkflow -- default isolation key (Gap #2)', () =>
     // Previously this defaulted to workflowId '' -- every conversation collided.
     expect(hints.workflowType).toBe('thread');
     expect(hints.workflowId).toBe('conv-1');
-  }, 15000);
+  });
 });

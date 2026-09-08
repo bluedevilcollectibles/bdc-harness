@@ -84,6 +84,96 @@ export interface PriorReviewWork {
   messageId: string;
   headSha: string;
   status: 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
+  verdict: 'approved' | 'changes_requested' | 'other' | null;
+  verdictId: string | null;
+  /**
+   * True only when this row was enqueued by the AUTOMATIC re-review path --
+   * i.e. its repeat_reason carries AUTO_REREVIEW_REASON_PREFIX. Initial
+   * reviews, legacy `review_exact_head:` rows, and reasons written by other
+   * subsystems or by hand are all false and never consume the attempt budget.
+   */
+  isAutoRereview: boolean;
+}
+
+/** Maximum auto-triggered re-reviews per PR; the initial review is not an attempt. */
+export const MAX_REREVIEW_ATTEMPTS = 3;
+
+/**
+ * Explicit machine-readable marker prefixing every repeat_reason this module
+ * writes for an AUTOMATIC re-review.
+ *
+ * `repeat_reason` is shared free text: Dispatch requires SOME reason on any
+ * repeat send, and several unrelated writers already fill it -- Taskmaster
+ * nudges (`tm:nudge:*`), XO escalation handoffs, hand-written operator
+ * re-review requests, and the pre-2026-09 Overseer enqueue path which stamped
+ * EVERY review (initial ones included) with `review_exact_head:<sha>`. So a
+ * non-null reason proves nothing about who wrote it or why.
+ *
+ * Review finding (Overseer, PR #772): deriving `isAutoRereview` from
+ * `repeat_reason !== null` therefore counts all of those as automatic
+ * re-review attempts, and a PR carrying MAX_REREVIEW_ATTEMPTS legacy rows is
+ * capped before a single automatic re-review has actually run. Verified
+ * against the live event store 2026-09-06: 6 rows in the legacy
+ * `review_exact_head:` format and 134 hand-written prose reasons, with
+ * shopops#662 alone holding 16 -- every one of which would have counted.
+ *
+ * The cap now counts ONLY rows this module marked. Anything else -- legacy
+ * format, another subsystem, a human -- is not an attempt.
+ */
+export const AUTO_REREVIEW_REASON_PREFIX = 'auto_rereview:head_moved:';
+
+/**
+ * True only for a repeat_reason this module wrote for an automatic re-review.
+ * Deliberately narrow: unrecognized reasons are NOT attempts, so an unrelated
+ * writer can never consume a PR's re-review budget.
+ */
+export function isAutoRereviewReason(repeatReason: string | null | undefined): boolean {
+  return typeof repeatReason === 'string' && repeatReason.startsWith(AUTO_REREVIEW_REASON_PREFIX);
+}
+
+export function buildRereviewReason(
+  priorVerdictId: string,
+  priorHeadSha: string,
+  newHeadSha: string
+): string {
+  return `${AUTO_REREVIEW_REASON_PREFIX}${newHeadSha} changes_requested verdict ${priorVerdictId} reviewed head ${priorHeadSha}; re-review new head ${newHeadSha}`;
+}
+
+/**
+ * Selects the prior review whose verdict authorizes (or refuses) an automatic
+ * re-review of `headSha`.
+ *
+ * Review finding (Overseer, PR #772): the previous `prior.find(work =>
+ * work.headSha !== headSha)` took the FIRST row on a different head.
+ * `listPriorReviewWork` returns newest-first, and a row is created the moment
+ * work is queued -- long before any verdict exists. So a rapid push sequence
+ * lost the verdict entirely:
+ *
+ *   1. head A is reviewed -> CHANGES_REQUESTED (row A carries the verdict)
+ *   2. head B arrives -> row B is queued, verdict null
+ *   3. head C arrives before B completes -> B is cancelled (verdict still
+ *      null), and `find` selects row B because it is newer than A
+ *
+ * At step 3 the selected row's verdict is null, so no repeat reason was built,
+ * and Dispatch rejected the enqueue with `repeat_reason_required` -- the
+ * automatic re-review silently died exactly when the author was pushing
+ * fastest. The verdict on A was still the live, unaddressed one.
+ *
+ * The fix is to skip rows that carry no verdict (queued, claimed, or cancelled
+ * before completion) and select the most recent VERDICT-BEARING row on a
+ * different head. That row is the standing review state of the PR.
+ *
+ * Rows on the CURRENT head are still excluded: a verdict on this exact head is
+ * a duplicate delivery, not a supersession, and must not authorize a repeat.
+ * A verdict of `approved` or `other` is deliberately still selected rather
+ * than skipped, so an approval continues to withhold authorization instead of
+ * letting an older changes_requested row reach back past it.
+ */
+export function findAuthorizingPriorReview(
+  prior: PriorReviewWork[],
+  headSha: string
+): PriorReviewWork | undefined {
+  return prior.find(work => work.headSha !== headSha && work.verdict !== null);
 }
 
 export interface IngestDeps {
@@ -117,6 +207,7 @@ export interface IngestDeps {
     headSha: string;
     baseRef: string;
     author: string;
+    repeatReason: string | null;
   }): Promise<{ messageId: string; alreadyExisted: boolean }>;
   /** Persist a correlated audit receipt. Never throws the ingest path open. */
   recordReceipt(input: {
@@ -329,8 +420,9 @@ export async function ingestPullRequestEvent(
   // review for this PR bound to a different head. Prior work on the SAME head
   // is a duplicate, not a supersession.
   let invalidatedMessageIds: string[] = [];
+  let prior: PriorReviewWork[] = [];
   try {
-    const prior = await deps.listPriorReviewWork({ owner, repo, prNumber });
+    prior = await deps.listPriorReviewWork({ owner, repo, prNumber });
     const staleIds = prior
       .filter(work => work.headSha !== headSha)
       .filter(work => work.status === 'queued' || work.status === 'claimed')
@@ -362,6 +454,38 @@ export async function ingestPullRequestEvent(
     return result;
   }
 
+  const priorAtDifferentHead = findAuthorizingPriorReview(prior, headSha);
+  let repeatReason: string | null = null;
+  if (priorAtDifferentHead?.verdict === 'changes_requested') {
+    const rereviewAttempts = prior.filter(work => work.isAutoRereview).length;
+    if (rereviewAttempts >= MAX_REREVIEW_ATTEMPTS) {
+      const result: IngestResult = {
+        disposition: 'blocked',
+        status: 200,
+        reason: 'rereview_attempts_exhausted',
+        correlationId,
+        headSha,
+        ...(invalidatedMessageIds.length > 0 ? { invalidatedMessageIds } : {}),
+      };
+      await safeReceipt(deps, {
+        correlationId,
+        deliveryId,
+        owner,
+        repo,
+        prNumber,
+        headSha,
+        disposition: result.disposition,
+        reason: result.reason,
+      });
+      return result;
+    }
+    repeatReason = buildRereviewReason(
+      priorAtDifferentHead.verdictId ?? priorAtDifferentHead.messageId,
+      priorAtDifferentHead.headSha,
+      headSha
+    );
+  }
+
   // Queue durable work bound to this EXACT head.
   try {
     const enqueued = await deps.enqueueReviewWork({
@@ -373,6 +497,7 @@ export async function ingestPullRequestEvent(
       headSha,
       baseRef,
       author,
+      repeatReason,
     });
     const disposition: IngestDisposition = enqueued.alreadyExisted
       ? 'duplicate_delivery'

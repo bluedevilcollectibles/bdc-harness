@@ -269,8 +269,22 @@ describe('duplicate delivery', () => {
 describe('stale-head invalidation', () => {
   test('in-flight work on an older head is cancelled when the head advances', async () => {
     const prior: PriorReviewWork[] = [
-      { messageId: 'old-1', headSha: OLD_HEAD, status: 'queued' },
-      { messageId: 'old-2', headSha: OLD_HEAD, status: 'claimed' },
+      {
+        messageId: 'old-1',
+        headSha: OLD_HEAD,
+        status: 'queued',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
+      {
+        messageId: 'old-2',
+        headSha: OLD_HEAD,
+        status: 'claimed',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
     ];
     const { deps, rec } = makeDeps({}, prior);
     const result = await ingestPullRequestEvent(req(prPayload()), deps);
@@ -281,9 +295,30 @@ describe('stale-head invalidation', () => {
 
   test('terminal prior work is NOT cancelled', async () => {
     const prior: PriorReviewWork[] = [
-      { messageId: 'done-1', headSha: OLD_HEAD, status: 'done' },
-      { messageId: 'failed-1', headSha: OLD_HEAD, status: 'failed' },
-      { messageId: 'cancelled-1', headSha: OLD_HEAD, status: 'cancelled' },
+      {
+        messageId: 'done-1',
+        headSha: OLD_HEAD,
+        status: 'done',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
+      {
+        messageId: 'failed-1',
+        headSha: OLD_HEAD,
+        status: 'failed',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
+      {
+        messageId: 'cancelled-1',
+        headSha: OLD_HEAD,
+        status: 'cancelled',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
     ];
     const { deps, rec } = makeDeps({}, prior);
     const result = await ingestPullRequestEvent(req(prPayload()), deps);
@@ -292,7 +327,16 @@ describe('stale-head invalidation', () => {
   });
 
   test('prior work on the SAME head is not treated as stale', async () => {
-    const prior: PriorReviewWork[] = [{ messageId: 'same-1', headSha: HEAD, status: 'queued' }];
+    const prior: PriorReviewWork[] = [
+      {
+        messageId: 'same-1',
+        headSha: HEAD,
+        status: 'queued',
+        verdict: null,
+        verdictId: null,
+        isAutoRereview: false,
+      },
+    ];
     const { deps, rec } = makeDeps({}, prior);
     await ingestPullRequestEvent(req(prPayload()), deps);
     expect(rec.cancelled).toHaveLength(0);

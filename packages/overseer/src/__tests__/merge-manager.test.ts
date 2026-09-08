@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from 'bun:test';
 import {
   createMergeManager,
+  parseBaseEffectOverrides,
   resolveMergeManagerMode,
   DEFAULT_MERGE_MANAGER_MODE,
 } from '../merge-manager.ts';
@@ -870,5 +871,171 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     expect(result.status).toBe('held');
     expect(result.reason).toBe('provenance_working_path_missing');
     expect(execute).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Per-repo base-effect overrides (John 2026-09-07, "yes add main", scoped by the XO to
+ * repos whose main is not a production surface).
+ *
+ * The effect classifier reads only the branch NAME, so bdc-xo -- docs, specs, scripts --
+ * had its main called production and every PR held for John forever. These tests fix the
+ * boundary: the named repo is reclassified, every other production main is untouched, a
+ * malformed entry changes nothing, and an override can never downgrade run metadata that
+ * already declared production.
+ */
+describe('per-repo base effect overrides', () => {
+  const BDC_XO_MAIN_NONE = parseBaseEffectOverrides('thinmansoftware/bdc-xo:main=none');
+
+  /** A run on `repo` whose PR targets `main`, forcing default evidence assembly. */
+  function mainTargetRecord(repo: string, metadata: Record<string, string> = {}): WatchedRunRecord {
+    return {
+      ...record,
+      repo,
+      headBranch: 'archon/thread-effects',
+      prEvidence: {
+        ...record.prEvidence,
+        pr: { owner: 'thinmansoftware', repo, number: 91 },
+      },
+      metadata: {
+        base_branch: 'main',
+        head_sha: RUN_HEAD_SHA,
+        base_sha: '1'.repeat(40),
+        changed_files: 'docs/work-orders/WO-EXAMPLE-01.md',
+        ...metadata,
+      },
+    };
+  }
+
+  function managerFor(
+    target: WatchedRunRecord,
+    overrides: ReadonlyMap<string, 'none' | 'staging' | 'production' | 'unknown'> | undefined,
+    spies: {
+      readonly judge: ReturnType<typeof mock>;
+      readonly execute: ReturnType<typeof mock>;
+      readonly insertOverseerAction: ReturnType<typeof mock>;
+    }
+  ): ReturnType<typeof createMergeManager> {
+    return createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      // `main` is allowed as a BASE here so the test isolates the EFFECT classification;
+      // allowed-bases semantics are deliberately untouched by this change.
+      allowedBases: ['dev', 'staging', 'main'],
+      baseEffectOverrides: overrides,
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      judge: spies.judge as never,
+      execute: spies.execute as never,
+      insertOverseerAction: spies.insertOverseerAction as never,
+      findPullRequest: async () => target.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha,
+    });
+  }
+
+  test('parses owner/repo:branch=effect and lowercases both halves of the key', () => {
+    const parsed = parseBaseEffectOverrides(
+      ' ThinmanSoftware/BDC-XO:Main=none , thinmansoftware/other:staging=staging '
+    );
+    expect(parsed.get('thinmansoftware/bdc-xo:main')).toBe('none');
+    expect(parsed.get('thinmansoftware/other:staging')).toBe('staging');
+    expect(parsed.size).toBe(2);
+  });
+
+  test('bdc-xo main is reclassified to none and the candidate is judged and merged', async () => {
+    const target = mainTargetRecord('bdc-xo');
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true, message: 'bdc_xo_main_merged' }));
+    const insertOverseerAction = mock(async () => undefined);
+
+    const result = await managerFor(target, BDC_XO_MAIN_NONE, {
+      judge,
+      execute,
+      insertOverseerAction,
+    })(target);
+
+    expect(result.status).toBe('executed');
+    expect(judge).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(insertOverseerAction).not.toHaveBeenCalledWith(
+      expect.objectContaining({ result: 'production_effect_held_for_john' })
+    );
+  });
+
+  test('lspro-react main stays production and is held when no override names it', async () => {
+    const target = mainTargetRecord('lspro-react');
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const insertOverseerAction = mock(async () => undefined);
+
+    // The bdc-xo override is loaded; it must not leak to any other repo.
+    const result = await managerFor(target, BDC_XO_MAIN_NONE, {
+      judge,
+      execute,
+      insertOverseerAction,
+    })(target);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+      execution: null,
+    });
+    expect(judge).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  test('a malformed entry is ignored and the branch regex still holds the repo', async () => {
+    // No '=', no ':', and an effect outside the vocabulary -- none may parse.
+    const parsed = parseBaseEffectOverrides(
+      'thinmansoftware/bdc-xo:main,thinmansoftware-bdc-xo=none,thinmansoftware/bdc-xo:main=maybe'
+    );
+    expect(parsed.size).toBe(0);
+
+    const target = mainTargetRecord('bdc-xo');
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const insertOverseerAction = mock(async () => undefined);
+
+    const result = await managerFor(target, parsed, {
+      judge,
+      execute,
+      insertOverseerAction,
+    })(target);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  test('an override cannot downgrade a run whose metadata declares production', async () => {
+    const target = mainTargetRecord('bdc-xo', { resulting_deployment_effect: 'production' });
+    const judge = mock(async input => approveReceipt(input));
+    const execute = mock(async () => ({ merged: true }));
+    const insertOverseerAction = mock(async () => undefined);
+
+    const result = await managerFor(target, BDC_XO_MAIN_NONE, {
+      judge,
+      execute,
+      insertOverseerAction,
+    })(target);
+
+    expect(result).toMatchObject({
+      status: 'held',
+      reason: 'production_effect_held_for_john',
+      execution: null,
+    });
+    expect(judge).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'merge_denied',
+        result: 'production_effect_held_for_john',
+      })
+    );
   });
 });

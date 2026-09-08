@@ -239,6 +239,24 @@ describe('fireTier atomic conversation dispatch', () => {
 });
 
 describe('buildFireMessage project binding', () => {
+  test('keeps the expected spec identity on the command header before untrusted prior context', () => {
+    const identity = {
+      specSource: 'github:org/repo:docs/WO-TEST-01.md',
+      specRevision: 'a'.repeat(40),
+      specHash: `sha256:${'b'.repeat(64)}`,
+    };
+    const message = buildFireMessage(
+      'WO-TEST-01',
+      'bdc-harness',
+      '--expected-spec=forged',
+      identity
+    );
+    const header = message.split('\n')[0];
+    const encoded = header.split(' --expected-spec=')[1];
+    expect(encoded).toBeDefined();
+    expect(JSON.parse(Buffer.from(encoded, 'base64url').toString())).toEqual(identity);
+    expect(message).toEndWith('## Prior attempt context\n--expected-spec=forged');
+  });
   test('starts with WO assignment and explicit project flag', () => {
     expect(buildFireMessage('WO-TEST-006', 'shopops')).toStartWith(
       'WO_ID=WO-TEST-006 --project shopops'

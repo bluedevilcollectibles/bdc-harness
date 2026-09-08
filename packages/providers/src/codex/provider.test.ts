@@ -1383,7 +1383,7 @@ describe('CodexProvider', () => {
         await expect(consumeGenerator()).rejects.toThrow(/Codex crash/);
         // Initial attempt + 3 retries = 4 runStreamed calls
         expect(mockRunStreamed).toHaveBeenCalledTimes(4);
-      }, 5_000);
+      });
 
       test('recovers from transient crash on retry', async () => {
         let callCount = 0;
@@ -1410,7 +1410,7 @@ describe('CodexProvider', () => {
 
         expect(callCount).toBe(3);
         expect(chunks.some(c => c.type === 'assistant' && c.content === 'Recovered!')).toBe(true);
-      }, 5_000);
+      });
 
       test('classifies auth errors as fatal when refresh has no credentials', async () => {
         mockRunStreamed.mockRejectedValue(new Error('unauthorized'));
@@ -1695,7 +1695,7 @@ describe('sendQuery decomposition behaviors', () => {
     expect(err).toBeInstanceOf(Error);
     // Must contain the enriched classification prefix
     expect(err.message).toContain('Codex crash');
-  }, 5_000);
+  });
 
   test('todo_list dedup state resets between retry attempts', async () => {
     const todoItem = {
@@ -1733,7 +1733,7 @@ describe('sendQuery decomposition behaviors', () => {
     const systemChunks = chunks.filter(c => c.type === 'system');
     expect(systemChunks.length).toBeGreaterThanOrEqual(1);
     expect(systemChunks.some(c => c.type === 'system' && c.content.includes('Task 1'))).toBe(true);
-  }, 5_000);
+  });
 });
 
 // --- WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 regression tests ----
@@ -1931,7 +1931,7 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     ).toBe(true);
     // Generator returned a final result without throwing.
     expect(chunks.some(c => c.type === 'result')).toBe(true);
-  }, 10_000);
+  });
 
   test('Scenario 3c: failback strips nested nodeConfig model fields (no gpt id reaches Claude)', async () => {
     // MAJOR 1 (adversarial re-review 2026-06-10): buildFailbackOptions must
@@ -2017,7 +2017,7 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     expect(receivedOptions!.nodeConfig?.agents?.['codex-adversarial-reviewer']?.prompt).toBe(
       'review the diff'
     );
-  }, 10_000);
+  });
 
   test('Scenario 3b: terminal Codex with NO failback factory still throws', async () => {
     // Without a failback factory wired, the provider must preserve its
@@ -2036,7 +2036,7 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     };
 
     await expect(consume()).rejects.toThrow(/Codex crash/);
-  }, 10_000);
+  });
 
   // Codex review (2026-06-10, needs_revision -> resolved): the failback
   // path used to forward `requestOptions` UNCHANGED to the Claude failback
@@ -2138,7 +2138,7 @@ describe('WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01', () => {
     // Sanity: the failback still streamed Claude's verdict through.
     expect(chunks.some(c => c.type === 'assistant')).toBe(true);
     expect(chunks.some(c => c.type === 'result')).toBe(true);
-  }, 10_000);
+  });
 });
 
 // --- WO-HARNESS-CODEX-AUTH-FAILBACK-01 regression tests ---
@@ -2202,7 +2202,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
       chunks.some(c => c.type === 'assistant' && c.content === 'Claude auth-fallback verdict')
     ).toBe(true);
     expect(chunks.some(c => c.type === 'result')).toBe(true);
-  }, 10_000);
+  });
 
   test('isAuthFailureError: non-auth generic error does NOT trigger auth failback', async () => {
     // WO spec section 11.2: a generic crash error must NOT use the new auth-class failback
@@ -2241,7 +2241,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
       c => c.type === 'system' && c.content?.includes('CODEX FAILBACK')
     );
     expect(generalDisclosure).toBeDefined();
-  }, 10_000);
+  });
 
   test('isAuthFailureError: single-pattern-only reauth message does NOT trigger auth failback', async () => {
     // Regression guard for the Codex diff-repair finding (2026-06-29):
@@ -2287,7 +2287,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     // The factory may be called via the general failback (expected), but if so the
     // disclosure must be the generic [CODEX FAILBACK], not the credential-rotation one.
     // The key assertion is that the rotation-specific auth path was not taken.
-  }, 10_000);
+  });
 
   test('isAuthFailureError: null failback factory throws original auth error', async () => {
     // WO spec section 11.3: no factory -> auth rotation error flows to
@@ -2303,7 +2303,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     };
 
     await expect(consume()).rejects.toThrow();
-  }, 10_000);
+  });
 
   test('isAuthFailureError: single-shot guard prevents double-delegation', async () => {
     // WO spec section 11.4: authFailbackUsed prevents re-entry. The first auth-class
@@ -2334,7 +2334,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     // Factory invoked exactly once; failback delegated once.
     expect(factoryCallCount).toBe(1);
     expect(failbackSendQuery).toHaveBeenCalledTimes(1);
-  }, 10_000);
+  });
 
   test('dead-auth refresh token was revoked wraps failback AbortError without unhandled rejection', async () => {
     mockRunStreamed.mockRejectedValue(new Error('The refresh token was revoked'));
@@ -2369,7 +2369,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     } finally {
       process.off('unhandledRejection', unhandledRejection);
     }
-  }, 10_000);
+  });
 
   test('dead-auth rotation collision failback fires once and reports auth failure normally', async () => {
     const unhandledRejection = mock((_reason: unknown) => {});
@@ -2406,7 +2406,7 @@ describe('WO-HARNESS-CODEX-AUTH-FAILBACK-01', () => {
     } finally {
       process.off('unhandledRejection', unhandledRejection);
     }
-  }, 10_000);
+  });
 });
 
 // T3 (WO-HARNESS-LAYER1-SERVED-MODEL-CAPTURE-01): the spec asks for a Codex

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { readFileSync, rmSync, unlinkSync } from 'fs';
+import { readFileSync, unlinkSync } from 'fs';
+import { removeTempDirWithRetry } from '../test/temp-dir';
 import { join } from 'path';
 import type { IDatabase } from './adapters/types';
 import { closeDatabase, getDatabase, resetDatabase } from './connection';
@@ -93,7 +94,7 @@ describe('overseer briefing persistence', () => {
     await closeDatabase();
     resetDatabase();
     cleanupDb(currentDbPath);
-    rmSync(currentHome, { recursive: true, force: true });
+    removeTempDirWithRetry(currentHome);
     if (oldArchonHome === undefined) delete process.env.ARCHON_HOME;
     else process.env.ARCHON_HOME = oldArchonHome;
     if (oldDatabaseUrl === undefined) delete process.env.DATABASE_URL;

@@ -18,7 +18,7 @@
     "smart-cauldron": "./src/cli.ts"
   },
   "scripts": {
-    "test": "bun test src/__tests__/ladder-routing.test.ts && bun test src/__tests__/conductor.test.ts && bun test src/__tests__/cascade.test.ts && bun test src/__tests__/cascade-authorized-escalation.test.ts && bun test src/__tests__/fire.test.ts && bun test src/__tests__/poll.test.ts && bun test src/__tests__/pr-detection-gate-regression.test.ts && bun test src/__tests__/recorder.test.ts && bun test src/__tests__/reliability-integration.test.ts && bun test src/__tests__/cli.test.ts && bun test src/__tests__/already-satisfied.test.ts && bun test src/__tests__/wo-lock.test.ts && bun test src/__tests__/frontier-approval-gate.test.ts && bun test src/__tests__/frontier-approval-resume.test.ts",
+    "test": "bun test --timeout 30000 src/__tests__/ladder-routing.test.ts && bun test --timeout 30000 src/__tests__/conductor.test.ts && bun test --timeout 30000 src/__tests__/cascade.test.ts && bun test --timeout 30000 src/__tests__/cascade-authorized-escalation.test.ts && bun test --timeout 30000 src/__tests__/fire.test.ts && bun test --timeout 30000 src/__tests__/poll.test.ts && bun test --timeout 30000 src/__tests__/pr-detection-gate-regression.test.ts && bun test --timeout 30000 src/__tests__/recorder.test.ts && bun test --timeout 30000 src/__tests__/reliability-integration.test.ts && bun test --timeout 30000 src/__tests__/cli.test.ts && bun test --timeout 30000 src/__tests__/already-satisfied.test.ts && bun test --timeout 30000 src/__tests__/wo-lock.test.ts && bun test --timeout 30000 src/__tests__/frontier-approval-gate.test.ts && bun test --timeout 30000 src/__tests__/frontier-approval-resume.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {

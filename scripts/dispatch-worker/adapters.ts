@@ -23,6 +23,29 @@ export interface AgentConfig {
   /** Defaults to 'stdin'. Set to 'prompt-file' for CLIs with no stdin prompt mode. */
   promptDelivery?: PromptDelivery;
   /**
+   * Absolute directory the agent process runs in. When unset (the default) the
+   * worker creates a fresh mkdtemp scratch directory per dispatch, which is
+   * what an agent that needs no repo context should get.
+   *
+   * John's directive 2026-09-08: a board seat answering a ballot in an empty
+   * temp dir has no repo, no wiki, and no skills, so it reports "Oracle
+   * unavailable / skill read blocked" every round. Pointing a seat at a real
+   * checkout gives it the context the board packet assumes it has.
+   *
+   * The worker NEVER writes into or deletes a configured cwd -- the prompt
+   * file still goes to a per-run temp directory. If the configured path does
+   * not exist, the worker warns and falls back to mkdtemp rather than failing
+   * the dispatch.
+   */
+  cwd?: string;
+  /**
+   * Extra environment variables merged over the worker's own environment for
+   * this agent's child process (e.g. ORACLE_URL, or a read-only token issued
+   * to one seat). Values are passed through unchanged; secrets belong in the
+   * worker's environment or a token file, never in a git-tracked config.
+   */
+  env?: Record<string, string>;
+  /**
    * ACP-only (kind: 'acp'), all optional with safe defaults.
    *
    * WO-HARNESS-ACP-DISPATCH-SLICE-01 / M-118: an ACP agent is spawned once per

@@ -1,10 +1,47 @@
 import { Database, constants } from 'bun:sqlite';
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { link, lstat, mkdtemp, readFile, readdir, rm, symlink } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { pathToFileURL } from 'url';
+
+// WINDOWS CI TIMEOUT CLASS -- file-local restatement of the repo-wide default.
+//
+// packages/core/src/test/setup.ts raises the default per-test timeout to 30s
+// via setDefaultTimeout() in the bunfig preload. That covers tests declared by
+// files bun discovers directly, but this file is NOT one of them: it lives
+// under scripts/ (outside every bunfig `root`) and is registered only through
+// the cross-package `await import(...)` at the top of
+// packages/core/src/db/adapters/sqlite.test.ts. On the Bun version CI pins
+// (1.3.11) the preload's raised default does not reach tests registered across
+// that import boundary, so they silently fall back to Bun's 5000ms default --
+// while a local Bun 1.3.13 run applies it and passes, hiding the gap.
+//
+// Every test here spawns a real child process and does real filesystem IO, so
+// on a slow windows-latest runner several land just past 5000ms (observed:
+// 5015ms/5016ms against siblings measuring 4391ms, 2984ms and 2484ms). Ubuntu
+// was always green: this is runner speed, not a product defect.
+//
+// RAISED 30s -> 90s (2026-09-08). The same class recurred at the higher
+// threshold: on run 34193910325 (windows-latest) "migrates only a temporary
+// copy..." and "fails when the expected heartbeat count does not match" BOTH
+// hit the 30000ms wall (30016ms / 30015ms) and their spawned children were
+// killed -- the CLI exited 143, SIGTERM, with "killed 1 dangling process"
+// logged immediately before. On the SAME commit and the SAME run, ubuntu ran
+// those two tests in 1160.99ms and 769.99ms. A ~26x platform gap with no
+// product difference is runner contention, and the two slowest tests here are
+// the ones that spawn the migration CLI *and* run a real SqliteAdapter
+// migration inside that child.
+//
+// 90s is chosen against the observed 30s wall rather than the ~1s happy path,
+// so it absorbs a badly contended runner without letting a genuine hang sit
+// for minutes.
+//
+// Restating the default here makes this file honest under any invocation --
+// the pinned `bun test:dispatch-migration-smoke`, the core package suite, or a
+// direct run -- and independent of the Bun version in play.
+setDefaultTimeout(90_000);
 
 const temporaryDirectories: string[] = [];
 const scriptPath = join(import.meta.dir, 'dispatch-migration-smoke.ts');
@@ -732,7 +769,7 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(missingParent.stderr).not.toContain(missingParentOutput);
     expect(await sha256(dbPath)).toBe(beforeHash);
     expect(await Bun.file(missingParentOutput).exists()).toBe(false);
-  }, 15_000);
+  });
 
   test.skipIf(process.platform === 'win32')(
     'rejects dangling output aliases before migration',
@@ -757,8 +794,7 @@ describe('dispatch-migration-smoke CLI', () => {
       expect(dangling.stderr).not.toContain(danglingOutput);
       expect((await lstat(danglingOutput)).isSymbolicLink()).toBe(true);
       expect(await sha256(dbPath)).toBe(beforeHash);
-    },
-    15_000
+    }
   );
 
   test('does not export when migration validation fails', async () => {
@@ -822,5 +858,5 @@ describe('dispatch-migration-smoke CLI', () => {
     expect(result.stderr).toContain('migrated_copy_export_failed');
     expect(result.stderr).not.toContain(outputPath);
     expect(await Bun.file(outputPath).exists()).toBe(false);
-  }, 15_000);
+  });
 });

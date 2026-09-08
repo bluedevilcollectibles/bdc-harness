@@ -23,7 +23,6 @@ import {
   listMessages,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
-  type DispatchSenderContext,
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
@@ -42,6 +41,7 @@ import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibi
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
 import { fireBackoffDecision } from './backoff';
+import { checkExpectations } from './expectations';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -55,25 +55,43 @@ const log = createLogger('taskmaster/loop');
 
 /** Ratified Q1 budgets. */
 export const MAX_EFFECTS_PER_TICK = 10;
+/** Conservative faucet bound for newly eligible work, within the shared cap. */
+export const MAX_FIRES_PER_TICK = 3;
 
 /**
  * Pause effect-delivery gate (WO-HARNESS-TASKMASTER-PAUSE-GATE-ENFORCE-01).
  *
- * When the control row is paused with scope='effects', ZERO effects leave the
- * process -- nothing is exempt, including P0 escalations and the digest. A
+ * WO-HARNESS-TASKMASTER-UNPAUSE-AND-RESET-01 Section 6 authorizes only the
+ * daily canary and self-pause notice to escape scope='effects'. A
  * pause with any non-'effects' scope keeps the legacy watching-never-dark
  * exemption for escalate_p0 and the digest. Callers must still check
  * pause_state !== 'RUNNING' before consulting this helper.
  */
 export function isPauseEffectsExempt(proposalType: string, pauseScope: string | null): boolean {
-  if (pauseScope === 'effects') return false;
-  return proposalType === 'escalate_p0' || proposalType === 'digest';
+  if (pauseScope === 'effects') {
+    return proposalType === 'canary' || proposalType === 'self_pause_notice';
+  }
+  return (
+    proposalType === 'escalate_p0' ||
+    proposalType === 'digest' ||
+    proposalType === 'self_pause_notice'
+  );
 }
 
 /** Journal lookback used for dedupe and per-item budgets. */
 const JOURNAL_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PROOF_DEADLINE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The only cascade run statuses that count as EVIDENCE of success.
+ *
+ * TERMINAL_WORKFLOW_STATUSES also contains failed / escalated / cancelled --
+ * those are terminal but they are the outcomes an expectation exists to catch,
+ * so they must NOT satisfy it. A run still pending or running does not satisfy
+ * it either: it is simply not yet proven, and the deadline decides.
+ */
+const CASCADE_SUCCESS_STATUSES: readonly string[] = ['completed'];
 
 export interface TaskmasterState {
   deadman: DeadmanState;
@@ -116,7 +134,16 @@ type TaskmasterDal = Pick<
   // Suppression accessors (M-155 WO 3) are optional on injected DALs so
   // pre-WO3 test doubles keep compiling; when absent, durable suppression
   // writes are inert (the pure grade-based check still applies).
-  Partial<Pick<typeof taskmasterDb, 'getSuppression' | 'setSuppression' | 'clearSuppression'>>;
+  Partial<
+    Pick<
+      typeof taskmasterDb,
+      | 'getSuppression'
+      | 'setSuppression'
+      | 'clearSuppression'
+      | 'registerExpectation'
+      | 'getExpectationCounts'
+    >
+  >;
 
 export interface GithubIssueEvidence {
   state: 'open' | 'closed';
@@ -140,12 +167,9 @@ export interface GithubIssueEvidence {
 export interface TaskmasterDeps {
   now?: () => Date;
   db?: TaskmasterDal;
-  createTask?: (
-    context: DispatchSenderContext,
-    data: CreateAuthenticatedMessageData
-  ) => ReturnType<typeof createAuthenticatedMessage>;
+  createTask?: typeof createAuthenticatedMessage;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
-  listThreads?: () => Promise<ThreadSnapshot[]>;
+  listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
   headroom?: () => Promise<HeadroomReading>;
   /** External-SOR check: does a dispatch row exist for this key, and when was it sent? */
   findEffectByIdempotencyKey?: (
@@ -165,6 +189,7 @@ export interface TaskmasterDeps {
   getHealthSample?: typeof taskmasterDb.getHealthSample;
   /** Test/monitor observer invoked whenever the periodic budget-hold warning is emitted. */
   onFireBudgetHolding?: (tickIndex: number, reason: string) => void;
+  checkExpectations?: (now: Date) => Promise<void>;
 }
 
 export interface TickResult {
@@ -226,7 +251,7 @@ async function defaultListUndeliveredRulings(): Promise<ThreadSnapshot[]> {
     }));
 }
 
-function priorityFromLabels(labels: string[]): ThreadPriority {
+export function priorityFromLabels(labels: string[]): ThreadPriority | null {
   for (const p of ['P0', 'P1', 'P2', 'P3'] as const) {
     if (
       labels.some(label => {
@@ -236,7 +261,7 @@ function priorityFromLabels(labels: string[]): ThreadPriority {
     )
       return p;
   }
-  return 'P2';
+  return null;
 }
 
 interface GithubIssue {
@@ -344,6 +369,8 @@ export interface ListedThread extends ThreadSnapshot {
   labels?: string[];
 }
 
+export type ListedThreadResult = ListedThread[] & { unlabelledPriorityTriage: string[] };
+
 export interface AdoptionRefreshResult {
   ran: boolean;
   failed: boolean;
@@ -372,13 +399,16 @@ function assertGithubRateLimit(response: Response, context: string): void {
  * production callers use the tick() default. `fetchImpl` is injectable for
  * tests only.
  */
-export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promise<ListedThread[]> {
+export async function defaultListThreads(
+  fetchImpl: typeof fetch = fetch
+): Promise<ListedThreadResult> {
   const repos = (process.env.TASKMASTER_GH_REPOS ?? 'thinmansoftware/bdc-xo')
     .split(',')
     .map(r => r.trim())
     .filter(Boolean);
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const threads: ListedThread[] = [];
+  const unlabelledPriorityTriage: string[] = [];
   for (const repo of repos) {
     const seen = new Set<number>();
     for (const label of WORK_LABELS) {
@@ -404,11 +434,18 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
           seen.add(issue.number);
           const labels = issue.labels.map(l => (typeof l === 'string' ? l : (l.name ?? '')));
           const priority = priorityFromLabels(labels);
+          if (priority === null) {
+            const ref = canonicalizeThreadRef(`gh:${repo}#${issue.number}`);
+            unlabelledPriorityTriage.push(ref);
+            log.warn({ threadRef: ref }, 'taskmaster.priority_triage_required');
+            continue;
+          }
           const normalizedLabels = labels.map(label => label.trim().toLowerCase());
           const hasClaimStatus = normalizedLabels.some(label =>
             ['status:building', 'status:review'].includes(label)
           );
           const ownerLogin = issue.assignees?.[0]?.login ?? null;
+          const isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
           threads.push({
             ref: canonicalizeThreadRef(`gh:${repo}#${issue.number}`),
             priority,
@@ -417,8 +454,9 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
             isBlocked: normalizedLabels.some(label =>
               ['blocked', 'status:blocked'].includes(label)
             ),
-            isUnclaimedP0:
-              priority === 'P0' && (issue.assignees ?? []).length === 0 && !hasClaimStatus,
+            isHeld: normalizedLabels.some(label => ['hold', 'status:hold'].includes(label)),
+            isUnclaimed,
+            isUnclaimedP0: priority === 'P0' && isUnclaimed,
             recipient: resolveRecipient(ownerLogin),
             title: issue.title ?? null,
             ownerLogin,
@@ -431,7 +469,7 @@ export async function defaultListThreads(fetchImpl: typeof fetch = fetch): Promi
       }
     }
   }
-  return threads;
+  return Object.assign(threads, { unlabelledPriorityTriage });
 }
 
 interface GithubIssueDetail extends GithubIssue {
@@ -611,23 +649,70 @@ export async function defaultGetGithubIssueEvidence(
   };
 }
 
-function digestProposal(actions24h: taskmasterDb.TmJournalEntry[], nowMs: number): ActionProposal {
+const RESET_COMMAND = "bash scripts/taskmaster/reset.sh --confirm --reason '<why>'";
+
+export function buildSelfPauseNotice(
+  reason: string,
+  epoch: number
+): CreateAuthenticatedMessageData {
+  return {
+    correlation_id: `tm-self-pause-${epoch}`,
+    idempotency_key: `tm:self-pause:${epoch}`,
+    task_type: 'agent_message',
+    recipient: 'duty-officer',
+    body: `Taskmaster self-paused: ${reason} Reset with: ${RESET_COMMAND}`,
+    subject_key: 'taskmaster:self-pause',
+    repeat_reason: 'A new Taskmaster epoch self-paused and requires Duty Officer attention.',
+  };
+}
+
+/*
+ * RETIREMENT: The daily canary retires when the Taskmaster has run 30 consecutive days with at least
+ * one `outcome='sent'` row per day and zero self-pause events in that window. Retirement is
+ * a board decision, not an automatic expiry -- the code MUST NOT self-disable.
+ */
+function digestProposal(
+  actions24h: taskmasterDb.TmJournalEntry[],
+  control: taskmasterDb.TmControlState,
+  nowMs: number,
+  expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
+  unlabelledPriorityTriage: string[] = []
+): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
-  const counts: Record<string, number> = {};
-  for (const action of actions24h) {
-    counts[`${action.action_type}:${action.outcome}`] =
-      (counts[`${action.action_type}:${action.outcome}`] ?? 0) + 1;
-  }
-  const summary =
-    Object.entries(counts)
-      .map(([k, v]) => `${k}=${v}`)
-      .join(', ') || 'no actions in the last 24h';
+  const digestActions = actions24h.filter(action => action.thread_ref !== 'taskmaster:reset');
+  const outcomeCount = (outcome: taskmasterDb.TmActionOutcome): number =>
+    digestActions.filter(action => action.outcome === outcome).length;
+  const sent = outcomeCount('sent');
+  const activity = digestActions.length === 0 ? 'no proposals today' : `sent=${sent}`;
+  const summary = `sent=${sent}, parked=${outcomeCount('parked')}, rejected=${outcomeCount('rejected')}`;
+  const pauseDetail =
+    control.pause_state === 'RUNNING'
+      ? activity
+      : `reason=${control.pause_reason ?? 'unspecified'}; reset with: ${RESET_COMMAND}`;
+  // Expectation registry counts and the unlabelled-priority triage list ride
+  // along on the same daily message (this WO); the canary's pause-state fields
+  // above are #757's. Both are load-bearing -- neither replaces the other.
+  const expectationSummary = expectationCounts
+    ? // `escalating` is reported alongside the rest: it is a NON-terminal state
+      // meaning an escalation was claimed but its operator notification is not
+      // yet confirmed sent. Omitting it hid outstanding escalation sends from
+      // the one daily message a human actually reads.
+      ` Expectations: pending=${expectationCounts.pending}, met=${expectationCounts.met}, failed=${expectationCounts.failed}, escalating=${expectationCounts.escalating}, escalated=${expectationCounts.escalated}, given_up=${expectationCounts.given_up}.`
+    : '';
+  const triageSummary = unlabelledPriorityTriage.length
+    ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
+    : '';
   return {
     type: 'digest',
     threadRef: `digest:${dateKey}`,
+    // The proposal remains on the existing allowlisted operator route; the
+    // dispatch step resolves the canary's concrete Duty Officer seat.
     recipient: 'operator',
     body:
-      `Taskmaster daily digest for ${dateKey}: ${summary}. ` +
+      `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
+      `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
+      `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.` +
+      `${expectationSummary}${triageSummary} ` +
       'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
@@ -986,6 +1071,14 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   recordTickAttempt(state.deadman, nowMs);
   let tickFailures = 0;
 
+  try {
+    if (deps.checkExpectations) await deps.checkExpectations(new Date(nowMs));
+    else if (!deps.db) await checkExpectations(new Date(nowMs));
+  } catch (error) {
+    tickFailures += 1;
+    log.warn({ err: error as Error }, 'taskmaster.expectations_tick_failed');
+  }
+
   // 1. Pause state + epoch captured.
   let control = await dal.getPauseState();
   const epoch = control.epoch;
@@ -1068,9 +1161,12 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   // and pause-parks on the fresh scope.
   if (control.pause_state === 'RUNNING') {
     try {
-      const gradedWindow = await dal.getActionsSince(
-        new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString()
-      );
+      const lookbackStartMs = nowMs - JOURNAL_LOOKBACK_MS;
+      const epochStartMs = Date.parse(control.updated_at);
+      const floorStartMs = Number.isFinite(epochStartMs)
+        ? Math.max(lookbackStartMs, epochStartMs)
+        : lookbackStartMs;
+      const gradedWindow = await dal.getActionsSince(new Date(floorStartMs).toISOString());
       let usefulCount = 0;
       let noiseCount = 0;
       for (const a of gradedWindow) {
@@ -1079,16 +1175,42 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       }
       if (usefulRateFloorBreached(usefulCount, noiseCount)) {
         const graded = usefulCount + noiseCount;
-        await dal.setPauseState({
+        const pauseReason =
+          `M-155 useful-rate floor auto-pause: ${usefulCount} useful of ` +
+          `${graded} graded (${Math.round((usefulCount / graded) * 100)}%) in the ` +
+          'epoch-bounded lookback is below the ratified 40% floor. Resume requires an ' +
+          'operator decision, not a timer.';
+        control = await dal.setPauseState({
           pause_state: 'PAUSED',
           pause_scope: 'effects',
-          pause_reason:
-            `M-155 useful-rate floor auto-pause: ${usefulCount} useful of ` +
-            `${graded} graded (${Math.round((usefulCount / graded) * 100)}%) in the ` +
-            '7-day lookback is below the ratified 40% floor. Resume requires an ' +
-            'operator decision, not a timer.',
+          pause_reason: pauseReason,
           pause_actor: 'taskmaster:useful-rate-floor',
         });
+        try {
+          // Apply the monitoring exemption; Dispatch atomically fences enqueue
+          // against reset using the expected paused epoch, not this snapshot.
+          const noticeControl = await dal.getPauseState();
+          if (
+            noticeControl.pause_state === 'PAUSED' &&
+            noticeControl.epoch === control.epoch &&
+            isPauseEffectsExempt('self_pause_notice', noticeControl.pause_scope)
+          ) {
+            await createTask(
+              { kind: 'system', sender: 'taskmaster' },
+              buildSelfPauseNotice(pauseReason, control.epoch),
+              {
+                taskmasterPausedEpoch: control.epoch,
+                // Carry the exact state the exemption was decided against so
+                // Dispatch can re-assert it inside its locked transaction.
+                taskmasterPausedState: 'PAUSED',
+                taskmasterPausedScope: noticeControl.pause_scope,
+              }
+            );
+          }
+        } catch (error) {
+          tickFailures += 1;
+          log.error({ err: error as Error }, 'taskmaster.self_pause_notice_failed');
+        }
         log.warn({ usefulCount, noiseCount }, 'taskmaster.useful_rate_floor_auto_paused');
       }
     } catch (error) {
@@ -1115,6 +1237,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
   let rulings: ThreadSnapshot[] = [];
   let threads: ThreadSnapshot[] = [];
+  let unlabelledPriorityTriage: string[] = [];
   try {
     rulings = await (deps.listUndeliveredRulings ?? defaultListUndeliveredRulings)();
   } catch (error) {
@@ -1122,7 +1245,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     log.warn({ err: error as Error }, 'taskmaster.rulings_read_failed');
   }
   try {
-    threads = await (deps.listThreads ?? defaultListThreads)();
+    const listed = await (deps.listThreads ?? defaultListThreads)();
+    threads = listed;
+    unlabelledPriorityTriage =
+      'unlabelledPriorityTriage' in listed ? listed.unlabelledPriorityTriage : [];
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.threads_read_failed');
@@ -1200,7 +1326,9 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     if (
       resolveFireVerbEnabled() &&
       backoff.kind === 'ready' &&
-      item.isUnclaimedP0 &&
+      (item.isUnclaimed ?? item.isUnclaimedP0) &&
+      !item.isBlocked &&
+      !item.isHeld &&
       typeof (item as ListedThread).title === 'string'
     ) {
       try {
@@ -1223,7 +1351,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
       adoption: adoptionRow?.title ? adoptionRow : undefined,
       grades: gradesByRef.get(canonRef),
       suppression: suppressionByRef.get(canonRef),
-      fireEligible: fireResult.eligible,
+      fireEligible: fireResult.eligible && Boolean(fireResult.evidence?.expectedSpec),
       fireLane: laneDecision.lane,
       fireHolding: laneDecision.holding,
       fireEscalate: backoff.kind === 'escalate',
@@ -1260,14 +1388,46 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
   }
 
   // Daily digest: one summary message per UTC day through the same path.
-  const digest = digestProposal(actions24h, nowMs);
+  let expectationCounts: Record<taskmasterDb.TmExpectationStatus, number> | undefined;
+  try {
+    expectationCounts = dal.getExpectationCounts
+      ? await dal.getExpectationCounts()
+      : deps.db
+        ? undefined
+        : await taskmasterDb.getExpectationCounts();
+  } catch (error) {
+    log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
+  }
+  const digest = digestProposal(
+    actions24h,
+    control,
+    nowMs,
+    expectationCounts,
+    unlabelledPriorityTriage
+  );
   proposals.push(digest);
 
   // Exceptions first so the per-tick budget can never starve them.
-  proposals.sort((a, b) => Number(b.actsImmediately) - Number(a.actsImmediately));
+  const priorityByRef = new Map([...rulings, ...threads].map(item => [item.ref, item.priority]));
+  const priorityRank: Record<ThreadPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 };
+  const proposalRank = (proposal: ActionProposal): number => {
+    if (proposal.type === 'deliver_ruling') return 0;
+    if (proposal.type === 'escalate_p0') return 1;
+    if (proposal.type === 'fire_cauldron') {
+      return 2 + priorityRank[priorityByRef.get(proposal.threadRef) ?? 'P3'];
+    }
+    if (proposal.type === 'nudge') return 6;
+    return 7;
+  };
+  proposals.sort((a, b) => {
+    const immediate = Number(b.actsImmediately) - Number(a.actsImmediately);
+    if (immediate !== 0) return immediate;
+    return proposalRank(a) - proposalRank(b);
+  });
   result.proposals = proposals.length;
 
   const touchedThisTick = new Set<string>();
+  let firesThisTick = 0;
 
   for (const proposal of proposals) {
     let existingAction =
@@ -1338,7 +1498,10 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     // digest alive so watching never goes dark.
     if (
       control.pause_state !== 'RUNNING' &&
-      !isPauseEffectsExempt(proposal.type, control.pause_scope)
+      !isPauseEffectsExempt(
+        proposal.type === 'digest' ? 'canary' : proposal.type,
+        control.pause_scope
+      )
     ) {
       result.parked += 1;
       await dal.recordAction({
@@ -1354,7 +1517,11 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
 
     // Budgets: max 10 effects/tick, 1 effect/item/tick. Overflow is
     // journaled as deferred, not dropped.
-    if (result.effects >= MAX_EFFECTS_PER_TICK || touchedThisTick.has(proposal.threadRef)) {
+    if (
+      result.effects >= MAX_EFFECTS_PER_TICK ||
+      (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
+      touchedThisTick.has(proposal.threadRef)
+    ) {
       result.deferred += 1;
       if (!existingAction) {
         existingAction = await dal.recordAction({
@@ -1397,7 +1564,11 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
     // mid-tick is caught even for escalate_p0/digest.
     const fresh = await dal.getPauseState();
     const freshPauseWithhold =
-      fresh.pause_state !== 'RUNNING' && !isPauseEffectsExempt(proposal.type, fresh.pause_scope);
+      fresh.pause_state !== 'RUNNING' &&
+      !isPauseEffectsExempt(
+        proposal.type === 'digest' ? 'canary' : proposal.type,
+        fresh.pause_scope
+      );
     if (fresh.epoch !== epoch || freshPauseWithhold) {
       // A pause that landed mid-tick (fresh scope withholds this effect) is a
       // pause-park, not an ordinary stale-epoch/resume expiry: re-tag the
@@ -1429,6 +1600,7 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         });
         const cascadePromise = executeCascade({
           woId: proposal.fireEvidence.woId,
+          expectedSpec: proposal.fireEvidence.expectedSpec,
           project: proposal.fireEvidence.project,
           dispatchId: proposal.idempotencyKey,
           token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
@@ -1442,19 +1614,43 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
           );
         });
         const admitted = await admission;
+        const registerExpectation =
+          dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
+        await registerExpectation?.({
+          // Deterministic identity: replaying this journal action after a crash
+          // between the cascade admission and updateActionOutcome reuses the
+          // SAME expectation rather than registering a second one with
+          // different retry/escalation keys.
+          action_ref: journalRow.id,
+          dispatch_ref: admitted.cascadeId,
+          recipient: proposal.recipient,
+          // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching on
+          // the admission row's existence alone is not evidence of anything:
+          // admission is what CREATES that row, so the expectation would be
+          // met the instant it was registered and a failed or stalled cascade
+          // would never escalate (review finding [major]).
+          evidence_json: JSON.stringify({
+            kind: 'db_row_exists',
+            table: 'remote_agent_workflow_runs',
+            where: { id: admitted.cascadeId, status: CASCADE_SUCCESS_STATUSES },
+          }),
+          due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+          on_absence: 'escalate',
+          max_retries: 0,
+        });
         await dal.updateActionOutcome(
           journalRow.id,
           'sent',
           JSON.stringify({ ...proposal, cascadeId: admitted.cascadeId, runId: admitted.cascadeId })
         );
       } else {
-        await createTask(
+        const dispatched = await createTask(
           { kind: 'system', sender: 'taskmaster' },
           {
             correlation_id: `tm-${journalRow.id}`,
             idempotency_key: proposal.idempotencyKey,
             task_type: 'agent_message',
-            recipient: proposal.recipient,
+            recipient: proposal.type === 'digest' ? 'duty-officer' : proposal.recipient,
             body: proposal.body,
             // Same-subject grouping + unconditional per-verb repeat reason
             // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
@@ -1462,11 +1658,28 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
             repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
           }
         );
+        const registerExpectation =
+          dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
+        await registerExpectation?.({
+          // Deterministic identity -- see the cascade branch above.
+          action_ref: journalRow.id,
+          dispatch_ref: dispatched.id,
+          recipient: proposal.recipient,
+          evidence_json: JSON.stringify({
+            kind: 'dispatch_reply_exists',
+            correlation_id: `tm-${journalRow.id}`,
+            classification: 'succeeded',
+          }),
+          due_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+          on_absence: proposal.type === 'digest' ? 'escalate' : 'redispatch',
+          max_retries: 2,
+        });
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
       journalRow.outcome = 'sent';
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
+      if (proposal.type === 'fire_cauldron') firesThisTick += 1;
       log.info(
         {
           actionType: proposal.type,
