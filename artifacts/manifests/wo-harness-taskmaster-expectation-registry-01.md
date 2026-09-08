@@ -2,7 +2,7 @@ Manifest-Version: 2
 WO: WO-HARNESS-TASKMASTER-EXPECTATION-REGISTRY-01
 Builder: Codex
 Files modified: packages/server/src/taskmaster/loop.ts, packages/server/src/taskmaster/loop.test.ts, packages/core/src/db/taskmaster.ts, packages/core/src/db/taskmaster.test.ts, packages/core/src/db/adapters/sqlite.ts
-Files created: migrations/047_tm_expectations.sql, packages/server/src/taskmaster/expectations.ts, packages/server/src/taskmaster/expectations.test.ts, artifacts/manifests/wo-harness-taskmaster-expectation-registry-01.md
+Files created: migrations/049_tm_expectations.sql, packages/server/src/taskmaster/expectations.ts, packages/server/src/taskmaster/expectations.test.ts, artifacts/manifests/wo-harness-taskmaster-expectation-registry-01.md
 Tests: 218/218 (bun test packages/core/src/db/taskmaster.test.ts packages/server/src/taskmaster)
 PRs: https://github.com/thinmansoftware/bdc-harness/pull/785
 Merge ancestors:

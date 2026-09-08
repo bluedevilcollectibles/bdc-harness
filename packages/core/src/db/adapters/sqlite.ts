@@ -1884,7 +1884,7 @@ export class SqliteAdapter implements IDatabase {
         is_unknown INTEGER NOT NULL DEFAULT 0 CHECK (is_unknown IN (0, 1))
       );
 
-      -- Taskmaster expectation registry (migration 047).
+      -- Taskmaster expectation registry (migration 049).
       CREATE TABLE IF NOT EXISTS tm_expectations (
         id TEXT PRIMARY KEY,
         dispatch_ref TEXT NOT NULL,
