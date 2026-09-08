@@ -9,6 +9,7 @@ import {
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
 import {
+  createDurableSweepCursor,
   createRealStaleVerdictSweepDeps,
   resolveStaleSweepMax,
   runStaleVerdictSweep,
@@ -116,7 +117,14 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     staleVerdictSweep: config =>
-      runStaleVerdictSweep(createRealStaleVerdictSweepDeps(config), resolveStaleSweepMax()),
+      runStaleVerdictSweep(
+        createRealStaleVerdictSweepDeps(config),
+        resolveStaleSweepMax(),
+        // DURABLE, not process-local: archon-app-1 is rebuilt regularly, and a
+        // cursor that rewinds on restart can never walk a store larger than one
+        // process lifetime covers (#786 review @45aa739e).
+        createDurableSweepCursor()
+      ),
   };
 }
 

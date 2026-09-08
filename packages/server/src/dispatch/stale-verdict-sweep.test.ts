@@ -4,11 +4,11 @@
  * Headline stop condition: "the sweep enqueues once" -- one re-review per stale
  * candidate, and a second sweep over the same completion enqueues nothing.
  */
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 import type { StandingVerdict } from '@archon/overseer/pr-review-check-ingest';
 import {
   DEFAULT_STALE_SWEEP_MAX,
-  resetStaleSweepCursor,
+  createMemorySweepCursor,
   resolveStaleSweepMax,
   runStaleVerdictSweep,
   verdictIsStale,
@@ -18,17 +18,14 @@ import {
 } from './stale-verdict-sweep';
 import { selectLatestCompletion } from './stale-verdict-sweep-wiring';
 
-// The sweep cursor is process-local and survives between calls by design, so a
-// test that does not pass its own cursor would otherwise inherit the offset the
-// previous test left behind.
-beforeEach(() => {
-  resetStaleSweepCursor();
-});
-
 const HEAD = '5ac93b765ac93b765ac93b765ac93b765ac93b76';
 
-function candidate(prNumber = 777, headSha = HEAD): SweepCandidate {
-  return { owner: 'thinmansoftware', repo: 'bdc-harness', prNumber, headSha };
+/**
+ * `cursorSeq` defaults to the PR number so a list of candidates built here is
+ * strictly ascending, exactly as the keyset query returns them.
+ */
+function candidate(prNumber = 777, headSha = HEAD, cursorSeq = prNumber): SweepCandidate {
+  return { owner: 'thinmansoftware', repo: 'bdc-harness', prNumber, headSha, cursorSeq };
 }
 
 /** A CHANGES_REQUESTED verdict recorded BEFORE the check completion below. */
@@ -59,9 +56,12 @@ function makeDeps(
 ): StaleVerdictSweepDeps {
   const rows = new Map<string, string>();
   return {
-    // Offset-aware, exactly like the real listing: the cursor is meaningless
-    // against a double that always returns the head of the list.
-    listCandidates: mock(async (limit, offset = 0) => candidates.slice(offset, offset + limit)),
+    // KEYSET-aware, exactly like the real listing: rows strictly after the
+    // given seq, ascending. A double that sliced by array index would hide the
+    // very bug the keyset cursor exists to fix.
+    listCandidates: mock(async (limit, afterSeq = 0) =>
+      candidates.filter(row => row.cursorSeq > afterSeq).slice(0, limit)
+    ),
     readStandingVerdict: mock(async () => STALE_VERDICT),
     readLatestCheckCompletion: mock(async () => {
       recorded.githubReads += 1;
@@ -228,7 +228,7 @@ describe('runStaleVerdictSweep', () => {
     const recorded: Recorded = { enqueued: [], githubReads: 0 };
     const deps = makeDeps([candidate()], recorded);
     const result = await runStaleVerdictSweep(deps, 0);
-    expect(result).toEqual({ examined: 0, enqueued: 0, duplicates: 0, consumed: 0 });
+    expect(result).toEqual({ examined: 0, enqueued: 0, duplicates: 0, consumed: 0, afterSeq: 0 });
     expect(deps.listCandidates).not.toHaveBeenCalled();
   });
 
@@ -315,8 +315,7 @@ describe('cursor: the sweep window advances across heartbeats', () => {
       readStandingVerdict: mock(async input => verdictFor(input.prNumber)),
     });
 
-    // A fresh cursor per test: the module-level one would leak between tests.
-    const cursor = { offset: 0 };
+    const cursor = createMemorySweepCursor();
     const max = 3;
     const perHeartbeatReads: number[] = [];
 
@@ -343,7 +342,7 @@ describe('cursor: the sweep window advances across heartbeats', () => {
     const deps = makeDeps(starvationCandidates(), recorded, {
       readStandingVerdict: mock(async input => verdictFor(input.prNumber)),
     });
-    const cursor = { offset: 0 };
+    const cursor = createMemorySweepCursor();
 
     const first = await runStaleVerdictSweep(deps, 3, cursor);
 
@@ -352,14 +351,16 @@ describe('cursor: the sweep window advances across heartbeats', () => {
     expect(first.examined).toBe(0);
     expect(recorded.githubReads).toBe(0);
     expect(first.consumed).toBe(8);
-    expect(cursor.offset).toBe(8);
+    // The resume token is the 8th candidate's DATABASE position, not a count.
+    expect(first.afterSeq).toBe(8);
+    expect(await cursor.read()).toBe(8);
   });
 
   test('the cursor rewinds at the end of the store so the sweep never stops', async () => {
     const recorded: Recorded = { enqueued: [], githubReads: 0 };
     // Fewer candidates than one window: the page is short, so the sweep is
-    // already at the end and must rewind rather than walk off into empty
-    // offsets and stop sweeping forever.
+    // already at the end and must rewind rather than walk off into positions
+    // that return nothing and stop sweeping forever.
     const deps = makeDeps([candidate(1, 'head-1'), candidate(2, 'head-2')], recorded, {
       readStandingVerdict: mock(async input => ({
         headSha: input.headSha,
@@ -368,15 +369,35 @@ describe('cursor: the sweep window advances across heartbeats', () => {
         recordedAt: '2026-09-07T12:07:00.000Z',
       })),
     });
-    const cursor = { offset: 0 };
+    const cursor = createMemorySweepCursor();
 
     await runStaleVerdictSweep(deps, 3, cursor);
-    expect(cursor.offset).toBe(0);
+    expect(await cursor.read()).toBe(0);
 
     // And from a cursor already past the end, it rewinds rather than sticking.
-    const past = { offset: 50 };
+    const past = createMemorySweepCursor(50);
     await runStaleVerdictSweep(deps, 3, past);
-    expect(past.offset).toBe(0);
+    expect(await past.read()).toBe(0);
+  });
+
+  test('a cursor whose read throws restarts the walk instead of failing the heartbeat', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const deps = makeDeps(starvationCandidates(), recorded, {
+      readStandingVerdict: mock(async input => verdictFor(input.prNumber)),
+    });
+    const broken = {
+      read: async (): Promise<number> => {
+        throw new Error('db_down');
+      },
+      write: async (): Promise<void> => {
+        throw new Error('db_down');
+      },
+    };
+
+    // Must not throw: the sweep rides the review worker heartbeat that carries
+    // the primary review path.
+    const result = await runStaleVerdictSweep(deps, 3, broken);
+    expect(result.consumed).toBe(8);
   });
 
   test('the GitHub-read bound holds on every heartbeat of a full walk', async () => {
@@ -388,7 +409,7 @@ describe('cursor: the sweep window advances across heartbeats', () => {
         headSha: input.headSha,
       })),
     });
-    const cursor = { offset: 0 };
+    const cursor = createMemorySweepCursor();
     const max = 3;
 
     for (let heartbeat = 0; heartbeat < 10; heartbeat += 1) {
@@ -396,6 +417,29 @@ describe('cursor: the sweep window advances across heartbeats', () => {
       await runStaleVerdictSweep(deps, max, cursor);
       expect(recorded.githubReads - before).toBeLessThanOrEqual(max);
     }
+  });
+
+  test('successive heartbeats fetch DIFFERENT slices, never the same page twice', async () => {
+    const recorded: Recorded = { enqueued: [], githubReads: 0 };
+    const requestedAfterSeq: number[] = [];
+    const candidates = starvationCandidates();
+    const deps = makeDeps(candidates, recorded, {
+      readStandingVerdict: mock(async input => verdictFor(input.prNumber)),
+      listCandidates: mock(async (limit, afterSeq = 0) => {
+        requestedAfterSeq.push(afterSeq);
+        return candidates.filter(row => row.cursorSeq > afterSeq).slice(0, limit);
+      }),
+    });
+    const cursor = createMemorySweepCursor();
+
+    for (let heartbeat = 0; heartbeat < 3; heartbeat += 1) {
+      await runStaleVerdictSweep(deps, 3, cursor);
+    }
+
+    // THE REGRESSION GUARD for the second finding: with an in-memory offset
+    // applied to a hard-capped page, every heartbeat asked for the same slice.
+    expect(requestedAfterSeq).toEqual([0, 8, 16]);
+    expect(new Set(requestedAfterSeq).size).toBe(requestedAfterSeq.length);
   });
 
   test('a verdict NEWER than the completion is not stale', async () => {
@@ -450,6 +494,7 @@ describe('cursor: the sweep window advances across heartbeats', () => {
       enqueued: 0,
       duplicates: 0,
       consumed: 0,
+      afterSeq: 0,
     });
   });
 });

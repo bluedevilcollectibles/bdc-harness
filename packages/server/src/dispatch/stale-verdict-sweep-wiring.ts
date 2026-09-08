@@ -20,11 +20,12 @@ import type {
   LatestCheckCompletion,
   StaleVerdictSweepDeps,
   SweepCandidate,
+  SweepCursor,
 } from './stale-verdict-sweep';
 
 export {
   DEFAULT_STALE_SWEEP_MAX,
-  resetStaleSweepCursor,
+  createMemorySweepCursor,
   resolveStaleSweepMax,
   runStaleVerdictSweep,
   verdictIsStale,
@@ -47,13 +48,22 @@ export {
  * Deduplicated by (repo, pr, head): a PR reviewed several times at one head has
  * one standing verdict, not several.
  *
- * ORDER AND OFFSET (Overseer review finding, PR #786 @939d42f7). `listMessages`
- * with neither a `subject_key` nor `status: 'queued'` orders `created_at ASC`,
- * so this walks the review queue OLDEST-FIRST and that order is stable across
- * calls -- which is what makes a numeric offset a valid cursor rather than a
- * way to skip rows. `offset` is applied to the DEDUPLICATED candidate sequence,
- * not to the raw message rows, so the caller's cursor counts the same units the
- * sweep loop consumes.
+ * KEYSET PAGINATION IN THE QUERY (Overseer review finding, PR #786 @45aa739e).
+ * An earlier version fetched one `listMessages` page -- hard-capped at 500 rows
+ * -- and applied the caller's offset to it afterwards, in memory. The live
+ * store holds ~4,900 dispatch rows and the review recipient alone already holds
+ * ~494, so the walk could never see past that first page: once the offset
+ * passed the candidates inside it, the sweep rewound and every completed review
+ * beyond row 500 was permanently unreachable. `afterSeq` is therefore pushed
+ * into the query as an exclusive lower bound on the database-assigned `seq`
+ * (migration 047), and `task_type`/`status` are filtered there too so a page of
+ * `limit` rows yields up to `limit` usable candidates instead of a handful.
+ *
+ * DEDUPE IS STILL IN MEMORY, and is safe there BECAUSE the walk is ordered and
+ * forward-only: duplicates of one (repo, pr, head) are collapsed within a page,
+ * and a duplicate that straddles a page boundary costs at most one redundant
+ * candidate on the next heartbeat -- bounded, and never a skipped row. Doing it
+ * in SQL would need a window function over a mixed-dialect schema for no gain.
  *
  * ELIGIBILITY IS NOT FILTERED HERE, and cannot be: a candidate's disposition
  * lives on a separate `pr_review_submit_receipt` row addressed to `operator`,
@@ -64,35 +74,57 @@ export {
  */
 export async function listRealSweepCandidates(
   limit: number,
-  offset = 0
+  afterSeq = 0
 ): Promise<SweepCandidate[]> {
-  // The scan window must cover the cursor's reach, not just one page, or an
-  // offset past the first 500 rows would return nothing forever. 500 is the
-  // hard cap `listMessages` enforces on its own limit.
-  const messages = await dispatch.listMessages({ recipient: REVIEW_RECIPIENT, limit: 500 });
+  // Over-fetch the raw page: dedupe and body-parse both drop rows, and the
+  // caller asked for `limit` USABLE candidates. Bounded by the DAL's own cap.
+  const messages = await dispatch.listMessagesBySeqCursor({
+    recipient: REVIEW_RECIPIENT,
+    task_type: 'run_review',
+    status: 'done',
+    afterSeq,
+    limit: Math.min(500, Math.max(limit * 4, 50)),
+  });
   const seen = new Set<string>();
   const candidates: SweepCandidate[] = [];
-  let index = 0;
   for (const message of messages) {
-    if (message.task_type !== 'run_review') continue;
-    if (message.status !== 'done') continue;
     const body = parseReviewWorkBody(message.body);
     if (!body?.owner || !body.repo || !body.prNumber || !body.headSha) continue;
     const key = `${body.owner}/${body.repo}#${body.prNumber}@${body.headSha}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    // Dedupe FIRST, then skip: the offset counts distinct candidates so it
-    // stays aligned with what the sweep loop consumes.
-    if (index++ < offset) continue;
     candidates.push({
       owner: body.owner,
       repo: body.repo,
       prNumber: body.prNumber,
       headSha: body.headSha,
+      cursorSeq: message.cursor_seq,
     });
     if (candidates.length >= limit) break;
   }
   return candidates;
+}
+
+/**
+ * The production cursor: a database row that survives archon-app-1 rebuilds.
+ *
+ * A process-local cursor rewinds to the head of the store on every restart, so
+ * a store larger than one process lifetime's worth of heartbeats would never be
+ * fully walked -- the same reason the required-contexts attempt counters had to
+ * become durable in migration 048. Both reads and writes are fail-soft inside
+ * the DAL; a cursor fault degrades to re-walking, never to a failed heartbeat.
+ */
+export function createDurableSweepCursor(): SweepCursor {
+  return {
+    read: async (): Promise<number> => {
+      const db = await import('@archon/core/db/overseer-sweep-cursor');
+      return db.readStaleSweepCursor();
+    },
+    write: async (afterSeq: number): Promise<void> => {
+      const db = await import('@archon/core/db/overseer-sweep-cursor');
+      await db.writeStaleSweepCursor(afterSeq);
+    },
+  };
 }
 
 interface CheckRunLike {
@@ -139,7 +171,7 @@ export function createRealStaleVerdictSweepDeps(config: ReviewRouteConfig): Stal
   const recheckDeps = createRealRecheckIngestDeps(config);
   const octokit = createRealOctokitClient();
   return {
-    listCandidates: (limit, offset) => listRealSweepCandidates(limit, offset),
+    listCandidates: (limit, afterSeq) => listRealSweepCandidates(limit, afterSeq),
     readStandingVerdict: candidate => recheckDeps.readStandingVerdict(candidate),
     async readLatestCheckCompletion(candidate): Promise<LatestCheckCompletion | null> {
       const runs = await octokit.checks.listForRef({

@@ -65,49 +65,67 @@ export function resolveStaleSweepMax(
   return Math.min(Math.floor(raw), 50);
 }
 
-/** One open PR the sweep may consider, as read from the local store. */
+/**
+ * One open PR the sweep may consider, as read from the local store.
+ *
+ * `cursorSeq` is the database-assigned position of the review work item this
+ * candidate came from. It is the resume token: the sweep records the highest
+ * one it consumed and the next heartbeat asks for rows strictly after it.
+ */
 export interface SweepCandidate {
   owner: string;
   repo: string;
   prNumber: number;
   headSha: string;
+  cursorSeq: number;
 }
 
 /**
- * How far into the candidate list the next heartbeat starts.
+ * Where the walk resumes, as a KEYSET rather than an array index.
  *
- * WHY A CURSOR EXISTS (Overseer review finding, PR #786 @939d42f7): the local
- * eligibility filter below REFUNDS its budget slot, so a candidate that is
- * approved or code-rejected costs nothing -- but it still consumes a slot in
- * the FETCHED ARRAY, which is only `max + CANDIDATE_LOOKAHEAD` long. With a
- * fixed window, a run of ineligible candidates at the window's start exhausted
- * the array with the budget unspent, and every subsequent heartbeat re-fetched
- * the identical rows. An eligible stale verdict sitting past the window was
- * never examined -- permanently, not just slowly.
+ * WHY A CURSOR EXISTS AT ALL (Overseer review finding, PR #786 @939d42f7): the
+ * local eligibility filter below REFUNDS its budget slot, so an approved or
+ * code-rejected candidate costs no GitHub read -- but it still consumes a slot
+ * in the fetched page. With a fixed window, a run of ineligible candidates
+ * exhausted the page with the budget unspent, and every later heartbeat
+ * re-fetched the identical rows.
  *
- * The cursor makes the window MOVE. Each heartbeat records how many candidates
- * it consumed and starts the next one there, so the sweep walks the whole store
- * across heartbeats instead of re-reading its head forever. The GitHub-read
- * bound is untouched: `max` still caps reads per heartbeat: the cursor changes
- * WHICH candidates a heartbeat sees, never HOW MANY it may touch.
+ * WHY IT IS A KEYSET AND PERSISTED (second Overseer finding, @45aa739e): the
+ * first fix used an in-memory array index against a page that `listMessages`
+ * hard-caps at 500 rows, applying the offset only AFTER that page was fetched.
+ * The live store holds ~4,900 dispatch rows, so the walk could never see past
+ * the first page: once the index passed the candidates inside it, the sweep
+ * rewound. And a process-local cursor rewinds on every archon-app-1 rebuild
+ * anyway. So the resume token is now the database-assigned `seq` of the last
+ * row consumed, pushed into the query itself and persisted across restarts --
+ * each page is a genuinely different slice of the store.
+ *
+ * The GitHub-read bound is untouched throughout: `max` still caps reads per
+ * heartbeat. The cursor changes WHICH candidates a heartbeat sees, never HOW
+ * MANY it may touch.
  */
 export interface SweepCursor {
-  /** Offset into the candidate ordering the next heartbeat resumes at. */
-  offset: number;
+  /** Read the persisted resume token, or 0 to start at the head of the store. */
+  read(): Promise<number>;
+  /** Persist the resume token reached by this heartbeat. */
+  write(afterSeq: number): Promise<void>;
 }
 
 /**
- * Process-local cursor. Deliberately in-memory rather than a database row: the
- * sweep is a backstop whose only cost of restarting at zero is re-walking a
- * bounded list a few heartbeats sooner, which is exactly the pre-cursor
- * behavior and therefore never worse. Persisting it would add a write per
- * heartbeat to buy nothing a restart does not already give back within a minute.
+ * An in-memory cursor, for tests and for any caller with no database.
+ *
+ * Production uses the durable one (`createDurableSweepCursor` in the wiring):
+ * a cursor that resets on restart cannot walk a store larger than what one
+ * process lifetime covers, which is the failure this exists to prevent.
  */
-const processCursor: SweepCursor = { offset: 0 };
-
-/** Test seam: reset the module cursor so heartbeats are independent. */
-export function resetStaleSweepCursor(): void {
-  processCursor.offset = 0;
+export function createMemorySweepCursor(initial = 0): SweepCursor {
+  let afterSeq = initial;
+  return {
+    read: async (): Promise<number> => afterSeq,
+    write: async (next: number): Promise<void> => {
+      afterSeq = next;
+    },
+  };
 }
 
 /** The latest completed check at a head, as read from GitHub. */
@@ -122,20 +140,18 @@ export interface LatestCheckCompletion {
 
 export interface StaleVerdictSweepDeps {
   /**
-   * Open PRs with a standing Overseer verdict, in a STABLE order. Reads the
-   * LOCAL dispatch store -- never GitHub -- so building the candidate set is
-   * free.
+   * Open PRs with a standing Overseer verdict, ascending by `cursorSeq`. Reads
+   * the LOCAL dispatch store -- never GitHub -- so building the candidate set
+   * is free.
    *
-   * `offset` is how many candidates to skip before returning `limit` of them:
-   * it is what lets successive heartbeats walk past a run of ineligible
-   * candidates instead of re-reading them forever. The ordering must be stable
-   * across calls or the cursor would skip rows rather than advance through
-   * them.
+   * `afterSeq` is an EXCLUSIVE lower bound pushed into the query, not an offset
+   * applied to an already-fetched page: that is what makes each page a
+   * genuinely different slice of a store far larger than any one page.
    *
-   * Returning fewer than `limit` rows means the store is exhausted at that
-   * offset, and the caller rewinds the cursor to the start.
+   * Returning fewer than `limit` rows means the walk has reached the end of the
+   * store, and the caller rewinds the cursor to the start.
    */
-  listCandidates(limit: number, offset: number): Promise<SweepCandidate[]>;
+  listCandidates(limit: number, afterSeq: number): Promise<SweepCandidate[]>;
   /** The standing verdict at that exact head, or null. Local read. */
   readStandingVerdict(candidate: SweepCandidate): Promise<StandingVerdict | null>;
   /**
@@ -170,11 +186,15 @@ export interface StaleVerdictSweepResult {
   duplicates: number;
   /**
    * Candidates this heartbeat walked past, INCLUDING the locally-ineligible
-   * ones that refunded their budget slot. This is what the cursor advances by,
-   * and it is reported so a heartbeat that spent no budget is still visibly
-   * making progress through the store.
+   * ones that refunded their budget slot. Reported so a heartbeat that spent no
+   * budget is still visibly making progress through the store.
    */
   consumed: number;
+  /**
+   * The resume token this heartbeat ended on: the `cursorSeq` of the last
+   * candidate consumed, or 0 when the walk wrapped at the end of the store.
+   */
+  afterSeq: number;
 }
 
 /**
@@ -205,12 +225,28 @@ export function verdictIsStale(
 export async function runStaleVerdictSweep(
   deps: StaleVerdictSweepDeps,
   max: number = resolveStaleSweepMax(),
-  cursor: SweepCursor = processCursor
+  cursor: SweepCursor = createMemorySweepCursor()
 ): Promise<StaleVerdictSweepResult> {
-  const result: StaleVerdictSweepResult = { examined: 0, enqueued: 0, duplicates: 0, consumed: 0 };
+  const result: StaleVerdictSweepResult = {
+    examined: 0,
+    enqueued: 0,
+    duplicates: 0,
+    consumed: 0,
+    afterSeq: 0,
+  };
   if (max <= 0) return result;
 
-  const startOffset = Math.max(0, cursor.offset);
+  let startAfterSeq: number;
+  try {
+    startAfterSeq = Math.max(0, await cursor.read());
+  } catch (error) {
+    // A cursor that cannot be read restarts the walk at the head of the store:
+    // wasteful, never wrong, and still bounded by the per-heartbeat budget.
+    log.warn({ err: error }, 'overseer_stale_verdict_sweep_cursor_read_failed');
+    startAfterSeq = 0;
+  }
+  result.afterSeq = startAfterSeq;
+
   let candidates: SweepCandidate[];
   try {
     // Ask for exactly the budget, never a multiple of it. An earlier version
@@ -229,20 +265,21 @@ export async function runStaleVerdictSweep(
     // sweepable PRs sitting just past the end. The over-fetch is bounded and
     // additive (not multiplicative), and a listed-but-never-touched candidate
     // costs nothing -- `listCandidates` is a single local query.
-    candidates = await deps.listCandidates(max + CANDIDATE_LOOKAHEAD, startOffset);
+    candidates = await deps.listCandidates(max + CANDIDATE_LOOKAHEAD, startAfterSeq);
   } catch (error) {
     log.error({ err: error }, 'overseer_stale_verdict_sweep_candidates_failed');
     return result;
   }
 
-  // EXHAUSTED AT THIS OFFSET: the cursor has walked past the end of the store.
-  // Rewind to the start so the next heartbeat re-examines from the top -- rows
-  // skipped earlier as ineligible may have acquired a new verdict since, and a
-  // cursor that only ever moved forward would stop sweeping entirely once it
-  // reached the end.
+  // END OF THE STORE: nothing remains after this cursor. Rewind so the next
+  // heartbeat starts from the head again -- rows skipped earlier as ineligible
+  // may have acquired a new verdict since, and a cursor that only ever moved
+  // forward would stop sweeping entirely once it reached the end.
   if (candidates.length === 0) {
-    if (startOffset === 0) return result;
-    cursor.offset = 0;
+    if (startAfterSeq !== 0) {
+      await safeWriteCursor(cursor, 0);
+      result.afterSeq = 0;
+    }
     return result;
   }
 
@@ -254,14 +291,20 @@ export async function runStaleVerdictSweep(
   // outcome that happens to be cheapest to reach.
   let remaining = max;
   // How many candidates this heartbeat actually walked past, ineligible ones
-  // included. This -- not the budget -- is what the cursor advances by, because
-  // the starvation being fixed is about ARRAY slots consumed, not budget spent.
+  // included -- the starvation being fixed is about page slots consumed, not
+  // budget spent.
   let consumed = 0;
+  // The resume token: the position of the LAST candidate consumed. Tracked
+  // separately from `consumed` because the cursor must be a real database
+  // position, not a count -- that is what lets the next page be a different
+  // slice of a store far larger than one page.
+  let lastSeq = startAfterSeq;
 
   for (const candidate of candidates) {
     if (remaining <= 0) break;
     remaining -= 1;
     consumed += 1;
+    lastSeq = candidate.cursorSeq;
     try {
       const verdict = await deps.readStandingVerdict(candidate);
       // Same authorization question as the webhook path, and deliberately the
@@ -331,13 +374,31 @@ export async function runStaleVerdictSweep(
     }
   }
 
-  // ADVANCE THE WINDOW by what this heartbeat actually walked, so the next one
-  // resumes past it rather than re-reading the same rows. When the fetched page
-  // was shorter than requested we were already at the end of the store, so the
-  // cursor rewinds instead of running off into offsets that return nothing.
+  // ADVANCE THE WALK to the last position actually consumed, so the next
+  // heartbeat asks for rows strictly after it rather than re-reading this
+  // slice. When the fetched page was shorter than requested AND we walked all
+  // of it, the store is exhausted, so the cursor rewinds to the head instead of
+  // running off into positions that return nothing forever.
   result.consumed = consumed;
   const pageWasShort = candidates.length < max + CANDIDATE_LOOKAHEAD;
   const reachedEndOfPage = consumed >= candidates.length;
-  cursor.offset = pageWasShort && reachedEndOfPage ? 0 : startOffset + consumed;
+  const nextAfterSeq = pageWasShort && reachedEndOfPage ? 0 : lastSeq;
+  await safeWriteCursor(cursor, nextAfterSeq);
+  result.afterSeq = nextAfterSeq;
   return result;
+}
+
+/**
+ * Persist the resume token without ever failing the heartbeat.
+ *
+ * A cursor that cannot be written leaves the sweep repeating one page, which
+ * the next successful write corrects. Losing a backstop's place is never worth
+ * taking down the review worker tick that carries the primary review path.
+ */
+async function safeWriteCursor(cursor: SweepCursor, afterSeq: number): Promise<void> {
+  try {
+    await cursor.write(afterSeq);
+  } catch (error) {
+    log.warn({ err: error, afterSeq }, 'overseer_stale_verdict_sweep_cursor_write_failed');
+  }
 }
