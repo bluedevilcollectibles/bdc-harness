@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS tm_expectations (
   max_retries INTEGER NOT NULL DEFAULT 0 CHECK (max_retries >= 0),
   retries INTEGER NOT NULL DEFAULT 0 CHECK (retries >= 0),
   status TEXT NOT NULL DEFAULT 'pending' CHECK (
-    status IN ('pending', 'met', 'failed', 'escalated', 'given_up')
+    status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
   ),
   evidence_pointer TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

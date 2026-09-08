@@ -247,6 +247,7 @@ describe('expectation supervisor', () => {
         };
         return row.retries;
       },
+      claimEscalation: async () => true,
       markEscalated: async () => {
         row = { ...row, status: 'escalated' };
       },
@@ -464,6 +465,7 @@ describe('expectation supervisor', () => {
       listDueExpectations: async () => [lastAttemptCrashed],
       checkEvidence: async () => ({ ok: false, pointer: null }),
       markFailed: async () => true,
+      claimEscalation: async () => true,
       markEscalated: async () => {
         escalations.push('escalated');
         return true;
@@ -508,10 +510,14 @@ describe('expectation supervisor', () => {
         status: 'queued',
         createdAt: new Date(0).toISOString(),
       }),
-      markEscalated: async () => {
-        order.push('markEscalated');
+      claimEscalation: async () => {
+        order.push('claimEscalation');
         // Conditional on the active set: the row is now 'met', so this loses.
         return rowClosedAsMet ? false : true;
+      },
+      markEscalated: async () => {
+        order.push('markEscalated');
+        return true;
       },
       getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
       createTask: async (_context, data) => {
@@ -524,11 +530,12 @@ describe('expectation supervisor', () => {
     // NO escalation dispatch row is created. Fails on the old behaviour, which
     // sent first and only then discovered the transition was lost.
     expect(keys).toEqual([]);
-    // And the transition is acquired BEFORE any send is attempted.
-    expect(order).toEqual(['markFailed', 'markEscalated']);
+    // The claim is acquired BEFORE any send is attempted, and losing it stops
+    // the tick before both the send and the terminal confirm.
+    expect(order).toEqual(['markFailed', 'claimEscalation']);
   });
 
-  test('a won escalation acquires the terminal transition before it sends', async () => {
+  test('a won escalation claims, then sends, then confirms', async () => {
     const order: string[] = [];
     const exhausted: TmExpectation = { ...base, retries: 2, max_retries: 2, status: 'failed' };
     await checkExpectations(new Date(), {
@@ -540,6 +547,10 @@ describe('expectation supervisor', () => {
         status: 'queued',
         createdAt: new Date(0).toISOString(),
       }),
+      claimEscalation: async () => {
+        order.push('claimEscalation');
+        return true;
+      },
       markEscalated: async () => {
         order.push('markEscalated');
         return true;
@@ -551,7 +562,160 @@ describe('expectation supervisor', () => {
       },
       retryDelayMs: 0,
     } as never);
-    expect(order).toEqual(['markEscalated', 'send:tm:expectation:expectation-1:escalate']);
+    // The terminal transition comes LAST, only once the send is confirmed.
+    expect(order).toEqual([
+      'claimEscalation',
+      'send:tm:expectation:expectation-1:escalate',
+      'markEscalated',
+    ]);
+  });
+
+  test('an escalation send that throws is replayed by the next tick, exactly once', async () => {
+    // THE ROUND-5 FINDING. Marking the row terminal before the send meant a
+    // send that threw left a terminal row that listDueExpectations would never
+    // select again -- the escalation was lost forever. The intermediate
+    // 'escalating' state stays selectable so the tick can finish it.
+    const sends: string[] = [];
+    const operatorTasks = new Set<string>();
+    let status: TmExpectation['status'] = 'failed';
+    let failNextSend = true;
+    const deps = {
+      listDueExpectations: async () =>
+        status === 'escalated' ? [] : [{ ...base, retries: 2, max_retries: 2, status }],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      findEffectByIdempotencyKey: async () => ({
+        id: 'sent-2',
+        status: 'queued',
+        createdAt: new Date(0).toISOString(),
+      }),
+      claimEscalation: async () => {
+        status = 'escalating';
+        return true;
+      },
+      markEscalated: async () => {
+        status = 'escalated';
+        return true;
+      },
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context: never, data: { idempotency_key: string }) => {
+        sends.push(data.idempotency_key);
+        if (failNextSend) {
+          failNextSend = false;
+          throw new Error('dispatch unavailable');
+        }
+        // Deterministic key: the dispatch DAL dedupes, so a replay of a send
+        // that DID land would reuse the row rather than create a second task.
+        operatorTasks.add(data.idempotency_key);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    };
+
+    // Tick 1: claim wins, send throws. The row is left 'escalating', NOT
+    // terminal, and no operator task exists yet.
+    await expect(checkExpectations(new Date(), deps as never)).rejects.toThrow(
+      'dispatch unavailable'
+    );
+    expect(status).toBe('escalating');
+    expect(operatorTasks.size).toBe(0);
+
+    // Tick 2: the row is still selected, the send is replayed under the SAME
+    // deterministic key, and only now does the row go terminal.
+    await checkExpectations(new Date(), deps as never);
+    expect(status).toBe('escalated');
+    expect([...operatorTasks]).toEqual(['tm:expectation:expectation-1:escalate']);
+
+    // Tick 3: terminal, so nothing more happens.
+    await checkExpectations(new Date(), deps as never);
+    expect(sends).toEqual([
+      'tm:expectation:expectation-1:escalate',
+      'tm:expectation:expectation-1:escalate',
+    ]);
+    // EXACTLY ONE operator task exists across the whole arc.
+    expect(operatorTasks.size).toBe(1);
+  });
+
+  test('a replayed escalation does not re-claim, re-fail, or burn a retry', async () => {
+    // An 'escalating' row goes straight to the replay: past the deadline check,
+    // past redispatch recovery, past markFailed and the give-up branch. Those
+    // decisions were already made when the escalation was claimed.
+    const calls: string[] = [];
+    const escalating: TmExpectation = {
+      ...base,
+      retries: 2,
+      max_retries: 2,
+      status: 'escalating',
+      // Deliberately NOT yet due: an owed escalation ignores the deadline.
+      due_at: new Date(Date.now() + 3_600_000).toISOString(),
+    };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [escalating],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => {
+        calls.push('markFailed');
+        return true;
+      },
+      claimEscalation: async () => {
+        calls.push('claimEscalation');
+        return true;
+      },
+      claimRedispatchAttempt: async () => {
+        calls.push('claimRedispatchAttempt');
+        return 3;
+      },
+      claimRecoveryReplay: async () => {
+        calls.push('claimRecoveryReplay');
+        return true;
+      },
+      markEscalated: async () => {
+        calls.push('markEscalated');
+        return true;
+      },
+      getMessage: async () => ({ id: 'original', correlation_id: 'c1' }) as never,
+      createTask: async (_context, data) => {
+        calls.push(`send:${data.idempotency_key}`);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    } as never);
+    // No re-claim, no markFailed, no retry burned -- just the replay and the
+    // terminal confirm.
+    expect(calls).toEqual(['send:tm:expectation:expectation-1:escalate', 'markEscalated']);
+  });
+
+  test('evidence arriving while escalating still closes the row as met', async () => {
+    // An escalation being owed does not override real evidence: if the work
+    // succeeded after all, met wins and no blocker is sent.
+    const calls: string[] = [];
+    const escalating: TmExpectation = {
+      ...base,
+      retries: 2,
+      max_retries: 2,
+      status: 'escalating',
+    };
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [escalating],
+      checkEvidence: async () => ({ ok: true, pointer: 'https://example/proof' }),
+      markMet: async () => {
+        calls.push('markMet');
+        return true;
+      },
+      claimEscalation: async () => {
+        calls.push('claimEscalation');
+        return true;
+      },
+      markEscalated: async () => {
+        calls.push('markEscalated');
+        return true;
+      },
+      createTask: async (_context, data) => {
+        calls.push(`send:${data.idempotency_key}`);
+        return { id: 'd' } as never;
+      },
+      retryDelayMs: 0,
+    } as never);
+    expect(calls).toEqual(['markMet']);
   });
 
   test('recovery advances the deadline, so a tick inside the interval does nothing', async () => {
@@ -579,6 +743,7 @@ describe('expectation supervisor', () => {
         claims.push('markFailed');
         return true;
       },
+      claimEscalation: async () => true,
       markEscalated: async () => {
         claims.push('markEscalated');
         return true;
@@ -657,6 +822,7 @@ describe('expectation supervisor', () => {
       listDueExpectations: async () => [exhausted],
       checkEvidence: async () => ({ ok: false, pointer: null }),
       markFailed: async () => true,
+      claimEscalation: async () => true,
       markEscalated: async () => {
         escalations.push('escalated');
         return true;
@@ -700,6 +866,7 @@ describe('expectation supervisor', () => {
       listDueExpectations: async () => [row],
       checkEvidence: async () => ({ ok: false, pointer: null }),
       markFailed: async () => true,
+      claimEscalation: async () => true,
       markEscalated: async () => {
         escalations.push('escalated');
         return true;

@@ -34,7 +34,21 @@ export type TmPauseState = 'RUNNING' | 'PAUSED' | 'HARD_PAUSE';
 export type TmHealthState = 'healthy' | 'degraded' | 'dark' | 'unknown';
 export type TmUsageConfidence = 'high' | 'low' | 'none';
 export type TmExpectationAbsence = 'redispatch' | 'escalate' | 'give_up';
-export type TmExpectationStatus = 'pending' | 'met' | 'failed' | 'escalated' | 'given_up';
+/**
+ * `escalating` is an intermediate, NON-terminal state: the tick has exclusively
+ * claimed the right to send the operator escalation but the send is not yet
+ * confirmed. It remains selectable by listDueExpectations precisely so a send
+ * that threw (or a process that died mid-send) is replayed on a later tick
+ * under the deterministic escalation key. Only a confirmed send advances it to
+ * the terminal `escalated`.
+ */
+export type TmExpectationStatus =
+  | 'pending'
+  | 'met'
+  | 'failed'
+  | 'escalating'
+  | 'escalated'
+  | 'given_up';
 
 export interface TmExpectation {
   id: string;
@@ -176,10 +190,18 @@ export async function registerExpectation(data: {
   return id;
 }
 
-/** Active expectations are returned even before due_at so success can close early. */
+/**
+ * Active expectations are returned even before due_at so success can close early.
+ *
+ * `escalating` is included deliberately. It is the claimed-but-unconfirmed
+ * escalation state, and a row sitting there means a send was authorized but may
+ * never have gone out (it threw, or the process died). Leaving it unselected is
+ * exactly how an escalation gets permanently lost, so the tick must keep seeing
+ * it until the send is confirmed.
+ */
 export async function listDueExpectations(_now: string): Promise<TmExpectation[]> {
   const result = await getDatabase().query<TmExpectation>(
-    "SELECT * FROM tm_expectations WHERE status IN ('pending', 'failed') ORDER BY due_at ASC"
+    "SELECT * FROM tm_expectations WHERE status IN ('pending', 'failed', 'escalating') ORDER BY due_at ASC"
   );
   return result.rows.map(normalizeExpectation);
 }
@@ -363,12 +385,45 @@ export async function claimRecoveryReplay(
 }
 
 /**
- * Close an expectation as escalated to a human. Conditioned on the row still
- * being active so a tick cannot escalate an expectation another tick has
- * already verified as met. Returns false when the row was already closed.
+ * CLAIM the right to send the operator escalation, without closing the row.
+ *
+ * This is the first half of a two-phase escalation, and it exists because both
+ * single-phase orderings are broken:
+ *
+ *  - send THEN transition: a worker that loses the transition has already put
+ *    an operator blocker on the wire and cannot retract it.
+ *  - transition THEN send: the row is terminal the instant the transition
+ *    commits, so a send that throws (or a crash right after) loses the
+ *    escalation forever -- listDueExpectations would never select it again.
+ *
+ * Claiming an intermediate NON-terminal `escalating` state gives both
+ * guarantees at once: it is exclusive (conditional on the active set, so a
+ * worker racing a concurrent markMet loses and never sends), and it is still
+ * selectable, so an unconfirmed send is replayed by a later tick under the
+ * deterministic escalation key. Returns false when the claim was lost.
+ */
+export async function claimEscalation(id: string, evidencePointer?: string): Promise<boolean> {
+  return transitionExpectation(id, 'escalating', ACTIVE_EXPECTATION_STATUSES, evidencePointer);
+}
+
+/**
+ * Close an expectation as escalated to a human -- the second half of the
+ * two-phase escalation, run only once the operator notification is CONFIRMED
+ * sent.
+ *
+ * Accepts the active set as well as `escalating` so that a tick which claimed
+ * and sent in one pass can close the row, and so a replay tick can close a row
+ * another worker left in `escalating`. The escalation dispatch is written under
+ * a deterministic idempotency key, so a replay reuses the existing row rather
+ * than creating a second operator task.
  */
 export async function markEscalated(id: string, evidencePointer?: string): Promise<boolean> {
-  return transitionExpectation(id, 'escalated', ACTIVE_EXPECTATION_STATUSES, evidencePointer);
+  return transitionExpectation(
+    id,
+    'escalated',
+    [...ACTIVE_EXPECTATION_STATUSES, 'escalating'],
+    evidencePointer
+  );
 }
 
 /**
@@ -385,6 +440,7 @@ export async function getExpectationCounts(): Promise<Record<TmExpectationStatus
     pending: 0,
     met: 0,
     failed: 0,
+    escalating: 0,
     escalated: 0,
     given_up: 0,
   };

@@ -63,6 +63,12 @@ export interface ExpectationDeps {
     dueAt: string,
     expectedDueAt: string
   ) => Promise<boolean | undefined>;
+  /**
+   * Claims the right to send the operator escalation by moving the row to the
+   * intermediate non-terminal 'escalating' state. Exclusive, so a worker that
+   * loses it never sends.
+   */
+  claimEscalation?: (id: string, evidencePointer?: string) => Promise<boolean | undefined>;
   markEscalated?: (id: string, evidencePointer?: string) => Promise<boolean | undefined>;
   markGivenUp?: (id: string, reason: string) => Promise<boolean | undefined>;
   getMessage?: (id: string) => Promise<DispatchMessage | null>;
@@ -305,7 +311,15 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         log.warn({ expectationId: expectation.id }, 'taskmaster.expectation_met_transition_lost');
       continue;
     }
-    if (now.getTime() < Date.parse(expectation.due_at)) continue;
+    // An 'escalating' row is an escalation this system already authorized and
+    // owes: the claim was won, but the send was never confirmed. It must go
+    // straight to the replay -- past the deadline check (the deadline is long
+    // gone and irrelevant now) and past redispatch recovery (the retry budget
+    // is spent; that is why it is escalating at all). Falling through either of
+    // those is how the owed escalation would be lost.
+    if (expectation.status !== 'escalating') {
+      if (now.getTime() < Date.parse(expectation.due_at)) continue;
+    }
 
     // RECOVERY FIRST, AND INDEPENDENT OF CLAIMING ANYTHING.
     //
@@ -327,7 +341,11 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
     // can have elapsed on it. Recovery therefore precedes markFailed, replays
     // the key, and stops the tick there; the evidence deadline is re-judged on
     // a later tick against an attempt that was actually dispatched.
-    if (expectation.on_absence === 'redispatch' && expectation.retries > 0) {
+    if (
+      expectation.status !== 'escalating' &&
+      expectation.on_absence === 'redispatch' &&
+      expectation.retries > 0
+    ) {
       const claimedKey = redispatchKey(expectation.id, expectation.retries);
       const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
       let alreadySent: boolean;
@@ -389,24 +407,40 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       }
     }
 
-    // EVERY follow-on action below is gated on winning this transition. A tick
-    // that loses it is stale: another tick has already marked this expectation
-    // met, escalated or given up, and acting on a snapshot taken before that
-    // would regress a terminal state and fire an external action (a redispatch
-    // or an operator escalation) for work that is already closed.
-    const claimedFailure = await (deps.markFailed ?? taskmasterDb.markFailed)(expectation.id);
-    if (claimedFailure === false) {
-      log.warn({ expectationId: expectation.id }, 'taskmaster.expectation_failed_transition_lost');
-      continue;
+    // An 'escalating' row skips the failure/give-up/redispatch decisions
+    // entirely: that decision was already made and the escalation was already
+    // claimed, so the only thing owed is the replay below. Note markFailed
+    // would refuse it anyway ('escalating' is not in the active set), but
+    // falling through would log a misleading transition-lost and `continue`,
+    // which is precisely how the owed escalation would be dropped.
+    if (expectation.status !== 'escalating') {
+      // EVERY follow-on action below is gated on winning this transition. A
+      // tick that loses it is stale: another tick has already marked this
+      // expectation met, escalated or given up, and acting on a snapshot taken
+      // before that would regress a terminal state and fire an external action
+      // (a redispatch or an operator escalation) for work that is already
+      // closed.
+      const claimedFailure = await (deps.markFailed ?? taskmasterDb.markFailed)(expectation.id);
+      if (claimedFailure === false) {
+        log.warn(
+          { expectationId: expectation.id },
+          'taskmaster.expectation_failed_transition_lost'
+        );
+        continue;
+      }
+      if (expectation.on_absence === 'give_up') {
+        await (deps.markGivenUp ?? taskmasterDb.markGivenUp)(
+          expectation.id,
+          'evidence absent at deadline'
+        );
+        continue;
+      }
     }
-    if (expectation.on_absence === 'give_up') {
-      await (deps.markGivenUp ?? taskmasterDb.markGivenUp)(
-        expectation.id,
-        'evidence absent at deadline'
-      );
-      continue;
-    }
-    if (expectation.on_absence === 'redispatch' && expectation.retries < expectation.max_retries) {
+    if (
+      expectation.status !== 'escalating' &&
+      expectation.on_absence === 'redispatch' &&
+      expectation.retries < expectation.max_retries
+    ) {
       const original = await (deps.getMessage ?? getMessage)(expectation.dispatch_ref);
       if (!original) {
         log.error({ expectationId: expectation.id }, 'taskmaster.expectation_dispatch_missing');
@@ -452,35 +486,47 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
       );
       continue;
     }
-    // ACQUIRE THE TERMINAL TRANSITION BEFORE SENDING, NOT AFTER.
+    // TWO-PHASE ESCALATION: claim -> send -> confirm.
     //
-    // markFailed is NOT an exclusive claim: 'failed' is itself in the active
-    // set, so failed -> failed succeeds and two workers can both pass it. Nor
-    // does winning it lock the row -- markMet permits failed -> met. So a
-    // worker could win markFailed, have a concurrent worker verify the evidence
-    // and mark the row met, and STILL put an operator blocker on the wire; the
-    // losing markEscalated afterwards could not retract that external action.
+    // Both single-phase orderings are broken, in mirror-image ways:
     //
-    // markEscalated IS exclusive (active -> escalated, conditional). Taking it
-    // first makes the terminal state the gate on the send: a worker that loses
-    // it never dispatches anything. Ordering an irreversible external action
-    // after the transition that authorizes it is the general rule here -- the
-    // same reason the redispatch claim precedes its send.
+    //  - send THEN transition: markFailed is not an exclusive claim ('failed'
+    //    is itself in the active set, so failed -> failed succeeds) and winning
+    //    it does not lock the row (markMet permits failed -> met). A worker
+    //    could therefore put an operator blocker on the wire for an expectation
+    //    another worker had already verified, and the losing transition
+    //    afterwards could not retract that external action.
+    //  - transition THEN send: the row is terminal the instant the transition
+    //    commits, so a send that throws -- or a crash right after it -- loses
+    //    the escalation forever, because listDueExpectations would never select
+    //    the row again.
+    //
+    // Claiming the intermediate NON-terminal 'escalating' state gives both
+    // guarantees at once. The claim is exclusive, so a worker that loses it
+    // never sends; and 'escalating' is still selectable, so an unconfirmed send
+    // is replayed on a later tick under the deterministic escalation key --
+    // which the dispatch DAL dedupes, so exactly one operator task exists.
+    // Only a confirmed send advances the row to terminal 'escalated'.
+    //
+    // This is the same shape the redispatch path already uses: claim a
+    // non-terminal state, act, and let the tick finish an unconfirmed action.
     const escalationPointer = `tm:expectation:${expectation.id}:escalate`;
-    const escalated = await (deps.markEscalated ?? taskmasterDb.markEscalated)(
-      expectation.id,
-      escalationPointer
-    );
-    if (escalated === false) {
-      log.warn(
-        { expectationId: expectation.id },
-        'taskmaster.expectation_escalated_transition_lost'
+    if (expectation.status !== 'escalating') {
+      const claimed = await (deps.claimEscalation ?? taskmasterDb.claimEscalation)(
+        expectation.id,
+        escalationPointer
       );
-      continue;
+      if (claimed === false) {
+        log.warn(
+          { expectationId: expectation.id },
+          'taskmaster.expectation_escalated_transition_lost'
+        );
+        continue;
+      }
     }
-    // Deterministic key: if this send throws, the next tick cannot re-send it
-    // (the row is already terminal), so the escalation is recorded by pointer
-    // and the key is stable for any manual replay.
+    // If this send throws, the row stays 'escalating' and a later tick replays
+    // it under this same deterministic key. Nothing is lost and nothing is
+    // duplicated.
     await (deps.createTask ?? createAuthenticatedMessage)(
       { kind: 'system', sender: 'taskmaster' },
       {
@@ -492,6 +538,15 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         body: `Taskmaster expectation exhausted: ${JSON.stringify(expectation)}`,
       }
     );
+    // Confirmed sent: close the row.
+    const escalated = await (deps.markEscalated ?? taskmasterDb.markEscalated)(
+      expectation.id,
+      escalationPointer
+    );
+    if (escalated === false) {
+      log.warn({ expectationId: expectation.id }, 'taskmaster.expectation_escalated_confirm_lost');
+      continue;
+    }
     log.error({ expectationId: expectation.id }, 'taskmaster.expectation_escalated');
   }
 }

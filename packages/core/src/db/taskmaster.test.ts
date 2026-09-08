@@ -42,6 +42,7 @@ import {
   markFailed,
   claimRedispatchAttempt,
   claimRecoveryReplay,
+  claimEscalation,
   markEscalated,
   markGivenUp,
   getExpectationCounts,
@@ -325,6 +326,72 @@ describe('tm_expectations DAL', () => {
     expect(
       await claimRecoveryReplay(id, 1, new Date().toISOString(), new Date(0).toISOString())
     ).toBe(false);
+  });
+
+  test('claimEscalation is exclusive and leaves the row selectable for replay', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-escalating',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    const [a, b] = await Promise.all([
+      claimEscalation(id, 'tm:expectation:x:escalate'),
+      claimEscalation(id, 'tm:expectation:x:escalate'),
+    ]);
+    // Exclusive: a worker that loses never sends.
+    expect([a, b].filter(Boolean)).toHaveLength(1);
+    const row = await db.query<{ status: string }>(
+      'SELECT status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('escalating');
+    // NOT terminal: the tick must still see it so an unconfirmed send is
+    // replayed rather than lost.
+    const due = await listDueExpectations(new Date().toISOString());
+    expect(due.map(r => r.id)).toContain(id);
+  });
+
+  test('markEscalated closes an escalating row, and escalating blocks a stale failure', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-escalating-close',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    expect(await claimEscalation(id, 'tm:expectation:y:escalate')).toBe(true);
+    // A stale worker cannot drag a claimed escalation back to failed.
+    expect(await markFailed(id)).toBe(false);
+    // The confirm closes it.
+    expect(await markEscalated(id, 'tm:expectation:y:escalate')).toBe(true);
+    const row = await db.query<{ status: string }>(
+      'SELECT status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('escalated');
+    // Terminal: gone from the due list, and no further transition succeeds.
+    const due = await listDueExpectations(new Date().toISOString());
+    expect(due.map(r => r.id)).not.toContain(id);
+    expect(await markEscalated(id, 'again')).toBe(false);
+  });
+
+  test('claimEscalation is refused once the expectation is met', async () => {
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-escalate-after-met',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    expect(await markMet(id, 'https://example/proof')).toBe(true);
+    // The round-4 guarantee, preserved: a worker racing a verification loses
+    // the claim and therefore never sends the blocker.
+    expect(await claimEscalation(id, 'tm:expectation:z:escalate')).toBe(false);
   });
 
   test('the claim refuses to exceed max_retries', async () => {
