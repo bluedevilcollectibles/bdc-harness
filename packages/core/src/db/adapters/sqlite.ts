@@ -587,6 +587,13 @@ export class SqliteAdapter implements IDatabase {
       }
 
       // Backfill in rowid order -- the order the rows were actually inserted.
+      //
+      // This heals NULL seq at every open, but it is NOT sufficient on its own:
+      // a raw/fixture/import insert can land AFTER this ran and before the next
+      // open. That is why the read path orders by COALESCE(seq, rowid) and
+      // seqValueExpression() takes MAX over COALESCE(seq, rowid) -- read scale,
+      // write scale and this backfill all agree on rowid as the fallback, so a
+      // NULL-seq row can never tie or outrank a later normal insert.
       this.db.run('UPDATE agent_dispatch_messages SET seq = rowid WHERE seq IS NULL');
 
       // Retired: an AFTER INSERT trigger populated the stored row, but SQLite

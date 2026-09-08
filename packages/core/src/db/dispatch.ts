@@ -441,11 +441,20 @@ export async function createAuthenticatedMessage(
  * INSERT -- which is what makes the order correct across concurrent writers and
  * restarts, as a client clock cannot be -- and both are visible to RETURNING *,
  * unlike an AFTER INSERT trigger.
+ *
+ * The SQLite maximum is taken over COALESCE(seq, rowid), NOT over seq alone.
+ * Review finding (Overseer, PR #800): the write scale and the read scale must
+ * be the SAME scale. Newest-first reads order by COALESCE(seq, rowid), so a
+ * raw/fixture/import row inserted with seq = NULL has an effective ordering
+ * value of its rowid. Computing the next seq from MAX(seq) alone ignored those
+ * rows, so a NULL-seq row with a high rowid could tie or outrank the next
+ * normally-inserted row -- an undefined tie, breaking the total order this
+ * column exists to guarantee.
  */
 function seqValueExpression(): string {
   return getDatabase().dialect === 'postgres'
     ? 'DEFAULT'
-    : '(SELECT COALESCE(MAX(seq), 0) + 1 FROM agent_dispatch_messages)';
+    : '(SELECT COALESCE(MAX(COALESCE(seq, rowid)), 0) + 1 FROM agent_dispatch_messages)';
 }
 
 /**

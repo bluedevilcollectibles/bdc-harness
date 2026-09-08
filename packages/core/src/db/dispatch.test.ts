@@ -2235,6 +2235,71 @@ describe('dispatch db', () => {
       return message.id;
     }
 
+    /**
+     * Write scale and read scale must be the SAME scale.
+     *
+     * Review finding (Overseer, PR #800): newest-first reads order by
+     * COALESCE(seq, rowid), so a raw/fixture/import row inserted with
+     * seq = NULL has an effective ordering value of its rowid. Computing the
+     * next seq from MAX(seq) alone ignored those rows entirely, so a NULL-seq
+     * row with a high rowid could tie or outrank the next normally-inserted
+     * row -- an undefined tie in the total order this column exists to
+     * guarantee.
+     *
+     * Runs against the real SqliteAdapter, not a double: the bug lives in the
+     * SQL expression, so only real SQL can pin it.
+     */
+    test('a normal insert outranks a raw NULL-seq row, by seq and by read order', async () => {
+      // A writer that bypasses createMessage entirely -- fixture, import, or
+      // hand-written SQL -- leaving seq NULL.
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+           (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, seq)
+         VALUES ($1, $2, $3, 'run_report', 'overseer', 'operator', '{}', 'queued', $4, NULL)`,
+        [
+          '11111111-1111-4111-8111-111111111111',
+          'pr-review:o/r#903@raw',
+          'idem-raw-null-seq',
+          '2026-09-08T00:00:00.000Z',
+        ]
+      );
+      const rawRow = await db.query<{ rowid: number; seq: number | null }>(
+        `SELECT rowid, seq FROM agent_dispatch_messages WHERE id = $1`,
+        ['11111111-1111-4111-8111-111111111111']
+      );
+      const rawRowid = rawRow.rows[0]!.rowid;
+      // Premise guard: the row really is NULL-seq, so the read path falls back
+      // to its rowid. Without this the test could pass vacuously.
+      expect(rawRow.rows[0]!.seq).toBeNull();
+
+      const later = await createMessage({
+        correlation_id: 'pr-review:o/r#903@normal',
+        idempotency_key: 'idem-after-raw',
+        task_type: 'run_report',
+        sender: 'overseer',
+        recipient: 'operator',
+        body: 'written through createMessage',
+      });
+      const laterRow = await db.query<{ seq: number }>(
+        `SELECT seq FROM agent_dispatch_messages WHERE id = $1`,
+        [later.id]
+      );
+
+      // STRICTLY greater than the raw row's effective ordering value, not equal
+      // to it -- equality is the undefined tie this fix removes.
+      expect(laterRow.rows[0]!.seq).toBeGreaterThan(rawRowid);
+
+      // And the read path agrees: the later write comes back first.
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#903@',
+      });
+      expect(found.map(message => message.id)).toEqual([
+        later.id,
+        '11111111-1111-4111-8111-111111111111',
+      ]);
+    });
+
     test('returns only subject_key-less rows matching the prefix, newest-first', async () => {
       const first = await legacyReceipt('a', 'pr-review:thinmansoftware/bdc-harness#800@aaa');
       const second = await legacyReceipt('b', 'pr-review:thinmansoftware/bdc-harness#800@bbb');
