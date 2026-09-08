@@ -438,6 +438,33 @@ export class SqliteAdapter implements IDatabase {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_session_columns_failed');
     }
 
+    // Taskmaster expectation registration key (migration 049). CREATE TABLE IF
+    // NOT EXISTS will not add the column to a database that already carries an
+    // earlier shape of tm_expectations, so backfill it and enforce the
+    // uniqueness that makes registration idempotent. The backfill uses the
+    // dispatch_ref, which is the identity for rows written before action_ref
+    // existed.
+    try {
+      const expectationCols = this.pragmaAll("PRAGMA table_info('tm_expectations')") as {
+        name: string;
+      }[];
+      if (expectationCols.length > 0) {
+        const expectationColNames = new Set(expectationCols.map(c => c.name));
+        if (!expectationColNames.has('registration_key')) {
+          this.db.run('ALTER TABLE tm_expectations ADD COLUMN registration_key TEXT');
+          this.db.run(
+            'UPDATE tm_expectations SET registration_key = dispatch_ref WHERE registration_key IS NULL'
+          );
+        }
+        this.db.run(
+          `CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key
+             ON tm_expectations(registration_key)`
+        );
+      }
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_tm_expectations_columns_failed');
+    }
+
     // Dispatch board-motion and agent messaging columns
     try {
       const boardColumns: [string, string][] = [
@@ -1887,6 +1914,11 @@ export class SqliteAdapter implements IDatabase {
       -- Taskmaster expectation registry (migration 049).
       CREATE TABLE IF NOT EXISTS tm_expectations (
         id TEXT PRIMARY KEY,
+        -- Stable identity for the causing work, normally
+        -- "<journal action id>:<dispatch_ref>". UNIQUE so a replayed action
+        -- cannot register a second expectation for the same dispatch (mirror
+        -- of migration 049).
+        registration_key TEXT NOT NULL UNIQUE,
         dispatch_ref TEXT NOT NULL,
         recipient TEXT NOT NULL,
         evidence_json TEXT NOT NULL,

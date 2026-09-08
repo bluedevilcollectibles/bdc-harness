@@ -462,6 +462,9 @@ describe('expectation registry tick wiring', () => {
     expect(registered).toHaveLength(1);
     expect(registered[0]?.dispatch_ref).toBe('msg-1');
     expect(registered[0]?.on_absence).toBe('escalate');
+    // The journal action id is the other half of the deterministic identity;
+    // without it a replayed action would register a second expectation.
+    expect(registered[0]?.action_ref).toBeTruthy();
     const digest = world.sentMessages.find(message =>
       message.idempotency_key.startsWith('tm:digest:')
     );
@@ -728,6 +731,9 @@ describe('fire_cauldron loop', () => {
       expect(registered).toHaveLength(1);
       expect(registered[0]?.dispatch_ref).toBe('cascade-501');
       expect(registered[0]?.evidence_json).toContain('remote_agent_workflow_runs');
+      // Deterministic identity: the journal action id is passed so a replayed
+      // fire reuses this expectation instead of registering a second one.
+      expect(registered[0]?.action_ref).toBe(fires[0]?.id);
 
       // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching only on
       // the admission row's existence is self-fulfilling -- admission creates

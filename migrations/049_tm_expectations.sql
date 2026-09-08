@@ -1,6 +1,13 @@
 -- Taskmaster expectation registry (WO-HARNESS-TASKMASTER-EXPECTATION-REGISTRY-01).
 CREATE TABLE IF NOT EXISTS tm_expectations (
   id UUID PRIMARY KEY,
+  -- Stable identity for the work that caused this expectation, normally
+  -- "<journal action id>:<dispatch_ref>". UNIQUE so that replaying an action
+  -- after a crash between the dispatch and the journal finalization cannot
+  -- register a second expectation for the same dispatch: a duplicate would
+  -- carry a different id, and therefore different retry and escalation
+  -- idempotency keys, producing duplicate external work.
+  registration_key TEXT NOT NULL UNIQUE,
   dispatch_ref TEXT NOT NULL,
   recipient TEXT NOT NULL,
   evidence_json TEXT NOT NULL,

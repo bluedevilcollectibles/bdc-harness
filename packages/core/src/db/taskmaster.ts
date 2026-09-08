@@ -161,6 +161,37 @@ function normalizeExpectation(row: TmExpectation): TmExpectation {
   };
 }
 
+/**
+ * Stable identity for one expectation, derived from the work that caused it.
+ *
+ * `registration_key` is what makes registration idempotent. It is NOT the
+ * random row id: a UUID differs on every call, so replaying an action after a
+ * crash between the dispatch and the journal finalization used to register a
+ * SECOND expectation for the same dispatch -- with a different id, and
+ * therefore different retry and escalation idempotency keys, which is duplicate
+ * external work rather than a harmless duplicate row.
+ *
+ * The pair (action_ref, dispatch_ref) is the identity: the same journal action
+ * dispatching the same thing is the same expectation, however many times the
+ * tick replays it. Callers without a journal action pass the dispatch_ref alone.
+ */
+export function expectationRegistrationKey(actionRef: string | null, dispatchRef: string): string {
+  return actionRef ? `${actionRef}:${dispatchRef}` : dispatchRef;
+}
+
+/**
+ * Register an expectation IDEMPOTENTLY.
+ *
+ * Two mechanisms, deliberately both: a deterministic identity (see
+ * expectationRegistrationKey) AND a database-enforced UNIQUE index on it, so
+ * the invariant survives a caller that forgets to pass action_ref and holds
+ * under concurrent ticks rather than depending on read-then-write timing.
+ *
+ * INSERT ... ON CONFLICT DO NOTHING RETURNING gives the existing row's id back
+ * on a replay, so the caller's retry/escalation keys stay identical across
+ * attempts. Returns the id of the expectation that now exists -- new or
+ * pre-existing.
+ */
 export async function registerExpectation(data: {
   dispatch_ref: string;
   recipient: string;
@@ -168,16 +199,22 @@ export async function registerExpectation(data: {
   due_at: string;
   on_absence: TmExpectationAbsence;
   max_retries: number;
+  /** Journal action id, when the registration is caused by one. */
+  action_ref?: string | null;
 }): Promise<string> {
-  const id = randomUUID();
+  const registrationKey = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+  const db = getDatabase();
   const now = new Date().toISOString();
-  await getDatabase().query(
+  const inserted = await db.query<{ id: string }>(
     `INSERT INTO tm_expectations
-     (id, dispatch_ref, recipient, evidence_json, due_at, on_absence, max_retries,
-      retries, status, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'pending', $8, $8)`,
+     (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
+      max_retries, retries, status, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $9)
+     ON CONFLICT (registration_key) DO NOTHING
+     RETURNING id`,
     [
-      id,
+      randomUUID(),
+      registrationKey,
       data.dispatch_ref,
       data.recipient,
       data.evidence_json,
@@ -187,7 +224,18 @@ export async function registerExpectation(data: {
       now,
     ]
   );
-  return id;
+  const row = inserted.rows[0];
+  if (row) return row.id;
+  // The conflict fired: an expectation for this exact work already exists.
+  // Return ITS id so every downstream key matches the first registration.
+  const existing = await db.query<{ id: string }>(
+    'SELECT id FROM tm_expectations WHERE registration_key = $1',
+    [registrationKey]
+  );
+  const existingRow = existing.rows[0];
+  if (!existingRow)
+    throw new Error('tm_expectations registration conflict without an existing row');
+  return existingRow.id;
 }
 
 /**

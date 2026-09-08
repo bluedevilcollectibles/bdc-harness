@@ -1613,6 +1613,11 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         const registerExpectation =
           dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
         await registerExpectation?.({
+          // Deterministic identity: replaying this journal action after a crash
+          // between the cascade admission and updateActionOutcome reuses the
+          // SAME expectation rather than registering a second one with
+          // different retry/escalation keys.
+          action_ref: journalRow.id,
           dispatch_ref: admitted.cascadeId,
           recipient: proposal.recipient,
           // The evidence must be a TERMINAL, SUCCESSFUL outcome. Matching on
@@ -1652,6 +1657,8 @@ export async function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): P
         const registerExpectation =
           dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
         await registerExpectation?.({
+          // Deterministic identity -- see the cascade branch above.
+          action_ref: journalRow.id,
           dispatch_ref: dispatched.id,
           recipient: proposal.recipient,
           evidence_json: JSON.stringify({

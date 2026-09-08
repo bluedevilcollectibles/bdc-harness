@@ -53,6 +53,104 @@ import {
 } from './taskmaster';
 
 describe('tm_expectations DAL', () => {
+  test('registering twice for the same dispatch yields one row and the same id', async () => {
+    // REGRESSION. registerExpectation generated a random UUID per call and the
+    // schema had no uniqueness on the identity, so replaying an action after a
+    // crash between the dispatch and updateActionOutcome registered a SECOND
+    // expectation for the same dispatch -- different id, therefore different
+    // retry and escalation idempotency keys, therefore duplicate external work.
+    //
+    // Real sqlite, not a double.
+    const registration = {
+      action_ref: 'journal-action-1',
+      dispatch_ref: 'dispatch-abc',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch' as const,
+      max_retries: 2,
+    };
+    const first = await registerExpectation(registration);
+    // The replay: same journal action, same dispatch, called again verbatim.
+    const second = await registerExpectation(registration);
+    expect(second).toBe(first);
+
+    const rows = await db.query<{ cnt: number | string }>(
+      'SELECT COUNT(*) AS cnt FROM tm_expectations WHERE dispatch_ref = $1',
+      ['dispatch-abc']
+    );
+    expect(Number(rows.rows[0]?.cnt)).toBe(1);
+
+    // The retry/escalation keys the supervisor derives are therefore identical
+    // across the replay -- which is the whole point of the fix.
+    expect(`tm:expectation:${second}:retry:1`).toBe(`tm:expectation:${first}:retry:1`);
+    expect(`tm:expectation:${second}:escalate`).toBe(`tm:expectation:${first}:escalate`);
+
+    // The replay must not resurrect a closed expectation either.
+    expect(await markMet(first, 'https://example/proof')).toBe(true);
+    const third = await registerExpectation(registration);
+    expect(third).toBe(first);
+    const after = await db.query<{ cnt: number | string }>(
+      'SELECT COUNT(*) AS cnt FROM tm_expectations WHERE dispatch_ref = $1',
+      ['dispatch-abc']
+    );
+    expect(Number(after.rows[0]?.cnt)).toBe(1);
+    const status = await db.query<{ status: string }>(
+      'SELECT status FROM tm_expectations WHERE id = $1',
+      [first]
+    );
+    expect(status.rows[0]?.status).toBe('met');
+  });
+
+  test('different dispatches and different actions stay distinct expectations', async () => {
+    // The uniqueness must not over-collapse: two genuinely different pieces of
+    // work are two expectations, even when they share one half of the identity.
+    const base = {
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'redispatch' as const,
+      max_retries: 2,
+    };
+    const a = await registerExpectation({
+      ...base,
+      action_ref: 'action-1',
+      dispatch_ref: 'dispatch-1',
+    });
+    const sameActionOtherDispatch = await registerExpectation({
+      ...base,
+      action_ref: 'action-1',
+      dispatch_ref: 'dispatch-2',
+    });
+    const otherActionSameDispatch = await registerExpectation({
+      ...base,
+      action_ref: 'action-2',
+      dispatch_ref: 'dispatch-1',
+    });
+    expect(new Set([a, sameActionOtherDispatch, otherActionSameDispatch]).size).toBe(3);
+  });
+
+  test('registration without an action_ref falls back to the dispatch_ref identity', async () => {
+    // A caller with no journal action still gets idempotency, keyed on the
+    // dispatch alone.
+    const registration = {
+      dispatch_ref: 'dispatch-no-action',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate' as const,
+      max_retries: 0,
+    };
+    const first = await registerExpectation(registration);
+    const second = await registerExpectation(registration);
+    expect(second).toBe(first);
+    const rows = await db.query<{ cnt: number | string }>(
+      'SELECT COUNT(*) AS cnt FROM tm_expectations WHERE dispatch_ref = $1',
+      ['dispatch-no-action']
+    );
+    expect(Number(rows.rows[0]?.cnt)).toBe(1);
+  });
+
   test('expectation_met_before_deadline', async () => {
     const id = await registerExpectation({
       dispatch_ref: 'dispatch-1',
