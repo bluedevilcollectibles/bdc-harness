@@ -15,6 +15,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import {
   MERGED_PR_SEARCH_QUERIES,
   TRACKER_INDEX_MAX_PAGES,
+  createCountedGitHubReconcileDeps,
   createTrackerIndex,
   runReconcileOnce,
   type ReconcileDeps,
@@ -102,7 +103,37 @@ describe('#796 -- the tracker lookup costs one listing, not one search per stem'
     // 30/minute cap in well under a minute.
     expect(counts.searches).toBe(0);
     expect(counts.listForRepo).toBe(1);
-    expect(index.stats()).toEqual({ searches: 0, listPages: 1 });
+    expect(index.stats()).toEqual({
+      searchesAttempted: 0,
+      searchesSucceeded: 0,
+      listPagesAttempted: 1,
+      listPagesSucceeded: 1,
+    });
+  });
+
+  test('a listing page that THROWS is still counted as attempted', async () => {
+    // #796 review: counting only after a successful response hides the call
+    // that actually consumed the budget -- the one that got the 403.
+    const failing = async (): Promise<never> =>
+      ({
+        search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+        issues: {
+          createComment: async () => undefined,
+          addLabels: async () => undefined,
+          update: async () => undefined,
+          listForRepo: async () => {
+            throw Object.assign(new Error('API rate limit exceeded for user ID 255238497'), {
+              status: 403,
+            });
+          },
+        },
+        pulls: { listFiles: async () => ({ data: [] }), get: async () => ({ data: {} }) },
+      }) as never;
+    const index = createTrackerIndex(failing);
+
+    await expect(index.findTrackerIssueByStem('WO-HARNESS-ANY-01')).rejects.toThrow();
+
+    expect(index.stats()).toMatchObject({ listPagesAttempted: 1, listPagesSucceeded: 0 });
   });
 
   test('a stem with no open tracker resolves to null without any extra call', async () => {
@@ -196,68 +227,157 @@ describe('#796 -- the tracker lookup costs one listing, not one search per stem'
   });
 });
 
-describe('#796 -- the per-pass call counts are logged', () => {
-  function budgetDeps(prs: ReconcileMergedPullRequest[]): {
-    deps: ReconcileDeps;
-    infos: { fields: Record<string, unknown>; message: string }[];
-    reported: number;
+/**
+ * The telemetry must MEASURE, not assume (#804 review).
+ *
+ * These drive the REAL `createCountedGitHubReconcileDeps` -- the same counting
+ * and reporting code `createDefaultReconcileDeps` ships -- against a stub
+ * client. The first cut's tests faked the reporter and asserted the constant it
+ * printed, which is exactly why they could not catch that it printed a constant.
+ */
+describe('#796 -- the per-pass call counts are MEASURED and logged', () => {
+  /** A client whose search queries succeed, fail, or throw per a script. */
+  function scriptedOctokit(searchOutcomes: ('ok' | 'rate-limit')[]): {
+    client: () => Promise<never>;
+    issued: number;
   } {
-    const infos: { fields: Record<string, unknown>; message: string }[] = [];
-    const state = { reported: 0 };
-    const deps: ReconcileDeps = {
-      readCursor: async () => null,
-      now: () => new Date('2026-09-08T05:00:00Z'),
-      searchMergedPullRequests: async () => prs,
-      findTrackerIssueByStem: async () => null,
-      addTrackerEvidenceComment: async () => undefined,
-      addTrackerLabel: async () => undefined,
-      closeTrackerIssue: async () => undefined,
-      hasSkipBeenNoted: async () => false,
-      hasCloseBeenRecorded: async () => false,
-      insertAction: async () => undefined,
-      reportGitHubCallsPerPass: () => {
-        state.reported += 1;
-        infos.push({
-          fields: { searches: MERGED_PR_SEARCH_QUERIES, stemSearches: 0 },
-          message: 'overseer.reconcile.github_calls_per_pass',
-        });
+    const state = { issued: 0 };
+    const client = {
+      search: {
+        issuesAndPullRequests: async () => {
+          const outcome = searchOutcomes[state.issued] ?? 'ok';
+          state.issued += 1;
+          if (outcome === 'rate-limit') {
+            throw Object.assign(new Error('API rate limit exceeded for user ID 255238497'), {
+              status: 403,
+            });
+          }
+          return { data: { items: [] } };
+        },
       },
-      log: { warn: () => {}, info: () => {} },
+      issues: {
+        createComment: async () => undefined,
+        addLabels: async () => undefined,
+        update: async () => undefined,
+        listForRepo: async () => ({ data: [] }),
+      },
+      pulls: { listFiles: async () => ({ data: [] }), get: async () => ({ data: {} }) },
     };
     return {
-      deps,
-      infos,
-      get reported() {
-        return state.reported;
+      client: async () => client as never,
+      get issued() {
+        return state.issued;
       },
     };
   }
 
-  test('the count is reported once on a normal pass', async () => {
-    const fake = budgetDeps([]);
+  function countedDeps(searchOutcomes: ('ok' | 'rate-limit')[] = []): {
+    deps: ReconcileDeps;
+    reports: Record<string, unknown>[];
+    issued: number;
+  } {
+    const reports: Record<string, unknown>[] = [];
+    const octokit = scriptedOctokit(searchOutcomes);
+    const logger = {
+      warn: () => {},
+      info: (fields: Record<string, unknown>, message: string) => {
+        if (message === 'overseer.reconcile.github_calls_per_pass') reports.push(fields);
+      },
+    };
+    const counted = createCountedGitHubReconcileDeps(octokit.client, logger);
+    return {
+      reports,
+      get issued() {
+        return octokit.issued;
+      },
+      deps: {
+        readCursor: async () => null,
+        now: () => new Date('2026-09-08T05:00:00Z'),
+        addTrackerEvidenceComment: async () => undefined,
+        addTrackerLabel: async () => undefined,
+        closeTrackerIssue: async () => undefined,
+        hasSkipBeenNoted: async () => false,
+        hasCloseBeenRecorded: async () => false,
+        insertAction: async () => undefined,
+        log: logger,
+        ...counted,
+      },
+    };
+  }
+
+  test('a clean pass reports the TRUE counts: 2 attempted, 2 succeeded', async () => {
+    const fake = countedDeps(['ok', 'ok']);
+
     await runReconcileOnce({ deps: fake.deps });
-    expect(fake.reported).toBe(1);
-    expect(fake.infos[0]?.fields.stemSearches).toBe(0);
+
+    expect(fake.reports).toHaveLength(1);
+    expect(fake.reports[0]).toMatchObject({
+      searches: 2,
+      searchesSucceeded: 2,
+      mergedPrSearchesAttempted: 2,
+      mergedPrSearchesSucceeded: 2,
+      stemSearchesAttempted: 0,
+    });
+    // The report matches what the client actually saw -- the assertion the
+    // constant-printing version could never make.
+    expect(fake.reports[0]?.searches).toBe(fake.issued);
   });
 
-  test('the count is reported even when the pass SKIPS on a rate limit', async () => {
-    // The skipped pass is exactly the one an operator is trying to explain, so
-    // reporting only on the happy path would hide the number that matters.
-    const fake = budgetDeps([]);
-    fake.deps.searchMergedPullRequests = async () => {
-      throw Object.assign(new Error('API rate limit exceeded for user ID 255238497'), {
-        status: 403,
-      });
-    };
+  test('a pass that fails on the FIRST query reports attempted=1 succeeded=0', async () => {
+    const fake = countedDeps(['rate-limit']);
+
     const result = await runReconcileOnce({ deps: fake.deps });
 
     expect(result.skipped).toBe(true);
-    expect(fake.reported).toBe(1);
+    // The exact defect: this used to report 2 searches for a pass that issued
+    // one and got a 403 -- in the very log line meant to explain the skip.
+    expect(fake.reports[0]).toMatchObject({
+      searches: 1,
+      searchesSucceeded: 0,
+      mergedPrSearchesAttempted: 1,
+      mergedPrSearchesSucceeded: 0,
+    });
+    expect(fake.issued).toBe(1);
   });
 
-  test('merged-PR searches stay a fixed 2 regardless of stem count', () => {
-    // One `in:title` query, one `in:body`. This is the ENTIRE search cost of a
-    // pass now; it used to be 2 + one per stem.
+  test('a pass that fails on the SECOND query reports attempted=2 succeeded=1', async () => {
+    const fake = countedDeps(['ok', 'rate-limit']);
+
+    await runReconcileOnce({ deps: fake.deps });
+
+    expect(fake.reports[0]).toMatchObject({ searches: 2, searchesSucceeded: 1 });
+  });
+
+  test('a pass that never issues a query reports ZERO, not the expected 2', async () => {
+    // resolveSearchSince throws before any GitHub call, so nothing was issued.
+    const fake = countedDeps(['ok', 'ok']);
+    fake.deps.readCursor = async () => {
+      throw new Error('cursor store unavailable');
+    };
+
+    await expect(runReconcileOnce({ deps: fake.deps })).rejects.toThrow();
+
+    // Reported from the `finally`, and honest: no call was made.
+    expect(fake.reports[0]).toMatchObject({ searches: 0, searchesSucceeded: 0 });
+    expect(fake.issued).toBe(0);
+  });
+
+  test('the tracker listing pages are reported too, attempted and succeeded', async () => {
+    const fake = countedDeps(['ok', 'ok']);
+
+    await runReconcileOnce({ deps: fake.deps });
+
+    // No PRs came back, so no stem was looked up and the index stayed unbuilt --
+    // the lazy path, honestly reported as zero pages rather than assumed one.
+    expect(fake.reports[0]).toMatchObject({
+      trackerListPagesAttempted: 0,
+      trackerListPagesSucceeded: 0,
+    });
+  });
+
+  test('a COMPLETE pass issues exactly MERGED_PR_SEARCH_QUERIES searches', () => {
+    // The constant is now only the EXPECTED count for a complete pass; the
+    // telemetry no longer derives its numbers from it.
     expect(MERGED_PR_SEARCH_QUERIES).toBe(2);
   });
 });

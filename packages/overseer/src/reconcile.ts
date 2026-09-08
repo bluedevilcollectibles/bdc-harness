@@ -29,12 +29,28 @@ const DEFAULT_TRACKER_REPO = 'bdc-xo';
 const DEFAULT_LOOKBACK_DAYS = 14;
 const DONE_LABEL = 'wo:done';
 /**
- * Merged-PR searches per pass: one `in:title`, one `in:body` (#796).
+ * Merged-PR search queries a COMPLETE pass issues: one `in:title`, one
+ * `in:body` (#796). The only searches reconcile makes at all -- the per-stem
+ * tracker search that used to sit on top of these is gone (`createTrackerIndex`).
  *
- * FIXED, and the only searches reconcile now makes. The per-stem tracker search
- * that used to sit on top of these is gone -- see `createTrackerIndex`.
+ * This is the EXPECTED count for a pass that runs to completion. It is NOT what
+ * the telemetry reports: a pass that fails partway issues fewer, so the report
+ * counts actual calls rather than assuming this number (#796 review).
  */
 export const MERGED_PR_SEARCH_QUERIES = 2;
+
+/** Counts GitHub calls as they are ISSUED, separating attempts from successes. */
+interface SearchCallCounter {
+  attempt(): void;
+  succeed(): void;
+}
+
+export interface TrackerIndexStats {
+  searchesAttempted: number;
+  searchesSucceeded: number;
+  listPagesAttempted: number;
+  listPagesSucceeded: number;
+}
 
 export interface ReconcileMergedPullRequest {
   owner: string;
@@ -495,6 +511,74 @@ async function hasDefaultCloseBeenRecorded(input: {
   });
 }
 
+/**
+ * The three GitHub-backed deps whose calls are counted, plus the reporter that
+ * emits those counts (#796, hardened per the #804 review).
+ *
+ * Split out of `createDefaultReconcileDeps` so a test can exercise the REAL
+ * counting and reporting code against a stub client, without mocking
+ * `@octokit/rest` or setting a token. The first cut's telemetry test faked the
+ * reporter itself and asserted a constant, which is precisely why it could not
+ * catch that the reporter was printing a constant.
+ *
+ * Counters live here, so they are per-deps-object -- and
+ * `createDefaultReconcileDeps` builds one per pass (`runReconcileOnce` line 190;
+ * `service.ts` calls it with no deps), making them per-pass as required.
+ */
+export function createCountedGitHubReconcileDeps(
+  getOctokit: () => Promise<OctokitLike>,
+  logger: ReconcileLogger = log
+): Required<
+  Pick<
+    ReconcileDeps,
+    'searchMergedPullRequests' | 'findTrackerIssueByStem' | 'reportGitHubCallsPerPass'
+  >
+> {
+  const trackerIndex = createTrackerIndex(getOctokit, logger);
+  let searchesAttempted = 0;
+  let searchesSucceeded = 0;
+  const searchCounter: SearchCallCounter = {
+    attempt: () => {
+      searchesAttempted += 1;
+    },
+    succeed: () => {
+      searchesSucceeded += 1;
+    },
+  };
+  return {
+    searchMergedPullRequests: async input =>
+      searchMergedPullRequests(await getOctokit(), input, searchCounter),
+    findTrackerIssueByStem: trackerIndex.findTrackerIssueByStem,
+    reportGitHubCallsPerPass: (): void => {
+      // SEARCHES PER PASS -- the number the issue asks to see logged, MEASURED
+      // rather than assumed (#804 review).
+      //
+      // Attempted and succeeded are reported separately because they diverge in
+      // exactly the case the log exists for: a pass killed by the search rate
+      // limit issued its call and got a 403, so attempted=1 succeeded=0. The
+      // first cut printed the constant `MERGED_PR_SEARCH_QUERIES` regardless --
+      // including for a pass that issued nothing at all -- which made the
+      // rate-limit skip line a fabrication rather than evidence.
+      //
+      // The headline `searches` is ATTEMPTED, because attempts are what the
+      // 30/minute search cap actually counts against.
+      const index = trackerIndex.stats();
+      logger.info?.(
+        {
+          searches: searchesAttempted + index.searchesAttempted,
+          searchesSucceeded: searchesSucceeded + index.searchesSucceeded,
+          mergedPrSearchesAttempted: searchesAttempted,
+          mergedPrSearchesSucceeded: searchesSucceeded,
+          stemSearchesAttempted: index.searchesAttempted,
+          trackerListPagesAttempted: index.listPagesAttempted,
+          trackerListPagesSucceeded: index.listPagesSucceeded,
+        },
+        'overseer.reconcile.github_calls_per_pass'
+      );
+    },
+  };
+}
+
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   if (!token) {
@@ -522,28 +606,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     );
     return octokit;
   };
-  // #796: the tracker lookup is a per-pass LISTING, not a per-stem search.
-  const trackerIndex = createTrackerIndex(getOctokit, log);
   return {
     readCursor: readReconcileCursorFromActions,
-    searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
-    findTrackerIssueByStem: trackerIndex.findTrackerIssueByStem,
-    reportGitHubCallsPerPass: (): void => {
-      // SEARCHES PER PASS -- the number the issue asks to see logged. It is now
-      // a fixed 2 (the title and body merged-PR queries) regardless of how many
-      // WO stems the lookback window holds; it used to grow by one per stem,
-      // which is what crossed search's 30/minute cap.
-      const stats = trackerIndex.stats();
-      log.info?.(
-        {
-          searches: MERGED_PR_SEARCH_QUERIES + stats.searches,
-          mergedPrSearches: MERGED_PR_SEARCH_QUERIES,
-          stemSearches: stats.searches,
-          trackerListPages: stats.listPages,
-        },
-        'overseer.reconcile.github_calls_per_pass'
-      );
-    },
+    ...createCountedGitHubReconcileDeps(getOctokit, log),
     listPullRequestFiles: async (pr): Promise<string[]> => {
       const client = await getOctokit();
       // per_page 100: a spec-only PR is 1-2 files, so the first page is always
@@ -604,7 +669,8 @@ async function resolveSearchSince(input: RunReconcileInput, deps: ReconcileDeps)
 
 async function searchMergedPullRequests(
   octokit: OctokitLike,
-  input: { org: string; since: string }
+  input: { org: string; since: string },
+  counter?: SearchCallCounter
 ): Promise<ReconcileMergedPullRequest[]> {
   const queries = [
     `org:${input.org} is:pr is:merged merged:>=${input.since} WO- in:title`,
@@ -613,12 +679,18 @@ async function searchMergedPullRequests(
   const results = new Map<string, ReconcileMergedPullRequest>();
 
   for (const q of queries) {
+    // ATTEMPTED before the await, SUCCEEDED after (#796 review). A pass that
+    // dies on the first query must report attempted=1 succeeded=0, not the
+    // constant 2 -- the previous telemetry reported two searches even when
+    // none were issued, which made the rate-limit skip log actively misleading.
+    counter?.attempt();
     const search = await octokit.search.issuesAndPullRequests({
       q,
       per_page: 100,
       sort: 'updated',
       order: 'desc',
     });
+    counter?.succeed();
     for (const item of search.data.items) {
       if (!item.pull_request) continue;
       const repo = parseRepositoryFromUrl(item.repository_url);
@@ -691,16 +763,21 @@ export function createTrackerIndex(
   logger: ReconcileLogger = log
 ): {
   findTrackerIssueByStem: (stem: string) => Promise<ReconcileTrackerIssue | null>;
-  stats: () => { searches: number; listPages: number };
+  stats: () => TrackerIndexStats;
 } {
   let index: Promise<Map<string, ReconcileTrackerIssue>> | null = null;
-  let listPages = 0;
+  // ATTEMPTED vs SUCCEEDED, counted at CALL TIME (#796 review). Incrementing
+  // only after a response returns hides exactly the calls an operator is trying
+  // to account for: the one that threw the rate-limit error.
+  let listPagesAttempted = 0;
+  let listPagesSucceeded = 0;
 
   const build = async (): Promise<Map<string, ReconcileTrackerIssue>> => {
     const octokit = await getOctokit();
     const byTitle = new Map<string, ReconcileTrackerIssue>();
     let truncated = false;
     for (let page = 1; page <= TRACKER_INDEX_MAX_PAGES; page += 1) {
+      listPagesAttempted += 1;
       const response = await octokit.issues.listForRepo({
         owner: DEFAULT_ORG,
         repo: DEFAULT_TRACKER_REPO,
@@ -708,7 +785,7 @@ export function createTrackerIndex(
         per_page: TRACKER_PAGE_SIZE,
         page,
       });
-      listPages += 1;
+      listPagesSucceeded += 1;
       for (const item of response.data) {
         // listForRepo returns PRs as issues too; the old search excluded them
         // with the same `pull_request` check.
@@ -741,7 +818,14 @@ export function createTrackerIndex(
       index ??= build();
       return (await index).get(stem) ?? null;
     },
-    stats: () => ({ searches: 0, listPages }),
+    stats: (): TrackerIndexStats => ({
+      // Zero, and MEASURED rather than assumed: the index issues no searches at
+      // all. If a future change reintroduces one, this must start counting it.
+      searchesAttempted: 0,
+      searchesSucceeded: 0,
+      listPagesAttempted,
+      listPagesSucceeded,
+    }),
   };
 }
 
