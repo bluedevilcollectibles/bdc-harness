@@ -25,6 +25,7 @@ import { runAndSubmitReview } from '../pr-review-submit.ts';
 import type { ReviewerVerdict, SubmitDeps } from '../pr-review-submit.ts';
 import {
   MAX_JUDGE_STDERR_BYTES,
+  MAX_JUDGE_STDERR_VERDICT_BYTES,
   STDERR_DRAIN_GRACE_MS,
   evaluatePullRequest,
   runReviewModelProcess,
@@ -307,6 +308,65 @@ describe('#798 -- one structured log line per evaluation', () => {
     expect(JSON.stringify(line)).not.toContain('timed out');
   });
 
+  test('a HOSTILE error string never reaches the log line', async () => {
+    // Review finding (Overseer, PR #802): the first cut logged result.error
+    // verbatim, reasoning that container logs are an operator surface. But
+    // model_error/evidence_error suffixes carry text this code did not
+    // construct -- a 401 body, an exception, a credential a failing CLI echoed
+    // -- and logs are shipped and aggregated far more widely than the receipt.
+    const logs = captureLogOutput();
+    const secret = 'evidence_error:Bad credentials for ghp_liveTokenValue123';
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () => reviewResult({ verdict: 'INDETERMINATE', error: secret }),
+    });
+
+    await deps.runReviewer(work);
+
+    const rendered = logs.join('\n');
+    expect(rendered).toContain('overseer_pr_review_verdict');
+    expect(rendered).not.toContain('ghp_liveTokenValue123');
+    expect(rendered).not.toContain('Bad credentials');
+    // The classified code still survives -- the diagnostic value is kept.
+    const line = logs
+      .map(chunk => JSON.parse(chunk) as Record<string, unknown>)
+      .find(entry => entry.msg === 'overseer_pr_review_verdict');
+    expect(line?.reason).toBe('evidence_error');
+  });
+
+  test('the log and the PR body apply the SAME redaction rule', async () => {
+    // One rule to reason about, not two: a binary-suffix code keeps its suffix
+    // in both places, and everything else degrades to the bare code in both.
+    const logs = captureLogOutput();
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () =>
+        reviewResult({ verdict: 'INDETERMINATE', error: 'model_timeout:codex' }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+
+    const line = logs
+      .map(chunk => JSON.parse(chunk) as Record<string, unknown>)
+      .find(entry => entry.msg === 'overseer_pr_review_verdict');
+    expect(line?.reason).toBe(publicReviewReason('model_timeout:codex'));
+    expect(verdict.summary).toContain('Reason: model_timeout:codex');
+  });
+
+  test('the receipt still carries the UNREDACTED reason for the operator', async () => {
+    // Redacting the log must not cost the operator the detail: the dispatch
+    // receipt is the narrower surface and keeps the full string.
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () =>
+        reviewResult({ verdict: 'INDETERMINATE', error: 'model_error:E2BIG from spawn' }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+
+    expect(verdict.reasonDetail).toBe('model_error:E2BIG from spawn');
+  });
+
   test('the line is emitted for a deferral too, not only for terminal verdicts', async () => {
     const logs = captureLogOutput();
     const deps = createRealSubmitDeps('review-app[bot]', {
@@ -516,6 +576,126 @@ describe('#798 -- the process runner surfaces stderr', () => {
     // The drain grace is a DEADLINE: a stderr pipe that never closes must not
     // extend the wall clock indefinitely.
     expect(Date.now() - started).toBeLessThan(25 + STDERR_DRAIN_GRACE_MS + 2_000);
+  });
+
+  test('a 10 MB stream never RETAINS more than the two caps', async () => {
+    // Review finding (Overseer, PR #802): the first cut appended every chunk to
+    // one string and sliced only at read time, so the advertised 2 KB bound was
+    // a read-time illusion -- a chatty judge retained everything it printed.
+    let chunksRead = 0;
+    const oneMegabyte = 'y'.repeat(1024 * 1024);
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (let index = 0; index < 10; index += 1) {
+          chunksRead += 1;
+          controller.enqueue(encoder.encode(oneMegabyte));
+        }
+        controller.close();
+      },
+    });
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 5_000, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: controller => controller.close() }),
+      stderr: stream,
+      exited: Promise.resolve(0),
+      kill: () => {},
+    }));
+
+    expect(chunksRead).toBe(10);
+    // The receipt copy stays at the tail cap...
+    expect(result.stderrTail?.length).toBe(MAX_JUDGE_STDERR_BYTES);
+    // ...and the fallback-parse copy at its own, far smaller than 10 MB.
+    expect(result.stdout.length).toBeLessThanOrEqual(MAX_JUDGE_STDERR_VERDICT_BYTES);
+  });
+
+  test('a never-closing stream leaves NO reader running after the timeout', async () => {
+    // The leak the reviewer named: a killed child whose pipe stays open left the
+    // read loop looping for the life of the worker, once per timed-out review.
+    let reads = 0;
+    let cancelled = false;
+    const stderr = {
+      getReader: () => ({
+        read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+          reads += 1;
+          if (cancelled) return { done: true };
+          // A real pipe yields to the event loop between chunks. Resolving
+          // synchronously would spin this loop hot and starve the wall-clock
+          // timer -- a defect in the DOUBLE, not in the reader under test.
+          await new Promise(resolve => setTimeout(resolve, 1));
+          // Never finishes -- a chatty hung judge.
+          return { done: false, value: new TextEncoder().encode('still alive\n') };
+        },
+        cancel: (): void => {
+          cancelled = true;
+        },
+      }),
+    } as unknown as ReadableStream;
+
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: controller => controller.close() }),
+      stderr,
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(result.timedOut).toBe(true);
+    expect(cancelled).toBe(true);
+    const readsAtReturn = reads;
+    await new Promise(resolve => setTimeout(resolve, 50));
+    // The loop is genuinely stopped, not merely slowed: no further reads occur
+    // after the call returned.
+    expect(reads).toBe(readsAtReturn);
+  });
+
+  test('the timeout path cancels BEFORE the call returns, not only after the race', async () => {
+    // Two cancels exist: one inside the timeout callback (after the drain
+    // grace) and one after the race settles. The second alone makes the test
+    // above pass, so this pins the FIRST -- otherwise correctness would depend
+    // on the ordering of two independent paths, and removing the timeout-path
+    // cancel would look safe when it is not.
+    let cancelledAt: number | null = null;
+    const start = Date.now();
+    const stderr = {
+      getReader: () => ({
+        read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+          await new Promise(resolve => setTimeout(resolve, 1));
+          if (cancelledAt !== null) return { done: true };
+          return { done: false, value: new TextEncoder().encode('x') };
+        },
+        cancel: (): void => {
+          cancelledAt ??= Date.now() - start;
+        },
+      }),
+    } as unknown as ReadableStream;
+
+    await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: controller => controller.close() }),
+      stderr,
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(cancelledAt).not.toBeNull();
+    // Cancelled around the wall clock plus the drain grace -- i.e. on the
+    // timeout path -- rather than only once the whole call unwound.
+    expect(cancelledAt!).toBeLessThan(25 + STDERR_DRAIN_GRACE_MS + 1_000);
+  });
+
+  test('the tail cap is BYTE-true, so multi-byte stderr cannot exceed it', async () => {
+    // `String.slice(-2048)` counts UTF-16 units; a 3-byte character would have
+    // let the payload run to roughly 6 KB under a 2 KB advertised cap.
+    const wide = '日'.repeat(MAX_JUDGE_STDERR_BYTES); // 3 bytes each in UTF-8
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 1_000, () =>
+      child('', wide, 1)
+    );
+
+    const bytes = new TextEncoder().encode(result.stderrTail ?? '').length;
+    expect(bytes).toBeLessThanOrEqual(MAX_JUDGE_STDERR_BYTES);
+    // And it is still the TAIL, decoded cleanly rather than left as mojibake.
+    expect((result.stderrTail ?? '').endsWith('日')).toBe(true);
   });
 
   test('the tail is bounded even when the hung process emitted megabytes', async () => {

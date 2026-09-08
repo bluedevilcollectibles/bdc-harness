@@ -622,6 +622,22 @@ export const DEFAULT_REVIEW_MODEL_TIMEOUT_MS = 60_000;
  */
 export const MAX_JUDGE_STDERR_BYTES = 2_048;
 
+/**
+ * Cap on stderr retained for the STDOUT-FALLBACK PARSE (#802 review).
+ *
+ * Separate from the tail cap because the two serve opposite ends of the stream:
+ * the receipt wants the last bytes (a failing CLI prints its error last), while
+ * the fallback parse wants the first bytes, because a judge that writes its
+ * JSON verdict to stderr writes it from the start. Sixty-four kilobytes is far
+ * past any real verdict (a REQUEST_CHANGES with forty findings is a few KB) and
+ * still bounds a runaway judge to a fixed cost.
+ *
+ * Once exceeded, the buffer stops accepting and marks itself truncated -- a
+ * truncated JSON payload simply fails to parse, which is already handled as
+ * `model_output_invalid`.
+ */
+export const MAX_JUDGE_STDERR_VERDICT_BYTES = 64 * 1024;
+
 export function resolveReviewModelTimeoutMs(
   env: Record<string, string | undefined> = process.env
 ): number {
@@ -784,7 +800,8 @@ export async function runReviewModelProcess(
   // that is stuck. The chunk loop below keeps the last MAX_JUDGE_STDERR_BYTES as
   // each chunk arrives, so the snapshot is correct at any instant.
   const stderrTail = createStderrTail();
-  const stderrRead = readStderrInto(subprocess.stderr, stderrTail);
+  const stderrReader = readStderrInto(subprocess.stderr, stderrTail);
+  const stderrRead = stderrReader.done;
 
   let timeout: Timer | undefined;
   let timedOut = false;
@@ -804,6 +821,10 @@ export async function runReviewModelProcess(
       // stays open forever must not extend the wall clock this callback exists
       // to enforce.
       void withDeadline(stderrRead, STDERR_DRAIN_GRACE_MS).then(() => {
+        // CANCEL after the snapshot (#802 review). A killed child whose pipe
+        // stays open would otherwise leave this reader looping for the life of
+        // the worker -- one leaked reader per timed-out review.
+        stderrReader.cancel();
         resolve({ exitCode: 124, stdout: '', timedOut: true, stderrTail: stderrTail.value() });
       });
     }, timeoutMs);
@@ -849,6 +870,9 @@ export async function runReviewModelProcess(
   })();
   const result = await Promise.race([processResult, timeoutResult]);
   if (timeout) clearTimeout(timeout);
+  // Idempotent, and needed on BOTH paths: a race won by processResult can still
+  // leave the stderr reader live if the child exited without closing the pipe.
+  stderrReader.cancel();
   // The child must never outlive this call: on the timeout path the kill above
   // already fired, but a race won by processResult can still leave the writer
   // parked if the child exited without draining stdin.
@@ -881,21 +905,109 @@ export const STDERR_DRAIN_GRACE_MS = 250;
  * string.
  */
 interface StderrTail {
-  append(chunk: string): void;
-  /** Last MAX_JUDGE_STDERR_BYTES received so far. */
+  /** Feed raw bytes. Retention is bounded by the two caps below, always. */
+  append(bytes: Uint8Array): void;
+  /** Last MAX_JUDGE_STDERR_BYTES, decoded. For the receipt. */
   value(): string;
-  /** Everything received so far, unbounded. */
+  /**
+   * Up to MAX_JUDGE_STDERR_VERDICT_BYTES from the START of the stream, decoded.
+   * For the stdout-fallback parse only.
+   */
   full(): string;
+  /** True once the verdict buffer stopped accepting bytes. */
+  truncated(): boolean;
+  /** Total bytes seen, including those dropped. */
+  bytesSeen(): number;
 }
 
+/**
+ * Skip a partial UTF-8 character at the START of a byte slice.
+ *
+ * A continuation byte matches 0b10xxxxxx. The slice was cut on an arbitrary
+ * byte boundary, so it may open mid-character; advancing past the continuation
+ * bytes (and the lead byte they belong to, which cannot be recovered) yields a
+ * slice that decodes cleanly. Bounded to 3 steps, the longest possible
+ * continuation run in UTF-8, so malformed input cannot spin.
+ */
+function dropLeadingPartialUtf8(bytes: Uint8Array): Uint8Array {
+  let start = 0;
+  while (start < bytes.length && start < 4 && ((bytes[start] ?? 0) & 0b1100_0000) === 0b1000_0000) {
+    start += 1;
+  }
+  return start === 0 ? bytes : bytes.subarray(start);
+}
+
+/**
+ * Bounded, BYTE-TRUE retention for a judge's stderr (#802 review).
+ *
+ * Three defects the first cut had, all fixed here:
+ *
+ * 1. UNBOUNDED MEMORY. It appended every chunk to one string and sliced only at
+ *    read time, so a judge emitting megabytes retained megabytes despite the
+ *    advertised 2 KB. Retention is now capped as bytes ARRIVE.
+ * 2. TWO PURPOSES, ONE BUFFER. The receipt wants the TAIL (a failing CLI prints
+ *    its error last); the stdout fallback wants the HEAD, because it parses a
+ *    verdict a judge wrote to stderr. Serving both from one unbounded string is
+ *    what forced the unbounded retention. They are now separate buffers with
+ *    separate finite caps, and the verdict buffer stops accepting once full.
+ * 3. UTF-16 SLICING. `String.slice(-2048)` counts UTF-16 code units, so
+ *    non-ASCII stderr blew past the byte limit. Bytes are now sliced as bytes
+ *    and decoded once at read time.
+ */
 function createStderrTail(): StderrTail {
-  let text = '';
+  // Ring: the last MAX_JUDGE_STDERR_BYTES, kept as bytes.
+  let ring = new Uint8Array(0);
+  // Head: the first MAX_JUDGE_STDERR_VERDICT_BYTES, for the fallback parse.
+  const head: Uint8Array[] = [];
+  let headBytes = 0;
+  let seen = 0;
+  let stopped = false;
   return {
-    append(chunk: string): void {
-      text += chunk;
+    append(bytes: Uint8Array): void {
+      if (bytes.length === 0) return;
+      seen += bytes.length;
+
+      if (headBytes < MAX_JUDGE_STDERR_VERDICT_BYTES) {
+        const room = MAX_JUDGE_STDERR_VERDICT_BYTES - headBytes;
+        const slice = bytes.length <= room ? bytes : bytes.subarray(0, room);
+        head.push(slice);
+        headBytes += slice.length;
+        if (headBytes >= MAX_JUDGE_STDERR_VERDICT_BYTES) stopped = true;
+      } else {
+        stopped = true;
+      }
+
+      // Tail ring: concatenate then keep only the trailing cap, so retention
+      // never exceeds cap + one chunk.
+      if (bytes.length >= MAX_JUDGE_STDERR_BYTES) {
+        ring = bytes.slice(bytes.length - MAX_JUDGE_STDERR_BYTES);
+        return;
+      }
+      const combined = new Uint8Array(ring.length + bytes.length);
+      combined.set(ring, 0);
+      combined.set(bytes, ring.length);
+      ring =
+        combined.length <= MAX_JUDGE_STDERR_BYTES
+          ? combined
+          : combined.slice(combined.length - MAX_JUDGE_STDERR_BYTES);
     },
-    value: (): string => text.slice(-MAX_JUDGE_STDERR_BYTES),
-    full: (): string => text,
+    // Drop a leading PARTIAL UTF-8 character before decoding. The ring is cut
+    // on a byte boundary, which can land mid-character; decoding that emits
+    // U+FFFD, and a replacement char re-encodes to 3 bytes -- so a tail cut
+    // inside a multi-byte character came back LARGER than the cap it was
+    // trimmed to (2,052 bytes for a 2,048 cap, caught by the byte-true test).
+    value: (): string => new TextDecoder().decode(dropLeadingPartialUtf8(ring)),
+    full: (): string => {
+      const joined = new Uint8Array(headBytes);
+      let offset = 0;
+      for (const chunk of head) {
+        joined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return new TextDecoder().decode(joined);
+    },
+    truncated: (): boolean => stopped,
+    bytesSeen: (): number => seen,
   };
 }
 
@@ -906,23 +1018,70 @@ function createStderrTail(): StderrTail {
  * timed-out review, not a failure, and a rejection here would surface as an
  * unhandled rejection under Bun's default handler.
  */
-async function readStderrInto(stream: ReadableStream | null, tail: StderrTail): Promise<void> {
-  if (!stream) return;
-  const decoder = new TextDecoder();
-  try {
-    const reader = stream.getReader();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value === undefined) continue;
-      tail.append(
-        typeof value === 'string' ? value : decoder.decode(value as Uint8Array, { stream: true })
-      );
+/**
+ * Drain a stream into `tail`, resolving when it closes or when cancelled.
+ *
+ * Returns a `cancel()` the caller MUST invoke on the timeout path. Review
+ * finding (Overseer, PR #802): without it, a killed child that leaves its pipe
+ * open left this loop reading forever -- a leaked reader per timed-out review,
+ * on the exact path a hung judge produces. The buffers are bounded now, so the
+ * leak is the reader itself rather than memory, but a review worker that
+ * accumulates one live reader per timeout is still a slow failure.
+ *
+ * Never rejects: a stream torn down by the kill is the expected end of a
+ * timed-out review, not a failure, and a rejection here would surface as an
+ * unhandled rejection under Bun's default handler.
+ */
+/**
+ * The two reader methods this module uses. Declared structurally because Bun's
+ * DOM `ReadableStreamDefaultReader` and node:stream/web's differ in shape
+ * (`readMany`), and a test double implements neither fully.
+ */
+interface StderrStreamReader {
+  read(): Promise<{ done: boolean; value?: unknown }>;
+  cancel(): unknown;
+}
+
+function readStderrInto(
+  stream: ReadableStream | null,
+  tail: StderrTail
+): { done: Promise<void>; cancel: () => void } {
+  const noop = (): void => undefined;
+  if (!stream) return { done: Promise.resolve(), cancel: noop };
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  // Structurally typed rather than `ReadableStreamDefaultReader`: Bun's DOM and
+  // node:stream/web reader types differ in shape (readMany), and only these two
+  // methods are used.
+  let reader: StderrStreamReader | null = null;
+  const done = (async (): Promise<void> => {
+    try {
+      const active = stream.getReader() as unknown as StderrStreamReader;
+      reader = active;
+      for (;;) {
+        if (cancelled) break;
+        const { done: finished, value } = await active.read();
+        if (finished) break;
+        if (value === undefined) continue;
+        // Bytes, never a decoded string: the caps are byte caps, and decoding
+        // per chunk would also split multi-byte characters at chunk edges.
+        tail.append(typeof value === 'string' ? encoder.encode(value) : (value as Uint8Array));
+      }
+    } catch {
+      // Stream gone (killed child, torn-down pipe). Whatever arrived is kept.
     }
-    tail.append(decoder.decode());
-  } catch {
-    // Stream gone (killed child, torn-down pipe). Whatever arrived is kept.
-  }
+  })();
+  return {
+    done,
+    cancel: (): void => {
+      cancelled = true;
+      try {
+        void reader?.cancel();
+      } catch {
+        // Best effort: teardown never changes the review's outcome.
+      }
+    },
+  };
 }
 
 /** Resolve when `promise` settles or `ms` elapses, whichever is first. */

@@ -489,8 +489,15 @@ export function createRealSubmitDeps(
       // for CHECKS_PENDING / CHECKS_UNAVAILABLE / TRANSPORT_ERROR, which
       // previously left no record of why the reviewer declined to judge.
       //
-      // The full `reason` is safe HERE and only here: container logs are an
-      // operator surface, unlike the PR body, which gets the redacted form.
+      // REDACTED, not verbatim (review finding, Overseer PR #802). The first
+      // cut logged `result.error` whole on the reasoning that container logs
+      // are an operator surface. That was wrong: `model_error:<exception>` and
+      // `evidence_error:<api message>` carry text this code did not construct,
+      // which can include credentials echoed by a failing CLI or a 401 body --
+      // and logs get shipped, aggregated and shared far more widely than the
+      // dispatch receipt. The SAME whitelist the PR body uses applies here, so
+      // there is exactly one redaction rule to reason about. The unredacted
+      // reason still reaches the operator on the receipt.
       log.info(
         {
           correlationId: work.correlationId,
@@ -499,7 +506,7 @@ export function createRealSubmitDeps(
           prNumber: work.prNumber,
           headSha: work.headSha,
           verdict: result.verdict,
-          reason: result.error ?? null,
+          reason: publicReviewReason(result.error),
           ladderTried: result.ladder_tried ?? [],
           durationMs: result.duration_ms ?? null,
           judgeStderrRungs: Object.keys(result.judge_stderr ?? {}),
