@@ -71,9 +71,11 @@ BEGIN
 END $$;
 
 -- Serves the newest-first reads: listMessages(subject_key) and
--- listMessagesByCorrelationPrefixWithoutSubjectKey both order by
--- (created_at DESC, seq DESC) scoped to a recipient.
-CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_created_seq
-  ON agent_dispatch_messages (recipient, created_at DESC, seq DESC);
+-- listMessagesByCorrelationPrefixWithoutSubjectKey both ORDER BY seq DESC
+-- scoped to a recipient. seq leads because it IS the ordering key -- ordering
+-- by created_at first would let a clock-skewed or restarted writer sort a later
+-- row behind earlier ones.
+CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_seq
+  ON agent_dispatch_messages (recipient, seq DESC);
 
 COMMIT;

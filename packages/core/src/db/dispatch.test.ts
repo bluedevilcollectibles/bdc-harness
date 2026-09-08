@@ -2330,6 +2330,46 @@ describe('dispatch db', () => {
       expect(found.map(message => message.id)).toEqual([...ids].reverse());
     });
 
+    /**
+     * seq must be the PRIMARY ordering key, not a tiebreak after created_at
+     * (Overseer review, PR #790).
+     *
+     * A writer that restarted, or whose clock skewed backwards, stamps a LOWER
+     * created_at than rows already committed -- while still taking a HIGHER
+     * seq, because seq comes from the database. Ordering by created_at first
+     * would sort that later write behind earlier rows, which is not an
+     * insertion order. The last row written must come back first regardless of
+     * what its clock said.
+     */
+    test('a row with an older created_at but higher seq still sorts first', async () => {
+      const earlier = await legacyReceipt('skew-old', 'pr-review:o/r#902@1');
+      const later = await legacyReceipt('skew-new', 'pr-review:o/r#902@2');
+
+      // Simulate the clock-skewed / restarted writer: the LATER row (higher
+      // seq) carries a created_at a full day BEFORE the earlier row.
+      await db.query(`UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2`, [
+        '2026-09-07T00:00:00.000Z',
+        earlier,
+      ]);
+      await db.query(`UPDATE agent_dispatch_messages SET created_at = $1 WHERE id = $2`, [
+        '2026-09-06T00:00:00.000Z',
+        later,
+      ]);
+
+      const found = await listMessagesByCorrelationPrefixWithoutSubjectKey({
+        recipient: 'operator',
+        correlationPrefix: 'pr-review:o/r#902@',
+      });
+
+      const rows = found.map(message => message.id);
+      // The genuinely-last write leads, even though its timestamp is older.
+      expect(rows).toEqual([later, earlier]);
+      // Guard the premise: this test is only meaningful while the timestamps
+      // actually disagree with insertion order.
+      const byId = new Map(found.map(message => [message.id, message.created_at]));
+      expect(byId.get(later)! < byId.get(earlier)!).toBe(true);
+    });
+
     test('reaches a row far beyond the listMessages page cap', async () => {
       // listMessages caps limit at 500 and has no offset, so a client-side
       // scan cannot see this row. The SQL predicate can.

@@ -589,21 +589,23 @@ export class SqliteAdapter implements IDatabase {
       // Backfill in rowid order -- the order the rows were actually inserted.
       this.db.run('UPDATE agent_dispatch_messages SET seq = rowid WHERE seq IS NULL');
 
-      // Stamp seq on every future insert from the same rowid counter, so the
-      // ordering key is assigned by the database at commit time rather than by
-      // any client clock.
-      this.db.run(`
-        CREATE TRIGGER IF NOT EXISTS trg_agent_dispatch_messages_seq
-        AFTER INSERT ON agent_dispatch_messages
-        FOR EACH ROW WHEN NEW.seq IS NULL
-        BEGIN
-          UPDATE agent_dispatch_messages SET seq = NEW.rowid WHERE rowid = NEW.rowid;
-        END
-      `);
+      // Retired: an AFTER INSERT trigger populated the stored row, but SQLite
+      // evaluates `RETURNING *` BEFORE the trigger fires, so callers were handed
+      // seq = NULL while the stored row held a value (real CI failure: a server
+      // route test compared a create response against a later re-read).
+      this.db.run('DROP TRIGGER IF EXISTS trg_agent_dispatch_messages_seq');
 
+      // Ordering must not depend on the writer remembering to set seq: raw SQL
+      // inserts, fixtures and imports bypass createMessage, and a NULL seq
+      // would make `ORDER BY seq DESC` an undefined order for those rows.
+      // SQLite cannot ALTER an existing column to add a DEFAULT, so seq is
+      // NULL-healed here on open and the ordering query coalesces NULLs to
+      // rowid, which is itself the insertion counter.
+
+      // seq leads: it is the newest-first ordering key, not a tiebreak.
       this.db.run(
-        `CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_created_seq
-           ON agent_dispatch_messages (recipient, created_at DESC, seq DESC)`
+        `CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_seq
+           ON agent_dispatch_messages (recipient, seq DESC)`
       );
     } catch (e: unknown) {
       getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_seq_failed');
