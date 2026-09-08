@@ -21,6 +21,7 @@ import {
   createRealListOpenPullRequests,
   deriveReviewDecision,
   extractWoId,
+  fetchAllOpenPullRequests,
   fetchAllPullRequestReviews,
   fetchReviewDecisions,
   resolveReviewGateLogin,
@@ -55,6 +56,8 @@ interface OctokitFakeOptions {
   readonly graphqlThrows?: boolean;
   /** Record every listReviews page requested, to assert pagination happened. */
   readonly reviewPageLog?: number[];
+  /** Record every pulls.list page requested, to assert the listing paginated. */
+  readonly pullPageLog?: number[];
 }
 
 function octokitWith(
@@ -64,7 +67,17 @@ function octokitWith(
 ): RealGitHubOctokitLike {
   const client: Record<string, unknown> = {
     pulls: {
-      list: async () => ({ data: pulls }),
+      // Serves real PAGES, exactly as the REST API does: `per_page` bounds each
+      // page and a short page is the last one. A fake that ignored paging and
+      // returned everything at once is what let the unpaginated listing bug
+      // reach production -- the double must be able to fail the same way.
+      list: async (input: { per_page?: number; page?: number }) => {
+        const perPage = input.per_page ?? pulls.length;
+        const page = input.page ?? 1;
+        options.pullPageLog?.push(page);
+        const start = (page - 1) * perPage;
+        return { data: pulls.slice(start, start + perPage) };
+      },
       get: async () => {
         throw new Error('pulls.get not used by listOpenPullRequests');
       },
@@ -873,5 +886,235 @@ describe('createRealListOpenPullRequests', () => {
     });
 
     expect(discovered?.reviewDecision).toBe('CHANGES_REQUESTED');
+  });
+});
+
+/**
+ * OPEN-PR LISTING PAGINATION (Overseer review of e729fea5).
+ *
+ * `octokit.pulls.list({ per_page: 100 })` unpaginated was the bug: a repo with
+ * more than 100 open PRs silently omits every later page on every tick, so
+ * those PRs are never evaluated as merge candidates and nothing anywhere says
+ * why. That is the invisible-candidate failure #758 exists to end, recreated
+ * one layer down -- and it fails looking exactly like a quiet backlog.
+ *
+ * Two open PRs against master on shopops alone already run to ~30; shopops and
+ * bdc-harness together can cross 100, so this is reachable, not theoretical.
+ */
+describe('open pull request listing pagination', () => {
+  /** `count` open PRs on `dev`, numbered 1..count, each with its own head. */
+  function manyOpenPulls(count: number): FakePullRequest[] {
+    return Array.from({ length: count }, (_unused, index) => {
+      const number = index + 1;
+      return {
+        number,
+        title: `feat: pr ${number}`,
+        state: 'open',
+        html_url: `https://example.invalid/${number}`,
+        head: { sha: `head-${number}`, ref: `feat/pr-${number}` },
+        base: { ref: 'dev' },
+      };
+    });
+  }
+
+  // THE HEADLINE. 150 open PRs is two pages; an unpaginated read sees 100 and
+  // the 50 newest simply do not exist as far as the merge coordinator knows.
+  test('150 open PRs across two pages are all listed', async () => {
+    const pullPageLog: number[] = [];
+    const list = createRealListOpenPullRequests(
+      octokitWith(manyOpenPulls(150), {}, { pullPageLog }),
+      { logger: { warn: () => undefined } }
+    );
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    expect(discovered).toHaveLength(150);
+    // Every PR number 1..150 is present -- not merely the right count.
+    const numbers = discovered.map(pr => pr.prNumber).sort((a, b) => a - b);
+    expect(numbers[0]).toBe(1);
+    expect(numbers[149]).toBe(150);
+    expect(new Set(numbers).size).toBe(150);
+    // It actually followed pages rather than asking for one huge one.
+    expect(pullPageLog).toEqual([1, 2]);
+    // A complete read flags nothing.
+    expect(discovered.every(pr => pr.listingTruncated === undefined)).toBe(true);
+  });
+
+  // A short first page is the last page: no wasted second request.
+  test('a single short page stops after one request', async () => {
+    const pullPageLog: number[] = [];
+    const list = createRealListOpenPullRequests(octokitWith(manyOpenPulls(3), {}, { pullPageLog }));
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    expect(discovered).toHaveLength(3);
+    expect(pullPageLog).toEqual([1]);
+  });
+
+  // An exactly-full final page cannot be distinguished from "more to come"
+  // without asking, so it asks -- and the empty page ends it.
+  test('an exactly-full page is followed by one more request that ends the walk', async () => {
+    const pullPageLog: number[] = [];
+    const list = createRealListOpenPullRequests(
+      octokitWith(manyOpenPulls(100), {}, { pullPageLog }),
+      { logger: { warn: () => undefined } }
+    );
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    expect(discovered).toHaveLength(100);
+    expect(pullPageLog).toEqual([1, 2]);
+    expect(discovered.every(pr => pr.listingTruncated === undefined)).toBe(true);
+  });
+
+  // THE CAP. 1001 PRs exceeds 10 pages x 100. The tick must not spin, so it
+  // stops -- but the omission is LOGGED and FLAGGED, never silent, because a
+  // truncated sweep and an empty queue look identical from the outside.
+  test('hitting the page cap logs it and flags the partial list instead of truncating silently', async () => {
+    const pullPageLog: number[] = [];
+    const warnings: { obj: Record<string, unknown>; msg: string }[] = [];
+    const list = createRealListOpenPullRequests(
+      octokitWith(manyOpenPulls(1001), {}, { pullPageLog }),
+      { logger: { warn: (obj, msg) => warnings.push({ obj, msg }) } }
+    );
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    // Stopped at the ceiling rather than walking 11 pages.
+    expect(pullPageLog).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    expect(discovered).toHaveLength(1000);
+
+    // SAID OUT LOUD, exactly once per repo per tick, with the numbers an
+    // operator needs. Filtered by message rather than asserting the total
+    // warning count: this REST-only fake also emits the pre-existing
+    // graphql-unavailable line, which is a separate, legitimate warning.
+    const truncationWarnings = warnings.filter(
+      entry => entry.msg === 'merge-coordinator.open_pull_request_listing_truncated'
+    );
+    expect(truncationWarnings).toHaveLength(1);
+    expect(truncationWarnings[0]?.obj).toMatchObject({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      pagesRead: 10,
+      pullsRead: 1000,
+    });
+
+    // ...and carried on the returned candidates, so a caller reading only the
+    // return value can still tell the sweep was partial.
+    expect(discovered.every(pr => pr.listingTruncated === true)).toBe(true);
+  });
+
+  // The flag marks a partial SWEEP, not a defective PR: the ones that were read
+  // are still fully evaluated candidates and keep their real review decision.
+  test('a truncated sweep still evaluates the PRs it did read', async () => {
+    const pulls = manyOpenPulls(1001);
+    const list = createRealListOpenPullRequests(
+      octokitWith(
+        pulls,
+        {},
+        {
+          pullPageLog: [],
+          graphqlDecisions: { 1: 'APPROVED' },
+        }
+      ),
+      { logger: { warn: () => undefined } }
+    );
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    const first = discovered.find(pr => pr.prNumber === 1);
+    expect(first?.reviewDecision).toBe('APPROVED');
+    expect(first?.listingTruncated).toBe(true);
+  });
+
+  // Base filtering is unchanged by pagination: a PR on an unwatched base is
+  // still COUNTED and returned (reporting base_branch_not_watched upstream)
+  // rather than silently absent -- and it too carries the truncation flag.
+  test('pagination does not change base filtering or the unwatched-base record', async () => {
+    const pulls = manyOpenPulls(150);
+    // Move one PR on the second page to an unwatched base.
+    const target = pulls[120];
+    if (target) target.base = { ref: 'release/ce' };
+
+    const list = createRealListOpenPullRequests(octokitWith(pulls), {
+      logger: { warn: () => undefined },
+    });
+
+    const discovered = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+
+    expect(discovered).toHaveLength(150);
+    const unwatched = discovered.find(pr => pr.prNumber === 121);
+    expect(unwatched?.baseRef).toBe('release/ce');
+    expect(unwatched?.reviewDecision).toBeNull();
+  });
+});
+
+describe('fetchAllOpenPullRequests', () => {
+  function pageOf(count: number, offset = 0): FakePullRequest[] {
+    return Array.from({ length: count }, (_unused, index) => {
+      const number = offset + index + 1;
+      return {
+        number,
+        title: `feat: pr ${number}`,
+        state: 'open',
+        html_url: `https://example.invalid/${number}`,
+        head: { sha: `head-${number}`, ref: `feat/pr-${number}` },
+        base: { ref: 'dev' },
+      };
+    });
+  }
+
+  test('reports complete on a short page and returns every PR', async () => {
+    const result = await fetchAllOpenPullRequests(octokitWith(pageOf(150)), {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.pulls).toHaveLength(150);
+  });
+
+  test('reports incomplete when the page ceiling is reached', async () => {
+    const result = await fetchAllOpenPullRequests(octokitWith(pageOf(1001)), {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+    });
+
+    expect(result.complete).toBe(false);
+    expect(result.pulls).toHaveLength(1000);
+  });
+
+  test('an empty repo reads one page and reports complete', async () => {
+    const result = await fetchAllOpenPullRequests(octokitWith([]), {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+    });
+
+    expect(result.complete).toBe(true);
+    expect(result.pulls).toHaveLength(0);
   });
 });

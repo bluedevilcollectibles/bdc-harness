@@ -196,6 +196,17 @@ export interface DiscoveredPullRequest {
    * visible instead of looking like a quiet backlog.
    */
   reviewDecisionFromFallback?: boolean;
+  /**
+   * True when the repo's open-PR listing hit the page ceiling, so PRs beyond it
+   * were never read on this tick. Set on every PR the truncated sweep DID
+   * return, because the flag's job is to make the omission visible somewhere a
+   * caller can see it: an unread PR has no record of its own to carry it.
+   *
+   * The PRs carrying this flag are still fully evaluated candidates -- the flag
+   * is about what is MISSING from the sweep, never a defect in the PR it rides
+   * on, and must not be read as a reason to hold it.
+   */
+  listingTruncated?: boolean;
 }
 
 export interface GitHubOpenPullRequestListInput {

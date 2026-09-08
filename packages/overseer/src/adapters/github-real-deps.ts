@@ -1278,8 +1278,61 @@ export interface RealListOpenPullRequestsOptions {
 }
 
 /**
+ * Hard ceiling on open-PR pages read per repo per tick, so one pathological
+ * repo cannot spin the tick. 10 pages x 100 = 1000 open PRs, far above any real
+ * repo here (shopops, the busiest, carries ~30 open against master).
+ */
+const MAX_OPEN_PR_PAGES = 10;
+const OPEN_PR_PAGE_SIZE = 100;
+
+/** One page of open PRs as the discovery path consumes them. */
+type OpenPullRequestPage = Awaited<ReturnType<RealGitHubOctokitLike['pulls']['list']>>['data'];
+
+/**
+ * Read EVERY open PR on the repo, following pages.
+ *
+ * `per_page: 100` unpaginated was the bug (Overseer review of e729fea5): a repo
+ * with more than 100 open PRs silently omits every later page on every tick, so
+ * those PRs are never evaluated as merge candidates and never appear anywhere
+ * saying why. That is precisely the invisible-candidate failure #758 exists to
+ * end, recreated one layer down -- and it fails in the direction that looks
+ * exactly like a quiet backlog.
+ *
+ * `complete` reports whether the whole set was actually read. Unlike the review
+ * derivation, an incomplete read here cannot fail closed by excluding anything:
+ * the PRs we DID read are still legitimate candidates, and holding them because
+ * a later page was unreachable would stall merges for the same "silence" reason.
+ * So the partial list is returned and the flag travels with it, to be logged and
+ * carried on every discovered PR rather than dropped.
+ */
+export async function fetchAllOpenPullRequests(
+  octokit: RealGitHubOctokitLike,
+  input: { owner: string; repo: string }
+): Promise<{ pulls: OpenPullRequestPage; complete: boolean }> {
+  const pulls: OpenPullRequestPage = [];
+  for (let page = 1; page <= MAX_OPEN_PR_PAGES; page += 1) {
+    // Called through `octokit.pulls` rather than detached, so a real client
+    // method keeps its receiver.
+    const batch = await octokit.pulls.list({
+      owner: input.owner,
+      repo: input.repo,
+      state: 'open',
+      per_page: OPEN_PR_PAGE_SIZE,
+      page,
+    });
+    const data = batch.data ?? [];
+    pulls.push(...data);
+    // A short page is the last page.
+    if (data.length < OPEN_PR_PAGE_SIZE) return { pulls, complete: true };
+  }
+  // Hit the page ceiling with full pages throughout: more may remain unread.
+  return { pulls, complete: false };
+}
+
+/**
  * Real listOpenPullRequests for PR-first merge candidate discovery
- * (bdc-harness#758). Lists open PRs, filters to the watched base branches, and
+ * (bdc-harness#758). Lists open PRs -- following pages, see
+ * `fetchAllOpenPullRequests` -- filters to the watched base branches, and
  * resolves each one's review decision.
  *
  * TWO SOURCES, IN ORDER OF AUTHORITY:
@@ -1307,12 +1360,25 @@ export function createRealListOpenPullRequests(
     const bases = (input.baseBranches ?? []).map(base => base.trim().toLowerCase()).filter(Boolean);
     const reviewGateLogin = options.reviewGateLogin ?? resolveReviewGateLogin();
     const logger = options.logger ?? log;
-    const listed = await octokit.pulls.list({
-      owner: input.owner,
-      repo: input.repo,
-      state: 'open',
-      per_page: 100,
-    });
+    const { pulls: listedPulls, complete: listingComplete } = await fetchAllOpenPullRequests(
+      octokit,
+      { owner: input.owner, repo: input.repo }
+    );
+
+    // ONE line per repo per tick when the ceiling is hit. A truncated listing
+    // means real merge candidates were never looked at, which is indistinguish-
+    // able from an empty queue unless it is said out loud.
+    if (!listingComplete) {
+      logger.warn(
+        {
+          owner: input.owner,
+          repo: input.repo,
+          pagesRead: MAX_OPEN_PR_PAGES,
+          pullsRead: listedPulls.length,
+        },
+        'merge-coordinator.open_pull_request_listing_truncated'
+      );
+    }
 
     const matchesBase = (baseRef: string): boolean =>
       bases.length === 0 || bases.includes(baseRef.trim().toLowerCase());
@@ -1320,7 +1386,7 @@ export function createRealListOpenPullRequests(
     // Batch GitHub's authoritative decision for every PR we will actually
     // evaluate. PRs on unwatched bases are excluded upstream on base grounds,
     // so spending query budget on them buys nothing.
-    const evaluatedNumbers = listed.data
+    const evaluatedNumbers = listedPulls
       .filter(pr => matchesBase(pr.base?.ref ?? ''))
       .map(pr => pr.number);
     const lookup = await fetchReviewDecisions(octokit, {
@@ -1352,7 +1418,7 @@ export function createRealListOpenPullRequests(
     const usedFallback = lookup.unavailableReason !== null;
 
     const discovered: DiscoveredPullRequest[] = [];
-    for (const pr of listed.data) {
+    for (const pr of listedPulls) {
       const baseRef = pr.base?.ref ?? '';
       // Filter bases here rather than via the API's `base` param so that a PR
       // targeting an unwatched base is still COUNTED as evaluated upstream and
@@ -1371,6 +1437,7 @@ export function createRealListOpenPullRequests(
           headSha: pr.head.sha,
           reviewDecision: null,
           woId: extractWoId(pr.title, pr.body),
+          ...(listingComplete ? {} : { listingTruncated: true }),
         });
         continue;
       }
@@ -1409,6 +1476,7 @@ export function createRealListOpenPullRequests(
         // an unwatched base never consults reviews at all, so it is not a
         // fallback casualty and is not counted as one.
         reviewDecisionFromFallback: usedFallback,
+        ...(listingComplete ? {} : { listingTruncated: true }),
       });
     }
     return discovered;
