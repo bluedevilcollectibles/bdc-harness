@@ -11,17 +11,19 @@
  * of the fix: WHICH enter the candidate set, and WHAT SPECIFIC REASON is
  * recorded for each one that does not. Silence for an excluded PR is the defect.
  */
-import { describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
 import {
   classifyDiscoveredPullRequest,
   classifyPullRequestEvidence,
   discoverMergeCandidates,
   pullRequestKey,
+  resetDiscoveryCursorForTests,
   resolveDiscoveryRepos,
   resolveWatchedBaseBranches,
   summarizeExclusions,
   DEFAULT_WATCHED_BASE_BRANCHES,
 } from '../merge-candidate-discovery.ts';
+import type { DiscoveryCursor } from '../merge-candidate-discovery.ts';
 import { watchLoop, watchOnce } from '../watch.ts';
 import { handleRecord } from '../service.ts';
 import type {
@@ -888,5 +890,302 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
 
     expect(discovery).toBeDefined();
     expect(mergeCalls).toHaveLength(0);
+  });
+});
+
+/**
+ * ROTATING EVALUATION WINDOW (Overseer review of c32e87ed).
+ *
+ * The per-tick bound always evaluated the FIRST `cap` PRs in the same repo
+ * order, restarting from the top every tick. With more open PRs than the cap,
+ * PR cap+1 onward were never evaluated -- and because the outer repo loop broke
+ * on the same counter, every repo after the first was never even LISTED. A
+ * second busy repo could be starved permanently by the first.
+ *
+ * It was also silent: `listingTruncated` covers the separate 1000-PR API
+ * listing ceiling, not this bound, so nothing said the window had been cut.
+ *
+ * The window now rotates over a keyset cursor and interleaves repos.
+ */
+describe('discovery evaluation window -- rotation and fairness', () => {
+  /** `count` open PRs on `dev` for one repo, numbered from `first`. */
+  function openPulls(repo: string, first: number, count: number): DiscoveredPullRequest[] {
+    return Array.from({ length: count }, (_unused, index) => pr({ prNumber: first + index, repo }));
+  }
+
+  /** Evidence that always excludes, so every PR is EVALUATED but none merges. */
+  function excludingEvidence(
+    pulls: readonly DiscoveredPullRequest[]
+  ): Record<number, PullRequestEvidence> {
+    const evidence: Record<number, PullRequestEvidence> = {};
+    for (const candidate of pulls)
+      evidence[candidate.prNumber] = conflictingEvidence(candidate.prNumber);
+    return evidence;
+  }
+
+  /**
+   * Deps serving two repos from one PR pool, so a sweep sees both. The base
+   * fixture helper is single-repo, so this builds the multi-repo listing.
+   */
+  function multiRepoDeps(
+    pools: Record<string, readonly DiscoveredPullRequest[]>
+  ): MergeCandidateDiscoveryDeps {
+    const all = Object.values(pools).flat();
+    const base = discoveryDeps(all, excludingEvidence(all));
+    return {
+      ...base,
+      listOpenPullRequests: async input => pools[input.repo] ?? [],
+    };
+  }
+
+  beforeEach(() => {
+    // The rotation cursor is process-local, so one test's leftover position
+    // would silently change the next test's window.
+    resetDiscoveryCursorForTests();
+  });
+
+  // THE HEADLINE. 250 PRs across two repos, cap 100 -> everything evaluated
+  // within 3 ticks, and nothing evaluated twice until everything has been
+  // evaluated once.
+  test('250 open PRs across two repos are all evaluated within 3 ticks, none twice', async () => {
+    const big = openPulls('bdc-harness', 1000, 200);
+    const small = openPulls('shopops', 2000, 50);
+    const deps = multiRepoDeps({ 'bdc-harness': big, shopops: small });
+    const repos = [
+      { owner: OWNER, repo: 'bdc-harness' },
+      { owner: OWNER, repo: 'shopops' },
+    ];
+
+    const seen: string[] = [];
+    let cursor: DiscoveryCursor | null = null;
+    for (let tick = 0; tick < 3; tick += 1) {
+      const result = await discoverMergeCandidates(deps, {
+        watchedBases: WATCHED_BASES,
+        repos,
+        maxPullRequestsPerTick: 100,
+        cursor,
+        logger: { info: () => undefined },
+      });
+      for (const exclusion of result.exclusions) {
+        seen.push(pullRequestKey(exclusion.owner, exclusion.repo, exclusion.prNumber));
+      }
+      cursor = result.cursorAfter;
+    }
+
+    // Every one of the 250 was evaluated within 3 ticks.
+    expect(new Set(seen).size).toBe(250);
+
+    // NO PR IS EVALUATED TWICE BEFORE EVERY PR HAS BEEN EVALUATED ONCE. The
+    // check is on the prefix up to the point the population is first covered:
+    // 3 ticks x 100 slots is 300, more than the 250 PRs, so the tick that
+    // completes the pass legitimately starts the NEXT pass with its spare
+    // slots. Asserting `seen.length === 250` would forbid that useful work.
+    const firstCoverage = new Set<string>();
+    let coveredAt = -1;
+    for (const [index, key] of seen.entries()) {
+      firstCoverage.add(key);
+      if (firstCoverage.size === 250) {
+        coveredAt = index;
+        break;
+      }
+    }
+    expect(coveredAt).toBeGreaterThanOrEqual(0);
+    // Every evaluation up to first full coverage was a distinct PR.
+    expect(new Set(seen.slice(0, coveredAt + 1)).size).toBe(coveredAt + 1);
+  });
+
+  // FAIRNESS. The small repo must not wait behind the big one: a single tick
+  // bounded at 100 has to spend some of its budget on each repo.
+  test('a small repo is not starved by a large one in the first tick', async () => {
+    const big = openPulls('bdc-harness', 1000, 200);
+    const small = openPulls('shopops', 2000, 50);
+    const deps = multiRepoDeps({ 'bdc-harness': big, shopops: small });
+
+    const result = await discoverMergeCandidates(deps, {
+      watchedBases: WATCHED_BASES,
+      repos: [
+        { owner: OWNER, repo: 'bdc-harness' },
+        { owner: OWNER, repo: 'shopops' },
+      ],
+      maxPullRequestsPerTick: 100,
+      logger: { info: () => undefined },
+    });
+
+    const perRepo = new Map<string, number>();
+    for (const exclusion of result.exclusions) {
+      perRepo.set(exclusion.repo, (perRepo.get(exclusion.repo) ?? 0) + 1);
+    }
+
+    expect(result.evaluated).toBe(100);
+    // Round-robin gives the small repo half the budget until it runs out.
+    expect(perRepo.get('shopops') ?? 0).toBe(50);
+    expect(perRepo.get('bdc-harness') ?? 0).toBe(50);
+  });
+
+  // The old shape broke the REPO loop on the same counter, so repo 2 was never
+  // listed at all once repo 1 filled the budget. This is that regression.
+  test('every repo is listed even when the first repo alone exceeds the cap', async () => {
+    const big = openPulls('bdc-harness', 1000, 200);
+    const small = openPulls('shopops', 2000, 50);
+    const listed: string[] = [];
+    const all = [...big, ...small];
+    const base = discoveryDeps(all, excludingEvidence(all));
+    const deps: MergeCandidateDiscoveryDeps = {
+      ...base,
+      listOpenPullRequests: async input => {
+        listed.push(input.repo);
+        return input.repo === 'bdc-harness' ? big : small;
+      },
+    };
+
+    const result = await discoverMergeCandidates(deps, {
+      watchedBases: WATCHED_BASES,
+      repos: [
+        { owner: OWNER, repo: 'bdc-harness' },
+        { owner: OWNER, repo: 'shopops' },
+      ],
+      maxPullRequestsPerTick: 100,
+      logger: { info: () => undefined },
+    });
+
+    expect(listed).toEqual(['bdc-harness', 'shopops']);
+    // ...and totalOpen reports the WHOLE population, not just the window.
+    expect(result.totalOpen).toBe(250);
+  });
+
+  // THE FLAG AND THE LOG. A truncated window must say so, distinctly from the
+  // listing ceiling.
+  test('a truncated window sets its own flag and logs the window line', async () => {
+    const pulls = openPulls('bdc-harness', 1000, 150);
+    const deps = multiRepoDeps({ 'bdc-harness': pulls });
+    const logged: { obj: Record<string, unknown>; msg: string }[] = [];
+
+    const result = await discoverMergeCandidates(deps, {
+      watchedBases: WATCHED_BASES,
+      repos: [{ owner: OWNER, repo: 'bdc-harness' }],
+      maxPullRequestsPerTick: 100,
+      logger: { info: (obj, msg) => logged.push({ obj, msg }) },
+    });
+
+    expect(result.evaluationWindowTruncated).toBe(true);
+    expect(result.evaluated).toBe(100);
+    expect(result.totalOpen).toBe(150);
+    expect(result.cursorAfter?.perRepo['thinmansoftware/bdc-harness']).toBe(1099);
+
+    const window = logged.filter(entry => entry.msg === 'merge-coordinator.discovery_window');
+    expect(window).toHaveLength(1);
+    expect(window[0]?.obj).toMatchObject({
+      evaluated: 100,
+      totalOpen: 150,
+      truncated: true,
+    });
+    expect(window[0]?.obj).toMatchObject({
+      cursorAfter: { perRepo: { 'thinmansoftware/bdc-harness': 1099 } },
+    });
+  });
+
+  // A complete pass is NOT truncated, and resets the cursor so the next tick
+  // starts at the top rather than drifting forever.
+  test('a complete pass reports untruncated and clears the cursor', async () => {
+    const pulls = openPulls('bdc-harness', 1000, 40);
+    const deps = multiRepoDeps({ 'bdc-harness': pulls });
+    const logged: { obj: Record<string, unknown>; msg: string }[] = [];
+
+    const result = await discoverMergeCandidates(deps, {
+      watchedBases: WATCHED_BASES,
+      repos: [{ owner: OWNER, repo: 'bdc-harness' }],
+      maxPullRequestsPerTick: 100,
+      logger: { info: (obj, msg) => logged.push({ obj, msg }) },
+    });
+
+    expect(result.evaluationWindowTruncated).toBe(false);
+    expect(result.evaluated).toBe(40);
+    expect(result.totalOpen).toBe(40);
+    expect(result.cursorAfter).toBeNull();
+
+    const window = logged.filter(entry => entry.msg === 'merge-coordinator.discovery_window');
+    expect(window[0]?.obj).toMatchObject({ truncated: false, cursorAfter: null });
+  });
+
+  // The cursor is a KEYSET, not an offset: a PR merging below the cursor
+  // between ticks must not cause the next tick to skip past unevaluated PRs.
+  test('a PR disappearing below the cursor does not skip unevaluated PRs', async () => {
+    const pulls = openPulls('bdc-harness', 1000, 10);
+    const deps = multiRepoDeps({ 'bdc-harness': pulls });
+    const repos = [{ owner: OWNER, repo: 'bdc-harness' }];
+
+    const first = await discoverMergeCandidates(deps, {
+      watchedBases: WATCHED_BASES,
+      repos,
+      maxPullRequestsPerTick: 4,
+      logger: { info: () => undefined },
+    });
+    expect(first.evaluated).toBe(4);
+    expect(first.cursorAfter?.perRepo['thinmansoftware/bdc-harness']).toBe(1003);
+
+    // PRs 1000 and 1001 merge and leave the open listing.
+    const remaining = pulls.filter(candidate => candidate.prNumber > 1001);
+    const shrunk = multiRepoDeps({ 'bdc-harness': remaining });
+
+    const second = await discoverMergeCandidates(shrunk, {
+      watchedBases: WATCHED_BASES,
+      repos,
+      maxPullRequestsPerTick: 4,
+      cursor: first.cursorAfter,
+      logger: { info: () => undefined },
+    });
+
+    // Resumes at 1004 -- the first PR after the cursor -- not at the start, and
+    // not skipping ahead because two rows vanished beneath it.
+    const seen = second.exclusions.map(exclusion => exclusion.prNumber);
+    expect(seen).toEqual([1004, 1005, 1006, 1007]);
+  });
+
+  // Wrap-around: once the end of the population is reached the window comes
+  // back to the beginning rather than stalling at the tail.
+  test('the window wraps back to the start of the population', async () => {
+    const pulls = openPulls('bdc-harness', 1000, 6);
+    const deps = multiRepoDeps({ 'bdc-harness': pulls });
+    const repos = [{ owner: OWNER, repo: 'bdc-harness' }];
+
+    const first = await discoverMergeCandidates(deps, {
+      watchedBases: WATCHED_BASES,
+      repos,
+      maxPullRequestsPerTick: 4,
+      logger: { info: () => undefined },
+    });
+    expect(first.exclusions.map(e => e.prNumber)).toEqual([1000, 1001, 1002, 1003]);
+
+    const second = await discoverMergeCandidates(deps, {
+      watchedBases: WATCHED_BASES,
+      repos,
+      maxPullRequestsPerTick: 4,
+      cursor: first.cursorAfter,
+      logger: { info: () => undefined },
+    });
+
+    // The two unevaluated PRs come first, then it wraps to the start.
+    expect(second.exclusions.map(e => e.prNumber)).toEqual([1004, 1005, 1000, 1001]);
+  });
+
+  // Without an explicit cursor the sweep still rotates, using the process-local
+  // position -- so the default production wiring is not stuck on tick one.
+  test('consecutive sweeps rotate without the caller threading a cursor', async () => {
+    const pulls = openPulls('bdc-harness', 1000, 6);
+    const deps = multiRepoDeps({ 'bdc-harness': pulls });
+    const repos = [{ owner: OWNER, repo: 'bdc-harness' }];
+    const options = {
+      watchedBases: WATCHED_BASES,
+      repos,
+      maxPullRequestsPerTick: 3,
+      logger: { info: () => undefined },
+    };
+
+    const first = await discoverMergeCandidates(deps, options);
+    const second = await discoverMergeCandidates(deps, options);
+
+    expect(first.exclusions.map(e => e.prNumber)).toEqual([1000, 1001, 1002]);
+    // Advanced on its own -- the defect was that this repeated 1000-1002 forever.
+    expect(second.exclusions.map(e => e.prNumber)).toEqual([1003, 1004, 1005]);
   });
 });

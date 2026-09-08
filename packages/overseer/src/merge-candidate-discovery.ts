@@ -47,12 +47,15 @@
  * decides which PRs get LOOKED AT. Whether any of them may actually merge is
  * still the Merge Manager's call, on exactly the rules it had before.
  */
+import { createLogger } from '@archon/paths';
 import type {
   DiscoveredPullRequest,
   MergeCandidateDiscoveryDeps,
   PullRequestEvidence,
   WatchedRunRecord,
 } from './types.ts';
+
+const log = createLogger('overseer/merge-candidate-discovery');
 
 /** Base branches evaluated when none are configured. Mirrors MERGE_MANAGER_ALLOWED_BASES. */
 export const DEFAULT_WATCHED_BASE_BRANCHES = ['dev', 'staging'] as const;
@@ -118,6 +121,43 @@ export interface MergeCandidateDiscoveryResult {
    * lookup threw). Distinguishes "nothing to merge" from "we did not look".
    */
   readonly unavailable: boolean;
+  /** Total open PRs listed across every repo, before the per-tick bound. */
+  readonly totalOpen: number;
+  /**
+   * True when the per-tick evaluation bound stopped the sweep short, so some
+   * open PRs were not looked at THIS tick. They are not lost: the cursor below
+   * resumes at the first unevaluated PR next tick.
+   *
+   * Deliberately distinct from `DiscoveredPullRequest.listingTruncated`, which
+   * reports the separate 1000-PR API listing ceiling. One says "we did not ASK
+   * about every PR", the other says "we did not LOOK at every PR we asked
+   * about" -- different causes, different fixes, so they are never merged.
+   */
+  readonly evaluationWindowTruncated: boolean;
+  /**
+   * Where the next tick resumes: the position after the last PR evaluated, as
+   * a keyset over (repo, PR number). Null when the sweep completed the whole
+   * population and the next tick starts from the beginning.
+   */
+  readonly cursorAfter: DiscoveryCursor | null;
+}
+
+/**
+ * Resume point for the rotating evaluation window, as a KEYSET rather than an
+ * offset. An offset would silently skip PRs whenever the population shifted
+ * between ticks (a PR merged or opened below the cursor); a keyset resumes at
+ * "the first PR after this one" and is stable under both.
+ *
+ * PER-REPO, because the sweep interleaves repos: each repo advances through its
+ * own PRs at its own rate, so one shared position cannot describe where the
+ * sweep is. A single cursor at the last-evaluated PR would name whichever repo
+ * happened to be last in the round-robin and rewind every other repo to zero --
+ * the sweep would then re-evaluate the same first `cap` PRs forever, which is
+ * the very defect the rotation exists to fix.
+ */
+export interface DiscoveryCursor {
+  /** Last PR number evaluated in each repo, keyed by lowercased `owner/repo`. */
+  readonly perRepo: Readonly<Record<string, number>>;
 }
 
 const EMPTY_RESULT: MergeCandidateDiscoveryResult = {
@@ -126,6 +166,9 @@ const EMPTY_RESULT: MergeCandidateDiscoveryResult = {
   evaluated: 0,
   fallbackReviewDecisions: 0,
   unavailable: true,
+  totalOpen: 0,
+  evaluationWindowTruncated: false,
+  cursorAfter: null,
 };
 
 /**
@@ -392,6 +435,119 @@ export interface DiscoverMergeCandidatesOptions {
    * `already_a_run_candidate` rather than evaluated twice.
    */
   readonly alreadyCoveredPullRequests?: ReadonlySet<string>;
+  /**
+   * Where to resume the rotating evaluation window. Pass the previous tick's
+   * `cursorAfter`. Omitted or null starts from the beginning of the population.
+   */
+  readonly cursor?: DiscoveryCursor | null;
+  /** Injectable for tests; defaults to this module's logger. */
+  readonly logger?: { info(obj: Record<string, unknown>, msg: string): void };
+}
+
+/**
+ * Process-local resume point, so the default wiring rotates without any caller
+ * having to thread the cursor through. A restart re-reads from the start of the
+ * population, which is correct-but-slower rather than wrong: no PR is skipped,
+ * some are merely re-evaluated sooner than strictly necessary.
+ *
+ * Deliberately NOT persisted. A durable cursor would need a store, a migration,
+ * and a staleness policy for a value whose worst-case cost is one redundant
+ * evaluation pass after a process restart. Kept in-process until that cost is
+ * shown to matter.
+ */
+let processCursor: DiscoveryCursor | null = null;
+
+/** Reset the process-local rotation cursor. Tests only. */
+export function resetDiscoveryCursorForTests(): void {
+  processCursor = null;
+}
+
+function repoKey(owner: string, repo: string): string {
+  return `${owner.toLowerCase()}/${repo.toLowerCase()}`;
+}
+
+/**
+ * Build one per-repo queue, each rotated to resume after that repo's own cursor
+ * position and wrapping within the repo.
+ *
+ * Rotation is per repo and PRs are sorted ascending by number, so "resume after
+ * N" is meaningful and stable: it uses a `> N` comparison rather than an exact
+ * match, which means a cursor pointing at a PR that has since merged still
+ * resumes at the next real PR instead of restarting the repo.
+ */
+function rotatedQueues(
+  repos: readonly DiscoveryRepoTarget[],
+  byRepo: ReadonlyMap<string, readonly DiscoveredPullRequest[]>,
+  cursor: DiscoveryCursor | null
+): { key: string; queue: DiscoveredPullRequest[]; fresh: DiscoveredPullRequest[] }[] {
+  const queues: { key: string; queue: DiscoveredPullRequest[]; fresh: DiscoveredPullRequest[] }[] =
+    [];
+  for (const target of repos) {
+    const key = repoKey(target.owner, target.repo);
+    const sorted = [...(byRepo.get(key) ?? [])].sort((a, b) => a.prNumber - b.prNumber);
+    if (sorted.length === 0) continue;
+    const after = cursor?.perRepo[key];
+    if (after === undefined) {
+      queues.push({ key, queue: sorted, fresh: sorted });
+      continue;
+    }
+    const index = sorted.findIndex(pr => pr.prNumber > after);
+    // `fresh` is the not-yet-evaluated tail of this repo's pass. When the repo
+    // has finished its pass it is empty, and the repo wraps to its top -- but
+    // only once every other repo has also finished, so a small repo cannot
+    // spend budget re-reading PRs while a large one still has unseen work.
+    const fresh = index < 0 ? [] : sorted.slice(index);
+    const rotated = index < 0 ? sorted : [...sorted.slice(index), ...sorted.slice(0, index)];
+    queues.push({ key, queue: rotated, fresh });
+  }
+  return queues;
+}
+
+/**
+ * Interleave the per-repo queues so one busy repo cannot consume the whole
+ * per-tick budget while a small repo waits behind it.
+ *
+ * Round-robin, preserving each repo's own rotated order. With repos of 200 and
+ * 50 PRs and a cap of 100, the small repo gets 50 of the slots rather than
+ * zero, and each repo still advances through its own PRs across ticks because
+ * the cursor is recorded per repo.
+ */
+function interleaveByRepo(
+  queues: readonly { key: string; queue: DiscoveredPullRequest[]; fresh: DiscoveredPullRequest[] }[]
+): DiscoveredPullRequest[] {
+  if (queues.length === 1) return [...(queues[0]?.queue ?? [])];
+
+  // UNEVALUATED WORK FIRST, round-robin across the repos that still have some.
+  // A repo that has finished its pass contributes nothing here, so its slots go
+  // to repos with PRs nobody has looked at yet -- otherwise a 50-PR repo would
+  // take half of every tick re-reading the same 50 while a 200-PR repo crawled.
+  const interleaved: DiscoveredPullRequest[] = [];
+  const withFresh = queues.filter(entry => entry.fresh.length > 0);
+  const freshTotal = withFresh.reduce((sum, entry) => sum + entry.fresh.length, 0);
+  for (let round = 0; interleaved.length < freshTotal; round += 1) {
+    for (const entry of withFresh) {
+      const pr = entry.fresh[round];
+      if (pr) interleaved.push(pr);
+    }
+  }
+
+  // Then the wrapped remainder, so a tick with spare budget after every repo
+  // has completed its pass starts the next pass instead of idling.
+  const seen = new Set(interleaved);
+  const total = queues.reduce((sum, entry) => sum + entry.queue.length, 0);
+  for (let round = 0; interleaved.length < total; round += 1) {
+    let advanced = false;
+    for (const entry of queues) {
+      const pr = entry.queue[round];
+      if (pr && !seen.has(pr)) {
+        interleaved.push(pr);
+        seen.add(pr);
+        advanced = true;
+      }
+    }
+    if (!advanced && round > total) break;
+  }
+  return interleaved;
 }
 
 export function pullRequestKey(owner: string, repo: string, prNumber: number): string {
@@ -466,25 +622,47 @@ export async function discoverMergeCandidates(
   let fallbackReviewDecisions = 0;
   let anyRepoListed = false;
 
+  // LIST EVERY REPO FIRST, then evaluate one interleaved sequence.
+  //
+  // The previous shape listed and evaluated repo-by-repo, breaking out of the
+  // outer loop once the per-tick bound was hit -- so with more open PRs than
+  // the cap, repos after the first were never even LISTED, let alone evaluated.
+  // Listing is cheap relative to per-PR evidence lookups, and it is what makes
+  // both the round-robin and an honest `totalOpen` possible.
+  const byRepo = new Map<string, readonly DiscoveredPullRequest[]>();
   for (const target of repos) {
-    if (evaluated >= maxPullRequests) break;
-    let pullRequests: readonly DiscoveredPullRequest[];
     try {
-      pullRequests = await listOpenPullRequests({
+      const listed = await listOpenPullRequests({
         owner: target.owner,
         repo: target.repo,
         baseBranches: watchedBases,
       });
+      byRepo.set(repoKey(target.owner, target.repo), listed);
       anyRepoListed = true;
     } catch {
       // One unreachable repo must not blind the sweep to every other repo.
       // Reported through `unavailable` only if NO repo could be listed.
       continue;
     }
+  }
 
-    for (const pr of pullRequests) {
+  const startCursor = options.cursor === undefined ? processCursor : options.cursor;
+  const queues = rotatedQueues(repos, byRepo, startCursor);
+  const totalOpen = queues.reduce((sum, entry) => sum + entry.queue.length, 0);
+  // Unevaluated PRs remaining in THIS pass. `totalOpen` is the whole population,
+  // so comparing evaluated against it would report a pass as truncated even on
+  // the tick that finishes it -- the window is truncated when work is left over.
+  const freshTotal = queues.reduce((sum, entry) => sum + entry.fresh.length, 0);
+  const sequence = interleaveByRepo(queues);
+
+  // Where each repo got to this tick, so the next tick resumes per repo rather
+  // than rewinding every repo to whichever one happened to be evaluated last.
+  const lastPerRepo = new Map<string, number>();
+  {
+    for (const pr of sequence) {
       if (evaluated >= maxPullRequests) break;
       evaluated += 1;
+      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
       // Counted BEFORE any exclusion `continue`: the PRs this most matters for
       // are precisely the ones the stricter fallback pushed into
       // `review_not_approved`. Counting only survivors would hide them.
@@ -572,12 +750,48 @@ export async function discoverMergeCandidates(
     }
   }
 
+  // The window truncated when PRs remained unevaluated after the bound. On a
+  // complete pass the cursor RESETS to null so the next tick starts at the top
+  // of the population rather than drifting forever.
+  // Truncated when this pass could not finish: PRs nobody has evaluated yet
+  // remain. A cursor is carried only then; completing the pass clears it so the
+  // next tick starts a fresh pass at the top of every repo.
+  const evaluationWindowTruncated = evaluated < freshTotal;
+  const cursorAfter: DiscoveryCursor | null =
+    evaluationWindowTruncated && lastPerRepo.size > 0
+      ? {
+          perRepo: {
+            // Repos untouched this tick keep their previous position, or they
+            // would silently restart while another repo consumed the budget.
+            ...(startCursor?.perRepo ?? {}),
+            ...Object.fromEntries(lastPerRepo),
+          },
+        }
+      : null;
+  processCursor = cursorAfter;
+
+  // ONE line per tick naming exactly how much of the population was looked at.
+  // A bounded window that says nothing is indistinguishable from a small
+  // population -- the same class of silence #758 exists to end.
+  (options.logger ?? log).info(
+    {
+      evaluated,
+      totalOpen,
+      cursorAfter,
+      truncated: evaluationWindowTruncated,
+    },
+    'merge-coordinator.discovery_window'
+  );
+
   return {
     candidates,
     exclusions,
     evaluated,
     fallbackReviewDecisions,
     unavailable: !anyRepoListed,
+    totalOpen,
+    evaluationWindowTruncated,
+    cursorAfter,
   };
 }
 

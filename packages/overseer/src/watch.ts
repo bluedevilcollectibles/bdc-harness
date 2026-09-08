@@ -350,6 +350,9 @@ export async function watchOnce(
     evaluated: 0,
     fallbackReviewDecisions: 0,
     unavailable: true,
+    totalOpen: 0,
+    evaluationWindowTruncated: false,
+    cursorAfter: null,
   };
   if (options.discoveryEnabled !== false) {
     try {
@@ -409,6 +412,13 @@ export async function watchOnce(
       // matching per-tick warn line is
       // 'merge-coordinator.review_decision_graphql_unavailable'.
       prsFallbackDecision: discovery.fallbackReviewDecisions,
+      // The per-tick evaluation window. `prsTotalOpen` is the whole open
+      // population; when it exceeds `prsEvaluated` the window truncated and the
+      // rest are picked up on following ticks via the rotating cursor. Without
+      // these two the heartbeat cannot distinguish "few open PRs" from "we only
+      // looked at the first 100 of them".
+      prsTotalOpen: discovery.totalOpen,
+      prsWindowTruncated: discovery.evaluationWindowTruncated,
       exclusionsByReason: summarizeExclusions(discovery.exclusions),
       eligible: outcomes.filter(outcome => outcome.action === 'merge_ready').length,
     },
