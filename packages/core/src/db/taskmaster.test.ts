@@ -378,6 +378,56 @@ describe('tm_expectations DAL', () => {
     expect(await markEscalated(id, 'again')).toBe(false);
   });
 
+  test('evidence during escalating closes the row as met, against the real DAL', async () => {
+    // REGRESSION. markMet used to accept only ['pending','failed'], so a row
+    // that had entered 'escalating' could never be closed by late evidence:
+    // markMet returned false, the supervisor continued past the rejected
+    // transition, and the row stayed 'escalating' forever with every later tick
+    // repeating the same failed close.
+    //
+    // This exercises the REAL sqlite DAL, not a double. The round-5 supervisor
+    // test asserted this behaviour through a markMet stub that always returned
+    // true, so it passed while the invariant underneath it was broken.
+    const id = await registerExpectation({
+      dispatch_ref: 'dispatch-met-during-escalating',
+      recipient: 'xo',
+      evidence_json: '{}',
+      due_at: new Date(0).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    expect(await claimEscalation(id, 'tm:expectation:m:escalate')).toBe(true);
+    const claimed = await db.query<{ status: string }>(
+      'SELECT status FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(claimed.rows[0]?.status).toBe('escalating');
+
+    // Late evidence must still close it.
+    expect(await markMet(id, 'https://example/late-proof')).toBe(true);
+    const row = await db.query<{ status: string; evidence_pointer: string | null }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(row.rows[0]?.status).toBe('met');
+    expect(row.rows[0]?.evidence_pointer).toBe('https://example/late-proof');
+
+    // A subsequent tick must not re-escalate or re-send: the row is terminal,
+    // so it is gone from the due list and every further transition is refused.
+    const due = await listDueExpectations(new Date().toISOString());
+    expect(due.map(r => r.id)).not.toContain(id);
+    expect(await claimEscalation(id, 'tm:expectation:m:escalate')).toBe(false);
+    expect(await markEscalated(id, 'tm:expectation:m:escalate')).toBe(false);
+    expect(await markFailed(id)).toBe(false);
+    expect(await markMet(id, 'https://example/second-observer')).toBe(false);
+    const final = await db.query<{ status: string; evidence_pointer: string | null }>(
+      'SELECT status, evidence_pointer FROM tm_expectations WHERE id = $1',
+      [id]
+    );
+    expect(final.rows[0]?.status).toBe('met');
+    expect(final.rows[0]?.evidence_pointer).toBe('https://example/late-proof');
+  });
+
   test('claimEscalation is refused once the expectation is met', async () => {
     const id = await registerExpectation({
       dispatch_ref: 'dispatch-escalate-after-met',

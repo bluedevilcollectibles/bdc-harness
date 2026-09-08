@@ -249,9 +249,24 @@ async function transitionExpectation(
  * Close an expectation as met. Returns false when another tick already closed
  * it -- evidence arriving twice is not an error, but the second observer must
  * not re-close the row.
+ *
+ * `escalating` is accepted alongside the active set. Evidence can legitimately
+ * arrive after a tick has claimed the escalation but before the operator
+ * notification is confirmed, and success is success however far escalation had
+ * progressed. Excluding it was a real bug: markMet returned false, the
+ * supervisor continued past the rejected transition, and the row stayed
+ * `escalating` forever with every later tick repeating the same failed close.
+ *
+ * The terminal states (`met`, `escalated`, `given_up`) are still excluded, so a
+ * stale worker cannot reopen a row that is genuinely closed.
  */
 export async function markMet(id: string, evidencePointer: string): Promise<boolean> {
-  return transitionExpectation(id, 'met', ACTIVE_EXPECTATION_STATUSES, evidencePointer);
+  return transitionExpectation(
+    id,
+    'met',
+    [...ACTIVE_EXPECTATION_STATUSES, 'escalating'],
+    evidencePointer
+  );
 }
 
 /**

@@ -688,17 +688,21 @@ describe('expectation supervisor', () => {
     // An escalation being owed does not override real evidence: if the work
     // succeeded after all, met wins and no blocker is sent.
     const calls: string[] = [];
-    const escalating: TmExpectation = {
-      ...base,
-      retries: 2,
-      max_retries: 2,
-      status: 'escalating',
-    };
+    // The fake honours the REAL DAL transition rule rather than returning true
+    // unconditionally. An always-true markMet stub is what let this test pass
+    // while the DAL underneath refused escalating -> met; the doubles must
+    // model the constraint they stand in for.
+    const ACTIVE_OR_ESCALATING = ['pending', 'failed', 'escalating'];
+    let status: TmExpectation['status'] = 'escalating';
+    let row: TmExpectation = { ...base, retries: 2, max_retries: 2, status };
     await checkExpectations(new Date(), {
-      listDueExpectations: async () => [escalating],
+      listDueExpectations: async () => [row],
       checkEvidence: async () => ({ ok: true, pointer: 'https://example/proof' }),
       markMet: async () => {
         calls.push('markMet');
+        if (!ACTIVE_OR_ESCALATING.includes(status)) return false;
+        status = 'met';
+        row = { ...row, status };
         return true;
       },
       claimEscalation: async () => {
@@ -715,7 +719,10 @@ describe('expectation supervisor', () => {
       },
       retryDelayMs: 0,
     } as never);
+    // The close succeeds and nothing else runs: no escalation claim, no
+    // pending-escalation replay send, no terminal escalate.
     expect(calls).toEqual(['markMet']);
+    expect(status).toBe('met');
   });
 
   test('recovery advances the deadline, so a tick inside the interval does nothing', async () => {
