@@ -107,6 +107,34 @@ export const defaultAgentConfigs: Record<string, AgentConfig> = {
       'read-only',
       '--ephemeral',
       '--ignore-user-config',
+      // WINDOWS SANDBOX MODE (#795). Without this the seat cannot run ANY
+      // command on Windows -- not even a file read. Every tool call comes back
+      // as `exec_command failed: CreateProcess { message: "Rejected(... rejected:
+      // blocked by policy")}`, which reads like a permissions policy and is why
+      // this went unnoticed since the flag set landed in PR #462 (2026-07-10).
+      //
+      // Cause, reproduced 2026-09-08 with these exact args in the seat's cwd:
+      // `--ignore-user-config` drops `[windows] sandbox = "unelevated"` from
+      // ~/.codex/config.toml, and this codex build needs an explicit
+      // windows.sandbox mode to construct a Windows sandbox at all. With none,
+      // and `exec` running at approval `never`, every command falls through to
+      // "blocked by policy". It is NOT the execpolicy rules file (`--ignore-rules`
+      // changes nothing) and NOT the cwd (#792 fixed that).
+      //
+      // UNCONDITIONAL, not gated on process.platform: the key is inert on Linux
+      // and macOS, and a platform-dependent default would make the tracked
+      // config differ from what a reader sees, which is how a seat goes mute
+      // in one environment and works in another.
+      //
+      // The seat stays read-only and offline -- verified with the override in
+      // place: reads return real content, a forced `Set-Content` is denied by
+      // the OS and the file never appears, and `curl https://example.com`
+      // returns 000. Dropping `--ignore-user-config` instead would be far
+      // worse: it loads hooks, every MCP server, `sandbox_mode =
+      // "danger-full-access"`, and a `shell_environment_policy.set` block that
+      // injects live secrets into the seat.
+      '-c',
+      'windows.sandbox="unelevated"',
     ],
   },
   grok: {

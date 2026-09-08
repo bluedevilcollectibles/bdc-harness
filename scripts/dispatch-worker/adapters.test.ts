@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { buildAgentInvocation, defaultAgentConfigs, parseFusionReviewBody } from './adapters';
 
 describe('dispatch worker adapters', () => {
@@ -68,5 +69,72 @@ describe('dispatch worker adapters', () => {
     expect(() => parseFusionReviewBody('review this raw prompt')).toThrow(
       'fusion_review_body_invalid'
     );
+  });
+});
+
+/**
+ * #795 -- the tracked codex seat default could not run ANY command on Windows.
+ *
+ * `--ignore-user-config` drops `[windows] sandbox = "unelevated"` from
+ * ~/.codex/config.toml, and this codex build cannot construct a Windows sandbox
+ * without an explicit mode. With none, and `exec` running at approval `never`,
+ * every tool call -- including a plain file read -- came back as
+ * `Rejected(... "blocked by policy")`, which READS LIKE A PERMISSIONS DECISION.
+ * That is why the seat went mute unnoticed from PR #462 (2026-07-10) until it
+ * was reproduced on 2026-09-08.
+ */
+describe('#795 codex seat Windows sandbox mode', () => {
+  test('the default codex args carry the -c windows.sandbox="unelevated" pair', () => {
+    const args = defaultAgentConfigs.codex.args;
+    const flagIndex = args.indexOf('-c');
+
+    expect(flagIndex).toBeGreaterThanOrEqual(0);
+    // The pair, in order: a `-c` whose value landed elsewhere configures nothing.
+    expect(args[flagIndex + 1]).toBe('windows.sandbox="unelevated"');
+  });
+
+  test('the pair is UNCONDITIONAL -- the source carries no platform branch', () => {
+    // The key is inert on Linux and macOS. A platform-gated default would make
+    // the tracked config differ from what a reader sees, which is exactly how a
+    // seat works in one environment and goes mute in another. This asserts it
+    // against the SOURCE, because a runtime check can only ever observe the
+    // platform the suite happens to be running on.
+    const source = readFileSync(new URL('./adapters.ts', import.meta.url), 'utf8');
+    const codexBlock = source.slice(source.indexOf('  codex: {'), source.indexOf('  grok: {'));
+    // Comments are stripped first: the block's own doc comment EXPLAINS that the
+    // pair is unconditional, and matching that prose would fail the very test it
+    // documents.
+    const code = codexBlock.replace(/\/\/.*$/gm, '');
+
+    expect(code).toContain('windows.sandbox="unelevated"');
+    expect(code).not.toContain('process.platform');
+    expect(code).not.toContain('win32');
+    expect(code).not.toMatch(/\?|&&|\|\|/);
+  });
+
+  test('the override sits AFTER --ignore-user-config, which is what drops the key', () => {
+    const args = defaultAgentConfigs.codex.args;
+    expect(args.indexOf('-c')).toBeGreaterThan(args.indexOf('--ignore-user-config'));
+  });
+
+  test('the seat is still read-only, ephemeral and user-config-free', () => {
+    // The fix adds ONE key. Dropping --ignore-user-config instead would load
+    // hooks, every MCP server, `sandbox_mode = "danger-full-access"`, and a
+    // shell_environment_policy.set block that injects live secrets.
+    const args = defaultAgentConfigs.codex.args;
+    expect(args).toContain('--sandbox');
+    expect(args[args.indexOf('--sandbox') + 1]).toBe('read-only');
+    expect(args).toContain('--ephemeral');
+    expect(args).toContain('--ignore-user-config');
+    expect(args).toContain('--skip-git-repo-check');
+    expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox');
+  });
+
+  test('the pair survives prompt building and never carries the prompt', () => {
+    const invocation = buildAgentInvocation(defaultAgentConfigs.codex, 'read CLAUDE.md');
+    const flagIndex = invocation.args.indexOf('-c');
+
+    expect(invocation.args[flagIndex + 1]).toBe('windows.sandbox="unelevated"');
+    expect(invocation.args).not.toContain('read CLAUDE.md');
   });
 });

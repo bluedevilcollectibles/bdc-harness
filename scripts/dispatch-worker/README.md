@@ -11,11 +11,17 @@ Operator-run watcher for `WO-HARNESS-DISPATCH-DROPBOX-V1-01`.
    (closes the plan's Dependency #1 / WO Stop Condition #4 CLI-shape check):
    - Claude Code: `claude --permission-mode plan -p <prompt>`.
    - Codex/Sol: `codex exec --skip-git-repo-check --sandbox read-only --ephemeral
-     --ignore-user-config <prompt>` -- the
+     --ignore-user-config -c windows.sandbox="unelevated" <prompt>` -- the
      `--skip-git-repo-check` flag is REQUIRED: without it codex exec refuses
      to run in any untrusted/non-git working directory ("Not inside a trusted
-     directory"), and dispatch tasks run in arbitrary workdirs. The example
-     config ships this flag.
+     directory"), and dispatch tasks run in arbitrary workdirs. The
+     `-c windows.sandbox="unelevated"` pair is REQUIRED TOO (#795): on Windows,
+     `--ignore-user-config` drops the `[windows] sandbox` key from
+     `~/.codex/config.toml`, this codex build cannot construct a Windows sandbox
+     without an explicit mode, and every command -- including a plain file read --
+     then fails with a misleading `Rejected(... "blocked by policy")`. It is inert
+     on Linux and macOS, so the default carries it unconditionally. The example
+     config ships both.
    - Grok: `grok --permission-mode plan --no-subagents -p <prompt>`.
    - Cursor: `cursor-agent --print --mode ask --trust <prompt>`.
    - Fusion accepts only a structured `run_review` JSON body containing `wo`, `diff`, `tests`,
@@ -63,7 +69,7 @@ checkout gives it the context the board packet already assumes it has.
   "agents": {
     "codex": {
       "command": "codex",
-      "args": ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--ignore-user-config"],
+      "args": ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--ephemeral", "--ignore-user-config", "-c", "windows.sandbox=\"unelevated\""],
       "cwd": "C:/Users/pcmed/projects/BDC_XO/.worktrees/xo-main",
       "env": { "ORACLE_URL": "https://oracle.bluedevilcollectibles.com" }
     }
