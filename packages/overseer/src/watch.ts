@@ -4,6 +4,13 @@ import { createLogger } from '@archon/paths';
 import { classifyError } from './classify';
 import { decide } from './decide';
 import { isPrMergeReady, isPrGreen, judgePullRequest } from './judge-pr';
+import {
+  discoverMergeCandidates,
+  pullRequestKey,
+  summarizeExclusions,
+  type DiscoverMergeCandidatesOptions,
+  type MergeCandidateDiscoveryResult,
+} from './merge-candidate-discovery';
 import type {
   GitHubClientDeps,
   OverseerRunRecord,
@@ -265,6 +272,28 @@ export interface WatchOnceOptions {
   logger?: WatchHeartbeatLogger;
   /** Oldest-first per-tick cap; defaults to OVERSEER_WATCH_MAX_RUNS_PER_TICK (25). */
   maxRunsPerTick?: number;
+  /**
+   * PR-first discovery options (bdc-harness#758). Passed straight through to
+   * discoverMergeCandidates; tests supply explicit repos/bases so the sweep is
+   * deterministic without touching process.env.
+   */
+  discovery?: DiscoverMergeCandidatesOptions;
+  /** Set false to skip the PR-first sweep entirely (used by narrow unit tests). */
+  discoveryEnabled?: boolean;
+}
+
+/**
+ * Which pull requests the run-derived pass already covered this tick, so the
+ * PR-first sweep can report them as `already_a_run_candidate` instead of
+ * building a second, competing record for the same PR.
+ */
+function coveredPullRequests(outcomes: readonly WatchedRunRecord[]): Set<string> {
+  const covered = new Set<string>();
+  for (const outcome of outcomes) {
+    const pr = outcome.prEvidence?.pr;
+    if (pr) covered.add(pullRequestKey(pr.owner, pr.repo, pr.number));
+  }
+  return covered;
 }
 
 export async function watchOnce(
@@ -301,16 +330,96 @@ export async function watchOnce(
       );
     }
   }
+  // PR-FIRST CANDIDATE DISCOVERY (bdc-harness#758).
+  //
+  // Everything above this line derives candidates from workflow RUNS, which can
+  // only ever surface a PR that is still reachable backwards from an open,
+  // unclosed run row. That is why 32 open PRs produced "total":2,"eligible":0 for
+  // 19 straight heartbeats on 2026-09-04 while #730 and #731 sat APPROVED and
+  // CLEAN: their runs had already been closed with a terminal overseer_actions
+  // row, so no amount of PR-side greenness could put them back in the set.
+  //
+  // The sweep below asks GitHub directly for the open PRs on the watched bases
+  // and evaluates every one. It changes only WHAT IS LOOKED AT -- every merge
+  // authorization rule downstream (M-48 enablement, production-effect hold,
+  // provenance, Review Gate exact-head approval, allowed bases, Grok judge) is
+  // untouched and still applies to each candidate it produces.
+  let discovery: MergeCandidateDiscoveryResult = {
+    candidates: [],
+    exclusions: [],
+    evaluated: 0,
+    fallbackReviewDecisions: 0,
+    unavailable: true,
+    totalOpen: 0,
+    evaluationWindowTruncated: false,
+    cursorAfter: null,
+  };
+  if (options.discoveryEnabled !== false) {
+    try {
+      discovery = await discoverMergeCandidates(deps, {
+        ...options.discovery,
+        alreadyCoveredPullRequests:
+          options.discovery?.alreadyCoveredPullRequests ?? coveredPullRequests(outcomes),
+      });
+    } catch (error) {
+      // A broken sweep must never take down the watch tick -- the run-derived
+      // outcomes above are still valid work.
+      log.error({ err: error as Error }, 'merge-coordinator.discovery_failed_isolated');
+    }
+  }
+
+  // One line per excluded PR. #758's verification condition is that an excluded
+  // PR names its reason rather than vanishing, so this is per-PR and greppable;
+  // the aggregate counts ride the heartbeat below for at-a-glance reading.
+  for (const exclusion of discovery.exclusions) {
+    heartbeatLogger.info(
+      {
+        owner: exclusion.owner,
+        repo: exclusion.repo,
+        prNumber: exclusion.prNumber,
+        reason: exclusion.reason,
+        detail: exclusion.detail,
+      },
+      'merge-coordinator.candidate_excluded'
+    );
+  }
+
+  for (const candidate of discovery.candidates) outcomes.push(candidate);
+
   // Merge-coordinator observability heartbeat
   // (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01). Fires on EVERY cycle regardless of how
   // many runs were evaluated -- a silent cycle is exactly what let "zero merge-manager
   // runtime log lines in 24h" go unnoticed while merge-ready PRs piled up. The
   // 'merge-coordinator.*' event key makes each evaluation cycle greppable in docker
   // logs and answers "is the coordinator running?" without needing a single eligible PR.
+  //
+  // `total` used to be runs.length -- the RUN count -- which is why it read 2
+  // against 32 open PRs and looked like a filter bug rather than a source
+  // mismatch (#758). The run and PR populations are now reported separately and
+  // named, because they are different populations and always were.
   heartbeatLogger.info(
     {
-      evaluated: terminalRuns.length,
-      total: runs.length,
+      evaluated: terminalRuns.length + discovery.evaluated,
+      total: runs.length + discovery.evaluated,
+      runsEvaluated: terminalRuns.length,
+      runsTotal: runs.length,
+      prsEvaluated: discovery.evaluated,
+      prCandidates: discovery.candidates.length,
+      prDiscoveryUnavailable: discovery.unavailable,
+      // Non-zero means GitHub's aggregate review decision was unavailable and
+      // the stricter REST fallback ran instead, so approved PRs may be sitting
+      // excluded. Reads as a DEGRADED GATE rather than a quiet backlog; the
+      // matching per-tick warn line is
+      // 'merge-coordinator.review_decision_graphql_unavailable'.
+      prsFallbackDecision: discovery.fallbackReviewDecisions,
+      // The per-tick evaluation window. `prsTotalOpen` is the whole open
+      // population; when it exceeds `prsEvaluated` the window truncated and the
+      // rest are picked up on following ticks via the rotating cursor. Without
+      // these two the heartbeat cannot distinguish "few open PRs" from "we only
+      // looked at the first 100 of them".
+      prsTotalOpen: discovery.totalOpen,
+      prsWindowTruncated: discovery.evaluationWindowTruncated,
+      exclusionsByReason: summarizeExclusions(discovery.exclusions),
       eligible: outcomes.filter(outcome => outcome.action === 'merge_ready').length,
     },
     'merge-coordinator.heartbeat_evaluated'
@@ -321,12 +430,30 @@ export async function watchOnce(
 export async function watchLoop(
   deps: OverseerRunStoreDeps & GitHubClientDeps,
   onRecord: (record: WatchedRunRecord) => Promise<void>,
-  options: { intervalMs?: number; once?: boolean; signal?: AbortSignal } = {}
+  options: {
+    intervalMs?: number;
+    once?: boolean;
+    signal?: AbortSignal;
+    /**
+     * Forwarded to watchOnce. Production passes nothing and the sweep reads its
+     * repos/bases from env; tests supply explicit values so an integration test
+     * can drive the real watchLoop -> onRecord path deterministically instead of
+     * reimplementing the dispatch it is trying to verify.
+     */
+    discovery?: WatchOnceOptions['discovery'];
+    discoveryEnabled?: boolean;
+  } = {}
 ): Promise<void> {
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
+  const watchOptions: WatchOnceOptions = {
+    ...(options.discovery === undefined ? {} : { discovery: options.discovery }),
+    ...(options.discoveryEnabled === undefined
+      ? {}
+      : { discoveryEnabled: options.discoveryEnabled }),
+  };
   for (;;) {
     if (options.signal?.aborted) return;
-    const records = await watchOnce(deps);
+    const records = await watchOnce(deps, watchOptions);
     for (const record of records) {
       if (options.signal?.aborted) return;
       await onRecord(record);

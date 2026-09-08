@@ -60,6 +60,14 @@ export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
 export { assembleQualifiedMergeEvidence, coordinateMergeReady } from './merge-coordinator';
+export {
+  classifyDiscoveredPullRequest,
+  classifyPullRequestEvidence,
+  discoverMergeCandidates,
+  resolveDiscoveryRepos,
+  resolveWatchedBaseBranches,
+  summarizeExclusions,
+} from './merge-candidate-discovery';
 export { MERGE_MANAGER_IDENTITY, createMergeManager } from './merge-manager';
 export { createGitHubQualifiedMergeAdapter } from './adapters/github-qualified-merge';
 export { resolveDefaultDeps, runOverseerService } from './service';
