@@ -25,6 +25,7 @@ import { runAndSubmitReview } from '../pr-review-submit.ts';
 import type { ReviewerVerdict, SubmitDeps } from '../pr-review-submit.ts';
 import {
   MAX_JUDGE_STDERR_BYTES,
+  STDERR_DRAIN_GRACE_MS,
   evaluatePullRequest,
   runReviewModelProcess,
 } from '../pr-review-evaluator.ts';
@@ -438,11 +439,55 @@ describe('#798 -- the process runner surfaces stderr', () => {
     expect(result.stderrTail).toBe('deprecation: --flag is going away');
   });
 
-  test('a timeout still reports whatever stderr had arrived before the kill', async () => {
-    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 5, () => ({
+  test('a stderr-only verdict LONGER than the tail bound is still parseable', async () => {
+    // The stdout fallback keeps the FULL stderr; only the diagnostic copy that
+    // rides the receipt is truncated. Bounding the fallback too would make a
+    // judge that writes its verdict to stderr unparseable whenever the verdict
+    // ran past 2 KB -- which any verdict carrying findings does.
+    const verdict = JSON.stringify({
+      verdict: 'REQUEST_CHANGES',
+      reviewed_head_sha: HEAD,
+      findings: Array.from({ length: 40 }, (_, index) => ({
+        scope: `file-${index}.ts`,
+        severity: 'major',
+        summary: 'A finding long enough to push this payload past the tail bound.',
+      })),
+    });
+    expect(verdict.length).toBeGreaterThan(MAX_JUDGE_STDERR_BYTES);
+
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 1_000, () =>
+      child('', verdict, 0)
+    );
+
+    expect(result.stdout).toBe(verdict);
+    expect(result.stderrTail?.length).toBe(MAX_JUDGE_STDERR_BYTES);
+  });
+
+  /**
+   * A stderr stream that emits `chunks` and then NEVER closes.
+   *
+   * This is the shape a genuinely hung judge produces, and the shape the first
+   * cut of #798 got wrong: reading with `new Response(stderr).text()` only ever
+   * resolves at end-of-stream, so the timeout snapshot ran before any text was
+   * available and the tail came back empty. A finite, already-closed stream --
+   * what the original test used -- cannot expose that, because it reaches EOF
+   * immediately. (Overseer finding, PR #802.)
+   */
+  function neverClosingStderr(chunks: string[]): ReadableStream {
+    const encoder = new TextEncoder();
+    return new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        // Deliberately no controller.close(): the process is hung, not finished.
+      },
+    });
+  }
+
+  test('a timeout reports stderr from a stream that never closes', async () => {
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
       stdin: null,
-      stdout: new Response('').body,
-      stderr: new Response('judge: starting up').body,
+      stdout: new ReadableStream({ start: () => {} }),
+      stderr: neverClosingStderr(['judge: starting up\n', 'judge: waiting on provider\n']),
       // Never settles on its own -- the wall clock is what ends this call.
       exited: new Promise<number>(() => {}),
       kill: () => {},
@@ -450,6 +495,40 @@ describe('#798 -- the process runner surfaces stderr', () => {
 
     expect(result.timedOut).toBe(true);
     expect(result.exitCode).toBe(124);
-    expect(result.stderrTail).toBe('judge: starting up');
+    // BOTH chunks, from a stream that never reached EOF. This is the assertion
+    // the pre-#802 implementation failed: it returned ''.
+    expect(result.stderrTail).toContain('judge: starting up');
+    expect(result.stderrTail).toContain('judge: waiting on provider');
+  });
+
+  test('a timeout with no stderr at all still returns, bounded by the grace', async () => {
+    const started = Date.now();
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: () => {} }),
+      stderr: new ReadableStream({ start: () => {} }),
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(result.timedOut).toBe(true);
+    expect(result.stderrTail).toBe('');
+    // The drain grace is a DEADLINE: a stderr pipe that never closes must not
+    // extend the wall clock indefinitely.
+    expect(Date.now() - started).toBeLessThan(25 + STDERR_DRAIN_GRACE_MS + 2_000);
+  });
+
+  test('the tail is bounded even when the hung process emitted megabytes', async () => {
+    const noise = 'x'.repeat(MAX_JUDGE_STDERR_BYTES * 2);
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: () => {} }),
+      stderr: neverClosingStderr([noise, 'THE-ACTUAL-ERROR']),
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(result.stderrTail?.length).toBe(MAX_JUDGE_STDERR_BYTES);
+    expect(result.stderrTail?.endsWith('THE-ACTUAL-ERROR')).toBe(true);
   });
 });

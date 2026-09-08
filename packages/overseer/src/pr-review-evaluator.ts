@@ -773,21 +773,18 @@ export async function runReviewModelProcess(
   // OVERSEER_REVIEW_MODEL_TIMEOUT_MS bounded only the model's THINKING time, not
   // the call, and a non-consuming child hung the review worker indefinitely with
   // no timeout, no verdict and no deferral.
-  // #798: the judge's stderr is read into this slot as soon as the stream
-  // closes, so BOTH the settled path and the timeout path can report it. The
-  // timeout path cannot simply await the stream -- that is the hang the wall
-  // clock exists to prevent -- so it reports whatever had already arrived when
-  // the child was killed, which for a hung CLI is exactly its startup output.
-  let stderrTail = '';
-  const stderrRead = subprocess.stderr
-    ? new Response(subprocess.stderr)
-        .text()
-        .then(text => {
-          stderrTail = text.slice(-MAX_JUDGE_STDERR_BYTES);
-          return text;
-        })
-        .catch(() => '')
-    : Promise.resolve('');
+  // #798: stderr is read INCREMENTALLY into a bounded tail buffer, not with
+  // `new Response(stderr).text()`.
+  //
+  // Review finding (Overseer, PR #802): `.text()` only resolves at
+  // END-OF-STREAM, so on the path this feature exists for -- a genuinely hung
+  // judge -- the timeout snapshot ran before the stream ever closed and the tail
+  // came back EMPTY. A hung CLI's stderr is exactly the diagnostic wanted, and
+  // it has usually already been written; it is the process, not the output,
+  // that is stuck. The chunk loop below keeps the last MAX_JUDGE_STDERR_BYTES as
+  // each chunk arrives, so the snapshot is correct at any instant.
+  const stderrTail = createStderrTail();
+  const stderrRead = readStderrInto(subprocess.stderr, stderrTail);
 
   let timeout: Timer | undefined;
   let timedOut = false;
@@ -800,7 +797,15 @@ export async function runReviewModelProcess(
       // EPIPE/abort rejection, swallowed below) instead of hanging on.
       subprocess.kill();
       destroyStdin(subprocess.stdin);
-      resolve({ exitCode: 124, stdout: '', timedOut: true, stderrTail });
+      // GRACE, then snapshot. The kill usually closes stderr, which lets the
+      // reader drain whatever the OS had already buffered -- so a short bounded
+      // wait recovers output the raw synchronous snapshot would miss. It is
+      // BOUNDED and never awaited unconditionally: a child whose stderr pipe
+      // stays open forever must not extend the wall clock this callback exists
+      // to enforce.
+      void withDeadline(stderrRead, STDERR_DRAIN_GRACE_MS).then(() => {
+        resolve({ exitCode: 124, stdout: '', timedOut: true, stderrTail: stderrTail.value() });
+      });
     }, timeoutMs);
   });
 
@@ -818,15 +823,20 @@ export async function runReviewModelProcess(
     // Never block on delivery completing: a child may legitimately exit before
     // consuming the whole prompt, which settles this as an EPIPE no-op.
     void delivery;
-    const [exitCode, stdout, stderr] = await Promise.all([
+    const [exitCode, stdout] = await Promise.all([
       subprocess.exited,
       subprocess.stdout ? new Response(subprocess.stdout).text() : Promise.resolve(''),
       // Reuse the single reader armed above: a ReadableStream may only be
-      // consumed once, so reading it a second time here would throw.
+      // consumed once, so reading it a second time here would throw. The text
+      // itself is taken from the tail buffer the reader fills.
       stderrRead,
     ]);
-    const payload = stdout.trim().length > 0 ? stdout : stderr;
-    const tail = stderr.slice(-MAX_JUDGE_STDERR_BYTES);
+    const tail = stderrTail.value();
+    // The stdout FALLBACK keeps the FULL stderr, not the 2 KB tail: a judge
+    // that writes its JSON verdict to stderr must still be parseable, and a
+    // verdict with findings runs well past 2 KB. Only the diagnostic copy that
+    // rides the receipt is bounded.
+    const payload = stdout.trim().length > 0 ? stdout : stderrTail.full();
     // A kill fired by the timeout also settles `exited`; report that as the
     // timeout it is rather than as a spurious non-zero exit.
     if (timedOut) return { exitCode: 124, stdout: '', timedOut: true, stderrTail: tail };
@@ -844,6 +854,90 @@ export async function runReviewModelProcess(
   // parked if the child exited without draining stdin.
   destroyStdin(subprocess.stdin);
   return result;
+}
+
+/**
+ * How long the timeout path waits for the stderr reader after killing the child
+ * (#798, Overseer finding on PR #802).
+ *
+ * The kill normally closes stderr, so the reader drains whatever the OS had
+ * buffered within a few milliseconds. A quarter second is generous for that and
+ * negligible against a judge wall clock measured in tens of seconds -- and it is
+ * a DEADLINE, not an await: a child whose stderr pipe somehow stays open cannot
+ * extend the timeout the callback exists to enforce.
+ */
+export const STDERR_DRAIN_GRACE_MS = 250;
+
+/**
+ * A bounded, always-readable view of a stream's trailing bytes.
+ *
+ * `full()` is the complete text (the stdout fallback needs it in order to parse
+ * a verdict a judge wrote to stderr); `value()` is the last
+ * MAX_JUDGE_STDERR_BYTES, which is what rides the receipt.
+ *
+ * Both are readable AT ANY MOMENT, mid-stream. That is the entire point: the
+ * previous implementation could only produce text at end-of-stream, so the
+ * timeout path -- the one case this exists to serve -- always saw an empty
+ * string.
+ */
+interface StderrTail {
+  append(chunk: string): void;
+  /** Last MAX_JUDGE_STDERR_BYTES received so far. */
+  value(): string;
+  /** Everything received so far, unbounded. */
+  full(): string;
+}
+
+function createStderrTail(): StderrTail {
+  let text = '';
+  return {
+    append(chunk: string): void {
+      text += chunk;
+    },
+    value: (): string => text.slice(-MAX_JUDGE_STDERR_BYTES),
+    full: (): string => text,
+  };
+}
+
+/**
+ * Drain a stream chunk by chunk into `tail`, resolving when it closes.
+ *
+ * Never rejects: a stream torn down by the kill is the expected end of a
+ * timed-out review, not a failure, and a rejection here would surface as an
+ * unhandled rejection under Bun's default handler.
+ */
+async function readStderrInto(stream: ReadableStream | null, tail: StderrTail): Promise<void> {
+  if (!stream) return;
+  const decoder = new TextDecoder();
+  try {
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value === undefined) continue;
+      tail.append(
+        typeof value === 'string' ? value : decoder.decode(value as Uint8Array, { stream: true })
+      );
+    }
+    tail.append(decoder.decode());
+  } catch {
+    // Stream gone (killed child, torn-down pipe). Whatever arrived is kept.
+  }
+}
+
+/** Resolve when `promise` settles or `ms` elapses, whichever is first. */
+async function withDeadline(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: Timer | undefined;
+  try {
+    await Promise.race([
+      promise.catch(() => undefined),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
