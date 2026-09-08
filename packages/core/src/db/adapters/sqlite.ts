@@ -590,6 +590,7 @@ export class SqliteAdapter implements IDatabase {
     }
 
     this.migrateDispatchSenderPrincipalIdempotency();
+    this.migrateDispatchSeq();
 
     try {
       const actionCols = this.db
@@ -614,6 +615,78 @@ export class SqliteAdapter implements IDatabase {
    * idempotency constraint with two partial unique indexes. Rebuild is fatal on
    * failure -- it must not be swallowed by the best-effort migration warn path.
    */
+  /**
+   * Database-assigned total order for the dispatch queue (mirrors Postgres
+   * migration 047_agent_dispatch_seq.sql).
+   *
+   * `created_at` has millisecond resolution while consecutive inserts finish
+   * inside one millisecond, and `id` is a random UUID, so newest-first ordering
+   * used to be decided at random on a tie. A process-local monotonic clock
+   * cannot fix that: concurrent writers still collide and a restarted writer can
+   * emit timestamps older than rows already committed. Only the database sees
+   * every writer, so the database assigns the order.
+   *
+   * SQLite's implicit `rowid` is already a monotonically increasing insertion
+   * key (the table is not WITHOUT ROWID), so it is the natural source. It cannot
+   * be exposed by adding an AUTOINCREMENT column -- SQLite's ALTER TABLE ADD
+   * COLUMN rejects AUTOINCREMENT and non-constant defaults -- so `seq` is a
+   * plain INTEGER backfilled from rowid, and inserts stamp it from rowid via
+   * the trigger below. That keeps a single source of truth for the order rather
+   * than a second counter that could drift.
+   */
+  private migrateDispatchSeq(): void {
+    try {
+      const tableExists = this.db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_dispatch_messages'"
+        )
+        .get() as { name?: string } | null;
+      if (!tableExists?.name) return;
+
+      const colNames = new Set(
+        (
+          this.db.prepare("PRAGMA table_info('agent_dispatch_messages')").all() as {
+            name: string;
+          }[]
+        ).map(c => c.name)
+      );
+      if (!colNames.has('seq')) {
+        this.db.run('ALTER TABLE agent_dispatch_messages ADD COLUMN seq INTEGER');
+      }
+
+      // Backfill in rowid order -- the order the rows were actually inserted.
+      //
+      // This heals NULL seq at every open, but it is NOT sufficient on its own:
+      // a raw/fixture/import insert can land AFTER this ran and before the next
+      // open. That is why the read path orders by COALESCE(seq, rowid) and
+      // seqValueExpression() takes MAX over COALESCE(seq, rowid) -- read scale,
+      // write scale and this backfill all agree on rowid as the fallback, so a
+      // NULL-seq row can never tie or outrank a later normal insert.
+      this.db.run('UPDATE agent_dispatch_messages SET seq = rowid WHERE seq IS NULL');
+
+      // Retired: an AFTER INSERT trigger populated the stored row, but SQLite
+      // evaluates `RETURNING *` BEFORE the trigger fires, so callers were handed
+      // seq = NULL while the stored row held a value (real CI failure: a server
+      // route test compared a create response against a later re-read).
+      this.db.run('DROP TRIGGER IF EXISTS trg_agent_dispatch_messages_seq');
+
+      // Ordering must not depend on the writer remembering to set seq: raw SQL
+      // inserts, fixtures and imports bypass createMessage, and a NULL seq
+      // would make `ORDER BY seq DESC` an undefined order for those rows.
+      // SQLite cannot ALTER an existing column to add a DEFAULT, so seq is
+      // NULL-healed here on open and the ordering query coalesces NULLs to
+      // rowid, which is itself the insertion counter.
+
+      // seq leads: it is the newest-first ordering key, not a tiebreak.
+      this.db.run(
+        `CREATE INDEX IF NOT EXISTS idx_agent_dispatch_messages_recipient_seq
+           ON agent_dispatch_messages (recipient, seq DESC)`
+      );
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_dispatch_seq_failed');
+    }
+  }
+
   private migrateDispatchSenderPrincipalIdempotency(): void {
     const tableExists = this.db
       .prepare(
@@ -1836,7 +1909,32 @@ export class SqliteAdapter implements IDatabase {
         updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
       );
 
+      -- overseer_required_contexts_attempts: durable consecutive-UNKNOWN counters
+      -- for the PR reviewer's required-status-check-context lookup (migration 048,
+      -- bdc-harness #777 review). The bound it enforces used to live in a
+      -- process-local Map, which reset on every container rebuild and counted
+      -- independently per worker process -- so the "bound" never actually arrived
+      -- and unreadable contexts still deferred forever.
+      --
+      -- All four key parts are load-bearing: owner/repo because identical commits
+      -- exist across forks; base_ref because required contexts are BASE-specific;
+      -- head_sha because a new push is a new question and a sibling PR on the same
+      -- base must not share (hence reset) this head's slot. Rows are deleted on a
+      -- successful lookup; touched_at exists only so abandoned heads can be retired
+      -- by age.
+      CREATE TABLE IF NOT EXISTS overseer_required_contexts_attempts (
+        owner TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        base_ref TEXT NOT NULL,
+        head_sha TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        touched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        PRIMARY KEY (owner, repo, base_ref, head_sha)
+      );
+
       -- Indexes
+      CREATE INDEX IF NOT EXISTS idx_overseer_required_contexts_attempts_touched
+        ON overseer_required_contexts_attempts(touched_at);
       CREATE UNIQUE INDEX IF NOT EXISTS uq_overseer_verdicts_run_head ON overseer_verdicts(run_id, head_sha);
       CREATE INDEX IF NOT EXISTS idx_overseer_verdicts_status ON overseer_verdicts(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);

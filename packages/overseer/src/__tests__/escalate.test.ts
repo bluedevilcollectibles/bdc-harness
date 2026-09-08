@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { rmSync } from 'fs';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { join } from 'path';
 import { closeDatabase, getOperatorCard, resetDatabase } from '@archon/core/db';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
@@ -25,7 +25,7 @@ describe.serial('durable escalation card', () => {
     else process.env.ARCHON_HOME = originalHome;
     if (originalUrl === undefined) delete process.env.DATABASE_URL;
     else process.env.DATABASE_URL = originalUrl;
-    rmSync(home, { recursive: true, force: true });
+    removeTempDirWithRetry(home);
   });
 
   test('persists a card whose guarded Dispatch body derives from canonical payload', async () => {

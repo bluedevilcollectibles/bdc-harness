@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { createHash } from 'crypto';
-import { rmSync } from 'fs';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { join } from 'path';
 import {
   appendDeliveryReceipt,
@@ -117,7 +117,7 @@ describe('durable operator-card delivery', () => {
     else process.env.ARCHON_HOME = oldHome;
     if (oldUrl === undefined) delete process.env.DATABASE_URL;
     else process.env.DATABASE_URL = oldUrl;
-    rmSync(home, { recursive: true, force: true });
+    removeTempDirWithRetry(home);
   });
 
   async function persistCard(): Promise<string> {
@@ -576,7 +576,7 @@ describe('default informational channel adapters', () => {
     else process.env.ARCHON_HOME = oldHome;
     if (oldUrl === undefined) delete process.env.DATABASE_URL;
     else process.env.DATABASE_URL = oldUrl;
-    rmSync(home, { recursive: true, force: true });
+    removeTempDirWithRetry(home);
   });
 
   async function defaultCardView() {

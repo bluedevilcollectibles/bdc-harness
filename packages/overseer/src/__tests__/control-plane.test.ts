@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, rmSync } from 'fs';
+import { existsSync } from 'fs';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { join } from 'path';
 import {
   acquireRepositoryMutationLease,
@@ -38,7 +39,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await closeDatabase();
   delete process.env.ARCHON_HOME;
-  if (existsSync(home)) rmSync(home, { recursive: true, force: true });
+  if (existsSync(home)) removeTempDirWithRetry(home);
 });
 
 describe('Overseer control-plane service', () => {

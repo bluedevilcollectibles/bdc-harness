@@ -87,6 +87,48 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     expect(verdict.reviewedHeadSha).toBe(HEAD);
   });
 
+  test('maps CHECKS_UNAVAILABLE to a terminal, non-approving blocked signal (#775)', async () => {
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      patOctokit: null,
+      evaluate: async () =>
+        reviewResult({
+          verdict: 'CHECKS_UNAVAILABLE',
+          error: 'required_contexts_unavailable_blocked:attempts=5:reason=permission',
+        }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+    expect(verdict.requiredContextsUnavailable).toBe(true);
+    expect(verdict.approved).toBe(false);
+    // Distinct from CHECKS_PENDING: that one is retried and carries no summary.
+    // This one is terminal, so it MUST carry a body -- a COMMENT with nothing
+    // in it would tell the human nothing about why the PR is stuck.
+    expect(verdict.checksPending).toBeUndefined();
+    expect(verdict.summary).toContain('review blocked, not approved');
+    expect(verdict.summary).toContain('5 attempts');
+    expect(verdict.summary).toContain('permission');
+    expect(verdict.reviewedHeadSha).toBe(HEAD);
+  });
+
+  test('the blocked summary names the transient cause when that is what failed', async () => {
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      patOctokit: null,
+      evaluate: async () =>
+        reviewResult({
+          verdict: 'CHECKS_UNAVAILABLE',
+          error: 'required_contexts_unavailable_blocked:attempts=5:reason=transient',
+        }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+    // Permission and transient need different human actions, so the remedy
+    // sentence must not be the same for both.
+    expect(verdict.summary).toContain('transient');
+    expect(verdict.summary).not.toContain('Grant the Overseer GitHub App');
+  });
+
   test('does not expose internal INDETERMINATE errors in the GitHub summary', async () => {
     const secretError = 'model_error:token=super-secret-provider-detail';
     const deps = createRealSubmitDeps('review-app[bot]', {
