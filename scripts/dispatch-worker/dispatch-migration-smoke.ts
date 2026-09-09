@@ -799,7 +799,12 @@ function assertFirstMigration(
       `expected ${expectedHeartbeats} heartbeat rows, found ${after.heartbeatRows}`
     );
   }
-  if (after.otherHeartbeatRows !== 0 || after.otherNonNormalRows !== 0) {
+  // Backfill rules apply only when introducing priority. Existing priorities
+  // must instead remain unchanged, as verified by the state digest above.
+  if (
+    !before.messageColumns.includes('priority') &&
+    (after.otherHeartbeatRows !== 0 || after.otherNonNormalRows !== 0)
+  ) {
     throw new SmokeFailure('migration_priority_validation_failed');
   }
   if (after.missingLivePrincipalRows !== 0) {
