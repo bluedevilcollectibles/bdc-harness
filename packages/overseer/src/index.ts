@@ -29,7 +29,7 @@ export type { Decision, DecideInput, DecisionResult } from './decide';
 
 export { runAuthorizedEscalation } from './authorized-escalation';
 export { parseM31ActionPermit, permitFromMetadata } from './permit';
-export { buildDispatchRunReportBody, lookupNotionPageId, runEscalation } from './escalate';
+export { buildDispatchRunReportBody, runEscalation } from './escalate';
 export type { EscalationContext, EscalationSourceEvent } from './escalate';
 export {
   buildOperatorCard,

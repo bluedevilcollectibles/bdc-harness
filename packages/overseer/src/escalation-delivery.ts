@@ -10,7 +10,7 @@ import {
 } from '@archon/core/db/overseer-briefing';
 import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
-import { buildDispatchRunReportBody, lookupNotionPage } from './escalate';
+import { buildDispatchRunReportBody } from './escalate';
 import { resolveWoBoardSeatOwner } from './owner-resolution';
 
 export interface ChannelDeliveryResult {
@@ -35,8 +35,6 @@ export interface DeliveryStore {
 
 export interface OperatorCardChannelDeps {
   fetch: typeof fetch;
-  notion_api_key?: string;
-  notion_database_id: string;
   builder_monitor_url: string;
   resolve_owner: (woId: string) => Promise<string | null>;
 }
@@ -48,7 +46,6 @@ const defaultStore: DeliveryStore = {
   completeDeliveryJob,
 };
 
-const DEFAULT_NOTION_DATABASE_ID = 'a6df831c-0b52-449f-8ca4-d77be6b70d0a';
 const DEFAULT_BUILDER_MONITOR_URL = 'https://n8n.bluedevilcollectibles.com/webhook/builder-status';
 
 function classifyHttpFailure(status: number, channel: string): ChannelDeliveryResult {
@@ -72,9 +69,6 @@ export function createDefaultOperatorCardChannels(
 ): OperatorCardChannel[] {
   const deps: OperatorCardChannelDeps = {
     fetch: overrides.fetch ?? globalThis.fetch,
-    notion_api_key: overrides.notion_api_key ?? process.env.NOTION_API_KEY,
-    notion_database_id:
-      overrides.notion_database_id ?? process.env.NOTION_DB_ID ?? DEFAULT_NOTION_DATABASE_ID,
     builder_monitor_url:
       overrides.builder_monitor_url ??
       process.env.BUILDER_MONITOR_WEBHOOK_URL ??
@@ -139,53 +133,15 @@ export function createDefaultOperatorCardChannels(
 
   const notion: OperatorCardChannel = {
     channel: 'notion',
-    deliver: async card => {
-      if (!deps.notion_api_key) {
-        return {
-          outcome: 'permanent_failure',
-          sanitized_status: 'notion_not_configured',
-          error_class: 'configuration',
-        };
-      }
-      const lookup = await lookupNotionPage(
-        deps.notion_api_key,
-        deps.notion_database_id,
-        card.card.wo_id,
-        deps.fetch
-      );
-      if (!lookup.page_id) {
-        return {
-          outcome: lookup.failure_outcome ?? 'permanent_failure',
-          sanitized_status: 'notion_page_not_found',
-          error_class: 'notion_lookup_failed',
-        };
-      }
-      const response = await deps.fetch('https://api.notion.com/v1/comments', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${deps.notion_api_key}`,
-          'Content-Type': 'application/json',
-          'Notion-Version': '2022-06-28',
-        },
-        body: JSON.stringify({
-          parent: { page_id: lookup.page_id },
-          rich_text: [
-            {
-              type: 'text',
-              text: {
-                content: `Overseer operator card ${card.card.card_id}: ${card.card.blocker}`,
-              },
-            },
-          ],
-        }),
-      });
-      return response.ok
-        ? { outcome: 'succeeded', sanitized_status: 'notion_comment_created' }
-        : classifyHttpFailure(response.status, 'notion_comment');
-    },
+    deliver: async () => ({
+      outcome: 'permanent_failure',
+      sanitized_status: 'notion_channel_retired',
+      error_class: 'notion_escalation_retired',
+    }),
     reconcile: async () => ({
-      outcome: 'indeterminate',
-      sanitized_status: 'notion_provider_state_unknown',
+      outcome: 'permanent_failure',
+      sanitized_status: 'notion_channel_retired',
+      error_class: 'notion_escalation_retired',
     }),
   };
   return [dispatch, builderMonitor, notion];
