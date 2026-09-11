@@ -1,6 +1,6 @@
 {
-  "_comment": "CANONICAL LADDER SOR for Smart Cauldron conductor fires. Ordered tier ladder: zero -> qwen -> codex -> claude -> frontier. Edit this file to change tier order or workflow bindings. refusedTiers lists dark/retired lanes that must NEVER be live entry points (cascade refuses them even under --entry). GLM tier REMOVED 2026-07-07 (John, zero-lane incident: $15.47/day burned, zero shipped code). Zero added 2026-07-07 for exhaustion/mechanical WOs: qwen builder + DeepSeek review + Codex with OpenRouter failback, no paid review seat. Keep money/auth/infra off this lane. Multi-tier vision retained; broken router lanes are not reconnected as live entry. ZERO + QWEN refused 2026-08-25 (John: OpenRouter balance $4, no further funds -- 402s on every zero-entry fire; 'use codex and grok / cursor lanes'). Entry floor is now codex; remaining OR credit reserved for emergency cheap-model board seats only, never build runs. CURSOR tier added 2026-08-26 (WO-HARNESS-CURSOR-BUILD-SEAT-01) positioned BELOW codex as the cheap always-on entry rung funded by the Cursor Ultra subscription -- SHIPPED REFUSED/DARK: the tier and its workflow binding exist but the cascade refuses it, so live behavior is unchanged. John flips it live by REMOVING 'cursor' from refusedTiers after observing the seat run and reviewing Cursor fair-use posture.",
-  "refusedTiers": ["glm", "zero", "qwen", "cursor"],
+  "_comment": "CANONICAL LADDER SOR for Smart Cauldron conductor fires. Ordered tier ladder: zero -> qwen -> codex -> claude -> frontier. Edit this file to change tier order or workflow bindings. refusedTiers lists dark/retired lanes that must NEVER be live entry points (cascade refuses them even under --entry). GLM tier REMOVED 2026-07-07 (John, zero-lane incident: $15.47/day burned, zero shipped code). Zero added 2026-07-07 for exhaustion/mechanical WOs: qwen builder + DeepSeek review + Codex with OpenRouter failback, no paid review seat. Keep money/auth/infra off this lane. Multi-tier vision retained; broken router lanes are not reconnected as live entry. ZERO + QWEN refused 2026-08-25 (John: OpenRouter balance $4, no further funds -- 402s on every zero-entry fire; 'use codex and grok / cursor lanes'). Entry floor is now codex; remaining OR credit reserved for emergency cheap-model board seats only, never build runs. CURSOR tier added 2026-08-26 (WO-HARNESS-CURSOR-BUILD-SEAT-01) positioned BELOW codex as the cheap always-on entry rung funded by the Cursor Ultra subscription -- SHIPPED REFUSED/DARK: the tier and its workflow binding exist but the cascade refuses it, so live behavior is unchanged. John flips it live by REMOVING 'cursor' from refusedTiers after observing the seat run and reviewing Cursor fair-use posture. CLAUDE + FRONTIER REFUSED 2026-08-29 (John: Claude usage exhausted -- 'tell overseer to disable temp due to usage all claude lanes or use calls to cursor'). GROK tier ADDED as the escalation rung above codex, using the existing bdc-feature-development-grok lane (verified resolving clean against the live canary snapshot 2026-08-29, zero capability issues). Ladder is now codex -> grok. TEMPORARY: restore claude/frontier when usage resets. CURSOR TIER REFUSED 2026-08-29: the 'cursor' tier exists in this ladder (added by PR #729) but its workflow 'bdc-feature-development-cursor' DOES NOT EXIST -- absent from .archon/workflows/defaults/ AND reported NOT REGISTERED by the live canary snapshot. A fire routed there would fail. Refused until the lane is actually built and registered; wiring it is separate work (bdc-xo issue to follow).",
+  "refusedTiers": ["glm", "zero", "qwen", "cursor", "claude", "frontier"],
   "premiumTiers": ["frontier"],
   "tiers": [
     {
@@ -24,6 +24,12 @@
     {
       "name": "codex",
       "workflowName": "bdc-feature-development-codex",
+      "isFrontier": false,
+      "costPerRunUsdEstimate": null
+    },
+    {
+      "name": "grok",
+      "workflowName": "bdc-feature-development-grok",
       "isFrontier": false,
       "costPerRunUsdEstimate": null
     },
