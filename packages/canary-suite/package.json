@@ -15,6 +15,9 @@
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {
+    "@archon/core": "workspace:*",
+    "@archon/persona-context-loader": "workspace:*",
+    "@archon/overseer": "workspace:*",
     "@archon/workflows": "workspace:*",
     "@archon/providers": "workspace:*",
     "@archon/smart-cauldron": "workspace:*",

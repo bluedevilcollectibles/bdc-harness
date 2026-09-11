@@ -1,6 +1,8 @@
 import { readFile } from 'fs/promises';
 import { runCanary, type RunCanaryOptions } from './runner';
 import type { RunCanaryResult } from './types';
+import { runMechanisms, type RunMechanismsOptions } from './mechanisms/mechanism-runner';
+import type { MechanismReport } from './mechanisms/types';
 import {
   runTaskmasterCanarySuite,
   writeTaskmasterCanaryArtifacts,
@@ -17,6 +19,9 @@ interface CanaryCliDeps {
     outputRoot: string,
     report: TaskmasterCanaryResult
   ) => Promise<readonly string[]>;
+  readonly mechanismRunner?: (
+    options: RunMechanismsOptions
+  ) => Promise<{ report: MechanismReport; artifactPaths: readonly string[] }>;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -47,6 +52,25 @@ export async function runCanaryCli(
   }
 ): Promise<number> {
   const command = args[0];
+  if (command === 'mechanisms') {
+    const outputRoot = flag(args, '--output-root');
+    const levelValue = flag(args, '--level') ?? '0';
+    if (!outputRoot || (levelValue !== '0' && levelValue !== '1')) {
+      deps.stderr('mechanism_canary_missing_or_invalid_required_argument');
+      return 3;
+    }
+    const result = await (deps.mechanismRunner ?? runMechanisms)({
+      outputRoot,
+      level: Number(levelValue) as 0 | 1,
+      env,
+    });
+    deps.stdout(
+      args.includes('--json')
+        ? JSON.stringify(result.report, null, 2)
+        : `${result.report.verdict}: ${result.report.suiteRunId}`
+    );
+    return exitFor(result.report.verdict);
+  }
   if (command === 'taskmaster') {
     const dbPath = flag(args, '--db-path');
     const statusUrl = flag(args, '--status-url');
@@ -82,7 +106,7 @@ export async function runCanaryCli(
   }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster> [options]');
+    deps.stderr('Usage: archon-canary <check|plan|taskmaster|mechanisms> [options]');
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

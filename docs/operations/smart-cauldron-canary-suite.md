@@ -1,5 +1,7 @@
 # Smart Cauldron Canary Suite
 
+For the data-driven audit that folds this lane check into review, dispatch, lease, Taskmaster, ledger, inbox, knowledge, and deploy checks, see [Cross-Mechanism Canary Audit](./mechanism-canary-audit.md).
+
 ## Plan 1 scope
 
 Plan 1 implements read-only Levels 0 and 1. It validates the reviewed eight-lane

@@ -7,3 +7,8 @@ export * from './report';
 export * from './runner';
 export * from './layer3-policy';
 export * from './probe-runner';
+export * from './mechanisms/types';
+export * from './mechanisms/registry';
+export * from './mechanisms/absence-evaluator';
+export * from './mechanisms/mechanism-runner';
+export * from './mechanisms/runner-liveness';

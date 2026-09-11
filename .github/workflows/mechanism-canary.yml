@@ -1,0 +1,79 @@
+name: Cross-Mechanism Canary
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      run_level_1:
+        description: Run explicitly gated mutating round-trip probes
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  mechanisms:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+      - run: bun install --frozen-lockfile
+      - name: Validate level 0 canary configuration
+        env:
+          ARCHON_OPERATOR_TOKEN: ${{ secrets.ARCHON_OPERATOR_TOKEN }}
+          ARCHON_API_BASE: ${{ vars.ARCHON_API_BASE }}
+          ARCHON_CODEBASE_ID: ${{ vars.ARCHON_CODEBASE_ID }}
+          ARCHON_DB_PATH: ${{ vars.ARCHON_DB_PATH }}
+          DATABASE_URL: ${{ secrets.CANARY_DATABASE_URL }}
+          ORACLE_API_KEY: ${{ secrets.ORACLE_API_KEY }}
+          REVIEW_CANARY_REPO: ${{ vars.REVIEW_CANARY_REPO }}
+          DEPLOY_CANARY_REPO: ${{ vars.DEPLOY_CANARY_REPO }}
+          DEPLOY_REVISION_URL: ${{ vars.DEPLOY_REVISION_URL }}
+          XO_LEASE_STATUS_URL: ${{ vars.XO_LEASE_STATUS_URL }}
+        run: |
+          for name in ARCHON_OPERATOR_TOKEN ARCHON_API_BASE ARCHON_CODEBASE_ID ARCHON_DB_PATH DATABASE_URL ORACLE_API_KEY REVIEW_CANARY_REPO DEPLOY_CANARY_REPO DEPLOY_REVISION_URL XO_LEASE_STATUS_URL; do
+            test -n "${!name}" || { echo "::error::Required canary configuration is unset: ${name}"; exit 1; }
+          done
+      - name: Run level 0 mechanism audit
+        env:
+          ARCHON_OPERATOR_TOKEN: ${{ secrets.ARCHON_OPERATOR_TOKEN }}
+          DATABASE_URL: ${{ secrets.CANARY_DATABASE_URL }}
+          ORACLE_API_KEY: ${{ secrets.ORACLE_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ARCHON_API_BASE: ${{ vars.ARCHON_API_BASE }}
+          ARCHON_CODEBASE_ID: ${{ vars.ARCHON_CODEBASE_ID }}
+          ARCHON_DB_PATH: ${{ vars.ARCHON_DB_PATH }}
+          REVIEW_CANARY_REPO: ${{ vars.REVIEW_CANARY_REPO }}
+          DEPLOY_CANARY_REPO: ${{ vars.DEPLOY_CANARY_REPO }}
+          DEPLOY_REVISION_URL: ${{ vars.DEPLOY_REVISION_URL }}
+          CANARY_WIKI_PATH: ${{ vars.CANARY_WIKI_PATH }}
+          XO_LEASE_STATUS_URL: ${{ vars.XO_LEASE_STATUS_URL }}
+          CANARY_MANIFEST: .archon/canaries/smart-cauldron.yaml
+        run: bun packages/canary-suite/src/cli.ts mechanisms --output-root harness-artifacts/canaries --json
+      - name: Run level 1 mechanism audit
+        if: ${{ inputs.run_level_1 == true }}
+        env:
+          ARCHON_OPERATOR_TOKEN: ${{ secrets.ARCHON_OPERATOR_TOKEN }}
+          DATABASE_URL: ${{ secrets.CANARY_DATABASE_URL }}
+          DISPATCH_CANARY_ENDPOINTS: ${{ secrets.DISPATCH_CANARY_ENDPOINTS }}
+          ORACLE_API_KEY: ${{ secrets.ORACLE_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          ARCHON_API_BASE: ${{ vars.ARCHON_API_BASE }}
+          ARCHON_CODEBASE_ID: ${{ vars.ARCHON_CODEBASE_ID }}
+          ARCHON_DB_PATH: ${{ vars.ARCHON_DB_PATH }}
+          REVIEW_CANARY_REPO: ${{ vars.REVIEW_CANARY_REPO }}
+          DEPLOY_CANARY_REPO: ${{ vars.DEPLOY_CANARY_REPO }}
+          DEPLOY_REVISION_URL: ${{ vars.DEPLOY_REVISION_URL }}
+          CANARY_WIKI_PATH: ${{ vars.CANARY_WIKI_PATH }}
+          XO_LEASE_STATUS_URL: ${{ vars.XO_LEASE_STATUS_URL }}
+          CANARY_MANIFEST: .archon/canaries/smart-cauldron.yaml
+        run: bun packages/canary-suite/src/cli.ts mechanisms --output-root harness-artifacts/canaries --level 1 --json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mechanism-canary-reports
+          path: harness-artifacts/canaries
