@@ -18,6 +18,7 @@ param()
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $ExitCode = 0
+. (Join-Path $PSScriptRoot "_docker-bun.ps1")
 
 function Pass { param([string]$msg) Write-Host "[PASS] $msg" }
 function Fail { param([string]$msg) Write-Host "[FAIL] $msg"; $script:ExitCode = 1 }
@@ -97,7 +98,7 @@ const j = await r.json();
 process.stdout.write(JSON.stringify(j));
 '@
   try {
-    $healthRaw = & $Docker exec archon-staging bun -e $statusJs 2>$null
+    $healthRaw = Invoke-BunScriptInContainer -Docker $Docker -ContainerName "archon-staging" -Script $statusJs
     $health = $healthRaw | ConvertFrom-Json
     if ($health.status -eq "ok") {
       Pass "Container /api/health returned status=ok"
@@ -117,7 +118,7 @@ if (!isFake) { console.log("REAL_ADAPTER_ACTIVE"); process.exit(1); }
 console.log("FAKE_ADAPTER_CONFIRMED");
 '@
   try {
-    $adapterCheck = & $Docker exec archon-staging bun -e $adapterCheckJs 2>$null
+    $adapterCheck = Invoke-BunScriptInContainer -Docker $Docker -ContainerName "archon-staging" -Script $adapterCheckJs
     if ($adapterCheck -match "FAKE_ADAPTER_CONFIRMED") {
       Pass "Fake adapter confirmed in container env"
     } else {
@@ -140,7 +141,7 @@ for (const k of keys) {
 }
 '@
   try {
-    $credCheck = & $Docker exec archon-staging bun -e $credCheckJs 2>$null
+    $credCheck = Invoke-BunScriptInContainer -Docker $Docker -ContainerName "archon-staging" -Script $credCheckJs
     if ($credCheck -notmatch "ghp_|github_pat_|Bearer |sk-") {
       Pass "No raw credential value visible in container env output"
     } else {
@@ -162,7 +163,7 @@ console.log(allOff ? "ALL_CAPS_DISABLED" : "CAP_ENABLED_FOUND");
 '@
 if ($ContainerState -eq "running") {
   try {
-    $capsCheck = & $Docker exec archon-staging bun -e $capsJs 2>$null
+    $capsCheck = Invoke-BunScriptInContainer -Docker $Docker -ContainerName "archon-staging" -Script $capsJs
     if ($capsCheck -match "ALL_CAPS_DISABLED") {
       Pass "All five capability flags are disabled in container env"
     } else {
@@ -196,7 +197,7 @@ try {
 }
 '@
   try {
-    $migCheck = & $Docker exec archon-staging bun -e $migCheckJs 2>$null
+    $migCheck = Invoke-BunScriptInContainer -Docker $Docker -ContainerName "archon-staging" -Script $migCheckJs
     if ($migCheck -match "^MIGRATION_034_OK") {
       Pass "Migration 034: overseer_capability_state has 5 rows, all disabled+closed: $migCheck"
     } else {
@@ -207,12 +208,12 @@ try {
   }
 }
 
-# --- Assertion 7: enabled live service path -- one persisted fake attempt ---
+# --- Assertion 7: enabled live service path -- qualified coordinator only ---
 # Run the actual one-shot Overseer watcher/service with a valid persistent
 # proposal, permit, and capability state. The subprocess temporarily enables one
-# fake capability, restores the prior state in finally, and fails unless exactly
-# one adapter_attempt is persisted with mutation_sent=false. No provider client
-# or mutation callback is allowed to run.
+# fake capability, restores the prior state in finally, and fails unless the
+# qualified merge coordinator is reached exactly once. The legacy merge callback
+# and fake adapter-attempt path must both remain unreachable.
 if ($ContainerState -eq "running") {
   $serviceCanaryJs = @'
 const { randomUUID } = await import("crypto");
@@ -240,6 +241,7 @@ const priorState = (await db.query("SELECT * FROM overseer_capability_state WHER
 if (!priorState) throw new Error("merge_capability_state_missing");
 
 let mergeCalls = 0;
+let coordinatorCalls = 0;
 const actions = [];
 try {
   await db.query(
@@ -290,11 +292,19 @@ try {
     valid_until: new Date(now + 60000).toISOString(),
   };
 
+  const mergeCoordinator = async record => {
+    coordinatorCalls++;
+    if (record.woId !== "WO-M42-STAGING-CANARY") {
+      throw new Error("unexpected_coordinator_record:" + record.woId);
+    }
+  };
+
   await runOverseerService({
     once: true,
     enabled: true,
     dryRun: false,
     adapterKind: "fake",
+    mergeCoordinator,
     deps: {
       listRunsForWatch: async () => [{
         id: "staging-run-" + suffix,
@@ -323,15 +333,13 @@ try {
   const attempts = (await listOverseerCapabilityEvents("merge")).filter(
     event => event.event_type === "adapter_attempt" && event.execution_id === executionId
   );
+  if (coordinatorCalls !== 1) throw new Error("qualified_coordinator_calls:" + coordinatorCalls);
   if (mergeCalls !== 0) throw new Error("real_merge_callback_called:" + mergeCalls);
-  if (actions.length !== 1 || actions[0].action !== "fake_merge_attempt") {
+  if (actions.length !== 0) {
     throw new Error("unexpected_service_action:" + JSON.stringify(actions));
   }
-  if (attempts.length !== 1) throw new Error("adapter_attempt_count:" + attempts.length);
-  if (attempts[0].details.adapter !== "fake-github") throw new Error("wrong_adapter");
-  if (attempts[0].details.accepted !== true) throw new Error("fake_attempt_not_accepted");
-  if (attempts[0].details.mutation_sent !== false) throw new Error("mutation_sent_true");
-  console.log("LIVE_SERVICE_CANARY_OK:attempts=1:mutation_sent=false:real_calls=0");
+  if (attempts.length !== 0) throw new Error("adapter_attempt_count:" + attempts.length);
+  console.log("LIVE_SERVICE_CANARY_OK:coordinator_calls=1:legacy_calls=0:adapter_attempts=0");
 } finally {
   await db.query(
     `UPDATE overseer_capability_state
@@ -346,23 +354,48 @@ try {
   await closeDatabase();
 }
 '@
+  $canaryHomeName = ".overseer-service-canary-$([Guid]::NewGuid().ToString('N'))"
+  $archonMountSource = Get-ContainerArchonMountSource -Docker $Docker -ContainerName "archon-staging"
+  $canaryHostPath = [IO.Path]::GetFullPath((Join-Path $archonMountSource $canaryHomeName))
+  $mountPrefix = [IO.Path]::GetFullPath($archonMountSource).TrimEnd('\') + '\'
+  if (-not $canaryHostPath.StartsWith($mountPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+    Fail "Enabled live Overseer service canary path escaped the staging mount"
+    exit 1
+  }
+  New-Item -ItemType Directory -Path $canaryHostPath | Out-Null
   try {
-    $serviceCanary = & $Docker exec `
-      -e ARCHON_HOME=/.archon `
-      -e OVERSEER_ENABLED=true `
-      -e OVERSEER_EMERGENCY_STOP=false `
-      -e OVERSEER_DRY_RUN=false `
-      -e OVERSEER_USE_FAKE_GITHUB_ADAPTER=1 `
-      -e OVERSEER_FAKE_GITHUB_REPOSITORIES=thinmansoftware/bdc-harness `
-      -e OVERSEER_MERGE_ACTIONS_ENABLED=true `
-      archon-staging bun -e $serviceCanaryJs 2>$null
-    if ($serviceCanary -match "LIVE_SERVICE_CANARY_OK:attempts=1:mutation_sent=false:real_calls=0") {
-      Pass "Enabled live Overseer service persisted exactly one inert fake attempt: $serviceCanary"
+    $serviceCanaryOptions = @(
+      "-e", "ARCHON_HOME=/.archon/$canaryHomeName",
+      "-e", "OVERSEER_ENABLED=true",
+      "-e", "OVERSEER_EMERGENCY_STOP=false",
+      "-e", "OVERSEER_DRY_RUN=false",
+      "-e", "OVERSEER_USE_FAKE_GITHUB_ADAPTER=1",
+      "-e", "OVERSEER_FAKE_GITHUB_REPOSITORIES=thinmansoftware/bdc-harness",
+      "-e", "OVERSEER_MERGE_ACTIONS_ENABLED=true"
+    )
+    $serviceCanary = Invoke-BunScriptInContainer `
+      -Docker $Docker `
+      -ContainerName "archon-staging" `
+      -Script $serviceCanaryJs `
+      -DockerExecOptions $serviceCanaryOptions
+    if ($serviceCanary -match "LIVE_SERVICE_CANARY_OK:coordinator_calls=1:legacy_calls=0:adapter_attempts=0") {
+      Pass "Enabled live Overseer service reached only the qualified coordinator: $serviceCanary"
     } else {
       Fail "Enabled live Overseer service canary failed: $serviceCanary"
     }
   } catch {
     Fail "Enabled live Overseer service canary exception: $($_.Exception.Message)"
+  } finally {
+    try {
+      if (Test-Path -LiteralPath $canaryHostPath) {
+        Remove-Item -LiteralPath $canaryHostPath -Recurse -Force -ErrorAction Stop
+      }
+      if (Test-Path -LiteralPath $canaryHostPath) {
+        throw "canary directory still exists"
+      }
+    } catch {
+      Fail "Enabled live Overseer service canary cleanup failed: $($_.Exception.Message)"
+    }
   }
 }
 

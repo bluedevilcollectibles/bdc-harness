@@ -12,6 +12,7 @@ param()
 
 $ErrorActionPreference = "Continue"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+. (Join-Path $PSScriptRoot "_docker-bun.ps1")
 
 $cmd = Get-Command docker -ErrorAction SilentlyContinue
 if ($cmd) { $Docker = $cmd.Source }
@@ -39,7 +40,7 @@ try {
 if ($state -like "running*") {
   $js = 'const {Database}=require("bun:sqlite");const db=new Database("/.archon/archon.db",{readonly:true});try{const rows=db.query("SELECT id,workflow_name,status,started_at FROM remote_agent_workflow_runs ORDER BY started_at DESC LIMIT 5").all();console.log(JSON.stringify(rows,null,1));}catch(e){console.log("event store not initialized yet: "+e.message);}'
   Write-Host "[staging-status] last 5 runs (staging event store):"
-  & $Docker exec archon-staging bun -e $js
+  Invoke-BunScriptInContainer -Docker $Docker -ContainerName "archon-staging" -Script $js
 } else {
   Write-Host "[staging-status] container not running -- event store persisted at staging-data/archon.db"
 }
