@@ -190,6 +190,23 @@ export interface ResolveRequiredContextsInput extends UnprotectedBranchProbes {
    * the bound, so the deferral it bounds would still be forever (#777 review).
    */
   attemptStore?: AttemptCounterStore;
+  /**
+   * Bypass the unprotected cache and re-read protection from GitHub (#804).
+   *
+   * REQUIRED for any MERGE-AFFECTING decision. The cached answer is a security
+   * policy statement with no external invalidation path -- nothing tells this
+   * process that a human enabled branch protection through the GitHub UI -- so
+   * a caller whose result can gate a merge must ask GitHub, not the cache.
+   *
+   * The reviewer's terminality check deliberately does NOT set this: it runs on
+   * every worker tick, it is the poll the cache exists to collapse, and a
+   * verdict it produces is re-gated by whatever asks with `revalidate` before a
+   * merge. Setting it here would reinstate the 40-second storm.
+   *
+   * Revalidating also INVALIDATES the entry, so a stale answer cannot be served
+   * to the next non-revalidating caller either.
+   */
+  revalidate?: boolean;
 }
 
 /**
@@ -507,6 +524,96 @@ function logSourceOnce(key: string, fields: Record<string, unknown>, message: st
 }
 
 /**
+ * How long a proven-unprotected base is trusted without re-asking (#796).
+ *
+ * THIRTY SECONDS, cut down from ten minutes on a security finding (Overseer, PR
+ * #804 [major]). "Unprotected" is a SECURITY POLICY answer, and there is no
+ * invalidation path when someone enables protection through the GitHub UI --
+ * so the cache must not be able to hide a policy change for any meaningful
+ * length of time. Ten minutes could serve "nothing is required here" for ten
+ * minutes after a human turned protection ON, and an empty required set routes
+ * the reviewer to the weaker reported-checks heuristic, whose APPROVE is what
+ * the merge manager gates on.
+ *
+ * Thirty seconds is chosen against the thing being fixed rather than against
+ * convenience: the observed poll was one call per ~40 seconds per work item,
+ * so a TTL just under that interval collapses the storm of concurrent items
+ * hitting the same base while leaving the steady-state re-check roughly
+ * per-poll. The stale window is now shorter than the time it takes a human to
+ * finish enabling protection and push again.
+ */
+export const UNPROTECTED_CACHE_TTL_MS = 30 * 1000;
+
+interface UnprotectedCacheEntry {
+  expiresAt: number;
+}
+
+/**
+ * Bases recently proven unprotected, with the wall-clock time the proof lapses.
+ *
+ * IN MEMORY, not a table. The entry is a pure API-load optimisation over an
+ * answer re-derivable at any moment, so losing it on a container rebuild costs
+ * one extra lookup -- unlike the ATTEMPT COUNTER, whose whole purpose (#777) is
+ * to outlive the process. A durable cache would be strictly worse here: it
+ * would survive the rebuild that is currently the fastest way to clear a stale
+ * security answer.
+ *
+ * Cached POSITIVE ONLY: `hasPositiveUnprotectedEvidence` requires two agreeing
+ * probes, so an entry is an authoritative answer, never an inferred one.
+ */
+const unprotectedBranchCache = new Map<string, UnprotectedCacheEntry>();
+
+/** Hit/miss counters so the effect on the poll rate stays measurable (#804). */
+const unprotectedCacheStats = { hits: 0, misses: 0, revalidations: 0 };
+
+export function unprotectedBranchCacheStats(): {
+  hits: number;
+  misses: number;
+  revalidations: number;
+} {
+  return { ...unprotectedCacheStats };
+}
+
+function isCachedUnprotected(key: string, now: number = Date.now()): boolean {
+  const entry = unprotectedBranchCache.get(key);
+  if (entry === undefined) {
+    unprotectedCacheStats.misses += 1;
+    return false;
+  }
+  if (entry.expiresAt <= now) {
+    unprotectedBranchCache.delete(key);
+    unprotectedCacheStats.misses += 1;
+    return false;
+  }
+  unprotectedCacheStats.hits += 1;
+  return true;
+}
+
+function cacheUnprotected(key: string, now: number = Date.now()): void {
+  unprotectedBranchCache.set(key, { expiresAt: now + UNPROTECTED_CACHE_TTL_MS });
+}
+
+/**
+ * Drop this base's cached answer. Called on every REVALIDATE so a
+ * merge-affecting lookup can never be served, or subsequently seeded, by an
+ * answer older than the call that asked for freshness.
+ */
+function invalidateUnprotected(key: string): void {
+  unprotectedBranchCache.delete(key);
+}
+
+/**
+ * Drop every cached unprotected answer. For tests, and for any caller that has
+ * just CHANGED a branch's protection and does not want to wait out the TTL.
+ */
+export function resetUnprotectedBranchCache(): void {
+  unprotectedBranchCache.clear();
+  unprotectedCacheStats.hits = 0;
+  unprotectedCacheStats.misses = 0;
+  unprotectedCacheStats.revalidations = 0;
+}
+
+/**
  * Resolve the base branch's required status-check contexts.
  *
  * Order: env override -> App client -> PAT client (on permission failure only)
@@ -546,6 +653,29 @@ export async function resolveRequiredContexts(
       'overseer.required_contexts.resolved'
     );
     return { state: 'known', contexts: overrideContexts, source: 'env_override' };
+  }
+
+  // UNPROTECTED CACHE (#796, narrowed on the #804 security finding). Checked
+  // BEFORE any fetch attempt, because the call being spared is the protection
+  // lookup itself. On 2026-09-08 the reviewer sent 45 GET
+  // .../branches/master/protection calls in 30 minutes for shopops/master --
+  // one every ~40 seconds, each answered "Branch not protected" -- because a
+  // queued work item re-asked the same settled question on every tick. Checking
+  // after the fetchers would spare only the two cheap probes and leave the poll
+  // exactly as it was.
+  //
+  // Below the ENV OVERRIDE on purpose: an explicit override is a deliberate
+  // operator statement and must always win over a cached observation.
+  //
+  // A REVALIDATING caller skips the cache entirely AND drops the entry, so a
+  // merge-affecting lookup always reaches GitHub and never leaves a stale
+  // answer behind for the next caller.
+  if (input.revalidate) {
+    unprotectedCacheStats.revalidations += 1;
+    invalidateUnprotected(key);
+  } else if (isCachedUnprotected(key)) {
+    await store.clear(counterKey);
+    return { state: 'known', contexts: [], source: 'unprotected_branch' };
   }
 
   const attempts: { source: 'app_client' | 'pat_client'; fetch: StatusCheckContextsFetcher }[] = [];
@@ -604,6 +734,12 @@ export async function resolveRequiredContexts(
   // is a real answer, not a fallback: it says "nothing is required here".
   if (await hasPositiveUnprotectedEvidence(input, baseRef)) {
     await store.clear(counterKey);
+    // Cached POSITIVE-ONLY, and only for a NON-revalidating caller. An
+    // unprotected answer is derived from two agreeing probes, so it is
+    // authoritative and safe to reuse briefly. A FAILED lookup is never cached:
+    // that would turn a transient API fault into a sticky wrong answer, and the
+    // attempt counter already bounds it.
+    if (!input.revalidate) cacheUnprotected(key);
     logSourceOnce(
       `unprotected:${key}`,
       { owner, repo, baseRef, source: 'unprotected_branch', lastReason },
