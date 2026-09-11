@@ -188,6 +188,118 @@ afterEach(async () => {
 });
 
 describe('dispatch-migration-smoke CLI', () => {
+  test('preserves populated Phase 0/1 priorities and lifecycle state on a quiescent copy', async () => {
+    const { dir, dbPath } = await makeLegacyFixture();
+    const source = new Database(dbPath);
+    source.run(
+      "ALTER TABLE agent_dispatch_messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('blocker', 'normal', 'heartbeat'))"
+    );
+    source.run(
+      "ALTER TABLE agent_dispatch_messages ADD COLUMN task_outcome TEXT CHECK (task_outcome IS NULL OR task_outcome IN ('succeeded', 'failed', 'blocked'))"
+    );
+    for (const name of [
+      'acknowledged_at',
+      'acknowledged_by',
+      'addressed_at',
+      'addressed_by',
+      'escalated_tg_at',
+      'escalated_sms_at',
+      'subject_key',
+      'repeat_reason',
+    ]) {
+      source.run(`ALTER TABLE agent_dispatch_messages ADD COLUMN ${name} TEXT`);
+    }
+    source.run(
+      "ALTER TABLE agent_dispatch_messages ADD COLUMN route_disposition TEXT CHECK (route_disposition IS NULL OR route_disposition IN ('unroutable', 'superseded'))"
+    );
+    source.run(
+      'ALTER TABLE agent_dispatch_messages ADD COLUMN supersedes_id TEXT REFERENCES agent_dispatch_messages(id)'
+    );
+    source.run(
+      "CREATE INDEX idx_agent_dispatch_messages_lease_expiry ON agent_dispatch_messages(lease_expires_at) WHERE status = 'claimed'"
+    );
+    source.run(
+      'CREATE INDEX idx_agent_dispatch_messages_recipient_status ON agent_dispatch_messages(recipient, status)'
+    );
+    source.run(
+      'CREATE INDEX idx_dispatch_board_pending ON agent_dispatch_messages(recipient_alias, status, created_at)'
+    );
+    source.run(
+      'CREATE INDEX idx_agent_dispatch_messages_subject_history ON agent_dispatch_messages(subject_key, created_at DESC, id DESC) WHERE subject_key IS NOT NULL'
+    );
+    source.run("UPDATE agent_dispatch_messages SET priority='heartbeat' WHERE id='report-1'");
+    source.run(`UPDATE agent_dispatch_messages SET priority='blocker', status='claimed',
+      subject_key='synthetic-subject', repeat_reason='synthetic-repeat',
+      acknowledged_at='2026-08-05T10:00:00.000Z', acknowledged_by='xo',
+      addressed_at='2026-08-05T10:00:00.000Z', addressed_by='xo',
+      escalated_tg_at='2026-08-05T10:00:00.000Z', escalated_sms_at='2026-08-05T10:00:00.000Z',
+      task_outcome='blocked', route_disposition='superseded', supersedes_id='old-report',
+      lease_owner='synthetic-worker', lease_expires_at='2026-08-05T10:30:00.000Z', fencing_token=2
+      WHERE id='report-2'`);
+    // A completed heartbeat is valid existing state, not a backfill candidate.
+    source.run(
+      "UPDATE agent_dispatch_messages SET priority='heartbeat', task_outcome='succeeded' WHERE id='old-report'"
+    );
+    const beforeRows = source
+      .query<Record<string, unknown>, []>('SELECT * FROM agent_dispatch_messages ORDER BY id')
+      .all();
+    const beforeIndexes = source
+      .query(
+        "SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name"
+      )
+      .all();
+    source.close();
+    const beforeHash = await sha256(dbPath);
+    const outputPath = join(dir, 'phase15-copy.db');
+    const result = await runCli([
+      '--source-copy',
+      dbPath,
+      '--expected-heartbeats',
+      '1',
+      '--migrated-copy-output',
+      outputPath,
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      'PASS rows_before=4 rows_after=4 heartbeat_rows=1 source_unchanged=true second_run_idempotent=true migrated_copy_ready=true'
+    );
+    expect(await sha256(dbPath)).toBe(beforeHash);
+    const outputUrl = pathToFileURL(outputPath);
+    outputUrl.searchParams.set('mode', 'ro');
+    outputUrl.searchParams.set('immutable', '1');
+    const migrated = new Database(
+      outputUrl.href,
+      constants.SQLITE_OPEN_READONLY | constants.SQLITE_OPEN_URI
+    );
+    try {
+      // Current dev also adds seq; compare every original column, not new columns.
+      const originalColumns = Object.keys(beforeRows[0]);
+      const afterRows = migrated
+        .query<
+          Record<string, unknown>,
+          []
+        >(`SELECT ${originalColumns.join(',')}, sender_principal_id FROM agent_dispatch_messages ORDER BY id`)
+        .all();
+      expect(
+        afterRows.map(({ sender_principal_id, ...row }) => {
+          expect(sender_principal_id).toBeNull();
+          return row;
+        })
+      ).toEqual(beforeRows);
+      expect(migrated.query('PRAGMA foreign_key_check').all()).toEqual([]);
+      const indexes = migrated
+        .query(
+          "SELECT name, sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name"
+        )
+        .all();
+      for (const index of beforeIndexes) expect(indexes).toContainEqual(index);
+    } finally {
+      migrated.close();
+    }
+    expect(await readdir(dir)).not.toContain('phase15-copy.db-wal');
+    expect(await readdir(dir)).not.toContain('phase15-copy.db-shm');
+  });
+
   test('migrates only a temporary copy and prints the exact non-secret PASS summary', async () => {
     const { dbPath } = await makeLegacyFixture();
     const beforeHash = await sha256(dbPath);
