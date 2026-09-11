@@ -262,7 +262,7 @@ describe('parseReviewWorkBody', () => {
   };
 
   test('round-trips a valid body', () => {
-    expect(parseReviewWorkBody(JSON.stringify(valid))).toEqual(valid);
+    expect(parseReviewWorkBody(JSON.stringify(valid))).toEqual({ ...valid, headCiGreen: false });
   });
 
   test('returns null on malformed JSON rather than throwing', () => {
@@ -280,5 +280,6 @@ describe('parseReviewWorkBody', () => {
     const parsed = parseReviewWorkBody(JSON.stringify(minimal));
     expect(parsed?.baseRef).toBe('');
     expect(parsed?.author).toBe('');
+    expect(parsed?.headCiGreen).toBe(false);
   });
 });
