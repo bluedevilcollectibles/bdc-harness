@@ -7,3 +7,5 @@ export * from './report';
 export * from './runner';
 export * from './layer3-policy';
 export * from './probe-runner';
+export * from './lifecycle-canary';
+export * from './lifecycle-report';

@@ -1,7 +1,8 @@
 import { expect, mock, test } from 'bun:test';
 import { runCanaryCli } from './cli';
-import type { CanaryReport, RunCanaryResult } from './types';
+import type { CanaryReport, LifecycleCanaryReport, RunCanaryResult } from './types';
 import type { TaskmasterCanaryResult } from './taskmaster-canary';
+import type { LifecycleCanaryDeps } from './lifecycle-canary';
 
 const baseReport: CanaryReport = {
   schemaVersion: 1,
@@ -159,4 +160,97 @@ test('taskmaster maps a failed report to exit 2 after writing its artifact', asy
 
   expect(await runCanaryCli([...taskmasterArgs, '--interval-ms', '60000'], {}, deps)).toBe(2);
   expect(deps.taskmasterArtifactWriter).toHaveBeenCalledWith('artifacts', failedReport);
+});
+
+const lifecycleArgs = [
+  'lifecycle',
+  '--run-id',
+  'lifecycle-20260902-0000',
+  '--output-root',
+  'artifacts',
+  '--db-path',
+  'archon.db',
+  '--github-repo',
+  'thinmansoftware/bdc-harness',
+];
+
+const lifecycleReport: LifecycleCanaryReport = {
+  schemaVersion: 1,
+  suiteRunId: 'lifecycle-20260902-0000',
+  generatedAt: '2026-09-02T00:00:00.000Z',
+  verdict: 'blocked',
+  reasonCodes: ['taskmaster_never_fires'],
+  invariantViolations: [],
+  legs: [],
+};
+
+function lifecycleDeps(report: LifecycleCanaryReport = lifecycleReport) {
+  const factoryArgs: unknown[] = [];
+  return {
+    runner: mock(async () => ({}) as RunCanaryResult),
+    lifecycleRunner: mock(async () => report),
+    lifecycleArtifactWriter: mock(async () => ['artifacts/lifecycle-20260902-0000/summary.md']),
+    lifecycleDepsFactory: mock((options: unknown) => {
+      factoryArgs.push(options);
+      return {} as LifecycleCanaryDeps;
+    }),
+    stdout: mock(() => {}),
+    stderr: mock(() => {}),
+    factoryArgs,
+  };
+}
+
+test.each([
+  ['--run-id', ''],
+  ['--output-root', ''],
+  ['--db-path', ''],
+  ['--github-repo', ''],
+] as const)('lifecycle rejects missing %s before running', async (name, value) => {
+  const deps = lifecycleDeps();
+  const index = lifecycleArgs.indexOf(name);
+  const invocation =
+    index >= 0
+      ? lifecycleArgs.map((argument, argumentIndex) =>
+          argumentIndex === index + 1 ? value : argument
+        )
+      : [...lifecycleArgs, name, value];
+  expect(await runCanaryCli(invocation, {}, deps)).toBe(3);
+  expect(deps.lifecycleRunner).not.toHaveBeenCalled();
+  expect(deps.stderr).toHaveBeenCalledWith('lifecycle_canary_missing_or_invalid_required_argument');
+});
+
+test('lifecycle fails closed when no firing implementation is configured', async () => {
+  const stderr: string[] = [];
+  const exit = await runCanaryCli(
+    lifecycleArgs,
+    {},
+    {
+      runner: mock(async () => ({}) as RunCanaryResult),
+      stdout: () => {},
+      stderr: value => stderr.push(value),
+    }
+  );
+  expect(exit).toBe(3);
+  expect(stderr.join('\n')).toContain('lifecycle_fire_not_configured');
+});
+
+test('lifecycle wires runner + artifact writer and maps a blocked report to exit 3', async () => {
+  const deps = lifecycleDeps();
+  const exit = await runCanaryCli(lifecycleArgs, {}, deps);
+  expect(exit).toBe(3); // blocked -> 3
+  expect(deps.lifecycleDepsFactory).toHaveBeenCalled();
+  expect(deps.lifecycleArtifactWriter).toHaveBeenCalledWith('artifacts', lifecycleReport);
+  expect(deps.stdout).toHaveBeenCalledWith(JSON.stringify(lifecycleReport, null, 2));
+  // Factory received the parsed options including defaults.
+  expect(deps.factoryArgs[0]).toMatchObject({
+    runId: 'lifecycle-20260902-0000',
+    githubRepo: 'thinmansoftware/bdc-harness',
+    baseBranch: 'dev',
+    mergeIdentity: 'bluedevilcollectibles',
+  });
+});
+
+test('lifecycle maps a failed report to exit 2', async () => {
+  const deps = lifecycleDeps({ ...lifecycleReport, verdict: 'failed' });
+  expect(await runCanaryCli(lifecycleArgs, {}, deps)).toBe(2);
 });

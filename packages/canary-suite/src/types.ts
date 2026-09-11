@@ -171,6 +171,56 @@ export interface RunCanaryResult {
   readonly artifactPaths: readonly string[];
 }
 
+export type LifecycleLegId =
+  | 'taskmaster-fire'
+  | 'codex-lane-build-pr'
+  | 'overseer-catch-defect'
+  | 'remediation-reaches-pr'
+  | 'overseer-reapprove'
+  | 'autonomous-merge'
+  | 'reconcile-closes-issue'
+  | 'dispatch-readable-reply'
+  | 'duty-officer-reports'
+  | 'canary-reverts';
+
+// Ordered list of the ten lifecycle legs; single source of truth for iteration
+// and report ordering. Titles mirror Section 6 of WO-HARNESS-LIFECYCLE-CANARY-01.
+export const LIFECYCLE_LEGS: readonly { readonly id: LifecycleLegId; readonly title: string }[] = [
+  { id: 'taskmaster-fire', title: 'Taskmaster proposes/dispatches the canary WO' },
+  { id: 'codex-lane-build-pr', title: 'codex lane builds and opens a PR' },
+  { id: 'overseer-catch-defect', title: 'Overseer requests changes on the planted defect' },
+  { id: 'remediation-reaches-pr', title: 'remediation reaches the PR' },
+  { id: 'overseer-reapprove', title: 'Overseer re-approves on push' },
+  { id: 'autonomous-merge', title: 'Merge Manager merges without a human' },
+  { id: 'reconcile-closes-issue', title: 'reconcile closes the GitHub issue' },
+  { id: 'dispatch-readable-reply', title: 'Dispatch worker delivers a readable reply' },
+  { id: 'duty-officer-reports', title: 'Duty Officer reports the run, flags nothing stale' },
+  { id: 'canary-reverts', title: 'the canary change reverts so dev stays clean' },
+];
+
+export interface LifecycleLegReport {
+  readonly legId: LifecycleLegId;
+  readonly title: string;
+  readonly verdict: CanaryVerdict;
+  readonly reasonCodes: readonly string[];
+  readonly evidenceRefs: readonly string[];
+  // Populated when a leg proceeded through a documented gap/fallback rather than
+  // the intended autonomous path (e.g. Taskmaster never fired, manual remediation).
+  readonly gap?: string;
+}
+
+export interface LifecycleCanaryReport {
+  readonly schemaVersion: 1;
+  readonly suiteRunId: string;
+  readonly generatedAt: string;
+  readonly verdict: CanaryVerdict;
+  readonly reasonCodes: readonly string[];
+  // Invariant violations are checked independently of leg verdicts and, when
+  // present, force the suite verdict to failed regardless of any leg result.
+  readonly invariantViolations: readonly string[];
+  readonly legs: readonly LifecycleLegReport[];
+}
+
 export const CANARY_LANES = [
   'bdc-feature-development-zero-open',
   'bdc-feature-development-zero',

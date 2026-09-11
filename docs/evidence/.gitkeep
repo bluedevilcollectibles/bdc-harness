@@ -1,0 +1,6 @@
+# Evidence artifacts
+
+Live-run evidence (e.g. lifecycle-canary-<date>.md) is committed here by the
+operator-approved live-execution phase. This placeholder keeps the directory
+tracked so a live run has a destination and so tooling that lists this directory
+does not error on a missing path.
