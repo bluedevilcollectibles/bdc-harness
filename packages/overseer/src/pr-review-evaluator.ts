@@ -63,12 +63,47 @@ export interface PrReviewResult {
    * spin the worker every tick.
    */
   retry_after_ms?: number;
+  /**
+   * Which ladder rungs were actually attempted, in order (#798).
+   *
+   * An INDETERMINATE says nothing about WHERE it gave up. With a two-rung
+   * ladder, "the first rung timed out and the second returned garbage" and
+   * "only one rung is configured and it returned garbage" produce the same
+   * `error` but need different fixes.
+   */
+  ladder_tried?: string[];
+  /** Wall-clock milliseconds spent invoking the ladder (#798). */
+  duration_ms?: number;
+  /**
+   * Judge stderr tails keyed by binary, for rungs that timed out, exited
+   * non-zero, or returned unparseable output (#798).
+   *
+   * OPERATOR-ONLY. This is the raw tail of a subprocess's stderr: it can carry
+   * provider internals and, in the worst case, credential fragments echoed by a
+   * failing CLI. It travels on the dispatch receipt body under the store's
+   * existing redaction and MUST NOT be placed in a PR body or any other public
+   * surface.
+   */
+  judge_stderr?: Record<string, string>;
 }
 
 export interface PrReviewModelResult {
   exitCode: number;
   stdout: string;
   timedOut: boolean;
+  /**
+   * Last `MAX_JUDGE_STDERR_BYTES` of the judge process's stderr (#798).
+   *
+   * The judge's own diagnostics were previously read only as a stdout FALLBACK
+   * (`payload = stdout || stderr`) and discarded entirely whenever stdout had
+   * content, so a rung that exited non-zero after printing a real error left no
+   * trace anywhere. This field carries that text to the operator record.
+   *
+   * NEVER reaches GitHub. It is stored on the dispatch receipt body, which the
+   * operator reads from the event store; the PR body gets only the error code
+   * (see `reviewErrorCode`).
+   */
+  stderrTail?: string;
 }
 
 export interface PrReviewDeps {
@@ -188,20 +223,48 @@ export function buildReviewPrompt(input: {
   ].join('\n');
 }
 
+/**
+ * Diagnostics gathered while walking the judge ladder (#798).
+ *
+ * Attached to whichever terminal/deferring result the walk produces so the
+ * reason for a non-verdict survives past the function that discovered it.
+ */
+interface LadderDiagnostics {
+  ladderTried: string[];
+  durationMs: number;
+  judgeStderr: Record<string, string>;
+}
+
+function withDiagnostics(result: PrReviewResult, diagnostics?: LadderDiagnostics): PrReviewResult {
+  if (!diagnostics) return result;
+  return {
+    ...result,
+    ladder_tried: diagnostics.ladderTried,
+    duration_ms: diagnostics.durationMs,
+    ...(Object.keys(diagnostics.judgeStderr).length > 0
+      ? { judge_stderr: diagnostics.judgeStderr }
+      : {}),
+  };
+}
+
 function indeterminate(
   input: PrReviewInput,
   deps: PrReviewDeps,
   acceptanceCriteriaAvailable: boolean,
-  error: string
+  error: string,
+  diagnostics?: LadderDiagnostics
 ): PrReviewResult {
-  return {
-    verdict: 'INDETERMINATE',
-    findings: [],
-    reviewed_head_sha: input.head_sha,
-    reviewer: deps.reviewer,
-    acceptance_criteria_available: acceptanceCriteriaAvailable,
-    error,
-  };
+  return withDiagnostics(
+    {
+      verdict: 'INDETERMINATE',
+      findings: [],
+      reviewed_head_sha: input.head_sha,
+      reviewer: deps.reviewer,
+      acceptance_criteria_available: acceptanceCriteriaAvailable,
+      error,
+    },
+    diagnostics
+  );
 }
 
 /**
@@ -264,17 +327,21 @@ function transportError(
   input: PrReviewInput,
   deps: PrReviewDeps,
   acceptanceCriteriaAvailable: boolean,
-  error: string
+  error: string,
+  diagnostics?: LadderDiagnostics
 ): PrReviewResult {
-  return {
-    verdict: 'TRANSPORT_ERROR',
-    findings: [],
-    reviewed_head_sha: input.head_sha,
-    reviewer: deps.reviewer,
-    acceptance_criteria_available: acceptanceCriteriaAvailable,
-    error,
-    retry_after_ms: TRANSPORT_ERROR_RETRY_MS,
-  };
+  return withDiagnostics(
+    {
+      verdict: 'TRANSPORT_ERROR',
+      findings: [],
+      reviewed_head_sha: input.head_sha,
+      reviewer: deps.reviewer,
+      acceptance_criteria_available: acceptanceCriteriaAvailable,
+      error,
+      retry_after_ms: TRANSPORT_ERROR_RETRY_MS,
+    },
+    diagnostics
+  );
 }
 
 /**
@@ -445,8 +512,23 @@ export async function evaluatePullRequest(
   let reachedAnyRung = false;
   let nonTransportFailure = false;
   let transportFailure: string | null = null;
+  // #798: every non-verdict outcome below now carries WHERE the ladder gave up
+  // and what the failing rung printed, so an INDETERMINATE is diagnosable from
+  // the receipt alone instead of requiring a source read.
+  const startedAt = Date.now();
+  const ladderTried: string[] = [];
+  const judgeStderr: Record<string, string> = {};
+  const diagnostics = (): LadderDiagnostics => ({
+    ladderTried,
+    durationMs: Date.now() - startedAt,
+    judgeStderr,
+  });
+  const recordStderr = (binary: string, tail: string | undefined): void => {
+    if (nonEmpty(tail)) judgeStderr[binary] = tail.slice(-MAX_JUDGE_STDERR_BYTES);
+  };
   for (const binary of ladder) {
     if (!nonEmpty(binary)) continue;
+    ladderTried.push(binary);
     try {
       const result = await deps.invokeModel(binary, prompt);
       if (result.timedOut) {
@@ -454,23 +536,32 @@ export async function evaluatePullRequest(
         // delivered anything to judge, so this rung was not reached.
         lastError = `model_timeout:${binary}`;
         transportFailure ??= lastError;
+        recordStderr(binary, result.stderrTail);
         continue;
       }
       // The process ran and returned. Whatever happens below is judgment.
       reachedAnyRung = true;
       if (result.exitCode !== 0) {
         lastError = `model_exit_nonzero:${binary}`;
+        recordStderr(binary, result.stderrTail);
         continue;
       }
       const parsed = parseReviewVerdict(result.stdout);
       if (!parsed) {
         lastError = `model_output_invalid:${binary}`;
+        recordStderr(binary, result.stderrTail);
         continue;
       }
       try {
         assertCandidateIsCurrentHead(input.head_sha, parsed.reviewed_head_sha);
       } catch {
-        return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
+        return indeterminate(
+          input,
+          deps,
+          acceptanceCriteriaAvailable,
+          'reviewed_head_mismatch',
+          diagnostics()
+        );
       }
       return {
         ...parsed,
@@ -494,9 +585,15 @@ export async function evaluatePullRequest(
   // (`reachedAnyRung`) and nothing threw a non-transport error
   // (`nonTransportFailure`). Either one makes the outcome terminal.
   if (transportFailure && !reachedAnyRung && !nonTransportFailure) {
-    return transportError(input, deps, acceptanceCriteriaAvailable, transportFailure);
+    return transportError(
+      input,
+      deps,
+      acceptanceCriteriaAvailable,
+      transportFailure,
+      diagnostics()
+    );
   }
-  return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError);
+  return indeterminate(input, deps, acceptanceCriteriaAvailable, lastError, diagnostics());
 }
 
 function defaultReviewLadder(): string[] {
@@ -514,6 +611,32 @@ export function configuredReviewIdentity(): ReviewAgentIdentity {
 
 /** Default judge wall clock; override with OVERSEER_REVIEW_MODEL_TIMEOUT_MS. */
 export const DEFAULT_REVIEW_MODEL_TIMEOUT_MS = 60_000;
+
+/**
+ * How much judge stderr is retained on a failed rung (#798).
+ *
+ * The TAIL, not the head: a CLI that fails prints its usage banner first and
+ * the actual error last, so the last bytes are the diagnostic ones. Two
+ * kilobytes is enough for a stack tail or an API error body while staying far
+ * inside the dispatch body budget even with a full ladder failing.
+ */
+export const MAX_JUDGE_STDERR_BYTES = 2_048;
+
+/**
+ * Cap on stderr retained for the STDOUT-FALLBACK PARSE (#802 review).
+ *
+ * Separate from the tail cap because the two serve opposite ends of the stream:
+ * the receipt wants the last bytes (a failing CLI prints its error last), while
+ * the fallback parse wants the first bytes, because a judge that writes its
+ * JSON verdict to stderr writes it from the start. Sixty-four kilobytes is far
+ * past any real verdict (a REQUEST_CHANGES with forty findings is a few KB) and
+ * still bounds a runaway judge to a fixed cost.
+ *
+ * Once exceeded, the buffer stops accepting and marks itself truncated -- a
+ * truncated JSON payload simply fails to parse, which is already handled as
+ * `model_output_invalid`.
+ */
+export const MAX_JUDGE_STDERR_VERDICT_BYTES = 64 * 1024;
 
 export function resolveReviewModelTimeoutMs(
   env: Record<string, string | undefined> = process.env
@@ -666,6 +789,20 @@ export async function runReviewModelProcess(
   // OVERSEER_REVIEW_MODEL_TIMEOUT_MS bounded only the model's THINKING time, not
   // the call, and a non-consuming child hung the review worker indefinitely with
   // no timeout, no verdict and no deferral.
+  // #798: stderr is read INCREMENTALLY into a bounded tail buffer, not with
+  // `new Response(stderr).text()`.
+  //
+  // Review finding (Overseer, PR #802): `.text()` only resolves at
+  // END-OF-STREAM, so on the path this feature exists for -- a genuinely hung
+  // judge -- the timeout snapshot ran before the stream ever closed and the tail
+  // came back EMPTY. A hung CLI's stderr is exactly the diagnostic wanted, and
+  // it has usually already been written; it is the process, not the output,
+  // that is stuck. The chunk loop below keeps the last MAX_JUDGE_STDERR_BYTES as
+  // each chunk arrives, so the snapshot is correct at any instant.
+  const stderrTail = createStderrTail();
+  const stderrReader = readStderrInto(subprocess.stderr, stderrTail);
+  const stderrRead = stderrReader.done;
+
   let timeout: Timer | undefined;
   let timedOut = false;
   const timeoutResult = new Promise<PrReviewModelResult>(resolve => {
@@ -677,7 +814,19 @@ export async function runReviewModelProcess(
       // EPIPE/abort rejection, swallowed below) instead of hanging on.
       subprocess.kill();
       destroyStdin(subprocess.stdin);
-      resolve({ exitCode: 124, stdout: '', timedOut: true });
+      // GRACE, then snapshot. The kill usually closes stderr, which lets the
+      // reader drain whatever the OS had already buffered -- so a short bounded
+      // wait recovers output the raw synchronous snapshot would miss. It is
+      // BOUNDED and never awaited unconditionally: a child whose stderr pipe
+      // stays open forever must not extend the wall clock this callback exists
+      // to enforce.
+      void withDeadline(stderrRead, STDERR_DRAIN_GRACE_MS).then(() => {
+        // CANCEL after the snapshot (#802 review). A killed child whose pipe
+        // stays open would otherwise leave this reader looping for the life of
+        // the worker -- one leaked reader per timed-out review.
+        stderrReader.cancel();
+        resolve({ exitCode: 124, stdout: '', timedOut: true, stderrTail: stderrTail.value() });
+      });
     }, timeoutMs);
   });
 
@@ -695,24 +844,259 @@ export async function runReviewModelProcess(
     // Never block on delivery completing: a child may legitimately exit before
     // consuming the whole prompt, which settles this as an EPIPE no-op.
     void delivery;
-    const [exitCode, stdout, stderr] = await Promise.all([
+    const [exitCode, stdout] = await Promise.all([
       subprocess.exited,
-      new Response(subprocess.stdout).text(),
-      new Response(subprocess.stderr).text(),
+      subprocess.stdout ? new Response(subprocess.stdout).text() : Promise.resolve(''),
+      // Reuse the single reader armed above: a ReadableStream may only be
+      // consumed once, so reading it a second time here would throw. The text
+      // itself is taken from the tail buffer the reader fills.
+      stderrRead,
     ]);
-    const payload = stdout.trim().length > 0 ? stdout : stderr;
+    const tail = stderrTail.value();
+    // The stdout FALLBACK keeps the FULL stderr, not the 2 KB tail: a judge
+    // that writes its JSON verdict to stderr must still be parseable, and a
+    // verdict with findings runs well past 2 KB. Only the diagnostic copy that
+    // rides the receipt is bounded.
+    const payload = stdout.trim().length > 0 ? stdout : stderrTail.full();
     // A kill fired by the timeout also settles `exited`; report that as the
     // timeout it is rather than as a spurious non-zero exit.
-    if (timedOut) return { exitCode: 124, stdout: '', timedOut: true };
-    return { exitCode, stdout: normalizeModelOutput(binary, payload), timedOut: false };
+    if (timedOut) return { exitCode: 124, stdout: '', timedOut: true, stderrTail: tail };
+    return {
+      exitCode,
+      stdout: normalizeModelOutput(binary, payload),
+      timedOut: false,
+      stderrTail: tail,
+    };
   })();
   const result = await Promise.race([processResult, timeoutResult]);
   if (timeout) clearTimeout(timeout);
+  // Idempotent, and needed on BOTH paths: a race won by processResult can still
+  // leave the stderr reader live if the child exited without closing the pipe.
+  stderrReader.cancel();
   // The child must never outlive this call: on the timeout path the kill above
   // already fired, but a race won by processResult can still leave the writer
   // parked if the child exited without draining stdin.
   destroyStdin(subprocess.stdin);
   return result;
+}
+
+/**
+ * How long the timeout path waits for the stderr reader after killing the child
+ * (#798, Overseer finding on PR #802).
+ *
+ * The kill normally closes stderr, so the reader drains whatever the OS had
+ * buffered within a few milliseconds. A quarter second is generous for that and
+ * negligible against a judge wall clock measured in tens of seconds -- and it is
+ * a DEADLINE, not an await: a child whose stderr pipe somehow stays open cannot
+ * extend the timeout the callback exists to enforce.
+ */
+export const STDERR_DRAIN_GRACE_MS = 250;
+
+/**
+ * A bounded, always-readable view of a stream's trailing bytes.
+ *
+ * `full()` is the complete text (the stdout fallback needs it in order to parse
+ * a verdict a judge wrote to stderr); `value()` is the last
+ * MAX_JUDGE_STDERR_BYTES, which is what rides the receipt.
+ *
+ * Both are readable AT ANY MOMENT, mid-stream. That is the entire point: the
+ * previous implementation could only produce text at end-of-stream, so the
+ * timeout path -- the one case this exists to serve -- always saw an empty
+ * string.
+ */
+interface StderrTail {
+  /** Feed raw bytes. Retention is bounded by the two caps below, always. */
+  append(bytes: Uint8Array): void;
+  /** Last MAX_JUDGE_STDERR_BYTES, decoded. For the receipt. */
+  value(): string;
+  /**
+   * Up to MAX_JUDGE_STDERR_VERDICT_BYTES from the START of the stream, decoded.
+   * For the stdout-fallback parse only.
+   */
+  full(): string;
+  /** True once the verdict buffer stopped accepting bytes. */
+  truncated(): boolean;
+  /** Total bytes seen, including those dropped. */
+  bytesSeen(): number;
+}
+
+/**
+ * Skip a partial UTF-8 character at the START of a byte slice.
+ *
+ * A continuation byte matches 0b10xxxxxx. The slice was cut on an arbitrary
+ * byte boundary, so it may open mid-character; advancing past the continuation
+ * bytes (and the lead byte they belong to, which cannot be recovered) yields a
+ * slice that decodes cleanly. Bounded to 3 steps, the longest possible
+ * continuation run in UTF-8, so malformed input cannot spin.
+ */
+function dropLeadingPartialUtf8(bytes: Uint8Array): Uint8Array {
+  let start = 0;
+  while (start < bytes.length && start < 4 && ((bytes[start] ?? 0) & 0b1100_0000) === 0b1000_0000) {
+    start += 1;
+  }
+  return start === 0 ? bytes : bytes.subarray(start);
+}
+
+/**
+ * Bounded, BYTE-TRUE retention for a judge's stderr (#802 review).
+ *
+ * Three defects the first cut had, all fixed here:
+ *
+ * 1. UNBOUNDED MEMORY. It appended every chunk to one string and sliced only at
+ *    read time, so a judge emitting megabytes retained megabytes despite the
+ *    advertised 2 KB. Retention is now capped as bytes ARRIVE.
+ * 2. TWO PURPOSES, ONE BUFFER. The receipt wants the TAIL (a failing CLI prints
+ *    its error last); the stdout fallback wants the HEAD, because it parses a
+ *    verdict a judge wrote to stderr. Serving both from one unbounded string is
+ *    what forced the unbounded retention. They are now separate buffers with
+ *    separate finite caps, and the verdict buffer stops accepting once full.
+ * 3. UTF-16 SLICING. `String.slice(-2048)` counts UTF-16 code units, so
+ *    non-ASCII stderr blew past the byte limit. Bytes are now sliced as bytes
+ *    and decoded once at read time.
+ */
+function createStderrTail(): StderrTail {
+  // Ring: the last MAX_JUDGE_STDERR_BYTES, kept as bytes.
+  let ring = new Uint8Array(0);
+  // Head: the first MAX_JUDGE_STDERR_VERDICT_BYTES, for the fallback parse.
+  const head: Uint8Array[] = [];
+  let headBytes = 0;
+  let seen = 0;
+  let stopped = false;
+  return {
+    append(bytes: Uint8Array): void {
+      if (bytes.length === 0) return;
+      seen += bytes.length;
+
+      if (headBytes < MAX_JUDGE_STDERR_VERDICT_BYTES) {
+        const room = MAX_JUDGE_STDERR_VERDICT_BYTES - headBytes;
+        const slice = bytes.length <= room ? bytes : bytes.subarray(0, room);
+        head.push(slice);
+        headBytes += slice.length;
+        if (headBytes >= MAX_JUDGE_STDERR_VERDICT_BYTES) stopped = true;
+      } else {
+        stopped = true;
+      }
+
+      // Tail ring: concatenate then keep only the trailing cap, so retention
+      // never exceeds cap + one chunk.
+      if (bytes.length >= MAX_JUDGE_STDERR_BYTES) {
+        ring = bytes.slice(bytes.length - MAX_JUDGE_STDERR_BYTES);
+        return;
+      }
+      const combined = new Uint8Array(ring.length + bytes.length);
+      combined.set(ring, 0);
+      combined.set(bytes, ring.length);
+      ring =
+        combined.length <= MAX_JUDGE_STDERR_BYTES
+          ? combined
+          : combined.slice(combined.length - MAX_JUDGE_STDERR_BYTES);
+    },
+    // Drop a leading PARTIAL UTF-8 character before decoding. The ring is cut
+    // on a byte boundary, which can land mid-character; decoding that emits
+    // U+FFFD, and a replacement char re-encodes to 3 bytes -- so a tail cut
+    // inside a multi-byte character came back LARGER than the cap it was
+    // trimmed to (2,052 bytes for a 2,048 cap, caught by the byte-true test).
+    value: (): string => new TextDecoder().decode(dropLeadingPartialUtf8(ring)),
+    full: (): string => {
+      const joined = new Uint8Array(headBytes);
+      let offset = 0;
+      for (const chunk of head) {
+        joined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return new TextDecoder().decode(joined);
+    },
+    truncated: (): boolean => stopped,
+    bytesSeen: (): number => seen,
+  };
+}
+
+/**
+ * Drain a stream chunk by chunk into `tail`, resolving when it closes.
+ *
+ * Never rejects: a stream torn down by the kill is the expected end of a
+ * timed-out review, not a failure, and a rejection here would surface as an
+ * unhandled rejection under Bun's default handler.
+ */
+/**
+ * Drain a stream into `tail`, resolving when it closes or when cancelled.
+ *
+ * Returns a `cancel()` the caller MUST invoke on the timeout path. Review
+ * finding (Overseer, PR #802): without it, a killed child that leaves its pipe
+ * open left this loop reading forever -- a leaked reader per timed-out review,
+ * on the exact path a hung judge produces. The buffers are bounded now, so the
+ * leak is the reader itself rather than memory, but a review worker that
+ * accumulates one live reader per timeout is still a slow failure.
+ *
+ * Never rejects: a stream torn down by the kill is the expected end of a
+ * timed-out review, not a failure, and a rejection here would surface as an
+ * unhandled rejection under Bun's default handler.
+ */
+/**
+ * The two reader methods this module uses. Declared structurally because Bun's
+ * DOM `ReadableStreamDefaultReader` and node:stream/web's differ in shape
+ * (`readMany`), and a test double implements neither fully.
+ */
+interface StderrStreamReader {
+  read(): Promise<{ done: boolean; value?: unknown }>;
+  cancel(): unknown;
+}
+
+function readStderrInto(
+  stream: ReadableStream | null,
+  tail: StderrTail
+): { done: Promise<void>; cancel: () => void } {
+  const noop = (): void => undefined;
+  if (!stream) return { done: Promise.resolve(), cancel: noop };
+  const encoder = new TextEncoder();
+  let cancelled = false;
+  // Structurally typed rather than `ReadableStreamDefaultReader`: Bun's DOM and
+  // node:stream/web reader types differ in shape (readMany), and only these two
+  // methods are used.
+  let reader: StderrStreamReader | null = null;
+  const done = (async (): Promise<void> => {
+    try {
+      const active = stream.getReader() as unknown as StderrStreamReader;
+      reader = active;
+      for (;;) {
+        if (cancelled) break;
+        const { done: finished, value } = await active.read();
+        if (finished) break;
+        if (value === undefined) continue;
+        // Bytes, never a decoded string: the caps are byte caps, and decoding
+        // per chunk would also split multi-byte characters at chunk edges.
+        tail.append(typeof value === 'string' ? encoder.encode(value) : (value as Uint8Array));
+      }
+    } catch {
+      // Stream gone (killed child, torn-down pipe). Whatever arrived is kept.
+    }
+  })();
+  return {
+    done,
+    cancel: (): void => {
+      cancelled = true;
+      try {
+        void reader?.cancel();
+      } catch {
+        // Best effort: teardown never changes the review's outcome.
+      }
+    },
+  };
+}
+
+/** Resolve when `promise` settles or `ms` elapses, whichever is first. */
+async function withDeadline(promise: Promise<unknown>, ms: number): Promise<void> {
+  let timer: Timer | undefined;
+  try {
+    await Promise.race([
+      promise.catch(() => undefined),
+      new Promise<void>(resolve => {
+        timer = setTimeout(resolve, ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**

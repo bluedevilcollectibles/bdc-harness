@@ -1,0 +1,714 @@
+/**
+ * #798 -- the INDETERMINATE reason must survive to somewhere a human reads it.
+ *
+ * Before this, `evaluatePullRequest` computed a precise reason
+ * (`model_timeout:codex`, `model_output_invalid:grok`, `reviewed_head_mismatch`)
+ * and `createRealSubmitDeps.runReviewer` threw it away. Three INDETERMINATE
+ * verdicts on 2026-09-08 (#777 twice, #790 once) were undiagnosable: the PR body
+ * carried a fixed sentence, the receipt carried only a disposition, and nothing
+ * was logged, so nobody could tell a timed-out judge from an unparseable answer.
+ *
+ * Three surfaces, three audiences, three redaction levels -- that split is what
+ * these tests pin:
+ *   PUBLIC PR body -> the code, plus a binary name when the suffix IS one.
+ *   OPERATOR receipt -> the full reason and the judge's stderr tail.
+ *   OPERATOR log     -> one structured line per evaluation.
+ */
+import { afterEach, describe, expect, test } from 'bun:test';
+import { rootLogger } from '@archon/paths';
+import {
+  buildIndeterminateSummary,
+  createRealSubmitDeps,
+  publicReviewReason,
+} from '../pr-review-wiring.ts';
+import { runAndSubmitReview } from '../pr-review-submit.ts';
+import type { ReviewerVerdict, SubmitDeps } from '../pr-review-submit.ts';
+import {
+  MAX_JUDGE_STDERR_BYTES,
+  MAX_JUDGE_STDERR_VERDICT_BYTES,
+  STDERR_DRAIN_GRACE_MS,
+  evaluatePullRequest,
+  runReviewModelProcess,
+} from '../pr-review-evaluator.ts';
+import type {
+  PrReviewDeps,
+  PrReviewInput,
+  PrReviewResult,
+  ReviewModelChild,
+} from '../pr-review-evaluator.ts';
+import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
+
+const HEAD = 'a'.repeat(40);
+
+// Log capture: the same pino-destination swap judge-first.test.ts uses. The
+// structured line is a DELIVERABLE of #798, not incidental output, so it is
+// asserted on rather than trusted.
+interface LogDestination {
+  write(chunk: string): unknown;
+}
+
+const loggerStreamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+  symbol => String(symbol) === 'Symbol(pino.stream)'
+)!;
+const loggerDestination = (rootLogger as unknown as Record<symbol, LogDestination>)[
+  loggerStreamSymbol
+];
+const originalLogWrite = loggerDestination.write.bind(loggerDestination);
+
+afterEach(() => {
+  loggerDestination.write = originalLogWrite;
+});
+
+function captureLogOutput(): string[] {
+  const chunks: string[] = [];
+  loggerDestination.write = (chunk: string): boolean => {
+    chunks.push(chunk);
+    return true;
+  };
+  return chunks;
+}
+
+const work = {
+  correlationId: 'pr-review:thinmansoftware/bdc-harness#42@' + HEAD,
+  messageId: 'message-1',
+  owner: 'thinmansoftware',
+  repo: 'bdc-harness',
+  prNumber: 42,
+  headSha: HEAD,
+  author: 'contributor',
+};
+
+function submitOctokit(): RealGitHubOctokitLike {
+  return {
+    pulls: {
+      get: async () => ({ data: { head: { sha: HEAD } } }),
+      createReview: async () => ({ data: { id: 1, state: 'CHANGES_REQUESTED' } }),
+    },
+    checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+  } as unknown as RealGitHubOctokitLike;
+}
+
+function reviewResult(overrides: Partial<PrReviewResult> = {}): PrReviewResult {
+  return {
+    verdict: 'APPROVE',
+    findings: [],
+    reviewed_head_sha: HEAD,
+    reviewer: { provider: 'test-cli', model: 'test-model' },
+    acceptance_criteria_available: false,
+    ...overrides,
+  };
+}
+
+const evaluatorInput: PrReviewInput = {
+  owner: 'thinmansoftware',
+  repo: 'bdc-harness',
+  pr_number: 42,
+  head_sha: HEAD,
+};
+
+function evaluatorDeps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
+  return {
+    reviewer: { provider: 'test-provider', model: 'codex' },
+    fetchEvidence: async () => ({
+      diff: '+ a change',
+      checks: [{ name: 'test', status: 'completed', conclusion: 'success' }],
+    }),
+    fetchAcceptanceCriteria: async () => null,
+    invokeModel: async () => ({ exitCode: 0, stdout: '', timedOut: true }),
+    ladder: ['codex'],
+    ...overrides,
+  };
+}
+
+describe('#798 -- the reason reaches the review body', () => {
+  test('an INDETERMINATE body states the reason, naming the judge that timed out', () => {
+    const summary = buildIndeterminateSummary('model_timeout:codex');
+    // The stop condition verbatim: the author of the PR can read WHICH judge
+    // failed and HOW, not just that "something" was indeterminate.
+    expect(summary).toContain('Reason: model_timeout:codex');
+    expect(summary).toContain('could not reach a determinate verdict');
+  });
+
+  test('the naming is limited to codes whose suffix IS a ladder binary', () => {
+    expect(publicReviewReason('model_exit_nonzero:grok')).toBe('model_exit_nonzero:grok');
+    expect(publicReviewReason('model_output_invalid:codex')).toBe('model_output_invalid:codex');
+    // evidence_error and model_error carry API/exception text this code did not
+    // construct. They degrade to the bare code -- never the detail half.
+    expect(publicReviewReason('model_error:token=super-secret')).toBe('model_error');
+    expect(publicReviewReason('evidence_error:Bad credentials for ghp_xxx')).toBe('evidence_error');
+  });
+
+  test('a hostile suffix on a binary-suffix code cannot smuggle text into the body', () => {
+    // A binary name is a short identifier. Anything else -- spaces, an embedded
+    // token, a newline -- fails the charset test and falls back to the code.
+    const summary = buildIndeterminateSummary('model_timeout:codex ghp_realtokenvalue here');
+    expect(summary).not.toContain('ghp_realtokenvalue');
+    expect(summary).toContain('Reason: model_timeout');
+  });
+
+  test('an unparseable error still yields a body, with no Reason detail invented', () => {
+    const summary = buildIndeterminateSummary(undefined);
+    expect(summary).not.toContain('Reason:');
+    expect(summary).toContain('could not reach a determinate verdict');
+  });
+});
+
+describe('#798 -- the reason reaches the submit receipt', () => {
+  /** Captures the receipt the submit path writes, which is the operator record. */
+  function capturingSubmitDeps(verdict: ReviewerVerdict): {
+    deps: SubmitDeps;
+    receipts: Record<string, unknown>[];
+  } {
+    const receipts: Record<string, unknown>[] = [];
+    return {
+      receipts,
+      deps: {
+        reviewerIdentity: 'review-app[bot]',
+        runReviewer: async () => verdict,
+        submitReview: async () => ({ submitted: true }),
+        currentHeadSha: async () => HEAD,
+        recordReceipt: async input => {
+          receipts.push(input as unknown as Record<string, unknown>);
+        },
+      },
+    };
+  }
+
+  test('the receipt for an INDETERMINATE result carries reason model_timeout:codex', async () => {
+    const { deps, receipts } = capturingSubmitDeps({
+      approved: false,
+      summary: buildIndeterminateSummary('model_timeout:codex'),
+      reviewedHeadSha: HEAD,
+      reasonDetail: 'model_timeout:codex',
+      ladderTried: ['codex', 'grok'],
+    });
+
+    const outcome = await runAndSubmitReview(work, deps);
+
+    expect(outcome.disposition).toBe('changes_requested');
+    expect(receipts).toHaveLength(1);
+    // The stop condition: an operator draining the dispatch inbox sees the
+    // reason without reading source or correlating container logs by hand.
+    expect(receipts[0]?.reasonDetail).toBe('model_timeout:codex');
+    expect(receipts[0]?.ladderTried).toEqual(['codex', 'grok']);
+  });
+
+  test('the judge stderr tail rides the receipt and never the PR body', async () => {
+    const stderr = 'codex: fatal: provider returned 500 (internal)';
+    let postedBody = '';
+    const { deps, receipts } = capturingSubmitDeps({
+      approved: false,
+      summary: buildIndeterminateSummary('model_exit_nonzero:codex'),
+      reviewedHeadSha: HEAD,
+      reasonDetail: 'model_exit_nonzero:codex',
+      judgeStderr: { codex: stderr },
+    });
+    deps.submitReview = async input => {
+      postedBody = input.body;
+      return { submitted: true };
+    };
+
+    await runAndSubmitReview(work, deps);
+
+    expect(receipts[0]?.judgeStderr).toEqual({ codex: stderr });
+    // The whole point of the operator/public split: stderr is diagnostic gold
+    // and also the most likely place a failing CLI echoes a credential.
+    expect(postedBody).not.toContain('provider returned 500');
+    expect(postedBody).toContain('Reason: model_exit_nonzero:codex');
+  });
+
+  test('a verdict carrying no diagnostics writes the pre-#798 receipt shape', async () => {
+    const { deps, receipts } = capturingSubmitDeps({
+      approved: true,
+      summary: 'No blocking findings.',
+      reviewedHeadSha: HEAD,
+    });
+
+    await runAndSubmitReview(work, deps);
+
+    expect(receipts[0]).not.toHaveProperty('reasonDetail');
+    expect(receipts[0]).not.toHaveProperty('judgeStderr');
+    expect(receipts[0]).not.toHaveProperty('ladderTried');
+  });
+});
+
+describe('#798 -- the wiring forwards what the evaluator found', () => {
+  test('runReviewer carries the evaluator error and stderr onto the verdict', async () => {
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () =>
+        reviewResult({
+          verdict: 'INDETERMINATE',
+          error: 'model_timeout:codex',
+          ladder_tried: ['codex'],
+          duration_ms: 61_000,
+          judge_stderr: { codex: 'thinking...' },
+        }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+
+    expect(verdict.reasonDetail).toBe('model_timeout:codex');
+    expect(verdict.judgeStderr).toEqual({ codex: 'thinking...' });
+    expect(verdict.ladderTried).toEqual(['codex']);
+    expect(verdict.summary).toContain('Reason: model_timeout:codex');
+  });
+
+  test('a deferral verdict forwards its reason too, so a silent defer is diagnosable', async () => {
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      patOctokit: null,
+      evaluate: async () =>
+        reviewResult({
+          verdict: 'TRANSPORT_ERROR',
+          error: 'model_error:E2BIG argument list too long',
+          retry_after_ms: 60_000,
+          ladder_tried: ['codex', 'grok'],
+        }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+
+    expect(verdict.transportError).toBe(true);
+    expect(verdict.reasonDetail).toBe('model_error:E2BIG argument list too long');
+    expect(verdict.ladderTried).toEqual(['codex', 'grok']);
+  });
+});
+
+describe('#798 -- one structured log line per evaluation', () => {
+  test('emits overseer_pr_review_verdict with the verdict, reason and ladder', async () => {
+    const logs = captureLogOutput();
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () =>
+        reviewResult({
+          verdict: 'INDETERMINATE',
+          error: 'model_timeout:codex',
+          ladder_tried: ['codex', 'grok'],
+          duration_ms: 61_000,
+          judge_stderr: { codex: 'timed out' },
+        }),
+    });
+
+    await deps.runReviewer(work);
+
+    const line = logs
+      .map(chunk => JSON.parse(chunk) as Record<string, unknown>)
+      .find(entry => entry.msg === 'overseer_pr_review_verdict');
+    expect(line).toBeDefined();
+    expect(line?.correlationId).toBe(work.correlationId);
+    expect(line?.verdict).toBe('INDETERMINATE');
+    // The FULL reason is safe in a container log -- that is the operator
+    // surface. Only the PR body gets the redacted form.
+    expect(line?.reason).toBe('model_timeout:codex');
+    expect(line?.ladderTried).toEqual(['codex', 'grok']);
+    expect(line?.durationMs).toBe(61_000);
+    // The stderr TEXT stays out of the log line; only which rungs produced it.
+    expect(line?.judgeStderrRungs).toEqual(['codex']);
+    expect(JSON.stringify(line)).not.toContain('timed out');
+  });
+
+  test('a HOSTILE error string never reaches the log line', async () => {
+    // Review finding (Overseer, PR #802): the first cut logged result.error
+    // verbatim, reasoning that container logs are an operator surface. But
+    // model_error/evidence_error suffixes carry text this code did not
+    // construct -- a 401 body, an exception, a credential a failing CLI echoed
+    // -- and logs are shipped and aggregated far more widely than the receipt.
+    const logs = captureLogOutput();
+    const secret = 'evidence_error:Bad credentials for ghp_liveTokenValue123';
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () => reviewResult({ verdict: 'INDETERMINATE', error: secret }),
+    });
+
+    await deps.runReviewer(work);
+
+    const rendered = logs.join('\n');
+    expect(rendered).toContain('overseer_pr_review_verdict');
+    expect(rendered).not.toContain('ghp_liveTokenValue123');
+    expect(rendered).not.toContain('Bad credentials');
+    // The classified code still survives -- the diagnostic value is kept.
+    const line = logs
+      .map(chunk => JSON.parse(chunk) as Record<string, unknown>)
+      .find(entry => entry.msg === 'overseer_pr_review_verdict');
+    expect(line?.reason).toBe('evidence_error');
+  });
+
+  test('the log and the PR body apply the SAME redaction rule', async () => {
+    // One rule to reason about, not two: a binary-suffix code keeps its suffix
+    // in both places, and everything else degrades to the bare code in both.
+    const logs = captureLogOutput();
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () =>
+        reviewResult({ verdict: 'INDETERMINATE', error: 'model_timeout:codex' }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+
+    const line = logs
+      .map(chunk => JSON.parse(chunk) as Record<string, unknown>)
+      .find(entry => entry.msg === 'overseer_pr_review_verdict');
+    expect(line?.reason).toBe(publicReviewReason('model_timeout:codex'));
+    expect(verdict.summary).toContain('Reason: model_timeout:codex');
+  });
+
+  test('the receipt still carries the UNREDACTED reason for the operator', async () => {
+    // Redacting the log must not cost the operator the detail: the dispatch
+    // receipt is the narrower surface and keeps the full string.
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      evaluate: async () =>
+        reviewResult({ verdict: 'INDETERMINATE', error: 'model_error:E2BIG from spawn' }),
+    });
+
+    const verdict = await deps.runReviewer(work);
+
+    expect(verdict.reasonDetail).toBe('model_error:E2BIG from spawn');
+  });
+
+  test('the line is emitted for a deferral too, not only for terminal verdicts', async () => {
+    const logs = captureLogOutput();
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: submitOctokit(),
+      patOctokit: null,
+      evaluate: async () => reviewResult({ verdict: 'CHECKS_PENDING', error: 'checks_pending' }),
+    });
+
+    await deps.runReviewer(work);
+
+    // A silent defer was the other half of the blind spot: the PR simply sat
+    // there with no review and no record of why.
+    const line = logs
+      .map(chunk => JSON.parse(chunk) as Record<string, unknown>)
+      .find(entry => entry.msg === 'overseer_pr_review_verdict');
+    expect(line?.verdict).toBe('CHECKS_PENDING');
+    expect(line?.reason).toBe('checks_pending');
+  });
+});
+
+describe('#798 -- the evaluator collects the diagnostics in the first place', () => {
+  test('a timed-out ladder reports which rungs were tried and their stderr', async () => {
+    const result = await evaluatePullRequest(
+      evaluatorInput,
+      evaluatorDeps({
+        ladder: ['codex', 'grok'],
+        invokeModel: async binary => ({
+          exitCode: 124,
+          stdout: '',
+          timedOut: true,
+          stderrTail: `${binary} produced no output`,
+        }),
+      })
+    );
+
+    expect(result.verdict).toBe('TRANSPORT_ERROR');
+    expect(result.error).toBe('model_timeout:codex');
+    expect(result.ladder_tried).toEqual(['codex', 'grok']);
+    expect(result.judge_stderr).toEqual({
+      codex: 'codex produced no output',
+      grok: 'grok produced no output',
+    });
+    expect(typeof result.duration_ms).toBe('number');
+  });
+
+  test('a rung that returns unparseable output has its stderr captured', async () => {
+    const result = await evaluatePullRequest(
+      evaluatorInput,
+      evaluatorDeps({
+        ladder: ['codex'],
+        invokeModel: async () => ({
+          exitCode: 0,
+          stdout: 'not json at all',
+          timedOut: false,
+          stderrTail: 'warning: model refused the schema',
+        }),
+      })
+    );
+
+    expect(result.verdict).toBe('INDETERMINATE');
+    expect(result.error).toBe('model_output_invalid:codex');
+    expect(result.judge_stderr).toEqual({ codex: 'warning: model refused the schema' });
+  });
+
+  test('a successful review carries no stderr map at all', async () => {
+    const result = await evaluatePullRequest(
+      evaluatorInput,
+      evaluatorDeps({
+        ladder: ['codex'],
+        invokeModel: async () => ({
+          exitCode: 0,
+          timedOut: false,
+          stdout: JSON.stringify({
+            verdict: 'APPROVE',
+            findings: [],
+            reviewed_head_sha: HEAD,
+          }),
+        }),
+      })
+    );
+
+    expect(result.verdict).toBe('APPROVE');
+    expect(result.judge_stderr).toBeUndefined();
+  });
+
+  test('the captured stderr is the TAIL, bounded to 2 KB', async () => {
+    // A failing CLI prints its usage banner first and the real error last, so
+    // the tail is the diagnostic half. Bounding it keeps a runaway judge from
+    // writing megabytes into every receipt.
+    const huge = 'x'.repeat(MAX_JUDGE_STDERR_BYTES * 3) + 'THE-ACTUAL-ERROR';
+    const result = await evaluatePullRequest(
+      evaluatorInput,
+      evaluatorDeps({
+        ladder: ['codex'],
+        invokeModel: async () => ({
+          exitCode: 3,
+          stdout: '',
+          timedOut: false,
+          stderrTail: huge,
+        }),
+      })
+    );
+
+    const captured = result.judge_stderr?.codex ?? '';
+    expect(captured.length).toBe(MAX_JUDGE_STDERR_BYTES);
+    expect(captured.endsWith('THE-ACTUAL-ERROR')).toBe(true);
+  });
+});
+
+describe('#798 -- the process runner surfaces stderr', () => {
+  function child(stdout: string, stderr: string, exitCode: number): ReviewModelChild {
+    return {
+      stdin: null,
+      stdout: new Response(stdout).body,
+      stderr: new Response(stderr).body,
+      exited: Promise.resolve(exitCode),
+      kill: () => {},
+    };
+  }
+
+  test('stderr is reported even when stdout also had content', async () => {
+    // The pre-#798 code read stderr ONLY as a stdout fallback, so a rung that
+    // printed a diagnostic alongside real output lost it entirely.
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 1_000, () =>
+      child('{"verdict":"APPROVE"}', 'deprecation: --flag is going away', 1)
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stdout).toContain('APPROVE');
+    expect(result.stderrTail).toBe('deprecation: --flag is going away');
+  });
+
+  test('a stderr-only verdict LONGER than the tail bound is still parseable', async () => {
+    // The stdout fallback keeps the FULL stderr; only the diagnostic copy that
+    // rides the receipt is truncated. Bounding the fallback too would make a
+    // judge that writes its verdict to stderr unparseable whenever the verdict
+    // ran past 2 KB -- which any verdict carrying findings does.
+    const verdict = JSON.stringify({
+      verdict: 'REQUEST_CHANGES',
+      reviewed_head_sha: HEAD,
+      findings: Array.from({ length: 40 }, (_, index) => ({
+        scope: `file-${index}.ts`,
+        severity: 'major',
+        summary: 'A finding long enough to push this payload past the tail bound.',
+      })),
+    });
+    expect(verdict.length).toBeGreaterThan(MAX_JUDGE_STDERR_BYTES);
+
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 1_000, () =>
+      child('', verdict, 0)
+    );
+
+    expect(result.stdout).toBe(verdict);
+    expect(result.stderrTail?.length).toBe(MAX_JUDGE_STDERR_BYTES);
+  });
+
+  /**
+   * A stderr stream that emits `chunks` and then NEVER closes.
+   *
+   * This is the shape a genuinely hung judge produces, and the shape the first
+   * cut of #798 got wrong: reading with `new Response(stderr).text()` only ever
+   * resolves at end-of-stream, so the timeout snapshot ran before any text was
+   * available and the tail came back empty. A finite, already-closed stream --
+   * what the original test used -- cannot expose that, because it reaches EOF
+   * immediately. (Overseer finding, PR #802.)
+   */
+  function neverClosingStderr(chunks: string[]): ReadableStream {
+    const encoder = new TextEncoder();
+    return new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        // Deliberately no controller.close(): the process is hung, not finished.
+      },
+    });
+  }
+
+  test('a timeout reports stderr from a stream that never closes', async () => {
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: () => {} }),
+      stderr: neverClosingStderr(['judge: starting up\n', 'judge: waiting on provider\n']),
+      // Never settles on its own -- the wall clock is what ends this call.
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).toBe(124);
+    // BOTH chunks, from a stream that never reached EOF. This is the assertion
+    // the pre-#802 implementation failed: it returned ''.
+    expect(result.stderrTail).toContain('judge: starting up');
+    expect(result.stderrTail).toContain('judge: waiting on provider');
+  });
+
+  test('a timeout with no stderr at all still returns, bounded by the grace', async () => {
+    const started = Date.now();
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: () => {} }),
+      stderr: new ReadableStream({ start: () => {} }),
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(result.timedOut).toBe(true);
+    expect(result.stderrTail).toBe('');
+    // The drain grace is a DEADLINE: a stderr pipe that never closes must not
+    // extend the wall clock indefinitely.
+    expect(Date.now() - started).toBeLessThan(25 + STDERR_DRAIN_GRACE_MS + 2_000);
+  });
+
+  test('a 10 MB stream never RETAINS more than the two caps', async () => {
+    // Review finding (Overseer, PR #802): the first cut appended every chunk to
+    // one string and sliced only at read time, so the advertised 2 KB bound was
+    // a read-time illusion -- a chatty judge retained everything it printed.
+    let chunksRead = 0;
+    const oneMegabyte = 'y'.repeat(1024 * 1024);
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (let index = 0; index < 10; index += 1) {
+          chunksRead += 1;
+          controller.enqueue(encoder.encode(oneMegabyte));
+        }
+        controller.close();
+      },
+    });
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 5_000, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: controller => controller.close() }),
+      stderr: stream,
+      exited: Promise.resolve(0),
+      kill: () => {},
+    }));
+
+    expect(chunksRead).toBe(10);
+    // The receipt copy stays at the tail cap...
+    expect(result.stderrTail?.length).toBe(MAX_JUDGE_STDERR_BYTES);
+    // ...and the fallback-parse copy at its own, far smaller than 10 MB.
+    expect(result.stdout.length).toBeLessThanOrEqual(MAX_JUDGE_STDERR_VERDICT_BYTES);
+  });
+
+  test('a never-closing stream leaves NO reader running after the timeout', async () => {
+    // The leak the reviewer named: a killed child whose pipe stays open left the
+    // read loop looping for the life of the worker, once per timed-out review.
+    let reads = 0;
+    let cancelled = false;
+    const stderr = {
+      getReader: () => ({
+        read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+          reads += 1;
+          if (cancelled) return { done: true };
+          // A real pipe yields to the event loop between chunks. Resolving
+          // synchronously would spin this loop hot and starve the wall-clock
+          // timer -- a defect in the DOUBLE, not in the reader under test.
+          await new Promise(resolve => setTimeout(resolve, 1));
+          // Never finishes -- a chatty hung judge.
+          return { done: false, value: new TextEncoder().encode('still alive\n') };
+        },
+        cancel: (): void => {
+          cancelled = true;
+        },
+      }),
+    } as unknown as ReadableStream;
+
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: controller => controller.close() }),
+      stderr,
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(result.timedOut).toBe(true);
+    expect(cancelled).toBe(true);
+    const readsAtReturn = reads;
+    await new Promise(resolve => setTimeout(resolve, 50));
+    // The loop is genuinely stopped, not merely slowed: no further reads occur
+    // after the call returned.
+    expect(reads).toBe(readsAtReturn);
+  });
+
+  test('the timeout path cancels BEFORE the call returns, not only after the race', async () => {
+    // Two cancels exist: one inside the timeout callback (after the drain
+    // grace) and one after the race settles. The second alone makes the test
+    // above pass, so this pins the FIRST -- otherwise correctness would depend
+    // on the ordering of two independent paths, and removing the timeout-path
+    // cancel would look safe when it is not.
+    let cancelledAt: number | null = null;
+    const start = Date.now();
+    const stderr = {
+      getReader: () => ({
+        read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+          await new Promise(resolve => setTimeout(resolve, 1));
+          if (cancelledAt !== null) return { done: true };
+          return { done: false, value: new TextEncoder().encode('x') };
+        },
+        cancel: (): void => {
+          cancelledAt ??= Date.now() - start;
+        },
+      }),
+    } as unknown as ReadableStream;
+
+    await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: controller => controller.close() }),
+      stderr,
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(cancelledAt).not.toBeNull();
+    // Cancelled around the wall clock plus the drain grace -- i.e. on the
+    // timeout path -- rather than only once the whole call unwound.
+    expect(cancelledAt!).toBeLessThan(25 + STDERR_DRAIN_GRACE_MS + 1_000);
+  });
+
+  test('the tail cap is BYTE-true, so multi-byte stderr cannot exceed it', async () => {
+    // `String.slice(-2048)` counts UTF-16 units; a 3-byte character would have
+    // let the payload run to roughly 6 KB under a 2 KB advertised cap.
+    const wide = '日'.repeat(MAX_JUDGE_STDERR_BYTES); // 3 bytes each in UTF-8
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 1_000, () =>
+      child('', wide, 1)
+    );
+
+    const bytes = new TextEncoder().encode(result.stderrTail ?? '').length;
+    expect(bytes).toBeLessThanOrEqual(MAX_JUDGE_STDERR_BYTES);
+    // And it is still the TAIL, decoded cleanly rather than left as mojibake.
+    expect((result.stderrTail ?? '').endsWith('日')).toBe(true);
+  });
+
+  test('the tail is bounded even when the hung process emitted megabytes', async () => {
+    const noise = 'x'.repeat(MAX_JUDGE_STDERR_BYTES * 2);
+    const result = await runReviewModelProcess({ argv: ['judge'] }, 'judge', 25, () => ({
+      stdin: null,
+      stdout: new ReadableStream({ start: () => {} }),
+      stderr: neverClosingStderr([noise, 'THE-ACTUAL-ERROR']),
+      exited: new Promise<number>(() => {}),
+      kill: () => {},
+    }));
+
+    expect(result.stderrTail?.length).toBe(MAX_JUDGE_STDERR_BYTES);
+    expect(result.stderrTail?.endsWith('THE-ACTUAL-ERROR')).toBe(true);
+  });
+});
