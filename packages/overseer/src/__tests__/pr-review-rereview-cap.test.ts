@@ -103,7 +103,12 @@ interface Captured {
 
 function deps(
   prior: PriorReviewWork[],
-  options: { existingMarkers?: Set<string>; commentSeam?: boolean; ci?: boolean | Error } = {}
+  options: {
+    existingMarkers?: Set<string>;
+    commentSeam?: boolean;
+    ci?: boolean | Error;
+    onCiCheck?: () => void;
+  } = {}
 ): { value: IngestDeps; captured: Captured } {
   const captured: Captured = { comments: [], receipts: [], enqueued: [] };
   const existingMarkers = options.existingMarkers ?? new Set<string>();
@@ -120,6 +125,7 @@ function deps(
       captured.receipts.push(input);
     },
     isHeadCiGreen: async () => {
+      options.onCiCheck?.();
       if (options.ci instanceof Error) throw options.ci;
       return options.ci === true;
     },
@@ -186,9 +192,27 @@ describe('#797 -- the cap is configurable', () => {
 });
 
 describe('#797 item 4 -- green fixed pushes re-arm within a lifetime ceiling', () => {
+  test('initial reviews do not fetch CI evidence used only by automatic progress tracking', async () => {
+    let ciChecks = 0;
+    const fake = deps([], { onCiCheck: () => (ciChecks += 1) });
+    expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
+    expect(ciChecks).toBe(0);
+    expect(fake.captured.enqueued[0]?.headCiGreen).toBe(false);
+  });
+
   test('four productive automatic rounds allow a fifth review (fuelglass regression)', async () => {
-    const prior = [...autoAttempts(4), work({ messageId: 'initial' })];
+    const prior = [
+      ...autoAttempts(4).map((row, index) => ({
+        ...row,
+        headSha: index === 0 ? NEW_HEAD : row.headSha,
+        headCiGreen: true,
+      })),
+      work({ messageId: 'initial' }),
+    ];
     const fake = deps(prior, { ci: true });
+    // The newest attempt is on the incoming head, so only the persisted green
+    // state on that row can prove progress to the preceding attempt.
+    expect(countConsecutiveAutoRereviews(prior, NEW_HEAD, true)).toBe(1);
     expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
     expect(fake.captured.enqueued[0]?.headCiGreen).toBe(true);
   });
@@ -231,9 +255,14 @@ describe('#797 item 4 -- green fixed pushes re-arm within a lifetime ceiling', (
     expect(resolveMaxTotalRereviews({ [MAX_TOTAL_REREVIEWS_ENV]: '0' })).toBe(10);
   });
 
-  test('newest-first progress compares the newest prior row to the incoming head', () => {
-    const newestFirst = autoAttempts(3);
-    expect(countConsecutiveAutoRereviews(newestFirst, NEW_HEAD, true)).toBe(0);
+  test('newest-first ordering is required when persisted progress resets the count', () => {
+    const newestFirst = autoAttempts(3).map((row, index) => ({
+      ...row,
+      headSha: index === 0 ? NEW_HEAD : row.headSha,
+      headCiGreen: index === 0,
+    }));
+    expect(countConsecutiveAutoRereviews(newestFirst, NEW_HEAD, false)).toBe(1);
+    expect(countConsecutiveAutoRereviews([...newestFirst].reverse(), NEW_HEAD, false)).toBe(3);
     expect(countTotalAutoRereviews(newestFirst)).toBe(3);
   });
 });

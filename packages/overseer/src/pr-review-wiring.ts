@@ -25,6 +25,7 @@ import {
   createRealSubmitPullRequestReview,
   summarizeChecks,
 } from './adapters/github-real-deps';
+import type { ExactHeadPullRequestEvidence } from './adapters/github-real-deps.ts';
 import {
   MAX_REREVIEW_ATTEMPTS_ENV,
   MAX_TOTAL_REREVIEWS_ENV,
@@ -60,6 +61,16 @@ export const REVIEW_RECIPIENT = 'overseer-reviewer';
 export interface ReviewRouteConfig {
   webhookSecret: string;
   reviewerIdentity: string;
+}
+
+/** Fail-closed CI-green decision shared by the production binding and tests. */
+export function isExactHeadCiGreen(evidence: ExactHeadPullRequestEvidence): boolean {
+  const summary = summarizeChecks(evidence.checks);
+  return (
+    checksAreTerminal(evidence.checks, evidence.requiredContexts) &&
+    summary.failed === 0 &&
+    summary.pending === 0
+  );
 }
 
 /**
@@ -542,12 +553,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         createRealOctokitClient(),
         createRealReadOnlyPatOctokitClient() ?? undefined
       )(input);
-      const summary = summarizeChecks(evidence.checks);
-      return (
-        checksAreTerminal(evidence.checks, evidence.requiredContexts) &&
-        summary.failed === 0 &&
-        summary.pending === 0
-      );
+      return isExactHeadCiGreen(evidence);
     },
 
     async postCapExhaustedComment(input): Promise<{ posted: boolean }> {

@@ -9,16 +9,44 @@
 import { describe, expect, test } from 'bun:test';
 import {
   createRealSubmitDeps,
+  isExactHeadCiGreen,
   REVIEW_REVIEWER_IDENTITY_ENV,
   REVIEW_WEBHOOK_SECRET_ENV,
   parseReviewWorkBody,
   resolveReviewRouteConfig,
   reviewSubjectKey,
 } from '../pr-review-wiring.ts';
-import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
+import type {
+  ExactHeadPullRequestEvidence,
+  RealGitHubOctokitLike,
+} from '../adapters/github-real-deps.ts';
 import type { PrReviewResult } from '../pr-review-evaluator.ts';
 
 const HEAD = 'a'.repeat(40);
+
+function evidence(
+  checks: ExactHeadPullRequestEvidence['checks'],
+  requiredContexts: string[] | null
+): ExactHeadPullRequestEvidence {
+  return { diff: '', checks, requiredContexts };
+}
+
+describe('isExactHeadCiGreen -- production fail-closed composition', () => {
+  test('accepts terminal successful required checks', () => {
+    expect(
+      isExactHeadCiGreen(
+        evidence([{ name: 'build', status: 'completed', conclusion: 'success' }], ['build'])
+      )
+    ).toBe(true);
+  });
+
+  test('rejects pending checks and unknown required contexts', () => {
+    const pending = [{ name: 'build', status: 'in_progress', conclusion: null }];
+    const passed = [{ name: 'build', status: 'completed', conclusion: 'success' }];
+    expect(isExactHeadCiGreen(evidence(pending, ['build']))).toBe(false);
+    expect(isExactHeadCiGreen(evidence(passed, null))).toBe(false);
+  });
+});
 
 function submitOctokit(): RealGitHubOctokitLike {
   return {

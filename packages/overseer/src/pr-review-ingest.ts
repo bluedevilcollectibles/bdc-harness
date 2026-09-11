@@ -652,20 +652,21 @@ export async function ingestPullRequestEvent(
     return result;
   }
 
-  // Persist this exact head's CI state with the queued row. The evidence seam
-  // is optional and failures are deliberately closed: unknown is not green.
   let headCiGreen = false;
-  if (deps.isHeadCiGreen) {
-    try {
-      headCiGreen = await deps.isHeadCiGreen({ owner, repo, prNumber, headSha });
-    } catch {
-      headCiGreen = false;
-    }
-  }
-
   const priorAtDifferentHead = findAuthorizingPriorReview(prior, headSha);
   let repeatReason: string | null = null;
   if (priorAtDifferentHead?.verdict === 'changes_requested') {
+    // Persist this exact head's CI state only for an automatic re-review. The
+    // live evidence lookup has durable failure accounting, so initial reviews
+    // must not invoke it when progress/cap tracking cannot use the result.
+    // Fail closed: unavailable or unknown evidence is never recorded as green.
+    if (deps.isHeadCiGreen) {
+      try {
+        headCiGreen = await deps.isHeadCiGreen({ owner, repo, prNumber, headSha });
+      } catch {
+        headCiGreen = false;
+      }
+    }
     // CONSECUTIVE, not lifetime (#797): a hand-requested review that ran resets
     // the budget, so a PR converging on a later round is not permanently locked
     // out of automatic review.
