@@ -1034,12 +1034,501 @@ nodes:
       COUNT=$(grep -c . "$SCOPE_FILE" || true)
       echo "ascii-gate PASS (scanned $COUNT changed source file(s), all ASCII)"
       exit 0
+  # bdc-xo #1940 (harness defect 2026-09-05: shopops #674 run 69f9d306, lspro-react #580
+  # run d31037ff). The engine-side build-manifest renders "Tests: N/A (required gates are
+  # reported separately)" and "Grep assertions: N/A" for every WO, and the validator's
+  # test claim was never tied to an executed command. Rule 10 (tests must test real
+  # behavior) and manifest v2 ("Tests: <pass>/<total> (<command>)") were both defeated.
+  # run-stop-tests MECHANICALLY executes the spec's declared test command (the first
+  # "Stop N (test suite)" block; fallback: the Section 9 "Tests: ... (<command>)" line)
+  # inside the run worktree and emits the OBSERVED pass/total. It never trusts a builder
+  # or validator claim. Always exits 0; the validator quotes TESTS_* as ground truth and
+  # stamp-manifest-evidence writes TESTS_LINE into the manifest "Tests:" line.
+  - id: run-stop-tests
+    persona: major-build
+    load_bearing: true
+    depends_on: [ascii-gate]
+    task_class: clerical
+    timeout: 1800000
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN rst core (byte-identical across lanes; extracted by unit test) ----
+      # POSIX awk only (the container ships mawk, not gawk): no IGNORECASE, no gensub.
+      # rst_class   (spec on stdin -> CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR; default CODE)
+      #   Reads the first "WO Class:" / "Class:" line. Doctrine default is CODE (Rule 14).
+      rst_class() {
+        local c
+        c="$(grep -m1 -E '^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*(CODE|INFRA|MIXED|DOCUMENTATION|DOCS|OPERATOR)' | sed -E 's/^[[:space:]]*(WO )?[Cc]lass:[[:space:]]*//' | grep -oE '^[A-Z]+' | head -1 || true)"
+        case "$c" in
+          CODE|INFRA|MIXED|DOCUMENTATION|OPERATOR) printf '%s' "$c" ;;
+          DOCS) printf 'DOCUMENTATION' ;;
+          *) printf 'CODE' ;;
+        esac
+      }
+      # rst_command_looks_runnable <cmd>   (rc 0 when the line names a known test runner
+      #   FOLLOWED BY AN ARGUMENT -- a bare "node" or "bun" mentioned in prose is not a
+      #   command (live false positive, run f4dabd76) -- and is not a dependency-install
+      #   step)
+      rst_command_looks_runnable() {
+        case "$1" in *'{{'*) return 1 ;; esac
+        printf '%s\n' "$1" | grep -qE '(^|[ /&|;(])(node|bun|bunx|npm|npm\.cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)[ ]+[^ &|;)]' || return 1
+        if printf '%s\n' "$1" | grep -qE '(^|[ &;|])(npm|npm\.cmd|pnpm|yarn|bun)[ ]+(ci|install|i|add)([ ]|$)'; then
+          return 1
+        fi
+        return 0
+      }
+      # rst_extract_commands   (spec on stdin -> one declared test command per line, deduped,
+      #   first 8). Ladder, in document order:
+      #     A. the template "Stop N (test suite|tests|unit tests|suite ...)" block(s): the
+      #        command line(s) up to "Expected:" (backslash joins continuation lines)
+      #     B. any backticked runner command inside a "Stop conditions" / "Stop Point" /
+      #        "Test scenarios" / "Verification" section, or on any "When:" line
+      #     C. the Section 9 "Tests: <n>/<n> (<command>)" parenthesised group(s)
+      #   Callers filter with rst_command_looks_runnable (drops prose, placeholders,
+      #   install steps).
+      rst_extract_commands() {
+        awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
+          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+          function emit(c) { c = clean(c); if (c != "" && !(c in seen)) { seen[c] = 1; print c } }
+          tstate == 1 {
+            if ($0 ~ /^[ \t]*```/) next
+            line = clean($0)
+            if (line == "") next
+            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0; next }
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
+            else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
+          }
+          tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Tt]est|[Uu]nit|[Ss]uite)/ { tstate = 1; tcmd = ""; next }
+          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition|[Ss]top [Pp]oint|[Tt]est [Ss]cenario|[Tt]est [Pp]lan|[Vv]erification/) ? 1 : 0 }
+          insec || $0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/ {
+            s = $0
+            while (match(s, /`[^`]+`/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          /^[ \t]*Tests:[ \t]/ {
+            s = $0
+            while (match(s, /\([^)]*\)/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
+              if (g ~ RUNNER) emit(g)
+            }
+          }
+          END { if (tstate == 1 && tcmd != "") emit(tcmd) }
+        ' | head -n 8
+      }
+      # rst_rescue_subdir <cmd>   (-> cmd, or "cd <dir> && <cmd>" when the command's first
+      #   relative path does not exist at the worktree root but exists in exactly one
+      #   depth-1 directory -- shopops specs write "node tests/x.js" meaning shopops-api/)
+      rst_rescue_subdir() {
+        local cmd="$1" tok p="" d hit="" n=0
+        case "$cmd" in cd\ *|*'&& cd '*) printf '%s' "$cmd"; return 0 ;; esac
+        for tok in $cmd; do
+          case "$tok" in
+            -*|*://*|*'='*) continue ;;
+            */*) p="${tok#./}"; break ;;
+          esac
+        done
+        if [ -z "$p" ] || [ -e "$p" ]; then printf '%s' "$cmd"; return 0; fi
+        for d in */; do
+          d="${d%/}"
+          case "$d" in node_modules|.git|dist|build) continue ;; esac
+          if [ -e "$d/$p" ]; then hit="$d"; n=$((n + 1)); fi
+        done
+        if [ "$n" -eq 1 ]; then printf 'cd %s && %s' "$hit" "$cmd"; else printf '%s' "$cmd"; fi
+      }
+      # rst_tests_in_diff <base-sha>   (-> one test command per line derived from the test
+      #   files this run created or modified since <base-sha>, plus untracked test files;
+      #   empty when the diff touched no test files). Runner choice: *.test.* / *.spec.* /
+      #   __tests__/ -> vitest if the root package.json declares vitest, jest if jest, else
+      #   bun test; <dir>/tests/test_*.js -> "cd <dir> && node tests/<file>"; *.py -> pytest.
+      #   Fixtures, helpers, run_all.js, snapshots and data files are excluded.
+      rst_tests_in_diff() {
+        local base="$1" files f js_runner="" bun_files="" py_files=""
+        files="$( { git diff --name-only "$base" -- 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null; } | sort -u \
+          | grep -E '(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.[cm]?[jt]sx?$|(^|/)test_[^/]*\.(js|mjs|cjs|py|sh)$' \
+          | grep -vE '(^|/)(fixtures?|helpers?|__snapshots__|__mocks__|setup)/|(^|/)(run_all|_[^/]*|setup[^/]*|conftest)\.[a-z]+$|\.(json|md|txt|csv|snap|sql|yaml|yml|html)$' || true)"
+        [ -n "$files" ] || return 0
+        if [ -f package.json ]; then
+          if grep -q '"vitest"' package.json; then js_runner="npx vitest run"
+          elif grep -q '"jest"' package.json; then js_runner="npx jest"
+          fi
+        fi
+        [ -n "$js_runner" ] || js_runner="bun test"
+        while IFS= read -r f; do
+          [ -z "$f" ] && continue
+          [ -e "$f" ] || continue
+          case "$f" in
+            *.py) py_files="${py_files:+$py_files }$f" ;;
+            *.test.*|*.spec.*|*__tests__/*) bun_files="${bun_files:+$bun_files }$f" ;;
+            */tests/test_*.js|*/tests/test_*.mjs|*/tests/test_*.cjs) printf 'cd %s && node tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.js|tests/test_*.mjs|tests/test_*.cjs) printf 'node %s\n' "$f" ;;
+            */tests/test_*.sh) printf 'cd %s && bash tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
+            tests/test_*.sh|tests/*.test.sh|tests/*_test.sh) printf 'bash %s\n' "$f" ;;
+            *) ;;
+          esac
+        done <<<"$files"
+        [ -n "$bun_files" ] && printf '%s %s\n' "$js_runner" "$bun_files"
+        [ -n "$py_files" ] && printf 'pytest %s\n' "$py_files"
+        return 0
+      }
+      # rst_repo_test_script   (-> the repo's own canonical test command when the root
+      #   package.json declares a "test" script: "bun run test" when a bun lockfile is
+      #   present, else "npm test"; empty otherwise). Last rung of the ladder: a CODE WO
+      #   whose spec names no command and whose diff touched no test file still gets
+      #   real numbers from the repo's suite instead of N/A.
+      rst_repo_test_script() {
+        [ -f package.json ] || return 0
+        python3 -c 'import json,sys; d=json.load(open("package.json")); s=d.get("scripts",{}); sys.exit(0 if isinstance(s,dict) and s.get("test") else 1)' 2>/dev/null || return 0
+        if [ -f bun.lock ] || [ -f bun.lockb ]; then printf 'bun run test\n'; else printf 'npm test\n'; fi
+      }
+      # rst_parse_counts   (test-runner output on stdin -> "<passed> <total>", or empty)
+      #   Sums every recognised summary line (a chained "a && b && c" command prints
+      #   several). Recognised: shopops run_all "Passed: N  Failed: M  Total: T" and
+      #   per-file "Tests: P/T"; jest "Tests: N failed, M passed, T total"; vitest
+      #   "Tests  N failed | M passed (T)"; bun "N pass" / "M fail"; TAP and node:test
+      #   "# pass N" / "pass N"; mocha "N passing" / "M failing"; pytest "N passed, M
+      #   failed in Xs". Fallback: count "PASS:"/"ok" vs "FAIL:"/"not ok" lines. ANSI
+      #   colour codes are stripped first (vitest).
+      rst_parse_counts() {
+        local esc raw counts
+        esc="$(printf '\033')"
+        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g")"
+        counts="$(printf '%s\n' "$raw" | awk '
+          /^[ \t]*Passed: [0-9]+[ \t]+Failed: [0-9]+[ \t]+Total: [0-9]+/ { p += $2; t += $6; hit = 1; next }
+          /^[ \t]*Tests: [0-9]+\/[0-9]+[ \t]*$/ { split($2, a, "/"); p += a[1]; t += a[2]; hit = 1; next }
+          /^[ \t]*Tests:.*[0-9]+ total/ { for (i = 1; i < NF; i++) { if ($(i+1) == "passed," || $(i+1) == "passed") p += $i; if ($(i+1) == "total") t += $i }; hit = 1; next }
+          /^[ \t]*Tests[ \t]+.*[0-9]+ passed.*\([0-9]+\)[ \t]*$/ { for (i = 1; i < NF; i++) { if ($(i+1) == "passed") p += $i }; m = $NF; gsub(/[()]/, "", m); t += m; hit = 1; next }
+          /^[ \t]*[0-9]+ pass[ \t]*$/ { p += $1; t += $1; hit = 1; next }
+          /^[ \t]*[0-9]+ fail[ \t]*$/ { t += $1; hit = 1; next }
+          /(^|[^A-Za-z0-9])pass [0-9]+[ \t]*$/ { p += $NF; t += $NF; hit = 1; next }
+          /(^|[^A-Za-z0-9])fail [0-9]+[ \t]*$/ { t += $NF; hit = 1; next }
+          /^[ \t]*[0-9]+ passing/ { p += $1; t += $1; hit = 1; next }
+          /^[ \t]*[0-9]+ failing/ { t += $1; hit = 1; next }
+          /^=+ .*[0-9]+ (passed|failed).* in [0-9.]+s/ { for (i = 1; i < NF; i++) { w = $(i+1); gsub(/,/, "", w); if (w == "passed") { p += $i; t += $i } else if (w == "failed" || w == "error" || w == "errors") t += $i }; hit = 1; next }
+          END { if (hit) print p, t }
+        ')"
+        if [ -z "$counts" ]; then
+          local pass fail
+          pass="$(printf '%s\n' "$raw" | grep -cE '^(PASS|ok)([: ]|$)' || true)"
+          fail="$(printf '%s\n' "$raw" | grep -cE '^(FAIL|not ok)([: ]|$)' || true)"
+          pass="${pass:-0}"; fail="${fail:-0}"
+          if [ "$pass" -gt 0 ] || [ "$fail" -gt 0 ]; then
+            counts="$pass $((pass + fail))"
+          fi
+        fi
+        printf '%s' "$counts"
+      }
+      # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
+      #   1500 s budget, appends every command's output to <log> under a "### run-stop-tests:"
+      #   header, and prints "<exit> <passed> <total>" -- exit is the first nonzero exit,
+      #   counts are summed across commands; "<exit>  " (empty counts) when nothing parsed)
+      rst_run_commands() {
+        local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
+        seg="$(mktemp)"
+        while IFS= read -r cmd; do
+          [ -z "$cmd" ] && continue
+          printf '### run-stop-tests: %s\n' "$cmd" >> "$log"
+          timeout 1500 bash -o pipefail -c "$cmd" > "$seg" 2>&1 < /dev/null
+          rc=$?
+          cat "$seg" >> "$log"
+          printf '### exit %s\n' "$rc" >> "$log"
+          [ "$rc" -ne 0 ] && [ "$exit_code" -eq 0 ] && exit_code="$rc"
+          c="$(rst_parse_counts < "$seg")"
+          if [ -n "$c" ]; then p=$((p + ${c%% *})); t=$((t + ${c##* })); hit=1; fi
+        done < "$cmds"
+        rm -f "$seg"
+        if [ "$hit" -eq 1 ]; then printf '%s %s %s' "$exit_code" "$p" "$t"; else printf '%s  ' "$exit_code"; fi
+      }
+      # rst_report <class> <cmd> <exit> <counts>   (-> TESTS_STATUS / TESTS_LINE lines)
+      #   Status law: passed only when the command exited 0 AND passed == total > 0.
+      #   Any nonzero exit, any failing test, or 0 tests ran is "failed". Unparseable
+      #   output is "counts_unparsed" (fail-closed downstream on CODE/MIXED). A CODE or
+      #   MIXED spec with no runnable test command AND no test files in the diff is
+      #   "no_command_declared" (spec + build defect).
+      rst_report() {
+        local class="$1" cmd="$2" exit_code="$3" counts="$4" status line p t
+        if [ -z "$cmd" ]; then
+          case "$class" in
+            CODE|MIXED) status="no_command_declared"; line="N/A ($class spec declares no executable test command and the diff touched no test files -- Rule 10 defect)" ;;
+            *) status="not_required"; line="N/A ($class class, no test command declared)" ;;
+          esac
+        elif [ -z "$counts" ]; then
+          status="counts_unparsed"
+          line="N/A (test command exited $exit_code but pass/total could not be parsed from its output: $cmd)"
+        else
+          p="${counts%% *}"; t="${counts##* }"
+          if [ "$exit_code" -ne 0 ] || [ "$t" -eq 0 ] || [ "$p" -lt "$t" ]; then
+            status="failed"
+            line="$p/$t ($cmd) -- FAILED, exit $exit_code"
+          else
+            status="passed"
+            line="$p/$t ($cmd)"
+          fi
+        fi
+        printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
+      }
+      # ---- END rst core ----
+
+      SPEC=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
+      EVIDENCE_DIR="${ARTIFACTS_DIR:-.}/evidence"
+      mkdir -p "$EVIDENCE_DIR" 2>/dev/null || true
+      LOG="$EVIDENCE_DIR/stop-tests.log"
+      CMDS="$EVIDENCE_DIR/stop-tests.commands"
+      : > "$LOG"; : > "$CMDS"
+      SOURCE="none"
+      while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        if rst_command_looks_runnable "$c"; then
+          rst_rescue_subdir "$c" >> "$CMDS"; printf '\n' >> "$CMDS"
+        else
+          echo "run-stop-tests: declared line is not a runnable test command, ignoring: $c" >&2
+        fi
+      done <<EOF_CMDS
+      $(printf '%s\n' "$SPEC" | rst_extract_commands)
+      EOF_CMDS
+      [ -s "$CMDS" ] && SOURCE="spec_declared"
+      EXIT_CODE=0
+      COUNTS=""
+      CMD_JOINED=""
+      # rst_try <source-label>: run whatever is in $CMDS; rc 0 when counts were parsed.
+      rst_try() {
+        [ -s "$CMDS" ] || return 1
+        CMD_JOINED="$(grep -v '^$' "$CMDS" | paste -sd ';' - | sed 's/;/; /g')"
+        RESULT="$(rst_run_commands "$CMDS" "$LOG")"
+        EXIT_CODE="${RESULT%% *}"
+        COUNTS="${RESULT#* }"
+        COUNTS="$(printf '%s' "$COUNTS" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        SOURCE="$1"
+        [ -n "$COUNTS" ]
+      }
+      if [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
+        # Ladder: spec-declared -> test files in this run's diff -> the repo's own test
+        # script. A rung whose command(s) produced no parseable counts (a prose mention
+        # that looked like a command, a runner that printed nothing) falls through to
+        # the next rung; the earlier attempt stays in the log and in TESTS_SOURCE.
+        TRIED=""
+        if ! rst_try "spec_declared"; then
+          [ -s "$CMDS" ] && TRIED="spec_declared command(s) gave no parseable counts: $CMD_JOINED"
+          : > "$CMDS"
+          RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
+          if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
+            rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
+          fi
+          if ! rst_try "tests_in_diff"; then
+            [ -s "$CMDS" ] && TRIED="${TRIED:+$TRIED; }tests_in_diff command(s) gave no parseable counts: $CMD_JOINED"
+            : > "$CMDS"
+            rst_repo_test_script > "$CMDS"
+            rst_try "repo_test_script" || true
+          fi
+        fi
+        if [ -z "$COUNTS" ] && [ -z "$CMD_JOINED" ] && [ -n "$TRIED" ]; then
+          # every rung was empty after the first; keep the first attempt's command so
+          # the N/A line names what was actually run
+          CMD_JOINED="${TRIED##*: }"
+        fi
+        [ -n "$TRIED" ] && SOURCE="$SOURCE (after: $TRIED)"
+      fi
+      echo "TESTS_CLASS=$CLASS"
+      echo "TESTS_SOURCE=$SOURCE"
+      echo "TESTS_COMMAND=${CMD_JOINED:-(none)}"
+      echo "TESTS_EXIT=$EXIT_CODE"
+      echo "TESTS_PASSED=${COUNTS%% *}"
+      echo "TESTS_TOTAL=${COUNTS##* }"
+      rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS"
+      echo "TESTS_LOG=$LOG"
+      if [ -s "$LOG" ]; then
+        echo "--- last 80 lines of test output ---"
+        tail -n 80 "$LOG"
+      fi
+      exit 0
+
+  # bdc-xo #1940. run-stop-greps MECHANICALLY executes every grep stop condition the
+  # spec declares ("Stop N (grep assertion ...)" header, command line, "Expected: N")
+  # inside the run worktree, under the same read-only command allowlist as
+  # verify-manifest-assertions, and emits OBSERVED counts in the manifest v2
+  # "<command> => <count>; ..." contract. stamp-manifest-evidence writes GREP_LINE into
+  # the manifest "Grep assertions:" line; the engine's "N/A (no declared mechanical
+  # assertions)" placeholder never reaches a PR body for a spec that declared greps.
+  - id: run-stop-greps
+    persona: major-build
+    load_bearing: true
+    depends_on: [ascii-gate]
+    task_class: clerical
+    timeout: 600000
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN rsg core (byte-identical across lanes; extracted by unit test) ----
+      # POSIX awk only (mawk in the container).
+      # rsg_extract   (spec on stdin -> one "<command>\t<op>\t<n>" line per grep stop)
+      #   Two shapes: (A) the template "Stop N (grep assertion ...)" header, command
+      #   line, "Expected: ..." line; (B) inside a "Stop conditions" section, a line
+      #   carrying a backticked read-only command (grep/rg/find/wc/test/cat/head/tail,
+      #   optional LC_ALL=C prefix) followed by its expectation in prose ("returns 2 or
+      #   greater", "=> 1", "returns nothing"). op is eq (default), ge ("at least", ">=",
+      #   "or more", "or greater"), le ("at most", "<="). "no output" / "nothing" /
+      #   "none" / "empty" mean eq 0. A declared assertion without a parseable
+      #   expectation is counted in GREP_DECLARED but not executed.
+      rsg_extract() {
+        awk '
+          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+          function expect(ex,   low, op, n) {
+            low = tolower(ex); op = "eq"; n = ""
+            if (low ~ /at least|>=|or more|or greater|minimum|no fewer/) op = "ge"
+            else if (low ~ /at most|<=|or fewer|or less|maximum|no more/) op = "le"
+            if (low ~ /no output|nothing|none|empty|no match/) n = "0"
+            else if (match(ex, /[0-9]+/)) n = substr(ex, RSTART, RLENGTH)
+            if (n == "") return ""
+            return op "\t" n
+          }
+          state == 1 {
+            if ($0 ~ /^[ \t]*```/) next
+            line = clean($0)
+            if (line == "") next
+            if (line ~ /^[Ee]xpected:/) {
+              ex = line; sub(/^[Ee]xpected:[ \t]*/, "", ex); e = expect(ex)
+              if (cmd != "" && e != "") print cmd "\t" e
+              state = 0; cmd = ""; next
+            }
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { state = 0; cmd = "" }
+            else {
+              cmd = (cmd == "" ? line : cmd " " line)
+              sub(/[ \t]*\\$/, "", cmd)
+              next
+            }
+          }
+          /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/ { state = 1; cmd = ""; declared++; next }
+          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; bl = 0; next }
+          insec && /^[ \t]*[*_]*[Bb]aseline/ { bl = 1 }
+          insec && bl && (/^[ \t]*$/ || /^[ \t]*([0-9]+[.)]|[-*])[ \t]/) { bl = 0 }
+          insec && !bl && /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)( |`)/ {
+            if (tolower($0) ~ /baseline|untouched tree|before the fix|before this wo/) next
+            s = $0
+            if (match(s, /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) {
+              g = substr(s, RSTART + 1, RLENGTH - 2); rest = substr(s, RSTART + RLENGTH)
+              declared++
+              e = expect(rest)
+              if (e != "") print g "\t" e
+            }
+          }
+          END { print "DECLARED\t" (declared + 0) }
+        '
+      }
+      # rsg_allow_cmd <command>   (same fail-closed read-only allowlist as the vma core)
+      rsg_allow_cmd() {
+        local c="$1" seg first
+        c="$(printf '%s' "$c" | sed -E 's/^(LC_ALL|LANG)=[A-Za-z0-9_.@-]+[[:space:]]+//')"
+        case "$c" in
+          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*) return 1 ;;
+          *' -delete'*|*' -exec'*|*' -ok'*|*' -fprint'*|*' -fls'*) return 1 ;;
+        esac
+        local IFS='|'
+        local -a segs
+        read -ra segs <<<"$c"
+        for seg in "${segs[@]}"; do
+          seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//')"
+          first="${seg%%[[:space:]]*}"
+          case "$first" in
+            grep|egrep|fgrep|rg|wc|find|cat|head|tail|sort|uniq|test) ;;
+            *) return 1 ;;
+          esac
+        done
+        return 0
+      }
+      # rsg_observe <command>   (-> observed count, or "ERR" on a hard command failure)
+      rsg_observe() {
+        local raw rawtrim rc
+        raw="$(bash -c "$1" 2>/dev/null < /dev/null)"; rc=$?
+        rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
+        if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
+          printf '%s' "$rawtrim"
+        elif [ -z "$rawtrim" ]; then
+          if [ "$rc" -le 1 ]; then printf '0'; else printf 'ERR'; fi
+        else
+          printf '%s\n' "$raw" | grep -c . || true
+        fi
+      }
+      # rsg_compare <op> <expected> <observed>   (rc 0 when the stop condition holds)
+      rsg_compare() {
+        case "$1" in
+          ge) [ "$3" -ge "$2" ] ;;
+          le) [ "$3" -le "$2" ] ;;
+          *) [ "$3" -eq "$2" ] ;;
+        esac
+      }
+      # rsg_run   (extracted TSV on stdin -> GREP_* summary lines + per-assertion detail)
+      rsg_run() {
+        local line cmd op n obs declared=0 executed=0 dropped=0 mismatch=0 out="" detail="" status tab
+        tab="$(printf '\t')"
+        while IFS= read -r line; do
+          case "$line" in
+            DECLARED*) declared="${line#DECLARED*"$tab"}"; continue ;;
+            "") continue ;;
+          esac
+          cmd="${line%%"$tab"*}"; line="${line#*"$tab"}"; op="${line%%"$tab"*}"; n="${line#*"$tab"}"
+          if ! rsg_allow_cmd "$cmd"; then
+            dropped=$((dropped + 1))
+            detail="${detail}DROPPED (not on read-only allowlist; not executed): $cmd => expected $op $n"$'\n'
+            continue
+          fi
+          obs="$(rsg_observe "$cmd")"
+          if [ "$obs" = "ERR" ]; then
+            dropped=$((dropped + 1))
+            detail="${detail}DROPPED (command errored): $cmd => expected $op $n"$'\n'
+            continue
+          fi
+          executed=$((executed + 1))
+          if rsg_compare "$op" "$n" "$obs"; then
+            detail="${detail}OK: $cmd => $obs (expected $op $n)"$'\n'
+          else
+            mismatch=$((mismatch + 1))
+            detail="${detail}MISMATCH: $cmd => $obs (expected $op $n)"$'\n'
+          fi
+          out="${out:+$out; }$cmd => $obs"
+        done
+        if [ "$declared" -eq 0 ]; then
+          status="none_declared"; out="N/A (spec declares no grep stop conditions)"
+        elif [ "$executed" -eq 0 ]; then
+          status="all_dropped"; out="N/A ($declared declared grep stop condition(s) but none executable under the read-only allowlist)"
+        elif [ "$mismatch" -gt 0 ]; then
+          status="mismatch"
+        else
+          status="passed"
+        fi
+        printf 'GREP_DECLARED=%s\nGREP_EXECUTED=%s\nGREP_DROPPED=%s\nGREP_MISMATCH=%s\nGREP_STATUS=%s\nGREP_LINE=%s\n' "$declared" "$executed" "$dropped" "$mismatch" "$status" "$out"
+        if [ -n "$detail" ]; then
+          printf -- '--- per-assertion detail ---\n%s' "$detail"
+        fi
+      }
+      # ---- END rsg core ----
+
+      SPEC=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      printf '%s\n' "$SPEC" | rsg_extract | rsg_run
+      exit 0
+
   - id: war-council-validator
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813
     persona: captain-ci-validator-codex
-    depends_on: [ascii-gate]
+    depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
     prompt: |
       Invoke or emulate the war-council-validator review for this Work Order.
@@ -1057,13 +1546,49 @@ nodes:
       Implementation output:
       $implement.output
 
+      Stop-condition evidence (MECHANICAL -- executed by the run-stop-tests and
+      run-stop-greps nodes in THIS worktree; this is the ground truth for every test
+      or grep claim in your verdict, bdc-xo #1940):
+      $run-stop-tests.output
+
+      $run-stop-greps.output
+
+      ## Test execution contract (Rule 10: tests must test real behavior)
+      - Run the spec's Stop 2 test command YOURSELF (Bash, in this worktree) and read
+        its output. Do not rely on the implementation summary, the plan, or a "tests
+        pass" sentence anywhere in the inputs.
+      - Your verdict MUST contain exactly one line of the form
+          TESTS_OBSERVED: <passed>/<total> (<command you executed>)
+        with counts you read from output produced in this session. If you could not
+        execute the command, write
+          TESTS_OBSERVED: not_run (<reason>)
+        and the verdict is needs_revision.
+      - A claim that tests pass without an executed command -- yours or the
+        builder's -- is itself a needs_revision finding.
+      - If your observed counts differ from the TESTS_PASSED / TESTS_TOTAL values
+        above, quote both and explain the difference. Never average or pick the
+        friendlier number.
+      - A test that cannot fail for the behavior it names (asserts nothing, exercises
+        a fallback path instead of the code under test, hardcodes a constant the
+        code has moved past) is a FAILED test: name each vacuous test and the
+        Section 7 scenario it was supposed to prove. Anchor: shopops #674 at
+        c4f9315 -- two of eight adapter tests were vacuous while "8/8 PASS" was
+        reported.
+      - If TESTS_STATUS above is failed, counts_unparsed, or no_command_declared on
+        a CODE or MIXED WO, the verdict is needs_revision; say which and why.
+      - Every GREP_STATUS mismatch above is a needs_revision finding (a declared stop
+        condition did not hold).
+
       Git diff:
       Run `git diff --stat` and `git diff --check`, then inspect the relevant changed files.
 
       ## Required Output
       Return either:
-      - satisfied: with evidence that the spec deliverables and stop conditions were met
-      - needs_revision: with exact file/path/behavior findings
+      - satisfied: with evidence that the spec deliverables and stop conditions were met,
+        the mandatory TESTS_OBSERVED line, and one sentence per Section 7 scenario
+        naming the test that would fail if that behavior regressed
+      - needs_revision: with exact file/path/behavior findings and the mandatory
+        TESTS_OBSERVED line
 
   # diff-review chain (doctrine: self-repair-review-loops + in-run-review-loops-feature-dev,
   # 2026-05-30). Runs AFTER validation, BEFORE the irreversible commit-and-push. Three nodes,
@@ -2588,10 +3113,174 @@ nodes:
       If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
 
 
+  # bdc-xo #1940. The engine-side build-manifest (evidence: manifest_v2) is mechanical
+  # for files/PR/merge-base but renders placeholder "Tests: N/A (required gates are
+  # reported separately)" and "Grep assertions: N/A (no declared mechanical
+  # assertions)" lines for EVERY WO. stamp-manifest-evidence overwrites both with the
+  # OBSERVED values from run-stop-tests / run-stop-greps (executed in this worktree),
+  # flips VALIDATION: PASS to FAIL when a declared stop condition did not hold, and
+  # records a "Stop conditions:" audit line. Short ALREADY_SATISFIED / BLOCKED
+  # manifests (no Tests: line) pass through untouched.
+  - id: stamp-manifest-evidence
+    persona: major-build
+    load_bearing: true
+    depends_on: [build-manifest, run-stop-tests, run-stop-greps]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN sme core (byte-identical across lanes; extracted by unit test) ----
+      # sme_field <KEY> <node-output>   (-> value of the first "KEY=..." line, or empty)
+      sme_field() {
+        printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//" || true
+      }
+      # sme_process <tests_line> <tests_status> <grep_line> <grep_status>
+      #   (manifest on stdin -> stdout). Rewrites the first "Tests:" and first
+      #   "Grep assertions:" lines with the observed values; a manifest without a
+      #   "Tests:" line is the short ALREADY_SATISFIED / BLOCKED form and passes through.
+      #   Missing evidence (a skipped run-stop-* node) is stamped honestly as
+      #   "N/A (evidence node did not run)". When tests failed or a grep stop condition
+      #   mismatched, "VALIDATION: PASS" becomes "VALIDATION: FAIL". A "Stop conditions:"
+      #   audit line is inserted after VALIDATION: (a non-label line there is outside
+      #   every bdc-ci section; OUTCOME: already lives there).
+      sme_process() {
+        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" manifest verdict
+        manifest="$(cat)"
+        if ! printf '%s\n' "$manifest" | grep -qE '^Tests:'; then
+          printf '%s\n' "$manifest"
+          return 0
+        fi
+        [ -n "$tests_line" ] || tests_line="N/A (evidence node run-stop-tests did not run)"
+        [ -n "$tests_status" ] || tests_status="missing"
+        [ -n "$grep_line" ] || grep_line="N/A (evidence node run-stop-greps did not run)"
+        [ -n "$grep_status" ] || grep_status="missing"
+        verdict="keep"
+        if [ "$tests_status" = "failed" ] || [ "$grep_status" = "mismatch" ]; then
+          verdict="fail"
+        fi
+        printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: tests=${tests_status}; greps=${grep_status} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
+          !ts && /^Tests:/ { print ENVIRON["T_LINE"]; ts = 1; next }
+          !gs && /^Grep assertions:/ { print ENVIRON["G_LINE"]; gs = 1; next }
+          !vs && /^VALIDATION:/ {
+            if (ENVIRON["VERDICT"] == "fail") print "VALIDATION: FAIL"; else print
+            print ENVIRON["S_LINE"]
+            vs = 1; next
+          }
+          { print }
+          END { if (!gs) print ENVIRON["G_LINE"]; if (!vs) print ENVIRON["S_LINE"] }
+        '
+      }
+      # ---- END sme core ----
+
+      TESTS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_TESTS'
+      $run-stop-tests.output
+      BDC_NODE_OUTPUT_RUN_STOP_TESTS
+      )
+      GREPS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_GREPS'
+      $run-stop-greps.output
+      BDC_NODE_OUTPUT_RUN_STOP_GREPS
+      )
+      MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $build-manifest.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+      printf '%s\n' "$MANIFEST_OUT" | sme_process \
+        "$(sme_field TESTS_LINE "$TESTS_OUT")" "$(sme_field TESTS_STATUS "$TESTS_OUT")" \
+        "$(sme_field GREP_LINE "$GREPS_OUT")" "$(sme_field GREP_STATUS "$GREPS_OUT")"
+
+  # bdc-xo #1940. manifest-evidence-check fails CLOSED (exit 1, no PR-body patch) when
+  # a CODE or MIXED WO would publish "Tests: N/A ..." (Rule 10 / manifest v2 require
+  # "<pass>/<total> (<command>)"), or when the spec declared grep stop conditions but
+  # the manifest's "Grep assertions:" line is N/A. Failing tests are NOT blocked here:
+  # they are stamped honestly (VALIDATION: FAIL) so the PR carries the real numbers.
+  - id: manifest-evidence-check
+    persona: major-build
+    load_bearing: true
+    depends_on: [stamp-manifest-evidence, run-stop-tests, run-stop-greps, block-reclassify]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN mec core (byte-identical across lanes; extracted by unit test) ----
+      # mec_field <KEY> <node-output>   (-> value of the first "KEY=..." line, or empty)
+      mec_field() {
+        printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//" || true
+      }
+      # mec_check <reclassify_status> <class> <tests_status> <grep_declared> <grep_status>
+      #   (stamped manifest on stdin -> "OK" rc 0, or "EVIDENCE_ERROR: ..." rc 1)
+      #   Only a PROCEED run (real build, real PR) is gated. CODE/MIXED: the Tests: line
+      #   must be "<n>/<n> ...". Any class: a spec that declared grep stop conditions
+      #   may not publish "Grep assertions: N/A". A short manifest (no Tests: line) is
+      #   the ALREADY_SATISFIED / BLOCKED form and is not gated.
+      mec_check() {
+        local status="$1" class="$2" tests_status="$3" grep_declared="$4" grep_status="$5" manifest tests_line grep_line
+        manifest="$(cat)"
+        if [ "$status" != "PROCEED" ]; then
+          echo "OK"
+          return 0
+        fi
+        if ! printf '%s\n' "$manifest" | grep -qE '^Tests:'; then
+          echo "OK"
+          return 0
+        fi
+        tests_line="$(printf '%s\n' "$manifest" | grep -E '^Tests:' | head -1 | sed 's/^Tests:[[:space:]]*//')"
+        grep_line="$(printf '%s\n' "$manifest" | grep -E '^Grep assertions:' | head -1 | sed 's/^Grep assertions:[[:space:]]*//')"
+        [ -n "$class" ] || class="CODE"
+        case "$class" in
+          CODE|MIXED)
+            if ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+'; then
+              echo "EVIDENCE_ERROR: Tests: \"${tests_line}\" on a ${class} WO (tests_status=${tests_status:-missing}). Manifest v2 / Rule 10 require \"Tests: <pass>/<total> (<command>)\" from an executed command; N/A is not admissible on a ${class} WO (bdc-xo #1940)." >&2
+              return 1
+            fi
+            ;;
+        esac
+        grep_declared="${grep_declared:-0}"
+        if [ "$grep_declared" -gt 0 ] 2>/dev/null; then
+          if printf '%s\n' "$grep_line" | grep -qiE '^(n/a|none|\(none\)|\[list\]|\[\])'; then
+            echo "EVIDENCE_ERROR: Grep assertions: \"${grep_line}\" but the spec declares ${grep_declared} grep stop condition(s) (grep_status=${grep_status:-missing}). Declared grep stop conditions must be executed and their observed counts published (bdc-xo #1940)." >&2
+            return 1
+          fi
+        fi
+        echo "OK"
+        return 0
+      }
+      # ---- END mec core ----
+
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      TESTS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_TESTS'
+      $run-stop-tests.output
+      BDC_NODE_OUTPUT_RUN_STOP_TESTS
+      )
+      GREPS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_GREPS'
+      $run-stop-greps.output
+      BDC_NODE_OUTPUT_RUN_STOP_GREPS
+      )
+      MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
+      $stamp-manifest-evidence.output
+      BDC_NODE_OUTPUT_MANIFEST
+      )
+      printf '%s\n' "$MANIFEST_OUT" | mec_check "$STATUS" \
+        "$(mec_field TESTS_CLASS "$TESTS_OUT")" "$(mec_field TESTS_STATUS "$TESTS_OUT")" \
+        "$(mec_field GREP_DECLARED "$GREPS_OUT")" "$(mec_field GREP_STATUS "$GREPS_OUT")"
+
   - id: stamp-manifest-pr
     persona: major-build
     load_bearing: true
-    depends_on: [build-manifest, open-pr-if-needed, block-reclassify]
+    depends_on: [stamp-manifest-evidence, open-pr-if-needed, block-reclassify]
     trigger_rule: all_done
     task_class: clerical
     # WO-HARNESS-MANIFEST-PR-FIELD-MECHANICAL-01: build-manifest prose is not
@@ -2644,7 +3333,7 @@ nodes:
       fi
 
       MANIFEST_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $build-manifest.output
+      $stamp-manifest-evidence.output
       BDC_NODE_OUTPUT_MANIFEST
       )
       printf '%s\n' "$MANIFEST_OUT" | smp_process "$STATUS" "$PR_URL"
@@ -2762,8 +3451,8 @@ nodes:
   # written to the PR body or Notion under trigger_rule: all_done.
   - id: patch-pr-body
     persona: major-build
-    depends_on: [build-manifest, stamp-manifest-pr, manifest-consistency-check]
-    when: "$manifest-consistency-check.output == 'OK'"
+    depends_on: [build-manifest, stamp-manifest-pr, manifest-consistency-check, manifest-evidence-check]
+    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -2963,7 +3652,7 @@ nodes:
 
   - id: flip-notion
     persona: xo
-    depends_on: [build-manifest, manifest-consistency-check]
+    depends_on: [stamp-manifest-evidence, manifest-consistency-check]
     when: "$manifest-consistency-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
@@ -2981,7 +3670,7 @@ nodes:
       STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
 
       MANIFEST=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST'
-      $build-manifest.output
+      $stamp-manifest-evidence.output
       BDC_NODE_OUTPUT_MANIFEST
       )
 
