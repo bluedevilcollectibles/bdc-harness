@@ -228,12 +228,77 @@ export function capCommentIdempotencyKey(
  */
 export const CAP_COMMENT_MAX_CLAIM_ATTEMPTS = 5;
 
-/** Per-process record of released claims, so a retry advances its key. */
+/**
+ * Per-process MEMO of the durable attempt count -- an optimisation, never the
+ * source of truth.
+ *
+ * Review finding (Overseer, #803 review 3): this map WAS the record. The claim
+ * rows it counted are durable, so after `createComment` failed, a retry picked
+ * up by another worker or after a restart started again at attempt 0 -- an
+ * idempotency key already held by the abandoned claim. That retry always loses,
+ * and the head is never announced: exactly the silent block this path exists to
+ * end. The count is now derived from the dispatch store (see
+ * `currentCapCommentAttempt`); this map only caches what that read returned.
+ */
 const capCommentClaimAttempts = new Map<string, number>();
 
-/** Test seam: forget every released-claim counter. */
+/** Test seam: forget every cached attempt count. */
 export function resetCapCommentClaimAttempts(): void {
   capCommentClaimAttempts.clear();
+}
+
+/**
+ * How many claim attempts this head has already burned, read from the DURABLE
+ * dispatch rows rather than process memory.
+ *
+ * Every claim writes one row whose `idempotency_key` is
+ * `<base>` for attempt 0 and `<base>:retry<n>` thereafter, all sharing the
+ * head's `subject_key`. Counting the retry keys that exist therefore
+ * reconstructs the attempt number on any worker, after any restart.
+ *
+ * A read failure falls back to the cached in-memory value rather than throwing:
+ * the caller's own catch already treats a broken claim store as "post anyway",
+ * and staying silent is the worse failure.
+ */
+export async function currentCapCommentAttempt(
+  input: CapCommentInput,
+  // Seam: the durable read. Defaults to the live dispatch store; a test supplies
+  // the rows a prior process would have left behind, which is the only way to
+  // exercise recovery without a database.
+  listClaims: (filters: {
+    recipient: string;
+    subject_key: string;
+    limit?: number;
+  }) => Promise<{ idempotency_key: string }[]> = dispatch.listMessages
+): Promise<number> {
+  const base = capCommentIdempotencyKey(input);
+  const cached = capCommentClaimAttempts.get(base) ?? 0;
+  try {
+    const rows = await listClaims({
+      recipient: 'operator',
+      subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+      limit: CAP_COMMENT_MAX_CLAIM_ATTEMPTS + 1,
+    });
+    let durable = 0;
+    for (const row of rows) {
+      const key = row.idempotency_key;
+      if (typeof key !== 'string' || !key.startsWith(base)) continue;
+      if (key === base) {
+        durable = Math.max(durable, 1);
+        continue;
+      }
+      const retry = /^:retry(\d+)$/.exec(key.slice(base.length));
+      if (retry) durable = Math.max(durable, Number(retry[1]) + 1);
+    }
+    // The durable rows and the local memo can disagree only when a write landed
+    // that this process did not make; the higher value is the safe one, because
+    // reusing a held key guarantees a lost claim.
+    const attempt = Math.max(durable, cached);
+    capCommentClaimAttempts.set(base, attempt);
+    return attempt;
+  } catch {
+    return cached;
+  }
 }
 
 /** Correlation prefix the claim's winning nonce is appended to. */
@@ -383,7 +448,7 @@ export async function postCapExhaustedCommentWith(
  * without needing the DAL to report which branch it took.
  */
 export async function claimCapCommentViaDispatch(input: CapCommentInput): Promise<boolean> {
-  const attempt = capCommentClaimAttempts.get(capCommentIdempotencyKey(input)) ?? 0;
+  const attempt = await currentCapCommentAttempt(input);
   // Past the attempt bound the claim stops gating: a permanently silent head is
   // a worse outcome than a possible duplicate, and the marker scan still
   // catches the duplicate whenever the earlier comment landed.
@@ -429,8 +494,13 @@ export async function claimCapCommentViaDispatch(input: CapCommentInput): Promis
  */
 export async function releaseCapCommentClaimViaDispatch(input: CapCommentInput): Promise<void> {
   const key = capCommentIdempotencyKey(input);
-  capCommentClaimAttempts.set(key, (capCommentClaimAttempts.get(key) ?? 0) + 1);
-  return Promise.resolve();
+  // Advance the LOCAL memo so an immediate in-process retry skips the key it
+  // just abandoned without paying for another store read. Recovery on a
+  // different worker or after a restart does not depend on this line -- the
+  // abandoned row itself is the durable record, and `currentCapCommentAttempt`
+  // counts it. This is a fast path, not the mechanism.
+  const attempt = await currentCapCommentAttempt(input);
+  capCommentClaimAttempts.set(key, attempt + 1);
 }
 
 /**
