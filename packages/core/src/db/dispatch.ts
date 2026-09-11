@@ -68,6 +68,18 @@ export interface DispatchMessage {
   repeat_reason: string | null;
 }
 
+/**
+ * A dispatch message plus the resume token for keyset pagination.
+ *
+ * `cursor_seq` is the row's effective position in the database-assigned total
+ * order (migration 047; `COALESCE(seq, rowid)` on SQLite). Feeding the last
+ * row's value back as `afterSeq` resumes strictly after it, which is what makes
+ * a walk over the whole store possible despite the 500-row page cap.
+ */
+export interface SeqCursorMessage extends DispatchMessage {
+  cursor_seq: number;
+}
+
 export interface DispatchWorker {
   worker_id: string;
   host: string;
@@ -584,6 +596,123 @@ export async function getMessage(id: string): Promise<DispatchMessage | null> {
   );
   const row = result.rows[0];
   return row ? normalizeMessage(row) : null;
+}
+
+/**
+ * Messages carrying an EXACT correlation_id, newest-first.
+ *
+ * EXISTS FOR THE OVERSEER RECHECK PATH (bdc-harness #782). To decide whether a
+ * completed check authorizes an automatic re-review, the ingest must read the
+ * standing submit receipt for one exact PR head. Those receipts are written to
+ * the `operator` recipient with `correlation_id` = the head-bound review
+ * correlation id and (on this lineage) no subject_key, so neither the
+ * subject_key query nor a `listMessages` page can find them: `listMessages`
+ * hard-caps `limit` at 500 with no offset or cursor, while the live store holds
+ * thousands of queued operator rows (#761 backlog). A genuinely older receipt
+ * -- exactly the one a stale CHANGES_REQUESTED verdict lives in -- sits well
+ * outside any single page.
+ *
+ * Equality, not a prefix: the caller already knows the exact head it is asking
+ * about, so an indexed exact match is both cheaper and narrower than a scan.
+ */
+export async function listMessagesByCorrelationId(filters: {
+  correlationId: string;
+  recipient?: string;
+  limit?: number;
+}): Promise<DispatchMessage[]> {
+  const limit = Math.max(1, Math.min(filters.limit ?? 50, 500));
+  const params: unknown[] = [filters.correlationId];
+  let where = 'correlation_id = $1';
+  if (filters.recipient) {
+    params.push(canonicalizePrincipal(filters.recipient));
+    where += ` AND recipient = $${params.length}`;
+  }
+  params.push(limit);
+  const result = await getDatabase().query<DispatchMessageRow>(
+    `SELECT * FROM agent_dispatch_messages
+     WHERE ${where}
+     ORDER BY created_at DESC, id DESC
+     LIMIT $${params.length}`,
+    params
+  );
+  return result.rows.map(normalizeMessage);
+}
+
+/**
+ * One keyset page of messages for a recipient, filtered by task_type and status,
+ * in ASCENDING order of the database-assigned `seq`.
+ *
+ * WHY THIS EXISTS (Overseer review finding, PR #786 @45aa739e). The
+ * stale-verdict sweep needs to walk EVERY completed review item in the store,
+ * but `listMessages` hard-caps `limit` at 500 and offers no offset or cursor.
+ * The live store holds ~4,900 dispatch rows and the review recipient alone
+ * already holds ~494, so a sweep paging with an in-memory array index re-fetched
+ * the same capped page forever: once its cursor passed the candidates inside
+ * that page it simply rewound, and any completed review beyond row 500 was
+ * permanently unreachable. Same failure class as the one
+ * `listMessagesByCorrelationId` above was added to fix.
+ *
+ * KEYSET, NOT OFFSET. `afterSeq` resumes strictly after a seq the caller has
+ * already seen, so each page is a genuinely different slice no matter how many
+ * rows were inserted between calls -- an OFFSET would skip or repeat rows as the
+ * table grows underneath the walk. `seq` is the database-assigned total order
+ * from migration 047, which is precisely why it is a safe resume token: it is
+ * assigned at the one serialization point every writer shares, unlike
+ * `created_at`, whose millisecond resolution ties on back-to-back inserts.
+ *
+ * ASCENDING on purpose. The sweep wants oldest-first (the stalest verdicts are
+ * the ones most worth revisiting), and an ascending keyset is monotonic: rows
+ * inserted during a walk land after the cursor and are picked up on a later
+ * pass, never causing a page to shift under it.
+ *
+ * Filtering task_type and status IN THE QUERY is what makes the page size mean
+ * something: the sweep's previous in-memory filter meant a page of 500 could
+ * yield only a handful of usable candidates.
+ */
+export async function listMessagesBySeqCursor(filters: {
+  recipient: string;
+  task_type?: string;
+  status?: DispatchMessageStatus;
+  /** Exclusive lower bound: return rows whose ordering value is strictly above. */
+  afterSeq?: number;
+  limit?: number;
+}): Promise<SeqCursorMessage[]> {
+  const limit = Math.max(1, Math.min(filters.limit ?? 100, 500));
+  // Same effective ordering value the newest-first reads use, so a cursor taken
+  // from one is meaningful to the other: on SQLite a raw/fixture/import row can
+  // still carry seq = NULL until the next open heals it, and its effective
+  // position is its rowid.
+  const seqExpression = getDatabase().dialect === 'postgres' ? 'seq' : 'COALESCE(seq, rowid)';
+  const params: unknown[] = [canonicalizePrincipal(filters.recipient)];
+  const clauses = [`recipient = $${params.length}`];
+  if (filters.task_type) {
+    params.push(filters.task_type);
+    clauses.push(`task_type = $${params.length}`);
+  }
+  if (filters.status) {
+    params.push(filters.status);
+    clauses.push(`status = $${params.length}`);
+  }
+  if (typeof filters.afterSeq === 'number') {
+    params.push(filters.afterSeq);
+    clauses.push(`${seqExpression} > $${params.length}`);
+  }
+  params.push(limit);
+  const result = await getDatabase().query<DispatchMessageRow & { cursor_seq: unknown }>(
+    `SELECT *, ${seqExpression} AS cursor_seq FROM agent_dispatch_messages
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY ${seqExpression} ASC
+     LIMIT $${params.length}`,
+    params
+  );
+  // `cursor_seq` is selected explicitly rather than read off the row's `seq`:
+  // Postgres returns a BIGINT identity as a STRING through the driver while
+  // SQLite returns a number, and `seq` is not part of the DispatchMessage
+  // contract. Coercing here keeps that dialect difference out of every caller.
+  return result.rows.map(row => ({
+    ...normalizeMessage(row),
+    cursor_seq: Number(row.cursor_seq),
+  }));
 }
 
 export async function listMessages(filters: {
@@ -1361,6 +1490,39 @@ export async function releaseMessage(data: {
   );
   if (result.rowCount !== 1) return null;
   return getMessage(data.id);
+}
+
+/**
+ * Fenced claimed-to-queued deferral with a bounded future `not_before`.
+ *
+ * WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7 names `deferMessage()`
+ * as the transition the review worker uses when it must come back later rather
+ * than post a terminal result. That transition already exists as
+ * `releaseMessage`, built under WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01
+ * with precisely the guards Section 9 and Test 3 require -- only the current
+ * lease owner, holding the current fencing token, on a row still `claimed`; the
+ * body, exact-head identity, subject_key and repeat_reason are preserved; the
+ * fence is bumped by the NEXT claim, not by the deferral.
+ *
+ * This is therefore a NAMED ALIAS, not a second implementation. Duplicating the
+ * SQL would mean two transitions that could drift apart on the single row that
+ * carries an in-flight review, which is exactly the class of bug fencing exists
+ * to prevent. `deferUntil` is required here (unlike `releaseMessage`'s optional
+ * `not_before`) because a deferral with no clock is an immediate re-claim and
+ * would spin the worker against the same unfinished evidence every tick.
+ */
+export async function deferMessage(data: {
+  id: string;
+  worker_id: string;
+  fencing_token: number;
+  defer_until: string;
+}): Promise<DispatchMessage | null> {
+  return releaseMessage({
+    id: data.id,
+    worker_id: data.worker_id,
+    fencing_token: data.fencing_token,
+    not_before: data.defer_until,
+  });
 }
 
 export type DispatchMutationResult =

@@ -2002,6 +2002,15 @@ export class SqliteAdapter implements IDatabase {
         PRIMARY KEY (owner, repo, base_ref, head_sha)
       );
 
+      -- Mirror of migration 050. Durable keyset cursor for the stale-verdict
+      -- sweep: a process-local cursor rewound to the head of the store on every
+      -- archon-app-1 rebuild, so rows past the first page were never reached.
+      CREATE TABLE IF NOT EXISTS overseer_sweep_cursor (
+        sweep TEXT PRIMARY KEY CHECK (sweep = 'stale_verdict'),
+        after_seq INTEGER NOT NULL DEFAULT 0 CHECK (after_seq >= 0),
+        updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_overseer_required_contexts_attempts_touched
         ON overseer_required_contexts_attempts(touched_at);

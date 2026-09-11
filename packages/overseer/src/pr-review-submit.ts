@@ -22,6 +22,7 @@ import type {
   SubmitPullRequestReviewResult,
 } from './adapters/github-real-deps.ts';
 import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
+import { classifyRateLimitError } from './github-rate-limit';
 import { resolveMergeManagerMode } from './merge-manager';
 
 /** What the governed reviewer returns. */
@@ -60,6 +61,17 @@ export interface ReviewerVerdict {
    * on 2026-09-07.
    */
   transportError?: boolean;
+  /**
+   * True when the GitHub client exhausted its rate budget mid-review, so no
+   * evidence could be read and no verdict formed (#782 part 2). NON-TERMINAL,
+   * exactly like `checksPending`: the item is released with a backoff and
+   * retried. It must never collapse into `approved: false` (REQUEST_CHANGES on
+   * rate-limit grounds) nor into a terminal reviewer_failed, which is what
+   * retired the review on #776 @c3935e09 on 2026-09-07.
+   */
+  rateLimited?: boolean;
+  /** Absolute instant (ISO-8601) the budget refills; from the reset header. */
+  retryAfter?: string;
   /** Safe error code (no detail) explaining the deferral, for the receipt. */
   reasonCode?: string;
   /** Milliseconds to wait before the item becomes claimable again. */
@@ -116,19 +128,57 @@ export type SubmitDisposition =
    * backoff and retried, exactly like `checks_pending` -- never terminal,
    * because terminating here posts a CHANGES_REQUESTED for a review that was
    * never actually performed.
-   *
-   * Overlaps by design with the `rate_limited` disposition on PR #786: both are
-   * "no verdict was formed, come back later" deferrals with the same shape.
-   * Whichever lands second should consider folding them into one
-   * transport-class deferral.
    */
-  | 'transport_error';
+  | 'transport_error'
+  /**
+   * NON-TERMINAL (#782 part 2). The GitHub rate budget was exhausted mid-review.
+   * Released with a backoff derived from the reset header and retried, exactly
+   * like `checks_pending` -- never terminal, because terminating here retires a
+   * review that was never actually performed and leaves the PR's stale verdict
+   * standing with nothing to clear it.
+   *
+   * Deliberately distinct from `transport_error` even though both are
+   * "no verdict was formed, come back later": a rate limit knows the exact
+   * instant it clears (the reset header, carried in `retryAfter`) whereas a
+   * transport failure only has a fixed backoff, and the two are worth telling
+   * apart in the receipt when diagnosing why a review did not land.
+   */
+  | 'rate_limited';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
   reason?: string;
   event?: OverseerReviewEvent;
-  /** Set only on `transport_error`: milliseconds until the item is retried. */
+  /**
+   * The review text the reviewer actually posted, for the terminal branches
+   * that formed a verdict (`approved`, `changes_requested`, and the
+   * `blocked_required_contexts_unavailable` COMMENT).
+   *
+   * WHY IT IS ON THE OUTCOME (#782 review finding, 2026-09-07): the worker
+   * persists `result_body: JSON.stringify(outcome)`, and the same-head recheck
+   * path has to decide whether a standing CHANGES_REQUESTED was caused by a
+   * CHECK (auto-clearable by a green re-run) or by a CODE finding (not). That
+   * question can only be answered from the reviewer's finding text -- and
+   * before this field existed the text was never persisted ANYWHERE: not on the
+   * outcome, and not on the submit receipt, whose recorded fields are
+   * disposition/event/reason only. `reason` is absent on a clean
+   * `changes_requested`, so `extractReviewSummary` returned null, every verdict
+   * failed `verdictAuthorizesRecheck`, and BOTH the webhook path and the stale
+   * sweep silently enqueued nothing -- the exact re-review this WO exists to
+   * deliver.
+   *
+   * Deliberately NOT set on the non-terminal deferrals (`checks_pending`,
+   * `rate_limited`, `transport_error`): no verdict was formed there, their
+   * `summary` is the empty string, and `checks_pending` already authorizes a
+   * recheck on its disposition alone.
+   */
+  summary?: string;
+  /** Set only on `rate_limited`: when the item should become claimable again. */
+  retryAfter?: string;
+  /**
+   * Milliseconds until the item is retried. Set on `transport_error`, and on
+   * `rate_limited` as the duration form of `retryAfter`.
+   */
   retryAfterMs?: number;
 }
 
@@ -221,6 +271,18 @@ export async function runAndSubmitReview(
   try {
     verdict = await deps.runReviewer(work);
   } catch (error) {
+    // A rate limit thrown out of the reviewer seam is a deferral, not a failure
+    // (#782 part 2). Classified BEFORE `reviewer_failed`, which is terminal and
+    // would retire a review that never ran.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'rate_limited',
+        reason: `rate_limited:reviewer_threw:${rateLimit.kind}:${rateLimit.source}`,
+        retryAfter: rateLimit.retryAfter,
+        retryAfterMs: rateLimit.retryAfterMs,
+      });
+    }
     return finish(deps, work, work.headSha, {
       disposition: 'reviewer_failed',
       reason: `reviewer_error:${errorCode(error)}`,
@@ -238,6 +300,21 @@ export async function runAndSubmitReview(
       reason: verdict.reasonCode
         ? `review_transport_error:${verdict.reasonCode}`
         : 'review_transport_error',
+      ...(typeof verdict.retryAfterMs === 'number' ? { retryAfterMs: verdict.retryAfterMs } : {}),
+    });
+  }
+
+  // RATE LIMITED (#782 part 2): no evidence was read and no verdict formed.
+  // Submit nothing; the worker releases the claim with the reset-derived backoff
+  // so the review resumes when the budget refills. Checked BEFORE the exact-head
+  // gates for the same reason as TRANSPORT ERROR above: nothing was evaluated,
+  // so there is no reviewed head to compare and a stale-head classification here
+  // would be false.
+  if (verdict.rateLimited) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'rate_limited',
+      reason: 'github_rate_limited',
+      ...(verdict.retryAfter ? { retryAfter: verdict.retryAfter } : {}),
       ...(typeof verdict.retryAfterMs === 'number' ? { retryAfterMs: verdict.retryAfterMs } : {}),
     });
   }
@@ -338,6 +415,7 @@ export async function runAndSubmitReview(
         ? 'required_contexts_unavailable_blocked'
         : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
       event: 'COMMENT',
+      ...summaryField(verdict),
     });
   }
 
@@ -386,7 +464,21 @@ export async function runAndSubmitReview(
   return finish(deps, work, work.headSha, {
     disposition: verdict.approved ? 'approved' : 'changes_requested',
     event,
+    ...summaryField(verdict),
   });
+}
+
+/**
+ * The reviewer's posted text, as an optional outcome field.
+ *
+ * Only emitted when the verdict actually carries text, so an outcome never
+ * gains an empty `summary` key that a consumer could mistake for evidence. The
+ * spread form keeps every terminal branch's shape identical to what it was
+ * before this field existed when there is nothing to carry.
+ */
+function summaryField(verdict: ReviewerVerdict): { summary?: string } {
+  const summary = verdict.summary?.trim() ?? '';
+  return summary.length > 0 ? { summary } : {};
 }
 
 function errorCode(error: unknown): string {
@@ -415,5 +507,7 @@ async function finish(
   } catch {
     // Receipt failure never converts a classified outcome into a throw.
   }
+  // The retry instant is part of the outcome, not the receipt: the worker reads
+  // it off the return value to schedule the deferral.
   return outcome;
 }
