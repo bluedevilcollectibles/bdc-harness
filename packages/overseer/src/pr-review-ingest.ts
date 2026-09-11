@@ -166,7 +166,7 @@ export function countConsecutiveAutoRereviews(
 ): number {
   let count = 0;
   for (let index = 0; index < prior.length; index += 1) {
-    const work = prior[index]!;
+    const work = prior[index];
     // A ROW WITH NO VERDICT IS NOT AN ATTEMPT, automatic or not.
     //
     // Review finding (Overseer, PR #803): the first cut counted every
@@ -681,7 +681,8 @@ export async function ingestPullRequestEvent(
           ? 'rereview_attempts_exhausted'
           : null;
     if (blockedReason) {
-      const firedRule = blockedReason === 'rereview_total_ceiling_reached' ? 'total' : 'consecutive';
+      const firedRule =
+        blockedReason === 'rereview_total_ceiling_reached' ? 'total' : 'consecutive';
       // SAY SO ON THE PR. The cap previously blocked with HTTP 200 and no
       // visible trace, so the author saw the reviewer simply go quiet.
       let commentPosted: boolean | null = null;
