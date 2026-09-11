@@ -95,8 +95,137 @@ export interface PriorReviewWork {
   isAutoRereview: boolean;
 }
 
-/** Maximum auto-triggered re-reviews per PR; the initial review is not an attempt. */
+/**
+ * Default maximum CONSECUTIVE auto-triggered re-reviews; the initial review is
+ * not an attempt. Override per deployment with OVERSEER_MAX_REREVIEW_ATTEMPTS.
+ */
 export const MAX_REREVIEW_ATTEMPTS = 3;
+
+/** Env var overriding the automatic re-review budget (#797). */
+export const MAX_REREVIEW_ATTEMPTS_ENV = 'OVERSEER_MAX_REREVIEW_ATTEMPTS';
+
+/**
+ * The effective automatic re-review budget (#797).
+ *
+ * The cap was hardcoded at 3, so the only way to let a PR that legitimately
+ * needed a fourth round get one was to edit and redeploy the harness. A
+ * non-numeric, zero, or negative value falls back to the default rather than
+ * disabling the guard: an operator typo must not turn a runaway PR loose on the
+ * judge budget, and `0` is far more likely to be a mistake than a deliberate
+ * "never auto re-review". Fractions are floored so `3.9` cannot buy a fourth
+ * attempt through a comparison technicality.
+ */
+export function resolveMaxRereviewAttempts(
+  env: Record<string, string | undefined> = process.env
+): number {
+  const raw = env[MAX_REREVIEW_ATTEMPTS_ENV];
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1) return MAX_REREVIEW_ATTEMPTS;
+  return Math.floor(parsed);
+}
+
+/**
+ * Counts CONSECUTIVE automatic re-reviews since the last non-automatic review
+ * that actually RAN (#797).
+ *
+ * The bug this fixes: the old count was `prior.filter(isAutoRereview).length`
+ * over the PR's whole history, so the budget could only ever be spent, never
+ * regained. A PR that converged on round five could not get its APPROVED
+ * without an operator, and the hand nudge an operator DID perform bought the PR
+ * exactly one review and then handed it straight back to an exhausted budget --
+ * which is what left #787 and #790 dark on round four on 2026-09-08.
+ *
+ * `prior` is newest-first, so this walks from the newest row and stops at the
+ * first non-automatic review that produced a verdict. That row is the operator
+ * (or initial) look the issue calls the reset point.
+ *
+ * A non-automatic row is only a reset if it RAN. A hand nudge sitting `queued`,
+ * or one `cancelled` by a later push, resolved nothing -- treating it as a reset
+ * would let anyone refill the budget indefinitely by queueing nudges that never
+ * execute, which is the runaway this cap exists to prevent. Rows with no verdict
+ * are therefore skipped entirely: they neither consume the budget nor restore it.
+ */
+export function countConsecutiveAutoRereviews(prior: PriorReviewWork[]): number {
+  let count = 0;
+  for (const work of prior) {
+    // A ROW WITH NO VERDICT IS NOT AN ATTEMPT, automatic or not.
+    //
+    // Review finding (Overseer, PR #803): the first cut counted every
+    // `isAutoRereview` row before asking whether it had been judged, which
+    // contradicted this function's own documented rule and was worse than a
+    // doc mismatch. A row exists from the moment work is QUEUED, so a rapid
+    // push sequence -- push, push, push before any review completes -- created
+    // three unjudged auto rows and exhausted the whole budget before a single
+    // automatic re-review had actually run. That is the exact opposite of the
+    // guard's purpose: the cap exists to stop a PR that never converges from
+    // burning judge budget, and an unjudged row burned none.
+    //
+    // The test is now symmetric. Only a row that reached a verdict counts, in
+    // either direction: an auto verdict spends the budget, a non-auto verdict
+    // (a hand nudge, or the initial review) restores it, and anything still in
+    // flight or cancelled before judging is skipped entirely.
+    if (!isJudgedVerdict(work.verdict)) continue;
+    if (work.isAutoRereview) {
+      count += 1;
+      continue;
+    }
+    // A non-auto review that RAN is the reset point.
+    return count;
+  }
+  return count;
+}
+
+/**
+ * True only when a prior row's verdict means A MODEL ACTUALLY JUDGED THE CODE.
+ *
+ * `null` is the obvious case (queued, claimed, or cancelled before completion).
+ * `'other'` is the subtle one, and it matters: `classifyVerdict` maps EVERY
+ * non-approve/non-changes_requested submit disposition to `'other'`, and the
+ * submit path writes a receipt for all of them -- including the DEFERRALS
+ * `checks_pending` and `transport_error`, where no judge was reached and no
+ * verdict was formed (#789, #790). Counting those as attempts would let a PR
+ * whose CI is merely slow, or whose judge host is briefly unreachable, burn its
+ * entire re-review budget without a single review having happened.
+ *
+ * Symmetrically, `'other'` must not RESET the budget either: a non-auto row
+ * that only deferred is not the operator look the reset represents.
+ */
+function isJudgedVerdict(verdict: PriorReviewWork['verdict']): boolean {
+  return verdict === 'approved' || verdict === 'changes_requested';
+}
+
+/**
+ * Marker embedded in the cap-exhausted PR comment so the same comment is never
+ * posted twice for one head (#797).
+ *
+ * Idempotency has to key on the HEAD, not the PR: a PR can exhaust its budget,
+ * get a hand nudge, converge, regress, and exhaust it again at a later head,
+ * and each of those is a distinct thing the author needs telling about. The
+ * marker is HTML-commented so it is invisible in the rendered comment while
+ * remaining exact-matchable by the adapter.
+ */
+export function rereviewCapCommentMarker(headSha: string): string {
+  return `<!-- overseer:rereview-budget-exhausted:${headSha} -->`;
+}
+
+/**
+ * The comment posted on the PR when the automatic budget is exhausted (#797).
+ *
+ * The whole defect was invisibility: the cap blocked the push with HTTP 200, an
+ * operator receipt, and a log line, so from the PR's side the reviewer simply
+ * stopped answering. This says what happened and what to do about it, in the
+ * one place the person pushing is actually looking.
+ */
+export function buildRereviewCapComment(headSha: string, maxAttempts: number): string {
+  return [
+    rereviewCapCommentMarker(headSha),
+    `Automatic re-review budget (${maxAttempts}) exhausted for this pull request.`,
+    '',
+    `The last review requested changes, and ${maxAttempts} consecutive automatic re-reviews have already run since a maintainer last looked. No review was queued for \`${headSha}\`.`,
+    '',
+    'A maintainer can request one more review with a Dispatch nudge; once a hand-requested review runs, automatic re-reviews resume for later pushes.',
+  ].join('\n');
+}
 
 /**
  * Explicit machine-readable marker prefixing every repeat_reason this module
@@ -209,6 +338,28 @@ export interface IngestDeps {
     author: string;
     repeatReason: string | null;
   }): Promise<{ messageId: string; alreadyExisted: boolean }>;
+  /**
+   * Post the cap-exhausted notice on the PR (#797). MUST be idempotent per
+   * head: the implementation checks for an existing comment carrying
+   * `rereviewCapCommentMarker(headSha)` before creating one, so a repeated
+   * push at the same head does not spam the thread.
+   *
+   * Optional so existing dependency doubles keep compiling; when absent, the
+   * cap still blocks and still writes its receipt -- it just stays silent, i.e.
+   * exactly the pre-#797 behaviour rather than a crash.
+   *
+   * Returns whether a comment was actually created (false = one already
+   * existed), which the receipt records so an operator can tell a first
+   * exhaustion from a repeat.
+   */
+  postCapExhaustedComment?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    body: string;
+    marker: string;
+  }): Promise<{ posted: boolean }>;
   /** Persist a correlated audit receipt. Never throws the ingest path open. */
   recordReceipt(input: {
     correlationId: string;
@@ -457,8 +608,32 @@ export async function ingestPullRequestEvent(
   const priorAtDifferentHead = findAuthorizingPriorReview(prior, headSha);
   let repeatReason: string | null = null;
   if (priorAtDifferentHead?.verdict === 'changes_requested') {
-    const rereviewAttempts = prior.filter(work => work.isAutoRereview).length;
-    if (rereviewAttempts >= MAX_REREVIEW_ATTEMPTS) {
+    // CONSECUTIVE, not lifetime (#797): a hand-requested review that ran resets
+    // the budget, so a PR converging on a later round is not permanently locked
+    // out of automatic review.
+    const maxAttempts = resolveMaxRereviewAttempts();
+    const rereviewAttempts = countConsecutiveAutoRereviews(prior);
+    if (rereviewAttempts >= maxAttempts) {
+      // SAY SO ON THE PR. The cap previously blocked with HTTP 200 and no
+      // visible trace, so the author saw the reviewer simply go quiet.
+      let commentPosted: boolean | null = null;
+      if (deps.postCapExhaustedComment) {
+        try {
+          const outcome = await deps.postCapExhaustedComment({
+            owner,
+            repo,
+            prNumber,
+            headSha,
+            body: buildRereviewCapComment(headSha, maxAttempts),
+            marker: rereviewCapCommentMarker(headSha),
+          });
+          commentPosted = outcome.posted;
+        } catch {
+          // A comment failure must not change the disposition: the block is
+          // correct either way, and the receipt still reaches the operator.
+          commentPosted = false;
+        }
+      }
       const result: IngestResult = {
         disposition: 'blocked',
         status: 200,
@@ -475,7 +650,10 @@ export async function ingestPullRequestEvent(
         prNumber,
         headSha,
         disposition: result.disposition,
-        reason: result.reason,
+        reason:
+          commentPosted === null
+            ? result.reason
+            : `${result.reason}:comment_${commentPosted ? 'posted' : 'existing_or_failed'}`,
       });
       return result;
     }

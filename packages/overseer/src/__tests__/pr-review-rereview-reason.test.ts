@@ -109,12 +109,12 @@ describe('bounded repeat reason policy', () => {
         isAutoRereview: true,
       })
     );
-    const blocked = deps([work(), ...attempts]);
+    const blocked = deps([...attempts, work()]);
     expect((await ingestPullRequestEvent(request(), blocked.value)).reason).toBe(
       'rereview_attempts_exhausted'
     );
     expect(blocked.enqueued).toHaveLength(0);
-    const allowed = deps([work(), ...attempts.slice(0, -1)]);
+    const allowed = deps([...attempts.slice(0, -1), work()]);
     expect((await ingestPullRequestEvent(request(), allowed.value)).disposition).toBe('queued');
   });
 
@@ -166,7 +166,7 @@ describe('auto re-review marker recognition', () => {
         isAutoRereview: isAutoRereviewReason(`review_exact_head:${String(index + 1).repeat(40)}`),
       })
     );
-    const fake = deps([work(), ...legacy]);
+    const fake = deps([...legacy, work()]);
     expect((await ingestPullRequestEvent(request(), fake.value)).disposition).toBe('queued');
     expect(isAutoRereviewReason(fake.enqueued[0]?.repeatReason ?? null)).toBe(true);
   });
@@ -182,7 +182,7 @@ describe('auto re-review marker recognition', () => {
       })
     );
     expect(attempts.every(attempt => attempt.isAutoRereview)).toBe(true);
-    const fake = deps([work(), ...attempts]);
+    const fake = deps([...attempts, work()]);
     expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
       'rereview_attempts_exhausted'
     );
@@ -206,7 +206,7 @@ describe('auto re-review marker recognition', () => {
       headSha: '9'.repeat(40),
       isAutoRereview: isAutoRereviewReason('tm:nudge:follow-up'),
     });
-    const fake = deps([work(), noise, ...autos]);
+    const fake = deps([...autos, noise, work()]);
     expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
       'rereview_attempts_exhausted'
     );
@@ -313,6 +313,9 @@ describe('verdict-bearing prior selection', () => {
         isAutoRereview: true,
       })
     );
+    // Newest-first: a verdict-less cancelled row, then the auto attempts, then
+    // the oldest row -- the initial review. A verdict-less row neither consumes
+    // the budget nor resets it, so the three auto attempts behind it still cap.
     const fake = deps([
       work({
         messageId: 'review-b',
@@ -321,8 +324,8 @@ describe('verdict-bearing prior selection', () => {
         verdict: null,
         verdictId: null,
       }),
-      work(),
       ...attempts,
+      work(),
     ]);
     expect((await ingestPullRequestEvent(request(), fake.value)).reason).toBe(
       'rereview_attempts_exhausted'
