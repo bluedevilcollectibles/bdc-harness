@@ -48,10 +48,23 @@ not the scarce thing; the right to CONSUME an absence action is.**
 
 An expectation is not itself one of Taskmaster's budgeted effects. Its
 `on_absence` action IS one. So the bound is placed there rather than on who may
-ask: `TASKMASTER_EXPECTATION_DAILY_CAP` (default 50) limits registrations per
-registrant per rolling 24 hours. Per-registrant, so one noisy caller cannot
-exhaust anyone else's headroom. Fifty supervised handoffs in a day by one caller
-is a loop, not a busy day.
+ask: `TASKMASTER_EXPECTATION_DAILY_CAP` (default 50) limits registrations across
+the WHOLE front door per rolling 24 hours.
+
+**Deliberately not per registrant.** A per-registrant cap bounds nothing when the
+registrant is a self-declared string: a caller at its limit sends a different
+name and carries on. Counting every externally-registered row (they carry the
+`ext:` key prefix) makes the cap a property of the operator token, which is the
+thing actually authenticated, and no amount of relabelling evades it. Rows the
+loop registered for itself are excluded and stay bounded by the loop's own
+per-tick budgets -- neither side should be able to exhaust the other's headroom.
+
+**A retry under an existing key is exempt.** It creates nothing, so charging it
+would turn the documented idempotent `200` into a `429` the moment a caller got
+busy, punishing exactly the safe retry behaviour the caller-supplied key exists
+to make possible.
+
+Fifty supervised handoffs in a day across all callers is a loop, not a busy day.
 
 **3. A seat MAY register an expectation on itself, EXCEPT to escalate.**
 
@@ -69,8 +82,23 @@ written to end, reconstituted one layer up. To supervise a seat's work with a
 real escalation, register from the ASSIGNING session, which is the party with an
 interest in noticing.
 
-This boundary is enforced in the route, not merely written here. A rule that
-lives only in a document is a rule nobody checks.
+This refusal is enforced in the route, not merely written here. A rule that lives
+only in a document is a rule nobody checks.
+
+**But be honest about what it is.** Both sides of the comparison come from the
+request body, so the check is a CORRECTNESS guard, not a security control: a
+caller holding the operator token can defeat it by naming a registrant other than
+itself. It is worth having because the realistic failure is a seat wiring up its
+own supervision by mistake and believing the result -- not a seat scheming to
+evade oversight it could evade more easily in a dozen other ways. It must simply
+never be mistaken for a boundary that holds against a caller trying to get around
+it. The only thing that could hold there is a registrant derived from an
+authenticated per-seat credential, which is the end state named in ruling 1.
+
+The same caveat is why the CAP is not per registrant: a control built on a
+self-declared field must either be evadeable-but-useful (this one) or be rebuilt
+on something authenticated (the cap). Both findings were raised by the Overseer
+review of PR bdc-harness#810 and are recorded here rather than quietly fixed.
 
 **4. No board motion is required, and here is why.**
 

@@ -53,6 +53,44 @@ describe('expectation front door: route wiring', () => {
     expect(handler).toMatch(/selfSupervised && body\.on_absence === 'escalate'/);
   });
 
+  test('the cap is token-wide, because registered_by is self-declared', () => {
+    // Overseer finding [major] on PR 810: a per-registrant cap bounds nothing
+    // when the registrant is a string in the request body -- a caller at its
+    // limit sends a different name. The enforced count is of every ext: row.
+    const handler = apiSource.slice(
+      apiSource.indexOf('// POST /api/taskmaster/expectations -'),
+      apiSource.indexOf('// GET /api/taskmaster/expectations -')
+    );
+    expect(handler).toContain('countExternalExpectationsSince');
+    expect(handler).not.toContain('countExpectationsRegisteredSince');
+  });
+
+  test('a retry of an existing key never consumes the cap', () => {
+    // Overseer finding [minor] on PR 810: charging a retry would turn the
+    // documented idempotent 200 into a 429 the moment a caller got busy.
+    const handler = apiSource.slice(
+      apiSource.indexOf('// POST /api/taskmaster/expectations -'),
+      apiSource.indexOf('// GET /api/taskmaster/expectations -')
+    );
+    const probeAt = handler.indexOf('expectationKeyExists');
+    const capAt = handler.indexOf('countExternalExpectationsSince');
+    expect(probeAt).toBeGreaterThan(-1);
+    // The existence probe must come FIRST and gate the count.
+    expect(probeAt).toBeLessThan(capAt);
+    expect(handler).toContain('if (!alreadyRegistered)');
+  });
+
+  test('the self-supervision guard is documented as a correctness check, not a boundary', () => {
+    // Both sides come from the request body, so it cannot hold against a caller
+    // trying to get around it. Saying so in the source is what stops a future
+    // reader treating it as a security control it is not.
+    const handler = apiSource.slice(
+      apiSource.indexOf('// POST /api/taskmaster/expectations -'),
+      apiSource.indexOf('// GET /api/taskmaster/expectations -')
+    );
+    expect(handler).toContain('CORRECTNESS guard, not a security control');
+  });
+
   test('the GET surface is read-only', () => {
     const handler = apiSource.slice(
       apiSource.indexOf('// GET /api/taskmaster/expectations -'),

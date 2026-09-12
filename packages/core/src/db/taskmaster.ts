@@ -214,24 +214,45 @@ export async function listExpectations(filter: {
 }
 
 /**
- * How many expectations this registrant has opened since `since`.
+ * How many expectations the FRONT DOOR has opened since `since`, across every
+ * registrant.
  *
- * Counts REGISTRATIONS, not effects. An expectation is not itself one of
- * Taskmaster's budgeted effects -- but its `on_absence` action is, so an
- * unbounded registrant could buy unbounded future escalations one row at a time.
- * This is the denominator the front door's per-caller daily cap is measured on.
- * Rows the loop registered for itself are counted under 'taskmaster' and are
- * bounded by the loop's own per-tick budgets, not by this.
+ * This, not the per-registrant count, is the enforceable bound. `registered_by`
+ * is self-declared by the caller (see TmExpectation), so a per-registrant cap
+ * bounds nothing: a caller at its limit simply sends a different name. Counting
+ * the whole externally-registered population instead makes the cap a property of
+ * the thing that IS authenticated -- the operator token -- and therefore
+ * unevadeable by relabelling.
+ *
+ * Identified by the `ext:` key prefix the route applies, which is the same thing
+ * that keeps external keys from colliding with loop-derived ones. Loop rows carry
+ * no such prefix and are bounded by the loop's own per-tick budgets, so they are
+ * deliberately excluded: the front door must not be able to exhaust the
+ * supervisor's own headroom, nor the supervisor the front door's.
  */
-export async function countExpectationsRegisteredSince(
-  registeredBy: string,
-  since: string
-): Promise<number> {
+export async function countExternalExpectationsSince(since: string): Promise<number> {
   const result = await getDatabase().query<{ count: number }>(
-    'SELECT COUNT(*) AS count FROM tm_expectations WHERE registered_by = $1 AND created_at >= $2',
-    [registeredBy, since]
+    "SELECT COUNT(*) AS count FROM tm_expectations WHERE registration_key LIKE 'ext:%' AND created_at >= $1",
+    [since]
   );
   return result.rows[0]?.count ?? 0;
+}
+
+/**
+ * Does an expectation already exist under this key?
+ *
+ * Lets the route distinguish a NEW registration from a RETRY before it consumes
+ * any budget. A retry of an existing key creates nothing, so charging it against
+ * the cap would turn a documented idempotent 200 into a 429 the moment a caller
+ * got busy -- punishing exactly the safe retry behaviour the key exists to make
+ * possible.
+ */
+export async function expectationKeyExists(registrationKey: string): Promise<boolean> {
+  const result = await getDatabase().query<{ id: string }>(
+    'SELECT id FROM tm_expectations WHERE registration_key = $1 LIMIT 1',
+    [registrationKey]
+  );
+  return result.rows.length > 0;
 }
 
 /**

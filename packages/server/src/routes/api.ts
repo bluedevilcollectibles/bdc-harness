@@ -99,20 +99,24 @@ export const REGISTER_STALE_AFTER_MS =
     : 120_000;
 
 /**
- * Runaway bound on the expectation front door, per registrant per rolling 24h.
+ * Runaway bound on the expectation front door as a whole, per rolling 24h.
  *
- * NOT a workflow limit -- 50 supervised handoffs in a day by one caller is far
- * past any real use, and a caller that hits it has a loop, not a busy day. The
- * bound exists because an expectation's `on_absence` action is a budgeted
- * Taskmaster effect: without it, one caller could buy unbounded future
- * escalations one row at a time and bypass the loop's own per-tick budgets.
- * Per-registrant so one noisy caller cannot exhaust anyone else's headroom.
+ * Deliberately NOT per registrant: `registered_by` is self-declared, so a
+ * per-registrant cap is evaded by sending a different name. Counting every
+ * externally-registered expectation makes the bound a property of the operator
+ * token, which is the thing actually authenticated.
+ *
+ * NOT a workflow limit -- 50 supervised handoffs in a day across all callers is
+ * far past any real use, and hitting it means a loop, not a busy day. The bound
+ * exists because an expectation's `on_absence` action is a budgeted Taskmaster
+ * effect: without it the front door could buy unbounded future escalations one
+ * row at a time, outside the loop's own per-tick budgets.
  */
 const parsedExpectationDailyCap = Number.parseInt(
   process.env.TASKMASTER_EXPECTATION_DAILY_CAP ?? '',
   10
 );
-export const EXPECTATION_DAILY_CAP_PER_REGISTRANT =
+export const EXPECTATION_DAILY_CAP =
   Number.isInteger(parsedExpectationDailyCap) && parsedExpectationDailyCap > 0
     ? parsedExpectationDailyCap
     : 50;
@@ -3442,6 +3446,17 @@ export function registerApiRoutes(
       // human. A seat that can self-register an escalation can also decline to
       // act on it, and nothing else in the system would know. So: recorded and
       // allowed for the inert actions, REFUSED for escalate.
+      //
+      // WHAT THIS CHECK IS AND IS NOT. Both sides of the comparison come from
+      // the request body, so it is a CORRECTNESS guard, not a security control:
+      // a caller holding the operator token can defeat it by naming a registrant
+      // other than itself. It is worth having anyway -- the failure it prevents
+      // is a seat wiring up its own supervision by mistake and believing the
+      // result, which is the realistic mistake -- but it must not be mistaken
+      // for a boundary that holds against a caller trying to get around it.
+      // The only thing that could hold there is a registrant derived from an
+      // authenticated per-seat credential, which does not exist yet; see the
+      // doctrine file for why the field is introduced now regardless.
       // Doctrine: docs/doctrine/taskmaster-expectation-registration.md.
       const selfSupervised =
         body.registered_by.trim().toLowerCase() === body.recipient.trim().toLowerCase();
@@ -3469,31 +3484,48 @@ export function registerApiRoutes(
           );
       }
 
-      // PER-CALLER DAILY CAP. An expectation is not itself one of Taskmaster's
-      // budgeted effects, but its on_absence action IS one -- so an unbounded
-      // registrant could buy unbounded future escalations one row at a time.
-      // Scoped per registrant so one noisy caller cannot exhaust another's
-      // budget, and deliberately generous: this is a runaway bound, not a
-      // workflow limit.
-      const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      const registeredToday = await taskmasterDb.countExpectationsRegisteredSince(
-        body.registered_by,
-        dayAgo
-      );
-      if (registeredToday >= EXPECTATION_DAILY_CAP_PER_REGISTRANT)
-        return apiError(
-          c,
-          429,
-          `Registrant ${body.registered_by} has opened ${String(registeredToday)} expectations ` +
-            `in 24h (cap ${String(EXPECTATION_DAILY_CAP_PER_REGISTRANT)})`
-        );
-
       // NAMESPACE THE KEY. The loop's own keys are "<action id>:<dispatch_ref>"
       // or a bare dispatch_ref; prefixing external ones makes a collision
       // between a caller's chosen key and a loop-derived key impossible, so a
       // caller cannot -- by accident or otherwise -- adopt or block the row the
-      // loop opened for one of its own dispatches.
+      // loop opened for one of its own dispatches. It is also what identifies
+      // the externally-registered population for the cap below.
       const registrationKey = `ext:${body.registered_by}:${body.registration_key}`;
+
+      // DAILY CAP ON THE FRONT DOOR AS A WHOLE -- NOT PER REGISTRANT.
+      //
+      // A per-registrant cap bounds nothing, because `registered_by` is
+      // self-declared: a caller at its limit sends a different name and carries
+      // on. The cap therefore counts every externally-registered expectation
+      // (the `ext:` prefix) and is a property of the thing that actually IS
+      // authenticated -- the operator token -- so relabelling cannot evade it.
+      // `registered_by` remains an audit and attribution field, which is all a
+      // self-declared value can honestly be.
+      //
+      // The bound exists because an expectation is not itself one of
+      // Taskmaster's budgeted effects but its `on_absence` action IS one, so an
+      // unbounded front door could buy unbounded future escalations one row at a
+      // time. Loop-registered rows are excluded: they are bounded by the loop's
+      // own per-tick budgets, and neither side should be able to exhaust the
+      // other's headroom.
+      //
+      // AN EXISTING KEY IS EXEMPT. A retry under a key that already exists
+      // creates nothing, so charging it would turn the documented idempotent
+      // 200 into a 429 the moment a caller got busy -- punishing exactly the
+      // safe retry behaviour the caller-supplied key exists to make possible.
+      const alreadyRegistered = await taskmasterDb.expectationKeyExists(registrationKey);
+      if (!alreadyRegistered) {
+        const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const registeredToday = await taskmasterDb.countExternalExpectationsSince(dayAgo);
+        if (registeredToday >= EXPECTATION_DAILY_CAP)
+          return apiError(
+            c,
+            429,
+            `The expectation front door has opened ${String(registeredToday)} expectations ` +
+              `in 24h (cap ${String(EXPECTATION_DAILY_CAP)}); retries of an existing ` +
+              'registration_key are always accepted'
+          );
+      }
       // Registration is idempotent on the key, so a retry is a 200 and not a
       // duplicate. `created` reports WHICH happened -- a caller that believes it
       // opened a fresh 24h expectation when it actually matched a key whose

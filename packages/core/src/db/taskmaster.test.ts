@@ -38,7 +38,8 @@ import {
   registerExpectation,
   registerExpectationReportingCreation,
   listExpectations,
-  countExpectationsRegisteredSince,
+  countExternalExpectationsSince,
+  expectationKeyExists,
   listDueExpectations,
   markMet,
   markFailed,
@@ -2093,7 +2094,10 @@ describe('expectation front door (bdc-xo#2007)', () => {
     expect(rows.rows[0]?.self_supervised).toBe(0);
   });
 
-  test('the daily count is scoped per registrant', async () => {
+  test('the cap counts the whole front door, not one self-declared registrant', async () => {
+    // registered_by is self-declared, so a per-registrant count bounds nothing:
+    // a caller at its limit sends a different name. The enforced count is of
+    // every ext: row, which makes the bound a property of the operator token.
     for (const n of [1, 2, 3]) {
       await registerExpectationReportingCreation({
         registration_key: `ext:xo:count-${String(n)}`,
@@ -2117,10 +2121,33 @@ describe('expectation front door (bdc-xo#2007)', () => {
       registered_by: 'codex',
     });
     const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
-    // One caller's registrations must not consume another's budget.
-    expect(await countExpectationsRegisteredSince('xo', dayAgo)).toBe(3);
-    expect(await countExpectationsRegisteredSince('codex', dayAgo)).toBe(1);
-    expect(await countExpectationsRegisteredSince('nobody', dayAgo)).toBe(0);
+    // Renaming the registrant does NOT reset the count.
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(4);
+  });
+
+  test("the cap excludes the loop's own rows, so neither side starves the other", async () => {
+    await registerExpectation({
+      dispatch_ref: 'loop-not-counted',
+      recipient: 'operator',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:counted',
+      dispatch_ref: 'ref-counted',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    // The loop row exists but is not chargeable to the front door.
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(1);
+    expect((await listExpectations({ limit: 10 })).total).toBe(2);
   });
 
   test('the count window excludes rows older than the cutoff', async () => {
@@ -2135,7 +2162,25 @@ describe('expectation front door (bdc-xo#2007)', () => {
       registered_by: 'xo',
     });
     const tomorrow = new Date(Date.now() + 86_400_000).toISOString();
-    expect(await countExpectationsRegisteredSince('xo', tomorrow)).toBe(0);
+    expect(await countExternalExpectationsSince(tomorrow)).toBe(0);
+  });
+
+  test('expectationKeyExists distinguishes a retry from a new registration', async () => {
+    // This is what lets a retry bypass the cap: a repeat under an existing key
+    // creates nothing, so charging it would turn the documented idempotent 200
+    // into a 429 and punish exactly the safe retry the key exists to enable.
+    expect(await expectationKeyExists('ext:xo:probe-1')).toBe(false);
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:probe-1',
+      dispatch_ref: 'ref-probe',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    expect(await expectationKeyExists('ext:xo:probe-1')).toBe(true);
   });
 
   test('an externally registered expectation is picked up by the due sweep', async () => {
