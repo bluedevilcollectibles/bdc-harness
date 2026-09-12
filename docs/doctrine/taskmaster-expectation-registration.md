@@ -74,6 +74,19 @@ regression test ('CONCURRENT registrations cannot exceed the cap') fails against
 the old shape. A bound whose job is to stop a runaway must not itself have a
 runaway window.
 
+**Atomic is not serializable.** The single-statement predicate is the whole
+answer on SQLite -- one writer at a time -- which is the dialect production
+actually runs (verified 2026-09-11: no `DATABASE_URL`, a 1.1 GB
+`/opt/bdc/archon-data/archon.db`). It is NOT the whole answer on PostgreSQL,
+where READ COMMITTED gives each statement its own snapshot: concurrent
+transactions with DISTINCT keys could each count the same below-cap total and
+each insert, and `ON CONFLICT` cannot save the bound because the keys do not
+collide. The capped path therefore also takes a `FOR UPDATE` row lock on the
+`tm_control` singleton under Postgres -- the same instrument this module already
+uses to fence pause state -- which orders the counts. Uncapped registrations
+(the loop's own, and exempt retries) take no lock, so the supervisor never
+queues behind the front door.
+
 Fifty supervised handoffs in a day across all callers is a loop, not a busy day.
 
 **3. A seat MAY register an expectation on itself, EXCEPT to escalate.**

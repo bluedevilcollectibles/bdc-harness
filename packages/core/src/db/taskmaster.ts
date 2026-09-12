@@ -386,10 +386,16 @@ export type RegisterExpectationResult =
  * rather than reproduce.
  *
  * So the count is evaluated by the database as part of the same statement that
- * writes: `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap`. The
- * subquery and the insert are one atomic unit under both dialects, so a racing
- * writer either sees the earlier row in its own count or is serialized behind
- * it. No extra locking, no dialect-specific SQL.
+ * writes: `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap`. On SQLite
+ * that is the whole answer -- one writer at a time, so the subquery cannot
+ * observe a state another writer is midway through changing.
+ *
+ * On PostgreSQL it is NOT, and atomic must not be confused with serializable:
+ * under READ COMMITTED each statement takes its own snapshot, so concurrent
+ * transactions with DISTINCT keys can each count the same below-cap total and
+ * each insert. The capped path therefore also takes a FOR UPDATE row lock on
+ * the tm_control singleton under Postgres, which orders the counts. See the
+ * comment at the insert for why that instrument and not SERIALIZABLE.
  *
  * A retry under an EXISTING key is exempt: the ON CONFLICT arm absorbs it before
  * the cap can reject it, so the documented idempotent 200 holds even at the cap.
@@ -432,16 +438,47 @@ export async function registerExpectationReportingCreation(
       ' WHERE (SELECT COUNT(*) FROM tm_expectations' +
       " WHERE registration_key LIKE 'ext:%' AND created_at >= $12) < $13";
   }
-  const inserted = await db.query<{ id: string }>(
-    `INSERT INTO tm_expectations
+  const insertSql = `INSERT INTO tm_expectations
      (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
       max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
      SELECT $1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11${capClause}
      ON CONFLICT (registration_key) DO NOTHING
-     RETURNING id`,
-    params
-  );
-  const createdId = inserted.rows[0]?.id;
+     RETURNING id`;
+
+  // POSTGRES NEEDS AN EXPLICIT LOCK; SQLITE DOES NOT.
+  //
+  // The cap predicate lives inside the INSERT, which is sufficient on SQLite:
+  // one writer at a time, so the subquery cannot observe a state another writer
+  // is midway through changing.
+  //
+  // It is NOT sufficient on PostgreSQL. Under the default READ COMMITTED
+  // isolation each statement takes its own snapshot, and rows inserted by a
+  // concurrent uncommitted transaction are invisible to it -- so N callers with
+  // DISTINCT registration keys can each count the same below-cap total and each
+  // insert, and ON CONFLICT cannot save the bound because the keys do not
+  // collide. A single statement is atomic; it is not serializable.
+  //
+  // So the capped path serializes on the tm_control singleton with FOR UPDATE,
+  // the same instrument this module already uses to fence pause state. Every
+  // capped registration takes that row lock first, which orders the counts:
+  // the second caller blocks until the first commits and then sees its row.
+  // SERIALIZABLE plus retry would also work, but costs a retry loop on a path
+  // that is not hot, and this repo already has the FOR UPDATE idiom.
+  //
+  // UNCAPPED registrations (the loop's own, and exempt retries) take no lock:
+  // they are bounded elsewhere and must not queue behind the front door.
+  const runInsert = async (
+    query: <U>(sql: string, p?: unknown[]) => Promise<QueryResult<U>>
+  ): Promise<string | undefined> => {
+    if (applyCap && db.dialect === 'postgres')
+      await query('SELECT epoch FROM tm_control WHERE id = 1 FOR UPDATE');
+    const result = await query<{ id: string }>(insertSql, params);
+    return result.rows[0]?.id;
+  };
+  const createdId =
+    applyCap && db.dialect === 'postgres'
+      ? await db.withTransaction(runInsert)
+      : await runInsert(db.query.bind(db));
   const existing = await db.query<TmExpectation>(
     'SELECT * FROM tm_expectations WHERE registration_key = $1',
     [data.registration_key]

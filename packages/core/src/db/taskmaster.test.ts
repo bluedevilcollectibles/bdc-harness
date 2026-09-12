@@ -2352,3 +2352,97 @@ describe('front door daily cap is enforced in the write (Overseer PR 810)', () =
     expect(await countExternalExpectationsSince(dayAgo)).toBe(5);
   });
 });
+
+describe('front door cap serializes on PostgreSQL (Overseer PR 810 round 3)', () => {
+  // The SQLite concurrency test above proves the bound on the dialect production
+  // actually runs (verified live 2026-09-11: no DATABASE_URL, a 1.1 GB
+  // /opt/bdc/archon-data/archon.db). It CANNOT prove it on PostgreSQL, where
+  // READ COMMITTED gives each statement its own snapshot -- so an atomic
+  // statement is not a serializable one, and concurrent transactions with
+  // DISTINCT keys could each count the same below-cap total and each insert.
+  //
+  // There is no Postgres instance in this suite, so what is asserted here is the
+  // MECHANISM: the capped path opens a transaction and takes the tm_control row
+  // lock BEFORE the insert, and the uncapped paths take neither.
+  const spec = JSON.stringify({ kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' });
+
+  /** A fake Postgres adapter that records the statements it is handed. */
+  function postgresSpy(): { adapter: SqliteAdapter; statements: string[] } {
+    const statements: string[] = [];
+    const query = async <T>(sql: string): Promise<{ rows: T[]; rowCount: number }> => {
+      statements.push(sql.trim().replace(/\s+/gu, ' '));
+      // Every read comes back empty. The insert then looks like a cap rejection
+      // and the lookup like a missing row, which is a clean `capped` return --
+      // and irrelevant here, because the statement ORDER is what is under test.
+      return { rows: [], rowCount: 0 };
+    };
+    const adapter = {
+      dialect: 'postgres',
+      query,
+      withTransaction: <T>(fn: (q: typeof query) => Promise<T>): Promise<T> => fn(query),
+    } as unknown as SqliteAdapter;
+    return { adapter, statements };
+  }
+
+  async function registerAgainstSpy(
+    statements: string[],
+    adapter: SqliteAdapter,
+    extra: { daily_cap?: number; cap_exempt?: boolean }
+  ): Promise<void> {
+    const real = db;
+    db = adapter;
+    try {
+      await registerExpectationReportingCreation({
+        registration_key: `ext:xo:pg-${String(statements.length)}`,
+        dispatch_ref: 'ref-pg',
+        recipient: 'fable-cursor',
+        evidence_json: spec,
+        due_at: new Date(Date.now() + 86_400_000).toISOString(),
+        on_absence: 'escalate',
+        max_retries: 0,
+        registered_by: 'xo',
+        ...extra,
+      });
+    } catch {
+      // An uncapped call with no row throws by design; the statements it issued
+      // are already recorded, which is all this test reads.
+    } finally {
+      db = real;
+    }
+  }
+
+  test('the capped path locks tm_control BEFORE inserting', async () => {
+    const spy = postgresSpy();
+    await registerAgainstSpy(spy.statements, spy.adapter, { daily_cap: 5 });
+    const lockAt = spy.statements.findIndex(s => s.includes('FOR UPDATE'));
+    const insertAt = spy.statements.findIndex(s => s.startsWith('INSERT INTO tm_expectations'));
+    expect(lockAt).toBeGreaterThan(-1);
+    expect(insertAt).toBeGreaterThan(-1);
+    // ORDER IS THE POINT. A lock taken after the insert serializes nothing.
+    expect(lockAt).toBeLessThan(insertAt);
+    expect(spy.statements[lockAt]).toContain('tm_control');
+  });
+
+  test('an UNCAPPED registration takes no lock, so the loop never queues behind the front door', async () => {
+    const spy = postgresSpy();
+    await registerAgainstSpy(spy.statements, spy.adapter, {});
+    expect(spy.statements.some(s => s.includes('FOR UPDATE'))).toBe(false);
+    expect(spy.statements.some(s => s.startsWith('INSERT INTO tm_expectations'))).toBe(true);
+  });
+
+  test('an EXEMPT retry takes no lock either', async () => {
+    const spy = postgresSpy();
+    await registerAgainstSpy(spy.statements, spy.adapter, { daily_cap: 5, cap_exempt: true });
+    expect(spy.statements.some(s => s.includes('FOR UPDATE'))).toBe(false);
+  });
+
+  test('the cap predicate is absent from an uncapped insert', () => {
+    // Belt and braces: an uncapped call must not carry the cap subquery at all,
+    // or the loop's own registrations would be bounded by the front door's cap.
+    const spy = postgresSpy();
+    return registerAgainstSpy(spy.statements, spy.adapter, {}).then(() => {
+      const insert = spy.statements.find(s => s.startsWith('INSERT INTO tm_expectations')) ?? '';
+      expect(insert).not.toContain('SELECT COUNT(*)');
+    });
+  });
+});
