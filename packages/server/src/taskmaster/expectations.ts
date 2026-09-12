@@ -710,7 +710,15 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         // and the loop did not close.
         recipient: 'xo',
         priority: 'blocker',
-        subject_key: `tm-expectation:${expectation.id}`,
+        // NO subject_key. normalizeDispatchSubjectKey accepts exactly three
+        // shapes -- wo:WO-..., digest:YYYY-MM-DD, gh:owner/repo#N -- and THROWS
+        // on anything else. An expectation id is none of them, so setting one
+        // here would make createAuthenticatedMessage throw at the moment of
+        // escalation and leave the row stuck in 'escalating' forever. That is
+        // the same shape of defect as the one this WO is fixing, and the same
+        // shape as the M-129 hardening that silently killed every digest send
+        // from 2026-08-25 onward. The idempotency_key already dedupes the
+        // replay, which is the only thing subject_key would have bought here.
         body: renderEscalationBody(expectation),
       }
     );

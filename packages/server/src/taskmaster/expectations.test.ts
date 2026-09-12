@@ -1215,6 +1215,28 @@ describe('escalation reaches a human (bdc-xo#2007)', () => {
     expect(sent[0]?.priority).toBe('blocker');
   });
 
+  test('the escalation carries no subject_key, which would throw and strand it', async () => {
+    // normalizeDispatchSubjectKey accepts ONLY wo:WO-..., digest:YYYY-MM-DD and
+    // gh:owner/repo#N, and throws 'dispatch_subject_key_invalid:shape' on
+    // anything else. An expectation id is none of those. A subject_key here
+    // would make the send throw at the moment of escalation and leave the row
+    // stuck in 'escalating' -- losing the escalation this WO exists to deliver.
+    // Caught live: the first draft of this fix set one.
+    const keys: (string | undefined)[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [escalating],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      claimEscalation: async () => true,
+      markEscalated: async () => true,
+      createTask: async (_context, data) => {
+        keys.push((data as { subject_key?: string }).subject_key);
+        return { id: 'd' } as never;
+      },
+    } as never);
+    expect(keys).toEqual([undefined]);
+  });
+
   test('escalation body is readable without opening the database', async () => {
     const sent: string[] = [];
     await checkExpectations(new Date(), {
