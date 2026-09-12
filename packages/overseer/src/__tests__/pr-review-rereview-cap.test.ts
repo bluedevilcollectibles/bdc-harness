@@ -228,15 +228,20 @@ describe('#797 item 4 -- green fixed pushes re-arm within a lifetime ceiling', (
   });
 
   test('moved heads with red CI do not re-arm', async () => {
-    expect((await ingestPullRequestEvent(request(), deps(autoAttempts(3), { ci: false }).value)).reason).toBe(
-      'rereview_attempts_exhausted'
-    );
+    expect(
+      (await ingestPullRequestEvent(request(), deps(autoAttempts(3), { ci: false }).value)).reason
+    ).toBe('rereview_attempts_exhausted');
   });
 
   test('unavailable CI fails closed', async () => {
-    expect((await ingestPullRequestEvent(request(), deps(autoAttempts(3), { ci: new Error('outage') }).value)).reason).toBe(
-      'rereview_attempts_exhausted'
-    );
+    expect(
+      (
+        await ingestPullRequestEvent(
+          request(),
+          deps(autoAttempts(3), { ci: new Error('outage') }).value
+        )
+      ).reason
+    ).toBe('rereview_attempts_exhausted');
   });
 
   test('ten productive rounds bind at the lifetime hard ceiling', async () => {
