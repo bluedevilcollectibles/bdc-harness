@@ -23,15 +23,20 @@ import {
   createRealOctokitClient,
   createRealReadOnlyPatOctokitClient,
   createRealSubmitPullRequestReview,
+  summarizeChecks,
 } from './adapters/github-real-deps';
+import type { ExactHeadPullRequestEvidence } from './adapters/github-real-deps.ts';
 import {
   MAX_REREVIEW_ATTEMPTS_ENV,
+  MAX_TOTAL_REREVIEWS_ENV,
   isAutoRereviewReason,
   resolveMaxRereviewAttempts,
+  resolveMaxTotalRereviews,
 } from './pr-review-ingest';
 import type { IngestDeps, PriorReviewWork } from './pr-review-ingest.ts';
 import {
   configuredReviewIdentity,
+  checksAreTerminal,
   evaluatePullRequest,
   invokeConfiguredReviewModel,
   reviewErrorCode,
@@ -56,6 +61,16 @@ export const REVIEW_RECIPIENT = 'overseer-reviewer';
 export interface ReviewRouteConfig {
   webhookSecret: string;
   reviewerIdentity: string;
+}
+
+/** Fail-closed CI-green decision shared by the production binding and tests. */
+export function isExactHeadCiGreen(evidence: ExactHeadPullRequestEvidence): boolean {
+  const summary = summarizeChecks(evidence.checks);
+  return (
+    checksAreTerminal(evidence.checks, evidence.requiredContexts) &&
+    summary.failed === 0 &&
+    summary.pending === 0
+  );
 }
 
 /**
@@ -84,6 +99,7 @@ export interface ReviewWorkBody {
   headSha: string;
   baseRef: string;
   author: string;
+  headCiGreen: boolean;
 }
 
 export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
@@ -104,6 +120,7 @@ export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
       headSha: value.headSha,
       baseRef: typeof value.baseRef === 'string' ? value.baseRef : '',
       author: typeof value.author === 'string' ? value.author : '',
+      headCiGreen: value.headCiGreen === true,
     };
   } catch {
     return null;
@@ -517,16 +534,27 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
   // getting reviews should be able to read the cap out of the container log
   // rather than inferring it from source.
   const maxRereviewAttempts = resolveMaxRereviewAttempts();
+  const maxTotalRereviews = resolveMaxTotalRereviews();
   log.info(
     {
       maxRereviewAttempts,
+      maxTotalRereviews,
       source: process.env[MAX_REREVIEW_ATTEMPTS_ENV] ? MAX_REREVIEW_ATTEMPTS_ENV : 'default',
+      totalSource: process.env[MAX_TOTAL_REREVIEWS_ENV] ? MAX_TOTAL_REREVIEWS_ENV : 'default',
     },
     'overseer.pr_review.rereview_budget_configured'
   );
   return {
     webhookSecret: config.webhookSecret,
     reviewerIdentity: config.reviewerIdentity,
+
+    async isHeadCiGreen(input): Promise<boolean> {
+      const evidence = await createRealFetchExactHeadPullRequestEvidence(
+        createRealOctokitClient(),
+        createRealReadOnlyPatOctokitClient() ?? undefined
+      )(input);
+      return isExactHeadCiGreen(evidence);
+    },
 
     async postCapExhaustedComment(input): Promise<{ posted: boolean }> {
       return postCapExhaustedCommentWith(
@@ -605,6 +633,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
             // `!== null` would exhaust the budget on rows that were never
             // automatic re-reviews. See AUTO_REREVIEW_REASON_PREFIX.
             isAutoRereview: isAutoRereviewReason(message.repeat_reason),
+            headCiGreen: body?.headCiGreen === true,
           };
         })
         .filter((work): work is PriorReviewWork => work.headSha !== '');
@@ -639,6 +668,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         headSha: input.headSha,
         baseRef: input.baseRef,
         author: input.author,
+        headCiGreen: input.headCiGreen,
       };
       const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
       // createAuthenticatedMessage is idempotent on idempotency_key: it returns the
