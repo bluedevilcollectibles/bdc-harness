@@ -36,6 +36,10 @@ import {
   resetTaskmaster,
   recordUsageSample,
   registerExpectation,
+  registerExpectationReportingCreation,
+  listExpectations,
+  countExternalExpectationsSince,
+  expectationKeyExists,
   listDueExpectations,
   markMet,
   markFailed,
@@ -2012,5 +2016,433 @@ describe('tm_suppression DAL (M-155 exception push)', () => {
       }
     );
     expect(repeat.repeat_reason).toBe('tm:nudge:follow-up');
+  });
+});
+
+describe('expectation front door (bdc-xo#2007)', () => {
+  const spec = JSON.stringify({ kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' });
+  const future = (): string => new Date(Date.now() + 86_400_000).toISOString();
+
+  test('a caller-supplied key replaces the derived one and is idempotent', async () => {
+    const first = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:fuelglass-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    expect(first.created).toBe(true);
+
+    // The SAME key with a DIFFERENT deadline must match the existing row, not
+    // open a second expectation and not move the first one's deadline.
+    const laterDeadline = new Date(Date.now() + 7 * 86_400_000).toISOString();
+    const second = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:fuelglass-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: laterDeadline,
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    expect(second.created).toBe(false);
+    expect(second.id).toBe(first.id);
+    expect(second.expectation.due_at).toBe(first.expectation.due_at);
+    expect(second.expectation.due_at).not.toBe(laterDeadline);
+
+    const all = await listExpectations({ limit: 50 });
+    expect(all.rows.filter(r => r.registration_key === 'ext:xo:fuelglass-1')).toHaveLength(1);
+  });
+
+  test('registered_by and self_supervised are persisted and readable', async () => {
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:grok:self-1',
+      dispatch_ref: 'ref-self',
+      recipient: 'grok',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'give_up',
+      max_retries: 0,
+      registered_by: 'grok',
+      self_supervised: true,
+    });
+    const rows = await listExpectations({ registered_by: 'grok', limit: 10 });
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]?.registered_by).toBe('grok');
+    expect(rows.rows[0]?.self_supervised).toBe(1);
+  });
+
+  test("the loop's own registrations are attributed to taskmaster, not to a caller", async () => {
+    // registerExpectation is the loop's path and passes no registrant, so the
+    // default must be the loop -- otherwise loop rows would land in whichever
+    // caller's daily budget happened to be the default.
+    await registerExpectation({
+      dispatch_ref: 'loop-dispatch-1',
+      recipient: 'operator',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    const rows = await listExpectations({ registered_by: 'taskmaster', limit: 10 });
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]?.dispatch_ref).toBe('loop-dispatch-1');
+    expect(rows.rows[0]?.self_supervised).toBe(0);
+  });
+
+  test('the cap counts the whole front door, not one self-declared registrant', async () => {
+    // registered_by is self-declared, so a per-registrant count bounds nothing:
+    // a caller at its limit sends a different name. The enforced count is of
+    // every ext: row, which makes the bound a property of the operator token.
+    for (const n of [1, 2, 3]) {
+      await registerExpectationReportingCreation({
+        registration_key: `ext:xo:count-${String(n)}`,
+        dispatch_ref: `ref-${String(n)}`,
+        recipient: 'fable-cursor',
+        evidence_json: spec,
+        due_at: future(),
+        on_absence: 'escalate',
+        max_retries: 0,
+        registered_by: 'xo',
+      });
+    }
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:codex:count-1',
+      dispatch_ref: 'ref-codex',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'codex',
+    });
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    // Renaming the registrant does NOT reset the count.
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(4);
+  });
+
+  test("the cap excludes the loop's own rows, so neither side starves the other", async () => {
+    await registerExpectation({
+      dispatch_ref: 'loop-not-counted',
+      recipient: 'operator',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:counted',
+      dispatch_ref: 'ref-counted',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    // The loop row exists but is not chargeable to the front door.
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(1);
+    expect((await listExpectations({ limit: 10 })).total).toBe(2);
+  });
+
+  test('the count window excludes rows older than the cutoff', async () => {
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:window-1',
+      dispatch_ref: 'ref-window',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    const tomorrow = new Date(Date.now() + 86_400_000).toISOString();
+    expect(await countExternalExpectationsSince(tomorrow)).toBe(0);
+  });
+
+  test('expectationKeyExists distinguishes a retry from a new registration', async () => {
+    // This is what lets a retry bypass the cap: a repeat under an existing key
+    // creates nothing, so charging it would turn the documented idempotent 200
+    // into a 429 and punish exactly the safe retry the key exists to enable.
+    expect(await expectationKeyExists('ext:xo:probe-1')).toBe(false);
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:probe-1',
+      dispatch_ref: 'ref-probe',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    expect(await expectationKeyExists('ext:xo:probe-1')).toBe(true);
+  });
+
+  test('an externally registered expectation is picked up by the due sweep', async () => {
+    // The whole point of the front door: a row a session registered must be
+    // supervised by exactly the same loop that supervises the loop's own rows.
+    const { id } = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:swept-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: new Date(Date.now() - 1000).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    const due = await listDueExpectations(new Date().toISOString());
+    expect(due.map(r => r.id)).toContain(id);
+  });
+
+  test('listExpectations filters by status and reports the unfiltered total', async () => {
+    const { id } = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:status-1',
+      dispatch_ref: 'ref-status',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:status-2',
+      dispatch_ref: 'ref-status-2',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    await markMet(id, 'https://example/pr/1');
+    const met = await listExpectations({ status: 'met', limit: 10 });
+    expect(met.rows).toHaveLength(1);
+    expect(met.total).toBe(1);
+    expect(met.rows[0]?.id).toBe(id);
+    expect(met.rows[0]?.evidence_pointer).toBe('https://example/pr/1');
+    const pending = await listExpectations({ status: 'pending', limit: 10 });
+    expect(pending.rows).toHaveLength(1);
+  });
+
+  test('limit caps the rows returned but not the reported total', async () => {
+    for (const n of [1, 2, 3, 4]) {
+      await registerExpectationReportingCreation({
+        registration_key: `ext:xo:limit-${String(n)}`,
+        dispatch_ref: `ref-limit-${String(n)}`,
+        recipient: 'fable-cursor',
+        evidence_json: spec,
+        due_at: future(),
+        on_absence: 'escalate',
+        max_retries: 0,
+        registered_by: 'xo',
+      });
+    }
+    const page = await listExpectations({ limit: 2 });
+    expect(page.rows).toHaveLength(2);
+    // A caller paging the registry must be told how much it has NOT seen.
+    expect(page.total).toBe(4);
+  });
+});
+
+describe('front door daily cap is enforced in the write (Overseer PR 810)', () => {
+  const spec = JSON.stringify({ kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' });
+  const future = (): string => new Date(Date.now() + 86_400_000).toISOString();
+
+  const register = (
+    key: string,
+    extra: { daily_cap?: number; cap_exempt?: boolean; registered_by?: string } = {}
+  ) =>
+    registerExpectationReportingCreation({
+      registration_key: key,
+      dispatch_ref: `ref-${key}`,
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: extra.registered_by ?? 'xo',
+      daily_cap: extra.daily_cap,
+      cap_exempt: extra.cap_exempt,
+    });
+
+  test('the cap refuses the row rather than writing it', async () => {
+    expect((await register('ext:xo:cap-a', { daily_cap: 2 })).capped).toBe(false);
+    expect((await register('ext:xo:cap-b', { daily_cap: 2 })).capped).toBe(false);
+    const third = await register('ext:xo:cap-c', { daily_cap: 2 });
+    expect(third.capped).toBe(true);
+    if (third.capped) expect(third.observed).toBe(2);
+    // The refusal must leave NOTHING behind -- a capped call that still wrote
+    // would both break the bound and hand the caller a supervised-looking row.
+    expect(await expectationKeyExists('ext:xo:cap-c')).toBe(false);
+    expect((await listExpectations({ limit: 20 })).total).toBe(2);
+  });
+
+  test('CONCURRENT registrations cannot exceed the cap', async () => {
+    // THE FINDING. A count-then-insert sequence lets N racing callers all
+    // observe a count below the cap and all then write. The cap is a predicate
+    // inside the INSERT precisely so the database evaluates it as part of the
+    // same statement that writes.
+    const cap = 3;
+    const results = await Promise.all(
+      Array.from({ length: 10 }, (_, i) => register(`ext:xo:race-${String(i)}`, { daily_cap: cap }))
+    );
+    const admitted = results.filter(r => !r.capped);
+    expect(admitted).toHaveLength(cap);
+    expect(results.filter(r => r.capped)).toHaveLength(10 - cap);
+    // And the database agrees -- the bound held in the data, not just in the
+    // return values.
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(cap);
+  });
+
+  test('a retry of an existing key is admitted even at the cap', async () => {
+    await register('ext:xo:retry-me', { daily_cap: 1 });
+    // Cap is now full. A NEW key must be refused...
+    expect((await register('ext:xo:something-new', { daily_cap: 1 })).capped).toBe(true);
+    // ...but the existing key must still return its row, not a 429. This is the
+    // [minor] finding: charging a retry turns the documented idempotent success
+    // into a refusal the moment a caller gets busy.
+    const retry = await register('ext:xo:retry-me', { daily_cap: 1, cap_exempt: true });
+    expect(retry.capped).toBe(false);
+    if (!retry.capped) expect(retry.created).toBe(false);
+  });
+
+  test('renaming the registrant does not buy more headroom', async () => {
+    // registered_by is self-declared, so a per-name cap would be evaded by
+    // simply sending a different name. The cap counts the whole ext: population.
+    expect((await register('ext:xo:n1', { daily_cap: 2, registered_by: 'xo' })).capped).toBe(false);
+    expect((await register('ext:codex:n2', { daily_cap: 2, registered_by: 'codex' })).capped).toBe(
+      false
+    );
+    const third = await register('ext:grok:n3', { daily_cap: 2, registered_by: 'grok' });
+    expect(third.capped).toBe(true);
+  });
+
+  test("the loop's own registrations are neither capped nor counted", async () => {
+    // The loop passes no cap and carries no ext: prefix. Neither side should be
+    // able to exhaust the other's headroom.
+    for (const n of [1, 2, 3, 4, 5]) {
+      await registerExpectation({
+        dispatch_ref: `loop-${String(n)}`,
+        recipient: 'operator',
+        evidence_json: spec,
+        due_at: future(),
+        on_absence: 'escalate',
+        max_retries: 0,
+      });
+    }
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(0);
+    // ...and the front door still has its full budget.
+    expect((await register('ext:xo:after-loop', { daily_cap: 1 })).capped).toBe(false);
+  });
+
+  test('omitting daily_cap skips the cap entirely', async () => {
+    for (const n of [1, 2, 3, 4, 5]) {
+      expect((await register(`ext:xo:uncapped-${String(n)}`)).capped).toBe(false);
+    }
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(5);
+  });
+});
+
+describe('front door cap serializes on PostgreSQL (Overseer PR 810 round 3)', () => {
+  // The SQLite concurrency test above proves the bound on the dialect production
+  // actually runs (verified live 2026-09-11: no DATABASE_URL, a 1.1 GB
+  // /opt/bdc/archon-data/archon.db). It CANNOT prove it on PostgreSQL, where
+  // READ COMMITTED gives each statement its own snapshot -- so an atomic
+  // statement is not a serializable one, and concurrent transactions with
+  // DISTINCT keys could each count the same below-cap total and each insert.
+  //
+  // There is no Postgres instance in this suite, so what is asserted here is the
+  // MECHANISM: the capped path opens a transaction and takes the tm_control row
+  // lock BEFORE the insert, and the uncapped paths take neither.
+  const spec = JSON.stringify({ kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' });
+
+  /** A fake Postgres adapter that records the statements it is handed. */
+  function postgresSpy(): { adapter: SqliteAdapter; statements: string[] } {
+    const statements: string[] = [];
+    const query = async <T>(sql: string): Promise<{ rows: T[]; rowCount: number }> => {
+      statements.push(sql.trim().replace(/\s+/gu, ' '));
+      // Every read comes back empty. The insert then looks like a cap rejection
+      // and the lookup like a missing row, which is a clean `capped` return --
+      // and irrelevant here, because the statement ORDER is what is under test.
+      return { rows: [], rowCount: 0 };
+    };
+    const adapter = {
+      dialect: 'postgres',
+      query,
+      withTransaction: <T>(fn: (q: typeof query) => Promise<T>): Promise<T> => fn(query),
+    } as unknown as SqliteAdapter;
+    return { adapter, statements };
+  }
+
+  async function registerAgainstSpy(
+    statements: string[],
+    adapter: SqliteAdapter,
+    extra: { daily_cap?: number; cap_exempt?: boolean }
+  ): Promise<void> {
+    const real = db;
+    db = adapter;
+    try {
+      await registerExpectationReportingCreation({
+        registration_key: `ext:xo:pg-${String(statements.length)}`,
+        dispatch_ref: 'ref-pg',
+        recipient: 'fable-cursor',
+        evidence_json: spec,
+        due_at: new Date(Date.now() + 86_400_000).toISOString(),
+        on_absence: 'escalate',
+        max_retries: 0,
+        registered_by: 'xo',
+        ...extra,
+      });
+    } catch {
+      // An uncapped call with no row throws by design; the statements it issued
+      // are already recorded, which is all this test reads.
+    } finally {
+      db = real;
+    }
+  }
+
+  test('the capped path locks tm_control BEFORE inserting', async () => {
+    const spy = postgresSpy();
+    await registerAgainstSpy(spy.statements, spy.adapter, { daily_cap: 5 });
+    const lockAt = spy.statements.findIndex(s => s.includes('FOR UPDATE'));
+    const insertAt = spy.statements.findIndex(s => s.startsWith('INSERT INTO tm_expectations'));
+    expect(lockAt).toBeGreaterThan(-1);
+    expect(insertAt).toBeGreaterThan(-1);
+    // ORDER IS THE POINT. A lock taken after the insert serializes nothing.
+    expect(lockAt).toBeLessThan(insertAt);
+    expect(spy.statements[lockAt]).toContain('tm_control');
+  });
+
+  test('an UNCAPPED registration takes no lock, so the loop never queues behind the front door', async () => {
+    const spy = postgresSpy();
+    await registerAgainstSpy(spy.statements, spy.adapter, {});
+    expect(spy.statements.some(s => s.includes('FOR UPDATE'))).toBe(false);
+    expect(spy.statements.some(s => s.startsWith('INSERT INTO tm_expectations'))).toBe(true);
+  });
+
+  test('an EXEMPT retry takes no lock either', async () => {
+    const spy = postgresSpy();
+    await registerAgainstSpy(spy.statements, spy.adapter, { daily_cap: 5, cap_exempt: true });
+    expect(spy.statements.some(s => s.includes('FOR UPDATE'))).toBe(false);
+  });
+
+  test('the cap predicate is absent from an uncapped insert', () => {
+    // Belt and braces: an uncapped call must not carry the cap subquery at all,
+    // or the loop's own registrations would be bounded by the front door's cap.
+    const spy = postgresSpy();
+    return registerAgainstSpy(spy.statements, spy.adapter, {}).then(() => {
+      const insert = spy.statements.find(s => s.startsWith('INSERT INTO tm_expectations')) ?? '';
+      expect(insert).not.toContain('SELECT COUNT(*)');
+    });
   });
 });

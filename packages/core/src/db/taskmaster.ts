@@ -61,6 +61,16 @@ export interface TmExpectation {
   retries: number;
   status: TmExpectationStatus;
   evidence_pointer: string | null;
+  /**
+   * WHO asked for this supervision. 'taskmaster' for rows the loop opened on
+   * its own dispatches; a caller identity for rows registered through the front
+   * door (bdc-xo#2007). Nullable only so a row written before migration 050 by
+   * some path the backfill did not see stays VISIBLE as unattributed rather
+   * than being silently relabelled as the loop's own work.
+   */
+  registered_by: string | null;
+  /** 1 when the registrant named ITSELF as the recipient. */
+  self_supervised: number;
   created_at: string;
   updated_at: string;
 }
@@ -155,10 +165,94 @@ function normalizeExpectation(row: TmExpectation): TmExpectation {
     ...row,
     max_retries: row.max_retries,
     retries: row.retries,
+    registered_by: row.registered_by ?? null,
+    // A row read back from a database that predates migration 050 (or a test
+    // double that omits the column) has no flag at all; absent means "not self
+    // supervised", which is the safe reading -- it never widens what is allowed.
+    self_supervised: row.self_supervised ?? 0,
     due_at: toIso(row.due_at),
     created_at: toIso(row.created_at),
     updated_at: toIso(row.updated_at),
   };
+}
+
+/**
+ * Read the registry. Read-only surface for the front door's GET, so a session
+ * can see what it has registered without opening the database -- the same
+ * reason the POST exists.
+ */
+export async function listExpectations(filter: {
+  status?: TmExpectationStatus;
+  registered_by?: string;
+  limit: number;
+}): Promise<{ rows: TmExpectation[]; total: number }> {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (filter.status) {
+    params.push(filter.status);
+    clauses.push(`status = $${String(params.length)}`);
+  }
+  if (filter.registered_by) {
+    params.push(filter.registered_by);
+    clauses.push(`registered_by = $${String(params.length)}`);
+  }
+  const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+  const db = getDatabase();
+  const total = await db.query<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM tm_expectations${where}`,
+    params
+  );
+  params.push(filter.limit);
+  const rows = await db.query<TmExpectation>(
+    `SELECT * FROM tm_expectations${where} ORDER BY created_at DESC LIMIT $${String(params.length)}`,
+    params
+  );
+  return {
+    rows: rows.rows.map(normalizeExpectation),
+    total: total.rows[0]?.count ?? 0,
+  };
+}
+
+/**
+ * How many expectations the FRONT DOOR has opened since `since`, across every
+ * registrant.
+ *
+ * This, not the per-registrant count, is the enforceable bound. `registered_by`
+ * is self-declared by the caller (see TmExpectation), so a per-registrant cap
+ * bounds nothing: a caller at its limit simply sends a different name. Counting
+ * the whole externally-registered population instead makes the cap a property of
+ * the thing that IS authenticated -- the operator token -- and therefore
+ * unevadeable by relabelling.
+ *
+ * Identified by the `ext:` key prefix the route applies, which is the same thing
+ * that keeps external keys from colliding with loop-derived ones. Loop rows carry
+ * no such prefix and are bounded by the loop's own per-tick budgets, so they are
+ * deliberately excluded: the front door must not be able to exhaust the
+ * supervisor's own headroom, nor the supervisor the front door's.
+ */
+export async function countExternalExpectationsSince(since: string): Promise<number> {
+  const result = await getDatabase().query<{ count: number }>(
+    "SELECT COUNT(*) AS count FROM tm_expectations WHERE registration_key LIKE 'ext:%' AND created_at >= $1",
+    [since]
+  );
+  return result.rows[0]?.count ?? 0;
+}
+
+/**
+ * Does an expectation already exist under this key?
+ *
+ * Lets the route distinguish a NEW registration from a RETRY before it consumes
+ * any budget. A retry of an existing key creates nothing, so charging it against
+ * the cap would turn a documented idempotent 200 into a 429 the moment a caller
+ * got busy -- punishing exactly the safe retry behaviour the key exists to make
+ * possible.
+ */
+export async function expectationKeyExists(registrationKey: string): Promise<boolean> {
+  const result = await getDatabase().query<{ id: string }>(
+    'SELECT id FROM tm_expectations WHERE registration_key = $1 LIMIT 1',
+    [registrationKey]
+  );
+  return result.rows.length > 0;
 }
 
 /**
@@ -201,15 +295,31 @@ export async function registerExpectation(data: {
   max_retries: number;
   /** Journal action id, when the registration is caused by one. */
   action_ref?: string | null;
+  /**
+   * CALLER-SUPPLIED identity, for registrations that do not originate in a
+   * journal action (the front door, bdc-xo#2007). When present it REPLACES the
+   * derived (action_ref, dispatch_ref) key entirely rather than being mixed
+   * with it: an external caller owns its own idempotency, and a key that was
+   * half caller-chosen and half derived would let the same logical request
+   * register twice under two different keys whenever the caller varied its
+   * dispatch_ref. Namespaced by the API so an external key can never collide
+   * with a loop-derived one.
+   */
+  registration_key?: string;
+  /** WHO asked for this supervision. The loop passes 'taskmaster'. */
+  registered_by?: string;
+  /** True when the registrant named itself as the recipient. */
+  self_supervised?: boolean;
 }): Promise<string> {
-  const registrationKey = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+  const registrationKey =
+    data.registration_key ?? expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
   const db = getDatabase();
   const now = new Date().toISOString();
   const inserted = await db.query<{ id: string }>(
     `INSERT INTO tm_expectations
      (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
-      max_retries, retries, status, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $9)
+      max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11)
      ON CONFLICT (registration_key) DO NOTHING
      RETURNING id`,
     [
@@ -221,6 +331,8 @@ export async function registerExpectation(data: {
       data.due_at,
       data.on_absence,
       data.max_retries,
+      data.registered_by ?? 'taskmaster',
+      data.self_supervised ? 1 : 0,
       now,
     ]
   );
@@ -236,6 +348,154 @@ export async function registerExpectation(data: {
   if (!existingRow)
     throw new Error('tm_expectations registration conflict without an existing row');
   return existingRow.id;
+}
+
+/**
+ * Outcome of a front-door registration.
+ *
+ * A discriminated union rather than a nullable row, because "the cap refused
+ * this" and "here is your expectation" have nothing in common to return: a
+ * capped call has no id, no deadline and no row. Forcing the caller to branch on
+ * `capped` is what stops a refusal being read as a registration.
+ */
+export type RegisterExpectationResult =
+  | { capped: false; id: string; created: boolean; expectation: TmExpectation }
+  | { capped: true; observed: number };
+
+/**
+ * Register through the front door, ENFORCING THE DAILY CAP ATOMICALLY.
+ *
+ * Reports whether this call created the row: the bare id cannot distinguish "I
+ * opened supervision for this" from "an expectation under this key already
+ * existed and you are now looking at ITS deadline". For the loop that difference
+ * is immaterial -- idempotency is the whole point. For an external caller it is
+ * not: a session told it registered a 24-hour expectation, when in fact it
+ * matched a key whose deadline passed yesterday, believes work is supervised
+ * that is not. Creation is read from the INSERT's own RETURNING clause, never
+ * from a SELECT taken before it, so two simultaneous first-time callers cannot
+ * both be told they created the row.
+ *
+ * THE CAP IS A PREDICATE INSIDE THE INSERT, NOT A CHECK BEFORE IT.
+ *
+ * Counting rows and then inserting -- even with the count inside a transaction
+ * -- leaves a window under SQLite's default deferred locking: two writers can
+ * both take read locks, both observe a count below the cap, and both then
+ * insert, so the bound is exceeded by however many callers raced. That is a real
+ * hole in a bound whose whole job is to stop a runaway buying unbounded future
+ * escalations, and it is the kind of near-miss this registry exists to prevent
+ * rather than reproduce.
+ *
+ * So the count is evaluated by the database as part of the same statement that
+ * writes: `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap`. On SQLite
+ * that is the whole answer -- one writer at a time, so the subquery cannot
+ * observe a state another writer is midway through changing.
+ *
+ * On PostgreSQL it is NOT, and atomic must not be confused with serializable:
+ * under READ COMMITTED each statement takes its own snapshot, so concurrent
+ * transactions with DISTINCT keys can each count the same below-cap total and
+ * each insert. The capped path therefore also takes a FOR UPDATE row lock on
+ * the tm_control singleton under Postgres, which orders the counts. See the
+ * comment at the insert for why that instrument and not SERIALIZABLE.
+ *
+ * A retry under an EXISTING key is exempt: the ON CONFLICT arm absorbs it before
+ * the cap can reject it, so the documented idempotent 200 holds even at the cap.
+ * (Order matters -- the cap predicate is evaluated first, so an at-cap retry
+ * would insert nothing and the conflict arm would never fire. Hence
+ * `capExempt`, which the route sets for a key it has already seen; the cap
+ * predicate is skipped entirely for those, and idempotency does the rest.)
+ */
+export async function registerExpectationReportingCreation(
+  data: Parameters<typeof registerExpectation>[0] & {
+    registration_key: string;
+    /** Per-24h bound on externally-registered rows. Omit to skip the cap. */
+    daily_cap?: number;
+    /** True when this key already exists, so the retry must not be capped. */
+    cap_exempt?: boolean;
+  }
+): Promise<RegisterExpectationResult> {
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  const applyCap = data.daily_cap !== undefined && data.cap_exempt !== true;
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const params: unknown[] = [
+    randomUUID(),
+    data.registration_key,
+    data.dispatch_ref,
+    data.recipient,
+    data.evidence_json,
+    data.due_at,
+    data.on_absence,
+    data.max_retries,
+    data.registered_by ?? 'taskmaster',
+    data.self_supervised ? 1 : 0,
+    now,
+  ];
+  // The guard reads the SAME `ext:` population the route's cap is defined over.
+  let capClause = '';
+  if (applyCap) {
+    params.push(dayAgo, data.daily_cap);
+    capClause =
+      ' WHERE (SELECT COUNT(*) FROM tm_expectations' +
+      " WHERE registration_key LIKE 'ext:%' AND created_at >= $12) < $13";
+  }
+  const insertSql = `INSERT INTO tm_expectations
+     (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
+      max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
+     SELECT $1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11${capClause}
+     ON CONFLICT (registration_key) DO NOTHING
+     RETURNING id`;
+
+  // POSTGRES NEEDS AN EXPLICIT LOCK; SQLITE DOES NOT.
+  //
+  // The cap predicate lives inside the INSERT, which is sufficient on SQLite:
+  // one writer at a time, so the subquery cannot observe a state another writer
+  // is midway through changing.
+  //
+  // It is NOT sufficient on PostgreSQL. Under the default READ COMMITTED
+  // isolation each statement takes its own snapshot, and rows inserted by a
+  // concurrent uncommitted transaction are invisible to it -- so N callers with
+  // DISTINCT registration keys can each count the same below-cap total and each
+  // insert, and ON CONFLICT cannot save the bound because the keys do not
+  // collide. A single statement is atomic; it is not serializable.
+  //
+  // So the capped path serializes on the tm_control singleton with FOR UPDATE,
+  // the same instrument this module already uses to fence pause state. Every
+  // capped registration takes that row lock first, which orders the counts:
+  // the second caller blocks until the first commits and then sees its row.
+  // SERIALIZABLE plus retry would also work, but costs a retry loop on a path
+  // that is not hot, and this repo already has the FOR UPDATE idiom.
+  //
+  // UNCAPPED registrations (the loop's own, and exempt retries) take no lock:
+  // they are bounded elsewhere and must not queue behind the front door.
+  const runInsert = async (
+    query: <U>(sql: string, p?: unknown[]) => Promise<QueryResult<U>>
+  ): Promise<string | undefined> => {
+    if (applyCap && db.dialect === 'postgres')
+      await query('SELECT epoch FROM tm_control WHERE id = 1 FOR UPDATE');
+    const result = await query<{ id: string }>(insertSql, params);
+    return result.rows[0]?.id;
+  };
+  const createdId =
+    applyCap && db.dialect === 'postgres'
+      ? await db.withTransaction(runInsert)
+      : await runInsert(db.query.bind(db));
+  const existing = await db.query<TmExpectation>(
+    'SELECT * FROM tm_expectations WHERE registration_key = $1',
+    [data.registration_key]
+  );
+  const row = existing.rows[0];
+  // Nothing inserted AND nothing under this key: the cap predicate rejected it.
+  // Distinguishable from a conflict precisely because a conflict leaves a row.
+  if (!row) {
+    if (applyCap) return { capped: true, observed: await countExternalExpectationsSince(dayAgo) };
+    throw new Error('tm_expectations registration conflict without an existing row');
+  }
+  return {
+    capped: false,
+    id: row.id,
+    created: createdId !== undefined,
+    expectation: normalizeExpectation(row),
+  };
 }
 
 /**

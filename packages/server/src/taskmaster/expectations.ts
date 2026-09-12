@@ -372,6 +372,69 @@ async function sendRedispatch(
   return key;
 }
 
+/**
+ * One escalation, in words a person can act on without opening the database.
+ *
+ * The previous body was `JSON.stringify(expectation)` -- a column dump whose
+ * reader has to know the schema to learn what is actually wrong. An escalation
+ * is read by a human under interruption, so it states the four things that
+ * decide what they do next: what proof was expected, who owed it, when it was
+ * due, and what has already been tried. The id and dispatch_ref stay verbatim
+ * so the row is still greppable.
+ */
+export function renderEscalationBody(expectation: taskmasterDb.TmExpectation): string {
+  let evidence: string;
+  try {
+    const spec = JSON.parse(expectation.evidence_json) as EvidenceSpec;
+    evidence = describeEvidence(spec);
+  } catch {
+    // Never let an unparseable spec swallow the escalation itself.
+    evidence = `unparseable evidence spec: ${expectation.evidence_json}`;
+  }
+  return [
+    'Taskmaster expectation EXHAUSTED -- no human has confirmed this work landed.',
+    '',
+    `Expected proof: ${evidence}`,
+    `Owed by:        ${expectation.recipient}`,
+    `Due at:         ${expectation.due_at} (passed)`,
+    `Attempts:       ${String(expectation.retries)} of ${String(expectation.max_retries)} retries used`,
+    `Registered by:  ${expectation.registered_by ?? 'unknown'}${
+      expectation.self_supervised ? ' (SELF-SUPERVISED)' : ''
+    }`,
+    '',
+    'What to do: confirm whether the work actually happened. If it did, the',
+    'evidence spec is wrong and should be corrected. If it did not, the work',
+    'needs a new owner.',
+    '',
+    `expectation_id: ${expectation.id}`,
+    `dispatch_ref:   ${expectation.dispatch_ref}`,
+  ].join('\n');
+}
+
+/** One evidence spec as a phrase, for the escalation body. */
+function describeEvidence(spec: EvidenceSpec): string {
+  switch (spec.kind) {
+    case 'issue_comment_exists':
+      return `a comment on ${spec.repo}#${String(spec.number)}${
+        spec.author ? ` by ${spec.author}` : ''
+      }${spec.marker ? ` containing "${spec.marker}"` : ''}`;
+    case 'label_present':
+      return `label "${spec.label}" on ${spec.repo}#${String(spec.number)}`;
+    case 'pr_opened':
+      return `an open PR in ${spec.repo}${
+        spec.head_branch ? ` from branch ${spec.head_branch}` : ''
+      }${spec.title_prefix ? ` titled "${spec.title_prefix}..."` : ''}`;
+    case 'lease_holder_is':
+      return `${spec.name} holding the XO lease`;
+    case 'dispatch_reply_exists':
+      return `a completed dispatch reply for correlation ${spec.correlation_id}${
+        spec.classification ? ` with outcome ${spec.classification}` : ''
+      }`;
+    case 'db_row_exists':
+      return `a row in ${spec.table} matching ${JSON.stringify(spec.where)}`;
+  }
+}
+
 export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): Promise<void> {
   const list = deps.listDueExpectations ?? taskmasterDb.listDueExpectations;
   const active = await list(now.toISOString());
@@ -622,9 +685,41 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
         correlation_id: `tm-expectation-${expectation.id}`,
         idempotency_key: escalationPointer,
         task_type: 'agent_message',
-        recipient: 'operator',
+        // ESCALATE TO 'xo', NOT 'operator'. An escalation that reaches nobody is
+        // not an escalation, and 'operator' reaches nobody:
+        //
+        //   - The 'operator' principal is delivery_mode 'drain_on_start', and
+        //     something acknowledges and addresses its mail within seconds of
+        //     arrival. Measured on the live database 2026-09-11: 3,535 operator
+        //     messages, 9 unaddressed, 258 addressed under five seconds. Both
+        //     expectations that have ever escalated (46f94406 on 2026-09-10,
+        //     faa69079 on 2026-09-11) had their blocker auto-addressed inside two
+        //     seconds and no human ever saw either one.
+        //   - 'xo' on the same database: 1,089 messages, 153 unaddressed, ZERO
+        //     addressed under five seconds. It is drained by a person, and the
+        //     XO session-start reflex reads it.
+        //   - The dispatch escalation clock's onward Telegram and SMS legs are
+        //     gated on `COALESCE(resolved_recipient, recipient) = 'xo'`
+        //     (claimDispatchEscalation, dispatch.ts). An escalation addressed to
+        //     'operator' is not merely unread -- it is structurally ineligible
+        //     for every out-of-band leg that exists. Addressing it to 'xo' is
+        //     what arms the four-hour Telegram handoff for a blocker nobody has
+        //     picked up.
+        //
+        // This is the whole of bdc-xo#2007's second finding: the mechanism ran
+        // and the loop did not close.
+        recipient: 'xo',
         priority: 'blocker',
-        body: `Taskmaster expectation exhausted: ${JSON.stringify(expectation)}`,
+        // NO subject_key. normalizeDispatchSubjectKey accepts exactly three
+        // shapes -- wo:WO-..., digest:YYYY-MM-DD, gh:owner/repo#N -- and THROWS
+        // on anything else. An expectation id is none of them, so setting one
+        // here would make createAuthenticatedMessage throw at the moment of
+        // escalation and leave the row stuck in 'escalating' forever. That is
+        // the same shape of defect as the one this WO is fixing, and the same
+        // shape as the M-129 hardening that silently killed every digest send
+        // from 2026-08-25 onward. The idempotency_key already dedupes the
+        // replay, which is the only thing subject_key would have bought here.
+        body: renderEscalationBody(expectation),
       }
     );
     // Confirmed sent: close the row.

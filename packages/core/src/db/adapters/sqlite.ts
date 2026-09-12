@@ -35,9 +35,29 @@ const TM_EXPECTATIONS_SCHEMA = `CREATE TABLE tm_expectations (
     status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
   ),
   evidence_pointer TEXT,
+  registered_by TEXT,
+  self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 )`;
+
+/**
+ * Front-door columns (migration 050, bdc-xo#2007), applied ADDITIVELY.
+ *
+ * These cannot ride the recreate path above: that path only fires on a table
+ * whose shape predates 049, and the live database is already at 049 WITH rows.
+ * A shape check that treated a missing `registered_by` as "outdated" would hit
+ * the non-empty refusal and block startup on a database that is merely one
+ * additive migration behind -- so these are ALTER TABLE ADD COLUMN, matching how
+ * agent_dispatch_messages has taken every column since phase 0.
+ */
+const TM_EXPECTATIONS_FRONT_DOOR_COLUMNS: [string, string][] = [
+  ['registered_by', 'TEXT'],
+  ['self_supervised', 'INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1))'],
+];
+
+const TM_EXPECTATIONS_REGISTERED_BY_INDEX =
+  'CREATE INDEX IF NOT EXISTS idx_tm_expectations_registered_by ON tm_expectations(registered_by, created_at)';
 
 const TM_EXPECTATIONS_UNIQUE_INDEX =
   'CREATE UNIQUE INDEX IF NOT EXISTS idx_tm_expectations_registration_key ON tm_expectations(registration_key)';
@@ -359,6 +379,26 @@ export class SqliteAdapter implements IDatabase {
             'db.sqlite_tm_expectations_empty_table_recreated'
           );
         }
+
+        // Front door (migration 050): add the registrant columns to a table
+        // that is otherwise current. Re-read the column list, because the
+        // recreate branch above may have just replaced the table.
+        const currentColumns = new Set(
+          (this.pragmaAll("PRAGMA table_info('tm_expectations')") as { name: string }[]).map(
+            c => c.name
+          )
+        );
+        for (const [name, definition] of TM_EXPECTATIONS_FRONT_DOOR_COLUMNS) {
+          if (currentColumns.has(name)) continue;
+          this.db.run(`ALTER TABLE tm_expectations ADD COLUMN ${name} ${definition}`);
+          // Every row that predates the front door was written by the loop, so
+          // this is the one registrant it can have been -- not a guess.
+          if (name === 'registered_by')
+            this.db.run(
+              "UPDATE tm_expectations SET registered_by = 'taskmaster' WHERE registered_by IS NULL"
+            );
+        }
+        this.db.run(TM_EXPECTATIONS_REGISTERED_BY_INDEX);
       }
     } catch (e: unknown) {
       // FAIL LOUDLY. A mismatched schema breaks expectation registration for
@@ -2139,6 +2179,10 @@ export class SqliteAdapter implements IDatabase {
           status IN ('pending', 'met', 'failed', 'escalating', 'escalated', 'given_up')
         ),
         evidence_pointer TEXT,
+        -- Front door (migration 050, bdc-xo#2007): WHO asked for this
+        -- supervision, and whether they named themselves as the recipient.
+        registered_by TEXT,
+        self_supervised INTEGER NOT NULL DEFAULT 0 CHECK (self_supervised IN (0, 1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -2149,6 +2193,8 @@ export class SqliteAdapter implements IDatabase {
         ON tm_expectations(status, due_at);
       CREATE INDEX IF NOT EXISTS idx_tm_expectations_dispatch_ref
         ON tm_expectations(dispatch_ref);
+      CREATE INDEX IF NOT EXISTS idx_tm_expectations_registered_by
+        ON tm_expectations(registered_by, created_at);
 
       INSERT OR IGNORE INTO tm_control (id, pause_state, epoch) VALUES (1, 'RUNNING', 0);
 
