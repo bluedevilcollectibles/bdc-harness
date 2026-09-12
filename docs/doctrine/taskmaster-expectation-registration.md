@@ -64,6 +64,16 @@ would turn the documented idempotent `200` into a `429` the moment a caller got
 busy, punishing exactly the safe retry behaviour the caller-supplied key exists
 to make possible.
 
+**The cap is a predicate inside the INSERT, not a check before it.** Counting
+rows and then inserting -- even inside a transaction -- lets concurrent callers
+all observe a count below the cap and all then write, exceeding the bound by
+however many raced. Measured: with the count-then-insert shape, ten simultaneous
+registrations against a cap of three admitted **nine**. The count is therefore
+evaluated by the database as part of the same statement that writes, and the
+regression test ('CONCURRENT registrations cannot exceed the cap') fails against
+the old shape. A bound whose job is to stop a runaway must not itself have a
+runaway window.
+
 Fifty supervised handoffs in a day across all callers is a loop, not a busy day.
 
 **3. A seat MAY register an expectation on itself, EXCEPT to escalate.**

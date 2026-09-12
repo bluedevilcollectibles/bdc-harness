@@ -351,46 +351,95 @@ export async function registerExpectation(data: {
 }
 
 /**
- * registerExpectation, but reporting WHETHER this call created the row.
+ * Outcome of a front-door registration.
  *
- * The bare id cannot distinguish "I opened supervision for this" from "an
- * expectation under this key already existed and you are now looking at ITS
- * deadline". For the loop that difference is immaterial -- idempotency is the
- * whole point. For an external caller it is not: a session told it registered a
- * 24-hour expectation, when in fact it matched a key whose deadline passed
- * yesterday, believes work is supervised that is not.
+ * A discriminated union rather than a nullable row, because "the cap refused
+ * this" and "here is your expectation" have nothing in common to return: a
+ * capped call has no id, no deadline and no row. Forcing the caller to branch on
+ * `capped` is what stops a refusal being read as a registration.
+ */
+export type RegisterExpectationResult =
+  | { capped: false; id: string; created: boolean; expectation: TmExpectation }
+  | { capped: true; observed: number };
+
+/**
+ * Register through the front door, ENFORCING THE DAILY CAP ATOMICALLY.
  *
- * Creation is read from the INSERT's own RETURNING clause, not from a SELECT
- * taken before it. ON CONFLICT DO NOTHING ... RETURNING yields a row only for
- * the caller whose insert actually landed, which makes this exact under
- * concurrency; a read-then-write would report two simultaneous first-time
- * callers as both having created the row.
+ * Reports whether this call created the row: the bare id cannot distinguish "I
+ * opened supervision for this" from "an expectation under this key already
+ * existed and you are now looking at ITS deadline". For the loop that difference
+ * is immaterial -- idempotency is the whole point. For an external caller it is
+ * not: a session told it registered a 24-hour expectation, when in fact it
+ * matched a key whose deadline passed yesterday, believes work is supervised
+ * that is not. Creation is read from the INSERT's own RETURNING clause, never
+ * from a SELECT taken before it, so two simultaneous first-time callers cannot
+ * both be told they created the row.
+ *
+ * THE CAP IS A PREDICATE INSIDE THE INSERT, NOT A CHECK BEFORE IT.
+ *
+ * Counting rows and then inserting -- even with the count inside a transaction
+ * -- leaves a window under SQLite's default deferred locking: two writers can
+ * both take read locks, both observe a count below the cap, and both then
+ * insert, so the bound is exceeded by however many callers raced. That is a real
+ * hole in a bound whose whole job is to stop a runaway buying unbounded future
+ * escalations, and it is the kind of near-miss this registry exists to prevent
+ * rather than reproduce.
+ *
+ * So the count is evaluated by the database as part of the same statement that
+ * writes: `INSERT ... SELECT ... WHERE (SELECT COUNT(*) ...) < cap`. The
+ * subquery and the insert are one atomic unit under both dialects, so a racing
+ * writer either sees the earlier row in its own count or is serialized behind
+ * it. No extra locking, no dialect-specific SQL.
+ *
+ * A retry under an EXISTING key is exempt: the ON CONFLICT arm absorbs it before
+ * the cap can reject it, so the documented idempotent 200 holds even at the cap.
+ * (Order matters -- the cap predicate is evaluated first, so an at-cap retry
+ * would insert nothing and the conflict arm would never fire. Hence
+ * `capExempt`, which the route sets for a key it has already seen; the cap
+ * predicate is skipped entirely for those, and idempotency does the rest.)
  */
 export async function registerExpectationReportingCreation(
-  data: Parameters<typeof registerExpectation>[0] & { registration_key: string }
-): Promise<{ id: string; created: boolean; expectation: TmExpectation }> {
+  data: Parameters<typeof registerExpectation>[0] & {
+    registration_key: string;
+    /** Per-24h bound on externally-registered rows. Omit to skip the cap. */
+    daily_cap?: number;
+    /** True when this key already exists, so the retry must not be capped. */
+    cap_exempt?: boolean;
+  }
+): Promise<RegisterExpectationResult> {
   const db = getDatabase();
   const now = new Date().toISOString();
+  const applyCap = data.daily_cap !== undefined && data.cap_exempt !== true;
+  const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const params: unknown[] = [
+    randomUUID(),
+    data.registration_key,
+    data.dispatch_ref,
+    data.recipient,
+    data.evidence_json,
+    data.due_at,
+    data.on_absence,
+    data.max_retries,
+    data.registered_by ?? 'taskmaster',
+    data.self_supervised ? 1 : 0,
+    now,
+  ];
+  // The guard reads the SAME `ext:` population the route's cap is defined over.
+  let capClause = '';
+  if (applyCap) {
+    params.push(dayAgo, data.daily_cap);
+    capClause =
+      ' WHERE (SELECT COUNT(*) FROM tm_expectations' +
+      " WHERE registration_key LIKE 'ext:%' AND created_at >= $12) < $13";
+  }
   const inserted = await db.query<{ id: string }>(
     `INSERT INTO tm_expectations
      (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
       max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11)
+     SELECT $1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11${capClause}
      ON CONFLICT (registration_key) DO NOTHING
      RETURNING id`,
-    [
-      randomUUID(),
-      data.registration_key,
-      data.dispatch_ref,
-      data.recipient,
-      data.evidence_json,
-      data.due_at,
-      data.on_absence,
-      data.max_retries,
-      data.registered_by ?? 'taskmaster',
-      data.self_supervised ? 1 : 0,
-      now,
-    ]
+    params
   );
   const createdId = inserted.rows[0]?.id;
   const existing = await db.query<TmExpectation>(
@@ -398,8 +447,14 @@ export async function registerExpectationReportingCreation(
     [data.registration_key]
   );
   const row = existing.rows[0];
-  if (!row) throw new Error('tm_expectations registration conflict without an existing row');
+  // Nothing inserted AND nothing under this key: the cap predicate rejected it.
+  // Distinguishable from a conflict precisely because a conflict leaves a row.
+  if (!row) {
+    if (applyCap) return { capped: true, observed: await countExternalExpectationsSince(dayAgo) };
+    throw new Error('tm_expectations registration conflict without an existing row');
+  }
   return {
+    capped: false,
     id: row.id,
     created: createdId !== undefined,
     expectation: normalizeExpectation(row),

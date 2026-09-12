@@ -61,8 +61,9 @@ describe('expectation front door: route wiring', () => {
       apiSource.indexOf('// POST /api/taskmaster/expectations -'),
       apiSource.indexOf('// GET /api/taskmaster/expectations -')
     );
-    expect(handler).toContain('countExternalExpectationsSince');
+    expect(handler).toContain('daily_cap: EXPECTATION_DAILY_CAP');
     expect(handler).not.toContain('countExpectationsRegisteredSince');
+    expect(apiSource).toContain('EXPECTATION_DAILY_CAP');
   });
 
   test('a retry of an existing key never consumes the cap', () => {
@@ -72,12 +73,25 @@ describe('expectation front door: route wiring', () => {
       apiSource.indexOf('// POST /api/taskmaster/expectations -'),
       apiSource.indexOf('// GET /api/taskmaster/expectations -')
     );
-    const probeAt = handler.indexOf('expectationKeyExists');
-    const capAt = handler.indexOf('countExternalExpectationsSince');
-    expect(probeAt).toBeGreaterThan(-1);
-    // The existence probe must come FIRST and gate the count.
-    expect(probeAt).toBeLessThan(capAt);
-    expect(handler).toContain('if (!alreadyRegistered)');
+    expect(handler).toContain('expectationKeyExists');
+    expect(handler).toContain('cap_exempt: capExempt');
+  });
+
+  test('the cap is enforced in the write, not by a count before it', () => {
+    // Overseer finding [major], round 2: a count taken in the route and an
+    // insert taken after it let concurrent callers all read a count below the
+    // cap and all then write. The route must hand the cap to the DAL, which
+    // evaluates it as a predicate inside the INSERT. Behavioural proof that this
+    // actually holds under concurrency lives in the DAL test
+    // ('CONCURRENT registrations cannot exceed the cap').
+    const handler = apiSource.slice(
+      apiSource.indexOf('// POST /api/taskmaster/expectations -'),
+      apiSource.indexOf('// GET /api/taskmaster/expectations -')
+    );
+    expect(handler).toContain('daily_cap: EXPECTATION_DAILY_CAP');
+    // The route must NOT decide admission from its own count.
+    expect(handler).not.toContain('countExternalExpectationsSince');
+    expect(handler).toContain('if (result.capped)');
   });
 
   test('the self-supervision guard is documented as a correctness check, not a boundary', () => {

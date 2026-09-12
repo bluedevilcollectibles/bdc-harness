@@ -3513,26 +3513,24 @@ export function registerApiRoutes(
       // creates nothing, so charging it would turn the documented idempotent
       // 200 into a 429 the moment a caller got busy -- punishing exactly the
       // safe retry behaviour the caller-supplied key exists to make possible.
-      const alreadyRegistered = await taskmasterDb.expectationKeyExists(registrationKey);
-      if (!alreadyRegistered) {
-        const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-        const registeredToday = await taskmasterDb.countExternalExpectationsSince(dayAgo);
-        if (registeredToday >= EXPECTATION_DAILY_CAP)
-          return apiError(
-            c,
-            429,
-            `The expectation front door has opened ${String(registeredToday)} expectations ` +
-              `in 24h (cap ${String(EXPECTATION_DAILY_CAP)}); retries of an existing ` +
-              'registration_key are always accepted'
-          );
-      }
+      //
+      // ENFORCED IN THE WRITE, NOT BEFORE IT. This probe only decides EXEMPTION;
+      // it does not decide admission. The cap itself is a predicate inside the
+      // INSERT (see registerExpectationReportingCreation), because a count taken
+      // here and an insert taken after it leave a window in which concurrent
+      // callers all read a count below the cap and all then write, exceeding the
+      // bound by however many raced. A stale read here is therefore harmless: at
+      // worst an existing key is treated as new, and the cap predicate lets it
+      // through anyway because the ON CONFLICT arm absorbs it.
+      const capExempt = await taskmasterDb.expectationKeyExists(registrationKey);
+
       // Registration is idempotent on the key, so a retry is a 200 and not a
       // duplicate. `created` reports WHICH happened -- a caller that believes it
       // opened a fresh 24h expectation when it actually matched a key whose
       // deadline passed yesterday believes work is supervised that is not. The
       // returned row is the STORED one for the same reason: on a conflict the
       // effective deadline is the first registration's, not this request's.
-      const { id, created, expectation } = await taskmasterDb.registerExpectationReportingCreation({
+      const result = await taskmasterDb.registerExpectationReportingCreation({
         dispatch_ref: body.dispatch_ref,
         recipient: body.recipient,
         evidence_json: JSON.stringify(body.evidence),
@@ -3542,7 +3540,18 @@ export function registerApiRoutes(
         registration_key: registrationKey,
         registered_by: body.registered_by,
         self_supervised: selfSupervised,
+        daily_cap: EXPECTATION_DAILY_CAP,
+        cap_exempt: capExempt,
       });
+      if (result.capped)
+        return apiError(
+          c,
+          429,
+          `The expectation front door has opened ${String(result.observed)} expectations ` +
+            `in 24h (cap ${String(EXPECTATION_DAILY_CAP)}); retries of an existing ` +
+            'registration_key are always accepted'
+        );
+      const { id, created, expectation } = result;
       getLog().info(
         { expectationId: id, registeredBy: body.registered_by, dueAt, created, selfSupervised },
         'taskmaster_expectation_registered'

@@ -2250,3 +2250,105 @@ describe('expectation front door (bdc-xo#2007)', () => {
     expect(page.total).toBe(4);
   });
 });
+
+describe('front door daily cap is enforced in the write (Overseer PR 810)', () => {
+  const spec = JSON.stringify({ kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' });
+  const future = (): string => new Date(Date.now() + 86_400_000).toISOString();
+
+  const register = (
+    key: string,
+    extra: { daily_cap?: number; cap_exempt?: boolean; registered_by?: string } = {}
+  ) =>
+    registerExpectationReportingCreation({
+      registration_key: key,
+      dispatch_ref: `ref-${key}`,
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: extra.registered_by ?? 'xo',
+      daily_cap: extra.daily_cap,
+      cap_exempt: extra.cap_exempt,
+    });
+
+  test('the cap refuses the row rather than writing it', async () => {
+    expect((await register('ext:xo:cap-a', { daily_cap: 2 })).capped).toBe(false);
+    expect((await register('ext:xo:cap-b', { daily_cap: 2 })).capped).toBe(false);
+    const third = await register('ext:xo:cap-c', { daily_cap: 2 });
+    expect(third.capped).toBe(true);
+    if (third.capped) expect(third.observed).toBe(2);
+    // The refusal must leave NOTHING behind -- a capped call that still wrote
+    // would both break the bound and hand the caller a supervised-looking row.
+    expect(await expectationKeyExists('ext:xo:cap-c')).toBe(false);
+    expect((await listExpectations({ limit: 20 })).total).toBe(2);
+  });
+
+  test('CONCURRENT registrations cannot exceed the cap', async () => {
+    // THE FINDING. A count-then-insert sequence lets N racing callers all
+    // observe a count below the cap and all then write. The cap is a predicate
+    // inside the INSERT precisely so the database evaluates it as part of the
+    // same statement that writes.
+    const cap = 3;
+    const results = await Promise.all(
+      Array.from({ length: 10 }, (_, i) => register(`ext:xo:race-${String(i)}`, { daily_cap: cap }))
+    );
+    const admitted = results.filter(r => !r.capped);
+    expect(admitted).toHaveLength(cap);
+    expect(results.filter(r => r.capped)).toHaveLength(10 - cap);
+    // And the database agrees -- the bound held in the data, not just in the
+    // return values.
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(cap);
+  });
+
+  test('a retry of an existing key is admitted even at the cap', async () => {
+    await register('ext:xo:retry-me', { daily_cap: 1 });
+    // Cap is now full. A NEW key must be refused...
+    expect((await register('ext:xo:something-new', { daily_cap: 1 })).capped).toBe(true);
+    // ...but the existing key must still return its row, not a 429. This is the
+    // [minor] finding: charging a retry turns the documented idempotent success
+    // into a refusal the moment a caller gets busy.
+    const retry = await register('ext:xo:retry-me', { daily_cap: 1, cap_exempt: true });
+    expect(retry.capped).toBe(false);
+    if (!retry.capped) expect(retry.created).toBe(false);
+  });
+
+  test('renaming the registrant does not buy more headroom', async () => {
+    // registered_by is self-declared, so a per-name cap would be evaded by
+    // simply sending a different name. The cap counts the whole ext: population.
+    expect((await register('ext:xo:n1', { daily_cap: 2, registered_by: 'xo' })).capped).toBe(false);
+    expect((await register('ext:codex:n2', { daily_cap: 2, registered_by: 'codex' })).capped).toBe(
+      false
+    );
+    const third = await register('ext:grok:n3', { daily_cap: 2, registered_by: 'grok' });
+    expect(third.capped).toBe(true);
+  });
+
+  test("the loop's own registrations are neither capped nor counted", async () => {
+    // The loop passes no cap and carries no ext: prefix. Neither side should be
+    // able to exhaust the other's headroom.
+    for (const n of [1, 2, 3, 4, 5]) {
+      await registerExpectation({
+        dispatch_ref: `loop-${String(n)}`,
+        recipient: 'operator',
+        evidence_json: spec,
+        due_at: future(),
+        on_absence: 'escalate',
+        max_retries: 0,
+      });
+    }
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(0);
+    // ...and the front door still has its full budget.
+    expect((await register('ext:xo:after-loop', { daily_cap: 1 })).capped).toBe(false);
+  });
+
+  test('omitting daily_cap skips the cap entirely', async () => {
+    for (const n of [1, 2, 3, 4, 5]) {
+      expect((await register(`ext:xo:uncapped-${String(n)}`)).capped).toBe(false);
+    }
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    expect(await countExternalExpectationsSince(dayAgo)).toBe(5);
+  });
+});
