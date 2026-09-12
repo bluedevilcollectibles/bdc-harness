@@ -215,3 +215,106 @@ describe('expectation front door: the contract', () => {
     ).toBe(false);
   });
 });
+
+describe('the composite key cannot collide (Overseer PR 810 round 4)', () => {
+  const valid = {
+    dispatch_ref: 'bdc-xo#2006',
+    recipient: 'fable-cursor',
+    evidence: { kind: 'pr_opened' as const, repo: 'thinmansoftware/fuelglass' },
+    due_in_minutes: 1440,
+  };
+
+  test('THE COLLISION: the two inputs that used to render the same key are both refused', () => {
+    // `ext:${registered_by}:${registration_key}` is ambiguous the moment either
+    // component may contain ':'. These two distinct requests both rendered
+    // `ext:xo:a:12345678`, so the second was handed the FIRST one's row with
+    // created:false and ITS deadline -- told its work was supervised when
+    // nothing was watching it. That is the precise failure this registry exists
+    // to prevent, so it must be refused at the door.
+    const a = registerExpectationBodySchema.safeParse({
+      ...valid,
+      registered_by: 'xo:a',
+      registration_key: '12345678',
+    });
+    const b = registerExpectationBodySchema.safeParse({
+      ...valid,
+      registered_by: 'xo',
+      registration_key: 'a:12345678',
+    });
+    expect(a.success).toBe(false);
+    expect(b.success).toBe(false);
+    // And prove the collision was real, so this test cannot quietly become
+    // vacuous if the construction changes.
+    expect(`ext:${'xo:a'}:${'12345678'}`).toBe(`ext:${'xo'}:${'a:12345678'}`);
+  });
+
+  test('a colon is refused in either component, wherever it sits', () => {
+    for (const [registered_by, registration_key] of [
+      ['x:o', 'abcdefgh'],
+      ['xo', 'abcd:efgh'],
+      [':xo', 'abcdefgh'],
+      ['xo:', 'abcdefgh'],
+      ['xo', ':abcdefgh'],
+      ['xo', 'abcdefgh:'],
+    ]) {
+      const parsed = registerExpectationBodySchema.safeParse({
+        ...valid,
+        registered_by,
+        registration_key,
+      });
+      expect(parsed.success).toBe(false);
+    }
+  });
+
+  test('whitespace is refused too, so a key cannot be two keys in a log line', () => {
+    expect(
+      registerExpectationBodySchema.safeParse({
+        ...valid,
+        registration_key: 'abcd efgh',
+      }).success
+    ).toBe(false);
+    expect(
+      registerExpectationBodySchema.safeParse({ ...valid, registered_by: 'x o' }).success
+    ).toBe(false);
+  });
+
+  test('the shapes real callers actually use still parse', () => {
+    // The constraint must not break the wrapper's own key shape, which is
+    // "<ref>-<digest>" with the ref sanitized to [A-Za-z0-9#._-].
+    for (const key of [
+      'bdc-xo#2006-72d3968715658a55',
+      'fuelglass-2006',
+      'WO-HARNESS-TASKMASTER-01',
+      'thinmansoftware/fuelglass@main',
+      'a.b_c+d-long-enough',
+    ]) {
+      const parsed = registerExpectationBodySchema.safeParse({
+        ...valid,
+        registration_key: key,
+      });
+      expect(parsed.success).toBe(true);
+    }
+    for (const who of ['xo', 'fable-cursor', 'codex', 'xo.main', 'claude+acp']) {
+      // An explicit key here: the `valid` fixture carries none, and a missing
+      // one would make every iteration fail for the wrong reason.
+      const parsed = registerExpectationBodySchema.safeParse({
+        ...valid,
+        registration_key: 'abcdefgh',
+        registered_by: who,
+      });
+      expect(parsed.success).toBe(true);
+    }
+  });
+
+  test('distinct inputs still produce distinct keys', () => {
+    const render = (by: string, key: string): string => `ext:${by}:${key}`;
+    const keys = new Set([
+      render('xo', 'abcdefgh'),
+      render('xo', 'abcdefgi'),
+      render('codex', 'abcdefgh'),
+      render('xo-a', 'abcdefgh'),
+      render('xo', 'a-abcdefgh'),
+    ]);
+    expect(keys.size).toBe(5);
+  });
+});

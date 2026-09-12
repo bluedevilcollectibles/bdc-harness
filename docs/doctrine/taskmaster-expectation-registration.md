@@ -161,6 +161,17 @@ exists: `claimDispatchEscalation` gates the Telegram and SMS handoffs on
 Escalations therefore address `xo`, which a person drains and which the XO
 session-start reflex reads.
 
+**The composite key must be unambiguous.** The stored key is
+`ext:<registered_by>:<registration_key>`, so both components reject `:` and
+whitespace at the schema. Without that, `('xo:a', '12345678')` and
+`('xo', 'a:12345678')` render the same stored key -- and the second caller is
+handed the FIRST one's row with `created: false` and its deadline, told its work
+is supervised when nothing is watching it. That is the exact failure this
+registry exists to prevent, so it is refused at the door rather than encoded
+around: excluding the delimiter also keeps keys greppable in the database and in
+logs. Do not relax either pattern without switching to an encoding that cannot
+collide.
+
 ## How to register
 
 Do not write SQL. One line:

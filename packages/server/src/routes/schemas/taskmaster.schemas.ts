@@ -171,8 +171,21 @@ export const registerExpectationBodySchema = z
      * content, and a caller that retries with a regenerated due_at would then
      * register a second expectation for the same work. Making the caller name
      * the identity is what makes a retry safe.
+     *
+     * NO COLONS. The stored key is `ext:<registered_by>:<registration_key>`, and
+     * a colon permitted inside either component makes that construction
+     * ambiguous: ('xo:a', '12345678') and ('xo', 'a:12345678') both render
+     * `ext:xo:a:12345678`. The second caller would be handed the FIRST one's row
+     * with `created: false` and its deadline, and would believe work is
+     * supervised that nothing is watching -- the exact failure this registry
+     * exists to prevent. Excluding the delimiter is preferred over escaping it
+     * because it also keeps keys greppable in the database and in logs.
      */
-    registration_key: z.string().min(8).max(200),
+    registration_key: z
+      .string()
+      .min(8)
+      .max(200)
+      .regex(/^[A-Za-z0-9_.@#/+-]+$/, 'registration_key must not contain ":" or whitespace'),
     dispatch_ref: z.string().min(1).max(500),
     recipient: z.string().min(1).max(200),
     evidence: evidenceSpecSchema,
@@ -181,12 +194,18 @@ export const registerExpectationBodySchema = z
     on_absence: z.enum(['redispatch', 'escalate', 'give_up']).default('escalate'),
     max_retries: z.number().int().min(0).max(5).default(0),
     /**
-     * WHO is asking. Recorded on the row and used as the denominator for the
-     * per-caller daily cap. Defaults to 'operator' because the operator token
-     * is what the route authenticates; a caller that names itself gets its own
-     * budget and its own audit trail instead of sharing the operator's.
+     * WHO is asking. Recorded on the row for attribution and audit. Self-declared
+     * and therefore NOT a security boundary -- which is why the daily cap counts
+     * the whole front door rather than this field.
+     *
+     * NO COLONS, for the same delimiter-ambiguity reason as registration_key.
      */
-    registered_by: z.string().min(1).max(200).default('operator'),
+    registered_by: z
+      .string()
+      .min(1)
+      .max(200)
+      .regex(/^[A-Za-z0-9_.@+-]+$/, 'registered_by must not contain ":" or whitespace')
+      .default('operator'),
   })
   .openapi('TaskmasterRegisterExpectationBody');
 

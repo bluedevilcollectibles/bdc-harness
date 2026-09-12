@@ -3490,6 +3490,14 @@ export function registerApiRoutes(
       // caller cannot -- by accident or otherwise -- adopt or block the row the
       // loop opened for one of its own dispatches. It is also what identifies
       // the externally-registered population for the cap below.
+      //
+      // THE CONCATENATION IS UNAMBIGUOUS ONLY BECAUSE NEITHER COMPONENT MAY
+      // CONTAIN THE DELIMITER. Both fields reject ':' at the schema (see
+      // registerExpectationBodySchema); without that, ('xo:a', '12345678') and
+      // ('xo', 'a:12345678') would both render `ext:xo:a:12345678`, and the
+      // second caller would be handed the FIRST one's row with created:false --
+      // told its work is supervised when nothing is watching it. Do not relax
+      // either regex without switching to an encoding that cannot collide.
       const registrationKey = `ext:${body.registered_by}:${body.registration_key}`;
 
       // DAILY CAP ON THE FRONT DOOR AS A WHOLE -- NOT PER REGISTRANT.

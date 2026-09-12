@@ -157,6 +157,23 @@ if (-not $Key) {
     $Key = "$($Ref -replace '[^A-Za-z0-9#._-]', '-')-$digest"
 }
 
+# NO COLONS in either component. The server stores the key as
+# "ext:<registered_by>:<key>", so a colon inside either half makes that
+# construction ambiguous -- ('xo:a','12345678') and ('xo','a:12345678') would
+# render the same stored key, and the second caller would be handed the FIRST
+# one's expectation with its deadline, believing work is supervised that nothing
+# is watching. The API rejects it; catching it here gives a usable message
+# instead of a 400 from a body the caller thought was fine.
+if ($Key -notmatch '^[A-Za-z0-9_.@#/+-]+$') {
+    throw "Key '$Key' may contain only letters, digits and _ . @ # / + - (no ':' or spaces)."
+}
+if ($RegisteredBy -notmatch '^[A-Za-z0-9_.@+-]+$') {
+    throw "RegisteredBy '$RegisteredBy' may contain only letters, digits and _ . @ + - (no ':' or spaces)."
+}
+if ($Key.Length -lt 8) {
+    throw "Key '$Key' is shorter than the 8 characters the API requires."
+}
+
 $payload = @{
     registration_key = $Key
     dispatch_ref     = $Ref
