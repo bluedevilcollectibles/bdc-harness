@@ -80,6 +80,10 @@ import {
   taskmasterPauseBodySchema,
   taskmasterResumeBodySchema,
   taskmasterControlResponseSchema,
+  registerExpectationBodySchema,
+  registerExpectationResponseSchema,
+  listExpectationsQuerySchema,
+  listExpectationsResponseSchema,
   registerListQuerySchema,
   registerListResponseSchema,
   registerMetaResponseSchema,
@@ -93,6 +97,25 @@ export const REGISTER_STALE_AFTER_MS =
   Number.isInteger(parsedRegisterStaleAfterMs) && parsedRegisterStaleAfterMs >= 0
     ? parsedRegisterStaleAfterMs
     : 120_000;
+
+/**
+ * Runaway bound on the expectation front door, per registrant per rolling 24h.
+ *
+ * NOT a workflow limit -- 50 supervised handoffs in a day by one caller is far
+ * past any real use, and a caller that hits it has a loop, not a busy day. The
+ * bound exists because an expectation's `on_absence` action is a budgeted
+ * Taskmaster effect: without it, one caller could buy unbounded future
+ * escalations one row at a time and bypass the loop's own per-tick budgets.
+ * Per-registrant so one noisy caller cannot exhaust anyone else's headroom.
+ */
+const parsedExpectationDailyCap = Number.parseInt(
+  process.env.TASKMASTER_EXPECTATION_DAILY_CAP ?? '',
+  10
+);
+export const EXPECTATION_DAILY_CAP_PER_REGISTRANT =
+  Number.isInteger(parsedExpectationDailyCap) && parsedExpectationDailyCap > 0
+    ? parsedExpectationDailyCap
+    : 50;
 
 let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -2311,6 +2334,50 @@ const postTaskmasterPauseRoute = createRoute({
   },
 });
 
+// Expectation front door (bdc-xo#2007). Until this route existed, the ONLY way
+// to put a row in tm_expectations was to be the Taskmaster loop itself: work
+// assigned any other way -- a Cursor seat, a Codex thread, John handing it to
+// someone in chat -- was invisible to the supervisor, and registering it by hand
+// meant sudo sqlite3 on the production host.
+const postTaskmasterExpectationRoute = createRoute({
+  method: 'post',
+  path: '/api/taskmaster/expectations',
+  tags: ['Taskmaster'],
+  summary: 'Register a supervision expectation for work assigned outside Taskmaster',
+  request: {
+    body: {
+      content: { 'application/json': { schema: registerExpectationBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: registerExpectationResponseSchema } },
+      description: 'The expectation id; `created: false` when the key already existed',
+    },
+    400: jsonError('Invalid evidence spec, deadline, or self-supervised escalation'),
+    401: jsonError('Missing or invalid operator token'),
+    429: jsonError('Registrant exceeded its daily expectation cap'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getTaskmasterExpectationsRoute = createRoute({
+  method: 'get',
+  path: '/api/taskmaster/expectations',
+  tags: ['Taskmaster'],
+  summary: 'List supervision expectations',
+  request: { query: listExpectationsQuerySchema },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: listExpectationsResponseSchema } },
+      description: 'Expectations, newest first',
+    },
+    401: jsonError('Missing or invalid operator token'),
+    500: jsonError('Server error'),
+  },
+});
+
 const postTaskmasterResumeRoute = createRoute({
   method: 'post',
   path: '/api/taskmaster/resume',
@@ -2344,7 +2411,11 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 401 | 403 | 404 | 409 | 422 | 500 | 503,
+    // 429 is here for the expectation front door's per-registrant daily cap
+    // (bdc-xo#2007). A cap breach is a rate refusal, not a malformed request:
+    // reporting it as 400 would tell a caller to fix a body that is correct,
+    // and as 403 would tell it to stop trying rather than to try later.
+    status: 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -3337,6 +3408,140 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'taskmaster_pause_failed');
       return apiError(c, 500, 'Failed to pause taskmaster');
+    }
+  });
+
+  // POST /api/taskmaster/expectations - the front door (bdc-xo#2007).
+  registerOpenApiRoute(postTaskmasterExpectationRoute, async c => {
+    try {
+      const body = getValidatedBody(c, registerExpectationBodySchema);
+
+      // EXACTLY ONE deadline form. Accepting both and silently preferring one
+      // means a caller that sends a stale due_at alongside a fresh
+      // due_in_minutes gets a deadline it did not intend -- and a supervision
+      // deadline that is wrong in the past fires an escalation immediately.
+      const absolute = body.due_at;
+      const relative = body.due_in_minutes;
+      if ((absolute === undefined) === (relative === undefined))
+        return apiError(c, 400, 'Provide exactly one of due_at or due_in_minutes');
+
+      const dueAt =
+        absolute === undefined
+          ? new Date(Date.now() + (relative ?? 0) * 60_000).toISOString()
+          : new Date(absolute).toISOString();
+      // A deadline already in the past is never a legitimate registration: it
+      // asks the very next tick to declare the work absent before anyone could
+      // have done it. Refusing is better than escalating on arrival.
+      if (Date.parse(dueAt) <= Date.now()) return apiError(c, 400, 'due_at must be in the future');
+
+      // SELF-SUPERVISION. A registrant naming ITSELF as the recipient is asking
+      // to be the only party that would notice its own silence. That is fine
+      // when the absence action is inert -- 'give_up' just closes the row, and
+      // 'redispatch' re-sends to the same mailbox the seat is already reading --
+      // but 'escalate' is the one that is supposed to reach past the seat to a
+      // human. A seat that can self-register an escalation can also decline to
+      // act on it, and nothing else in the system would know. So: recorded and
+      // allowed for the inert actions, REFUSED for escalate.
+      // Doctrine: docs/doctrine/taskmaster-expectation-registration.md.
+      const selfSupervised =
+        body.registered_by.trim().toLowerCase() === body.recipient.trim().toLowerCase();
+      if (selfSupervised && body.on_absence === 'escalate')
+        return apiError(
+          c,
+          400,
+          'A registrant cannot escalate against itself: register the expectation ' +
+            'from the assigning session, or use on_absence=redispatch/give_up'
+        );
+
+      // REDISPATCH NEEDS A REAL DISPATCH TO REPLAY. The redispatch path loads
+      // the original message by dispatch_ref (getMessage) and gives up if it is
+      // missing -- so a dispatch_ref that is not a dispatch id (a GitHub ref
+      // like "bdc-xo#2006", say) would register cleanly and then quietly close
+      // itself as given_up at the deadline instead of retrying. Caught here,
+      // where the caller can still fix it.
+      if (body.on_absence === 'redispatch') {
+        const original = await dispatchDb.getMessage(body.dispatch_ref);
+        if (!original)
+          return apiError(
+            c,
+            400,
+            'on_absence=redispatch requires dispatch_ref to name an existing dispatch message'
+          );
+      }
+
+      // PER-CALLER DAILY CAP. An expectation is not itself one of Taskmaster's
+      // budgeted effects, but its on_absence action IS one -- so an unbounded
+      // registrant could buy unbounded future escalations one row at a time.
+      // Scoped per registrant so one noisy caller cannot exhaust another's
+      // budget, and deliberately generous: this is a runaway bound, not a
+      // workflow limit.
+      const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const registeredToday = await taskmasterDb.countExpectationsRegisteredSince(
+        body.registered_by,
+        dayAgo
+      );
+      if (registeredToday >= EXPECTATION_DAILY_CAP_PER_REGISTRANT)
+        return apiError(
+          c,
+          429,
+          `Registrant ${body.registered_by} has opened ${String(registeredToday)} expectations ` +
+            `in 24h (cap ${String(EXPECTATION_DAILY_CAP_PER_REGISTRANT)})`
+        );
+
+      // NAMESPACE THE KEY. The loop's own keys are "<action id>:<dispatch_ref>"
+      // or a bare dispatch_ref; prefixing external ones makes a collision
+      // between a caller's chosen key and a loop-derived key impossible, so a
+      // caller cannot -- by accident or otherwise -- adopt or block the row the
+      // loop opened for one of its own dispatches.
+      const registrationKey = `ext:${body.registered_by}:${body.registration_key}`;
+      // Registration is idempotent on the key, so a retry is a 200 and not a
+      // duplicate. `created` reports WHICH happened -- a caller that believes it
+      // opened a fresh 24h expectation when it actually matched a key whose
+      // deadline passed yesterday believes work is supervised that is not. The
+      // returned row is the STORED one for the same reason: on a conflict the
+      // effective deadline is the first registration's, not this request's.
+      const { id, created, expectation } = await taskmasterDb.registerExpectationReportingCreation({
+        dispatch_ref: body.dispatch_ref,
+        recipient: body.recipient,
+        evidence_json: JSON.stringify(body.evidence),
+        due_at: dueAt,
+        on_absence: body.on_absence,
+        max_retries: body.max_retries,
+        registration_key: registrationKey,
+        registered_by: body.registered_by,
+        self_supervised: selfSupervised,
+      });
+      getLog().info(
+        { expectationId: id, registeredBy: body.registered_by, dueAt, created, selfSupervised },
+        'taskmaster_expectation_registered'
+      );
+      return c.json({
+        id,
+        registration_key: registrationKey,
+        due_at: expectation.due_at,
+        on_absence: expectation.on_absence,
+        created,
+        self_supervised: expectation.self_supervised === 1,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_expectation_register_failed');
+      return apiError(c, 500, 'Failed to register taskmaster expectation');
+    }
+  });
+
+  // GET /api/taskmaster/expectations - read the registry without a database.
+  registerOpenApiRoute(getTaskmasterExpectationsRoute, async c => {
+    try {
+      const query = getValidatedQuery(c, listExpectationsQuerySchema);
+      const result = await taskmasterDb.listExpectations({
+        status: query.status,
+        registered_by: query.registered_by,
+        limit: query.limit,
+      });
+      return c.json(result);
+    } catch (error) {
+      getLog().error({ err: error }, 'taskmaster_expectation_list_failed');
+      return apiError(c, 500, 'Failed to list taskmaster expectations');
     }
   });
 

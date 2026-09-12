@@ -36,6 +36,9 @@ import {
   resetTaskmaster,
   recordUsageSample,
   registerExpectation,
+  registerExpectationReportingCreation,
+  listExpectations,
+  countExpectationsRegisteredSince,
   listDueExpectations,
   markMet,
   markFailed,
@@ -2012,5 +2015,193 @@ describe('tm_suppression DAL (M-155 exception push)', () => {
       }
     );
     expect(repeat.repeat_reason).toBe('tm:nudge:follow-up');
+  });
+});
+
+describe('expectation front door (bdc-xo#2007)', () => {
+  const spec = JSON.stringify({ kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' });
+  const future = (): string => new Date(Date.now() + 86_400_000).toISOString();
+
+  test('a caller-supplied key replaces the derived one and is idempotent', async () => {
+    const first = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:fuelglass-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    expect(first.created).toBe(true);
+
+    // The SAME key with a DIFFERENT deadline must match the existing row, not
+    // open a second expectation and not move the first one's deadline.
+    const laterDeadline = new Date(Date.now() + 7 * 86_400_000).toISOString();
+    const second = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:fuelglass-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: laterDeadline,
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    expect(second.created).toBe(false);
+    expect(second.id).toBe(first.id);
+    expect(second.expectation.due_at).toBe(first.expectation.due_at);
+    expect(second.expectation.due_at).not.toBe(laterDeadline);
+
+    const all = await listExpectations({ limit: 50 });
+    expect(all.rows.filter(r => r.registration_key === 'ext:xo:fuelglass-1')).toHaveLength(1);
+  });
+
+  test('registered_by and self_supervised are persisted and readable', async () => {
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:grok:self-1',
+      dispatch_ref: 'ref-self',
+      recipient: 'grok',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'give_up',
+      max_retries: 0,
+      registered_by: 'grok',
+      self_supervised: true,
+    });
+    const rows = await listExpectations({ registered_by: 'grok', limit: 10 });
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]?.registered_by).toBe('grok');
+    expect(rows.rows[0]?.self_supervised).toBe(1);
+  });
+
+  test("the loop's own registrations are attributed to taskmaster, not to a caller", async () => {
+    // registerExpectation is the loop's path and passes no registrant, so the
+    // default must be the loop -- otherwise loop rows would land in whichever
+    // caller's daily budget happened to be the default.
+    await registerExpectation({
+      dispatch_ref: 'loop-dispatch-1',
+      recipient: 'operator',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+    });
+    const rows = await listExpectations({ registered_by: 'taskmaster', limit: 10 });
+    expect(rows.rows).toHaveLength(1);
+    expect(rows.rows[0]?.dispatch_ref).toBe('loop-dispatch-1');
+    expect(rows.rows[0]?.self_supervised).toBe(0);
+  });
+
+  test('the daily count is scoped per registrant', async () => {
+    for (const n of [1, 2, 3]) {
+      await registerExpectationReportingCreation({
+        registration_key: `ext:xo:count-${String(n)}`,
+        dispatch_ref: `ref-${String(n)}`,
+        recipient: 'fable-cursor',
+        evidence_json: spec,
+        due_at: future(),
+        on_absence: 'escalate',
+        max_retries: 0,
+        registered_by: 'xo',
+      });
+    }
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:codex:count-1',
+      dispatch_ref: 'ref-codex',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'codex',
+    });
+    const dayAgo = new Date(Date.now() - 86_400_000).toISOString();
+    // One caller's registrations must not consume another's budget.
+    expect(await countExpectationsRegisteredSince('xo', dayAgo)).toBe(3);
+    expect(await countExpectationsRegisteredSince('codex', dayAgo)).toBe(1);
+    expect(await countExpectationsRegisteredSince('nobody', dayAgo)).toBe(0);
+  });
+
+  test('the count window excludes rows older than the cutoff', async () => {
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:window-1',
+      dispatch_ref: 'ref-window',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    const tomorrow = new Date(Date.now() + 86_400_000).toISOString();
+    expect(await countExpectationsRegisteredSince('xo', tomorrow)).toBe(0);
+  });
+
+  test('an externally registered expectation is picked up by the due sweep', async () => {
+    // The whole point of the front door: a row a session registered must be
+    // supervised by exactly the same loop that supervises the loop's own rows.
+    const { id } = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:swept-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: new Date(Date.now() - 1000).toISOString(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    const due = await listDueExpectations(new Date().toISOString());
+    expect(due.map(r => r.id)).toContain(id);
+  });
+
+  test('listExpectations filters by status and reports the unfiltered total', async () => {
+    const { id } = await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:status-1',
+      dispatch_ref: 'ref-status',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    await registerExpectationReportingCreation({
+      registration_key: 'ext:xo:status-2',
+      dispatch_ref: 'ref-status-2',
+      recipient: 'fable-cursor',
+      evidence_json: spec,
+      due_at: future(),
+      on_absence: 'escalate',
+      max_retries: 0,
+      registered_by: 'xo',
+    });
+    await markMet(id, 'https://example/pr/1');
+    const met = await listExpectations({ status: 'met', limit: 10 });
+    expect(met.rows).toHaveLength(1);
+    expect(met.total).toBe(1);
+    expect(met.rows[0]?.id).toBe(id);
+    expect(met.rows[0]?.evidence_pointer).toBe('https://example/pr/1');
+    const pending = await listExpectations({ status: 'pending', limit: 10 });
+    expect(pending.rows).toHaveLength(1);
+  });
+
+  test('limit caps the rows returned but not the reported total', async () => {
+    for (const n of [1, 2, 3, 4]) {
+      await registerExpectationReportingCreation({
+        registration_key: `ext:xo:limit-${String(n)}`,
+        dispatch_ref: `ref-limit-${String(n)}`,
+        recipient: 'fable-cursor',
+        evidence_json: spec,
+        due_at: future(),
+        on_absence: 'escalate',
+        max_retries: 0,
+        registered_by: 'xo',
+      });
+    }
+    const page = await listExpectations({ limit: 2 });
+    expect(page.rows).toHaveLength(2);
+    // A caller paging the registry must be told how much it has NOT seen.
+    expect(page.total).toBe(4);
   });
 });

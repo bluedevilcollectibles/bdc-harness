@@ -61,6 +61,16 @@ export interface TmExpectation {
   retries: number;
   status: TmExpectationStatus;
   evidence_pointer: string | null;
+  /**
+   * WHO asked for this supervision. 'taskmaster' for rows the loop opened on
+   * its own dispatches; a caller identity for rows registered through the front
+   * door (bdc-xo#2007). Nullable only so a row written before migration 050 by
+   * some path the backfill did not see stays VISIBLE as unattributed rather
+   * than being silently relabelled as the loop's own work.
+   */
+  registered_by: string | null;
+  /** 1 when the registrant named ITSELF as the recipient. */
+  self_supervised: number;
   created_at: string;
   updated_at: string;
 }
@@ -155,10 +165,73 @@ function normalizeExpectation(row: TmExpectation): TmExpectation {
     ...row,
     max_retries: row.max_retries,
     retries: row.retries,
+    registered_by: row.registered_by ?? null,
+    // A row read back from a database that predates migration 050 (or a test
+    // double that omits the column) has no flag at all; absent means "not self
+    // supervised", which is the safe reading -- it never widens what is allowed.
+    self_supervised: row.self_supervised ?? 0,
     due_at: toIso(row.due_at),
     created_at: toIso(row.created_at),
     updated_at: toIso(row.updated_at),
   };
+}
+
+/**
+ * Read the registry. Read-only surface for the front door's GET, so a session
+ * can see what it has registered without opening the database -- the same
+ * reason the POST exists.
+ */
+export async function listExpectations(filter: {
+  status?: TmExpectationStatus;
+  registered_by?: string;
+  limit: number;
+}): Promise<{ rows: TmExpectation[]; total: number }> {
+  const clauses: string[] = [];
+  const params: unknown[] = [];
+  if (filter.status) {
+    params.push(filter.status);
+    clauses.push(`status = $${String(params.length)}`);
+  }
+  if (filter.registered_by) {
+    params.push(filter.registered_by);
+    clauses.push(`registered_by = $${String(params.length)}`);
+  }
+  const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+  const db = getDatabase();
+  const total = await db.query<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM tm_expectations${where}`,
+    params
+  );
+  params.push(filter.limit);
+  const rows = await db.query<TmExpectation>(
+    `SELECT * FROM tm_expectations${where} ORDER BY created_at DESC LIMIT $${String(params.length)}`,
+    params
+  );
+  return {
+    rows: rows.rows.map(normalizeExpectation),
+    total: total.rows[0]?.count ?? 0,
+  };
+}
+
+/**
+ * How many expectations this registrant has opened since `since`.
+ *
+ * Counts REGISTRATIONS, not effects. An expectation is not itself one of
+ * Taskmaster's budgeted effects -- but its `on_absence` action is, so an
+ * unbounded registrant could buy unbounded future escalations one row at a time.
+ * This is the denominator the front door's per-caller daily cap is measured on.
+ * Rows the loop registered for itself are counted under 'taskmaster' and are
+ * bounded by the loop's own per-tick budgets, not by this.
+ */
+export async function countExpectationsRegisteredSince(
+  registeredBy: string,
+  since: string
+): Promise<number> {
+  const result = await getDatabase().query<{ count: number }>(
+    'SELECT COUNT(*) AS count FROM tm_expectations WHERE registered_by = $1 AND created_at >= $2',
+    [registeredBy, since]
+  );
+  return result.rows[0]?.count ?? 0;
 }
 
 /**
@@ -201,15 +274,31 @@ export async function registerExpectation(data: {
   max_retries: number;
   /** Journal action id, when the registration is caused by one. */
   action_ref?: string | null;
+  /**
+   * CALLER-SUPPLIED identity, for registrations that do not originate in a
+   * journal action (the front door, bdc-xo#2007). When present it REPLACES the
+   * derived (action_ref, dispatch_ref) key entirely rather than being mixed
+   * with it: an external caller owns its own idempotency, and a key that was
+   * half caller-chosen and half derived would let the same logical request
+   * register twice under two different keys whenever the caller varied its
+   * dispatch_ref. Namespaced by the API so an external key can never collide
+   * with a loop-derived one.
+   */
+  registration_key?: string;
+  /** WHO asked for this supervision. The loop passes 'taskmaster'. */
+  registered_by?: string;
+  /** True when the registrant named itself as the recipient. */
+  self_supervised?: boolean;
 }): Promise<string> {
-  const registrationKey = expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
+  const registrationKey =
+    data.registration_key ?? expectationRegistrationKey(data.action_ref ?? null, data.dispatch_ref);
   const db = getDatabase();
   const now = new Date().toISOString();
   const inserted = await db.query<{ id: string }>(
     `INSERT INTO tm_expectations
      (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
-      max_retries, retries, status, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $9)
+      max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11)
      ON CONFLICT (registration_key) DO NOTHING
      RETURNING id`,
     [
@@ -221,6 +310,8 @@ export async function registerExpectation(data: {
       data.due_at,
       data.on_absence,
       data.max_retries,
+      data.registered_by ?? 'taskmaster',
+      data.self_supervised ? 1 : 0,
       now,
     ]
   );
@@ -236,6 +327,62 @@ export async function registerExpectation(data: {
   if (!existingRow)
     throw new Error('tm_expectations registration conflict without an existing row');
   return existingRow.id;
+}
+
+/**
+ * registerExpectation, but reporting WHETHER this call created the row.
+ *
+ * The bare id cannot distinguish "I opened supervision for this" from "an
+ * expectation under this key already existed and you are now looking at ITS
+ * deadline". For the loop that difference is immaterial -- idempotency is the
+ * whole point. For an external caller it is not: a session told it registered a
+ * 24-hour expectation, when in fact it matched a key whose deadline passed
+ * yesterday, believes work is supervised that is not.
+ *
+ * Creation is read from the INSERT's own RETURNING clause, not from a SELECT
+ * taken before it. ON CONFLICT DO NOTHING ... RETURNING yields a row only for
+ * the caller whose insert actually landed, which makes this exact under
+ * concurrency; a read-then-write would report two simultaneous first-time
+ * callers as both having created the row.
+ */
+export async function registerExpectationReportingCreation(
+  data: Parameters<typeof registerExpectation>[0] & { registration_key: string }
+): Promise<{ id: string; created: boolean; expectation: TmExpectation }> {
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  const inserted = await db.query<{ id: string }>(
+    `INSERT INTO tm_expectations
+     (id, registration_key, dispatch_ref, recipient, evidence_json, due_at, on_absence,
+      max_retries, retries, status, registered_by, self_supervised, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 'pending', $9, $10, $11, $11)
+     ON CONFLICT (registration_key) DO NOTHING
+     RETURNING id`,
+    [
+      randomUUID(),
+      data.registration_key,
+      data.dispatch_ref,
+      data.recipient,
+      data.evidence_json,
+      data.due_at,
+      data.on_absence,
+      data.max_retries,
+      data.registered_by ?? 'taskmaster',
+      data.self_supervised ? 1 : 0,
+      now,
+    ]
+  );
+  const createdId = inserted.rows[0]?.id;
+  const existing = await db.query<TmExpectation>(
+    'SELECT * FROM tm_expectations WHERE registration_key = $1',
+    [data.registration_key]
+  );
+  const row = existing.rows[0];
+  if (!row) throw new Error('tm_expectations registration conflict without an existing row');
+  return {
+    id: row.id,
+    created: createdId !== undefined,
+    expectation: normalizeExpectation(row),
+  };
 }
 
 /**

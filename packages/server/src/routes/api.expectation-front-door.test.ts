@@ -1,0 +1,165 @@
+import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { evidenceSpecSchema, registerExpectationBodySchema } from './schemas/taskmaster.schemas';
+
+const apiSource = readFileSync(join(import.meta.dir, 'api.ts'), 'utf8');
+
+/**
+ * bdc-xo#2007. The registry shipped with #1850 and every live row was written
+ * by the loop itself; there was no way for a session to say "I gave this work
+ * to that seat, check on me", so registering one meant sudo sqlite3 on the
+ * production host. These tests hold the front door open.
+ */
+describe('expectation front door: route wiring', () => {
+  test('both routes are mounted', () => {
+    expect(apiSource).toContain('registerOpenApiRoute(postTaskmasterExpectationRoute');
+    expect(apiSource).toContain('registerOpenApiRoute(getTaskmasterExpectationsRoute');
+  });
+
+  test('the POST declares its refusals, so a caller is not surprised by them', () => {
+    const declaration = apiSource.slice(
+      apiSource.indexOf('const postTaskmasterExpectationRoute'),
+      apiSource.indexOf('const getTaskmasterExpectationsRoute')
+    );
+    expect(declaration).toContain("401: jsonError('Missing or invalid operator token')");
+    expect(declaration).toMatch(/400: jsonError\(/);
+    expect(declaration).toMatch(/429: jsonError\(/);
+  });
+
+  test('registration is namespaced, so an external key cannot collide with a loop key', () => {
+    // The loop's keys are "<action id>:<dispatch_ref>" or a bare dispatch_ref.
+    // Without the prefix, a caller could name a key that adopts or blocks the
+    // row the loop opened for one of its own dispatches.
+    expect(apiSource).toContain('`ext:${body.registered_by}:${body.registration_key}`');
+  });
+
+  test('the handler enforces exactly one deadline form', () => {
+    const handler = apiSource.slice(
+      apiSource.indexOf('// POST /api/taskmaster/expectations -'),
+      apiSource.indexOf('// GET /api/taskmaster/expectations -')
+    );
+    expect(handler).toContain('Provide exactly one of due_at or due_in_minutes');
+    // A deadline already past asks the very next tick to call the work absent.
+    expect(handler).toContain('due_at must be in the future');
+  });
+
+  test('self-supervised escalation is refused in code, not merely documented', () => {
+    const handler = apiSource.slice(
+      apiSource.indexOf('// POST /api/taskmaster/expectations -'),
+      apiSource.indexOf('// GET /api/taskmaster/expectations -')
+    );
+    expect(handler).toContain('A registrant cannot escalate against itself');
+    expect(handler).toMatch(/selfSupervised && body\.on_absence === 'escalate'/);
+  });
+
+  test('the GET surface is read-only', () => {
+    const handler = apiSource.slice(
+      apiSource.indexOf('// GET /api/taskmaster/expectations -'),
+      apiSource.indexOf('// POST /api/taskmaster/resume -')
+    );
+    expect(handler).not.toMatch(/registerExpectation|markMet|markFailed|markEscalated/);
+  });
+});
+
+describe('expectation front door: the contract', () => {
+  test('all six evidence kinds #1850 specified are reachable', () => {
+    // THE GAP. checkEvidence has implemented all six since #1850, but the live
+    // rows used only dispatch_reply_exists -- the other five were code nothing
+    // could reach. The schema is what makes them reachable, so this test is the
+    // thing that keeps them so.
+    const kinds = [
+      { kind: 'issue_comment_exists', repo: 'a/b', number: 1 },
+      { kind: 'label_present', repo: 'a/b', number: 1, label: 'status:review' },
+      { kind: 'pr_opened', repo: 'thinmansoftware/fuelglass' },
+      { kind: 'lease_holder_is', name: 'xo-main' },
+      { kind: 'dispatch_reply_exists', correlation_id: 'c1' },
+      { kind: 'db_row_exists', table: 'runs', where: { id: 'r1' } },
+    ];
+    for (const spec of kinds) {
+      const parsed = evidenceSpecSchema.safeParse(spec);
+      expect(parsed.success).toBe(true);
+    }
+    expect(kinds).toHaveLength(6);
+  });
+
+  test('an unknown evidence kind is refused at registration, not at the deadline', () => {
+    // Refusing late would leave an expectation that can never be satisfied and
+    // escalates for work that may well have been done.
+    expect(evidenceSpecSchema.safeParse({ kind: 'vibes', repo: 'a/b' }).success).toBe(false);
+  });
+
+  test('db_row_exists rejects an identifier that is not an identifier', () => {
+    expect(
+      evidenceSpecSchema.safeParse({
+        kind: 'db_row_exists',
+        table: 'runs; DROP TABLE tm_expectations',
+        where: { id: 'r1' },
+      }).success
+    ).toBe(false);
+    expect(
+      evidenceSpecSchema.safeParse({
+        kind: 'db_row_exists',
+        table: 'runs',
+        where: { 'id = 1 OR 1': 'x' },
+      }).success
+    ).toBe(false);
+  });
+
+  test('db_row_exists accepts the null and IN predicate forms checkEvidence implements', () => {
+    const parsed = evidenceSpecSchema.safeParse({
+      kind: 'db_row_exists',
+      table: 'remote_agent_workflow_runs',
+      where: { cascade_id: 'abc', status: ['completed', 'succeeded'], failed_at: null },
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  test('registration_key is required: the server cannot invent idempotency', () => {
+    const withoutKey = registerExpectationBodySchema.safeParse({
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence: { kind: 'pr_opened', repo: 'a/b' },
+      due_in_minutes: 1440,
+    });
+    expect(withoutKey.success).toBe(false);
+  });
+
+  test('defaults are the safe ones: escalate, no retries, attributed caller', () => {
+    const parsed = registerExpectationBodySchema.parse({
+      registration_key: 'fuelglass-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence: { kind: 'pr_opened', repo: 'a/b' },
+      due_in_minutes: 1440,
+    });
+    // An unspecified absence action must be the one that TELLS SOMEONE.
+    expect(parsed.on_absence).toBe('escalate');
+    expect(parsed.max_retries).toBe(0);
+    expect(parsed.registered_by).toBe('operator');
+  });
+
+  test('max_retries is bounded, so one registration cannot buy unbounded sends', () => {
+    const tooMany = registerExpectationBodySchema.safeParse({
+      registration_key: 'fuelglass-1',
+      dispatch_ref: 'bdc-xo#2006',
+      recipient: 'fable-cursor',
+      evidence: { kind: 'pr_opened', repo: 'a/b' },
+      due_in_minutes: 1440,
+      max_retries: 99,
+    });
+    expect(tooMany.success).toBe(false);
+  });
+
+  test('due_in_minutes is bounded to 30 days', () => {
+    expect(
+      registerExpectationBodySchema.safeParse({
+        registration_key: 'k-12345678',
+        dispatch_ref: 'r',
+        recipient: 'x',
+        evidence: { kind: 'pr_opened', repo: 'a/b' },
+        due_in_minutes: 43_201,
+      }).success
+    ).toBe(false);
+  });
+});

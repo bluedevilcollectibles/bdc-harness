@@ -4,6 +4,7 @@ import {
   checkExpectations,
   EvidenceProbeCapped,
   nextPageUrl,
+  renderEscalationBody,
   type EvidenceSpec,
 } from './expectations';
 import type { TmExpectation } from '@archon/core/db/taskmaster';
@@ -19,6 +20,8 @@ const base: TmExpectation = {
   retries: 0,
   status: 'pending',
   evidence_pointer: null,
+  registered_by: 'taskmaster',
+  self_supervised: 0,
   created_at: new Date(0).toISOString(),
   updated_at: new Date(0).toISOString(),
 };
@@ -1170,5 +1173,125 @@ describe('expectation supervisor', () => {
       retryDelayMs: 0,
     } as never);
     expect(keys).toEqual([]);
+  });
+});
+
+describe('escalation reaches a human (bdc-xo#2007)', () => {
+  // THE DEFECT: on 2026-09-11 both expectations that had ever escalated
+  // (46f94406, faa69079) sent a blocker to recipient 'operator', and it was
+  // auto-acknowledged and auto-addressed inside two seconds. Measured on the
+  // live database that day: operator had 3,535 messages and 9 unaddressed,
+  // 258 of them addressed under five seconds; 'xo' had 1,089 messages, 153
+  // unaddressed, and ZERO addressed under five seconds. 'operator' is also
+  // structurally ineligible for the Telegram and SMS legs, which
+  // claimDispatchEscalation gates on recipient = 'xo'.
+  const escalating = {
+    ...base,
+    id: 'exp-escalate',
+    on_absence: 'escalate' as const,
+    max_retries: 0,
+    due_at: new Date(0).toISOString(),
+  };
+
+  test('escalates to xo, not operator', async () => {
+    const sent: { recipient: string; priority: string; body: string }[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [escalating],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      claimEscalation: async () => true,
+      markEscalated: async () => true,
+      createTask: async (_context, data) => {
+        sent.push({
+          recipient: data.recipient,
+          priority: data.priority as string,
+          body: data.body,
+        });
+        return { id: 'd' } as never;
+      },
+    } as never);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.recipient).toBe('xo');
+    expect(sent[0]?.priority).toBe('blocker');
+  });
+
+  test('escalation body is readable without opening the database', async () => {
+    const sent: string[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [
+        {
+          ...escalating,
+          recipient: 'fable-cursor',
+          registered_by: 'xo',
+          evidence_json: JSON.stringify({
+            kind: 'pr_opened',
+            repo: 'thinmansoftware/fuelglass',
+          }),
+        },
+      ],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      claimEscalation: async () => true,
+      markEscalated: async () => true,
+      createTask: async (_context, data) => {
+        sent.push(data.body);
+        return { id: 'd' } as never;
+      },
+    } as never);
+    const body = sent[0] ?? '';
+    // The four things that decide what a human does next.
+    expect(body).toContain('an open PR in thinmansoftware/fuelglass');
+    expect(body).toContain('fable-cursor');
+    expect(body).toContain('Registered by:  xo');
+    expect(body).toContain('exp-escalate');
+    // NOT a JSON column dump, which is what it used to be.
+    expect(body).not.toContain('evidence_json');
+  });
+
+  test('a self-supervised escalation says so in the body', async () => {
+    const sent: string[] = [];
+    await checkExpectations(new Date(), {
+      listDueExpectations: async () => [
+        { ...escalating, registered_by: 'grok', recipient: 'grok', self_supervised: 1 },
+      ],
+      checkEvidence: async () => ({ ok: false, pointer: null }),
+      markFailed: async () => true,
+      claimEscalation: async () => true,
+      markEscalated: async () => true,
+      createTask: async (_context, data) => {
+        sent.push(data.body);
+        return { id: 'd' } as never;
+      },
+    } as never);
+    expect(sent[0]).toContain('SELF-SUPERVISED');
+  });
+
+  test('every evidence kind renders a phrase, never [object Object]', () => {
+    const specs: EvidenceSpec[] = [
+      { kind: 'issue_comment_exists', repo: 'a/b', number: 7, author: 'xo', marker: 'DONE' },
+      { kind: 'label_present', repo: 'a/b', number: 7, label: 'status:review' },
+      { kind: 'pr_opened', repo: 'a/b', head_branch: 'feat/x' },
+      { kind: 'lease_holder_is', name: 'xo-main' },
+      { kind: 'dispatch_reply_exists', correlation_id: 'c1', classification: 'succeeded' },
+      { kind: 'db_row_exists', table: 'runs', where: { id: 'r1' } },
+    ];
+    for (const spec of specs) {
+      const body = renderEscalationBody({ ...base, evidence_json: JSON.stringify(spec) });
+      expect(body).not.toContain('[object Object]');
+      expect(body).not.toContain('undefined');
+      // The kind name itself is a schema token, not a phrase; the renderer must
+      // say what the proof IS, so the raw kind must not leak into the line.
+      const line = body.split('\n').find(l => l.startsWith('Expected proof:')) ?? '';
+      expect(line).not.toContain(spec.kind);
+      expect(line.length).toBeGreaterThan('Expected proof: '.length + 5);
+    }
+  });
+
+  test('an unparseable evidence spec still escalates', () => {
+    // An escalation is the last line of defence; a malformed spec must not be
+    // the thing that swallows it.
+    const body = renderEscalationBody({ ...base, evidence_json: 'not json' });
+    expect(body).toContain('unparseable evidence spec');
+    expect(body).toContain('EXHAUSTED');
   });
 });
